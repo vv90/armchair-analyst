@@ -1,6 +1,6 @@
 use std::{error, fmt};
 
-use client_evm::{EvmNetwork, RpcConfig};
+use client_evm::{ClientEvent, EvmNetwork, RpcConfig};
 
 pub(crate) const RPC_HTTP_URL_ENV: &str = "AA_RPC_HTTP_URL";
 pub(crate) const RPC_WS_URL_ENV: &str = "AA_RPC_WS_URL";
@@ -41,6 +41,44 @@ impl fmt::Display for CliError {
 }
 
 impl error::Error for CliError {}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct EventFeedback {
+    pub(crate) event_count: u64,
+    pub(crate) line: String,
+}
+
+pub(crate) fn format_event_feedback(event: &ClientEvent, event_count: u64) -> EventFeedback {
+    match event {
+        ClientEvent::Subscribed { subscription_id } => EventFeedback {
+            event_count,
+            line: format!("connected subscription={subscription_id}"),
+        },
+        ClientEvent::Notification { result, .. } => {
+            let event_count = event_count + 1;
+            let address = result.address();
+            EventFeedback {
+                event_count,
+                line: address.to_string(),
+            }
+        }
+        ClientEvent::NewHead { header, .. } => {
+            let event_count = event_count + 1;
+
+            EventFeedback {
+                event_count,
+                line: format!(
+                    "head block={} hash={}",
+                    header.inner.inner.number, header.inner.hash
+                ),
+            }
+        }
+        ClientEvent::Closed { subscription_id } => EventFeedback {
+            event_count,
+            line: format!("closed subscription={subscription_id}"),
+        },
+    }
+}
 
 pub(crate) fn load_rpc_config_with<Env, Prompt>(
     mut read_env: Env,
@@ -103,7 +141,55 @@ fn normalize_config_value(value: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use client_evm::{ClientEvent, ClientHead};
+    use serde_json::json;
+
     use super::*;
+
+    #[test]
+    fn subscribed_event_feedback_includes_subscription_id() {
+        let feedback = format_event_feedback(
+            &ClientEvent::Subscribed {
+                subscription_id: "0xsubscription".to_owned(),
+            },
+            3,
+        );
+
+        assert_eq!(feedback.event_count, 3);
+        assert_eq!(feedback.line, "connected subscription=0xsubscription");
+    }
+
+    #[test]
+    fn closed_event_feedback_includes_subscription_id() {
+        let feedback = format_event_feedback(
+            &ClientEvent::Closed {
+                subscription_id: "0xsubscription".to_owned(),
+            },
+            3,
+        );
+
+        assert_eq!(feedback.event_count, 3);
+        assert_eq!(feedback.line, "closed subscription=0xsubscription");
+    }
+
+    #[test]
+    fn new_head_event_feedback_includes_block_number_and_hash() -> Result<(), serde_json::Error> {
+        let feedback = format_event_feedback(
+            &ClientEvent::NewHead {
+                subscription_id: "0xsubscription".to_owned(),
+                header: new_head()?,
+            },
+            3,
+        );
+
+        assert_eq!(feedback.event_count, 4);
+        assert_eq!(
+            feedback.line,
+            "head block=9 hash=0x0000000000000000000000000000000000000000000000000000000000000001"
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn all_env_values_present_returns_config_without_prompting() {
@@ -257,6 +343,31 @@ mod tests {
             .to_string(),
             "subscription failed: websocket error"
         );
+    }
+
+    fn new_head() -> Result<ClientHead, serde_json::Error> {
+        serde_json::from_value(json!({
+            "hash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "sha3Uncles": "0x0000000000000000000000000000000000000000000000000000000000000003",
+            "miner": "0x0000000000000000000000000000000000000004",
+            "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000005",
+            "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000006",
+            "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000007",
+            "logsBloom": zero_logs_bloom(),
+            "difficulty": "0xd",
+            "number": "0x9",
+            "gasLimit": "0xb",
+            "gasUsed": "0xa",
+            "timestamp": "0xc",
+            "extraData": "0x010203",
+            "mixHash": "0x000000000000000000000000000000000000000000000000000000000000000e",
+            "nonce": "0x000000000000000f"
+        }))
+    }
+
+    fn zero_logs_bloom() -> String {
+        format!("0x{}", "00".repeat(256))
     }
 
     fn env_from<const N: usize>(

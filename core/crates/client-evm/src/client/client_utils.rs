@@ -50,6 +50,15 @@ pub(crate) fn build_pool_events_subscribe_request(request_id: u64) -> Value {
     })
 }
 
+pub(crate) fn build_new_heads_subscribe_request(request_id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_subscribe",
+        "params": ["newHeads"]
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_unsubscribe_request(request_id: u64, subscription_id: &str) -> Value {
     json!({
@@ -189,6 +198,21 @@ mod tests {
             .map(|topics| topics.iter().collect::<HashSet<_>>().len());
 
         assert_eq!(unique_topic_count, Some(9));
+    }
+
+    #[test]
+    fn new_heads_subscribe_request_uses_new_heads_subscription() {
+        let request = build_new_heads_subscribe_request(9);
+
+        assert_eq!(
+            request,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "eth_subscribe",
+                "params": ["newHeads"]
+            })
+        );
     }
 
     #[test]
@@ -361,6 +385,15 @@ mod tests {
             let request = build_pool_events_subscribe_request(request_id);
 
             prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
+        }
+
+        #[test]
+        fn new_heads_subscribe_request_preserves_request_id(request_id in any::<u64>()) {
+            let request = build_new_heads_subscribe_request(request_id);
+
+            prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
+            prop_assert_eq!(request.get("method"), Some(&json!("eth_subscribe")));
+            prop_assert_eq!(request.get("params"), Some(&json!(["newHeads"])));
         }
 
         #[test]
