@@ -1,0 +1,16 @@
+[package]
+name = "aa-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+client-evm = { path = "../client-evm" }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+serde_json = "1.0.150"
+
+[lints]
+workspace = true

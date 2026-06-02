@@ -1,0 +1,17 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "path": "/usr/bin/direnv",
+        "arguments": [
+          "exec",
+          "/workspaces/armchair-analyst",
+          "rust-analyzer"
+        ]
+      },
+      "initialization_options": {
+        "linkedProjects": ["./core/Cargo.toml"]
+      }
+    }
+  }
+}

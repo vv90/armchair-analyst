@@ -1,0 +1,30 @@
+# Repository Instructions
+
+- **Do not edit code without an explicit command from the human.** Discussion, analysis, and proposals are fine — but no file edits until the human says to proceed.
+- When making changes, do them is smallest possible increments. Avoid making multiple changes at once, large sweeping changes, or changes that are not immediately necessary. Each change should be as small as possible and should be easily understandable at a glance.
+- Test-first always:
+    - Write tests before implementation.
+    - Confirm tests fail for the intended reason before writing production logic.
+    - Prefer stubs/placeholders when introducing new modules to establish structure and compile-time contracts first.
+- Prefer property-based tests by default for core logic (state transitions, framing, math, ordering, validation).
+- Keep domain logic pure:
+    - Pure, deterministic functions for business logic and state transitions.
+    - Isolate side effects (network, DB, time, randomness) behind thin adapters/interfaces.
+    - Clearly separate pure logic from effetful code
+    - Move as much logic as possible into pure functions to maximize testability and reasoning.
+    - Keep impure logic as simple as possible, ideally trivial
+- Prefer functional style:
+    - Favor immutability and pure functions.
+    - Avoid mutable state and side effects when possible.
+    - Use combinators and higher-order functions to express logic declaratively.
+- Panic-free production code:
+    - Do not use `unwrap`, `expect`, `panic!`, `todo!`, or `unreachable!` on runtime paths.
+    - Handle all recoverable errors via typed `Result`/error enums.
+    - Treat panic safety as part of API design and test strategy.
+- Type-driven design:
+    - Use ADTs/newtypes for IDs, tokens, bounded values, and protocol messages.
+    - Model invalid states as unrepresentable when practical.
+    - Validate at boundaries and convert into validated internal types immediately.
+- Fail early:
+    - Prefer compile-time guarantees over runtime checks.
+    - Prefer input validation errors over deferred logic errors.

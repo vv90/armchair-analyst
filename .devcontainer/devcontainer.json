@@ -1,0 +1,9 @@
+{
+    "name": "armchair-analyst-devcontainer",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "vscode",
+    "updateRemoteUserUID": false,
+    "postCreateCommand": "nix develop --command true && direnv allow"
+}
