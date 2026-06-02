@@ -36,6 +36,7 @@ dependencies = [
  "alloy-core",
  "alloy-eips",
  "alloy-genesis",
+ "alloy-rpc-types",
  "alloy-serde",
  "alloy-trie",
 ]
@@ -65,6 +66,20 @@ dependencies = [
  "serde_json",
  "serde_with",
  "thiserror",
+]
+
+[[package]]
+name = "alloy-consensus-any"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5406343e306856dc2be762700e98a16904de45dee14a07f233e742ce68daff2f"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-serde",
+ "serde",
 ]
 
 [[package]]
@@ -199,6 +214,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-network-primitives"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd28d9bfd11729037d194f2b1d43db8642eb3f342032691f4ca96bb745479c3c"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-serde",
+ "serde",
+]
+
+[[package]]
 name = "alloy-primitives"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +274,38 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "alloy-rpc-types"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "052c031d1f7c5611997056bbcb8814e5cbf20f7efeee8c3de690555172038cf2"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "alloy-serde",
+ "serde",
+]
+
+[[package]]
+name = "alloy-rpc-types-eth"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175a2a5b6017d7f61b5e4b800d21215fe8e94fe729d00828e13bb6d93dcf3492"
+dependencies = [
+ "alloy-consensus",
+ "alloy-consensus-any",
+ "alloy-eips",
+ "alloy-network-primitives",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-serde",
+ "alloy-sol-types",
+ "itertools 0.13.0",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

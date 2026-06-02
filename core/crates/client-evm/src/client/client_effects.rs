@@ -1,6 +1,6 @@
 use std::{net::TcpStream, str, sync::mpsc::Sender};
 
-use alloy::primitives::Log;
+use alloy::rpc::types::Log;
 use serde::Deserialize;
 use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
@@ -131,4 +131,88 @@ fn send_event(sender: &Sender<ClientEvent>, event: ClientEvent) -> Result<(), Cl
     sender
         .send(event)
         .map_err(|_| ClientEvmError::EventReceiverDropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::{primitives::B256, rpc::types::Log as RpcLog};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn subscription_notification_preserves_rpc_log_metadata() {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_subscription",
+            "params": {
+                "subscription": "0xsubscription",
+                "result": {
+                    "address": "0x0000000000000000000000000000000000000001",
+                    "topics": [
+                        "0x0000000000000000000000000000000000000000000000000000000000000002"
+                    ],
+                    "data": "0x",
+                    "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000003",
+                    "blockNumber": "0x4",
+                    "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000005",
+                    "transactionIndex": "0x6",
+                    "logIndex": "0x7",
+                    "removed": true
+                }
+            }
+        });
+
+        let result = serde_json::from_value::<SubscriptionNotification<RpcLog>>(notification);
+
+        assert!(matches!(
+            result,
+            Ok(SubscriptionNotification {
+                params: SubscriptionDataParams {
+                    subscription,
+                    result,
+                },
+            }) if subscription == "0xsubscription"
+                && result.address().to_string()
+                    == "0x0000000000000000000000000000000000000001"
+                && result.topic0() == Some(&B256::with_last_byte(2))
+                && result.block_hash == Some(B256::with_last_byte(3))
+                && result.block_number == Some(4)
+                && result.transaction_hash == Some(B256::with_last_byte(5))
+                && result.transaction_index == Some(6)
+                && result.log_index == Some(7)
+                && result.removed
+        ));
+    }
+
+    #[test]
+    fn client_notification_carries_rpc_log() {
+        let notification = json!({
+            "params": {
+                "subscription": "0xsubscription",
+                "result": {
+                    "address": "0x0000000000000000000000000000000000000001",
+                    "topics": [],
+                    "data": "0x",
+                    "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000003",
+                    "blockNumber": "0x4",
+                    "transactionHash": null,
+                    "transactionIndex": null,
+                    "logIndex": null,
+                    "removed": false
+                }
+            }
+        });
+        let parsed = serde_json::from_value::<SubscriptionNotification<RpcLog>>(notification);
+
+        assert!(matches!(
+            parsed.map(|notification| ClientEvent::Notification {
+                subscription_id: notification.params.subscription,
+                result: notification.params.result,
+            }),
+            Ok(ClientEvent::Notification { result, .. })
+                if result.block_hash == Some(B256::with_last_byte(3))
+                    && result.block_number == Some(4)
+        ));
+    }
 }

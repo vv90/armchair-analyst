@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256};
 
 struct State {
-    block_hash: U256,
+    block_hash: B256,
     observed_addresses: HashSet<Address>,
 }
 
