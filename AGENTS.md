@@ -22,8 +22,8 @@
     - Handle all recoverable errors via typed `Result`/error enums.
     - Treat panic safety as part of API design and test strategy.
 - Type-driven design:
-    - Use ADTs/newtypes for IDs, tokens, bounded values, and protocol messages.
-    - Model invalid states as unrepresentable when practical.
+    - Use ADTs/newtypes to model invalid states as unrepresentable.
+    - Avoid data duplication in models (same data exists in more than one place or can be inferred).
     - Validate at boundaries and convert into validated internal types immediately.
 - Fail early:
     - Prefer compile-time guarantees over runtime checks.
