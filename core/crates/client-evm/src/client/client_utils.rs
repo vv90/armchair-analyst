@@ -1,6 +1,9 @@
+use alloy::primitives::BlockHash;
 use serde_json::{Value, json};
 
-use crate::{ClientEvmError, EvmNetwork, RpcConfig, uniswap_v3::pool_event_signature_hashes};
+use crate::{
+    ClientEvmError, ClientHead, EvmNetwork, RpcConfig, uniswap_v3::pool_event_signature_hashes,
+};
 
 pub(crate) fn compose_ws_endpoint(config: &RpcConfig) -> Result<String, ClientEvmError> {
     let ws_url = config.ws_url.trim();
@@ -20,6 +23,29 @@ pub(crate) fn compose_ws_endpoint(config: &RpcConfig) -> Result<String, ClientEv
     Ok(format!(
         "{}/{}/{}",
         ws_url.trim_end_matches('/'),
+        network_path(config.network),
+        api_key
+    ))
+}
+
+pub(crate) fn compose_http_endpoint(config: &RpcConfig) -> Result<String, ClientEvmError> {
+    let http_url = config.http_url.trim();
+    if http_url.is_empty() {
+        return Err(ClientEvmError::InvalidHttpConfig(
+            "http url is required".to_owned(),
+        ));
+    }
+
+    let api_key = config.api_key.trim();
+    if api_key.is_empty() {
+        return Err(ClientEvmError::InvalidHttpConfig(
+            "rpc api key is required".to_owned(),
+        ));
+    }
+
+    Ok(format!(
+        "{}/{}/{}",
+        http_url.trim_end_matches('/'),
         network_path(config.network),
         api_key
     ))
@@ -56,6 +82,15 @@ pub(crate) fn build_new_heads_subscribe_request(request_id: u64) -> Value {
         "id": request_id,
         "method": "eth_subscribe",
         "params": ["newHeads"]
+    })
+}
+
+pub(crate) fn build_block_header_request(request_id: u64, block_hash: BlockHash) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_getBlockByHash",
+        "params": [block_hash, false]
     })
 }
 
@@ -109,10 +144,58 @@ pub(crate) fn parse_subscription_response(
         })
 }
 
+pub(crate) fn parse_block_header_response(
+    value: &Value,
+    expected_request_id: u64,
+    expected_block_hash: BlockHash,
+) -> Result<Option<ClientHead>, ClientEvmError> {
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block header response must use json-rpc 2.0".to_owned(),
+        ));
+    }
+
+    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        ClientEvmError::MalformedJsonRpcResponse(
+            "block header response must contain a numeric request id".to_owned(),
+        )
+    })?;
+
+    if response_id != expected_request_id {
+        return Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block header response request id does not match request".to_owned(),
+        ));
+    }
+
+    match (value.get("result"), value.get("error")) {
+        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block header response must not contain both result and error".to_owned(),
+        )),
+        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block header response must contain result or error".to_owned(),
+        )),
+        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
+        (Some(Value::Null), None) => Ok(None),
+        (Some(result), None) => {
+            let header = serde_json::from_value::<ClientHead>(result.clone())
+                .map_err(ClientEvmError::JsonError)?;
+
+            if header.inner.hash != expected_block_hash {
+                return Err(ClientEvmError::MalformedJsonRpcResponse(
+                    "returned block hash does not match requested block hash".to_owned(),
+                ));
+            }
+
+            Ok(Some(header))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
+    use alloy::primitives::B256;
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
@@ -147,6 +230,209 @@ mod tests {
         assert!(matches!(
             compose_ws_endpoint(&config),
             Err(ClientEvmError::InvalidSubscriptionConfig(_))
+        ));
+    }
+
+    #[test]
+    fn compose_http_endpoint_appends_network_and_key() {
+        let config = rpc_config_with_http(" https://lb.drpc.org/ ", " api-key ");
+
+        let result = compose_http_endpoint(&config);
+
+        assert!(matches!(
+            result.as_deref(),
+            Ok("https://lb.drpc.org/ethereum/api-key")
+        ));
+    }
+
+    #[test]
+    fn compose_http_endpoint_rejects_empty_http_url() {
+        let config = rpc_config_with_http(" ", "api-key");
+
+        assert!(matches!(
+            compose_http_endpoint(&config),
+            Err(ClientEvmError::InvalidHttpConfig(_))
+        ));
+    }
+
+    #[test]
+    fn compose_http_endpoint_rejects_empty_api_key() {
+        let config = rpc_config_with_http("https://lb.drpc.org", "\t");
+
+        assert!(matches!(
+            compose_http_endpoint(&config),
+            Err(ClientEvmError::InvalidHttpConfig(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_request_uses_hash_without_full_transactions() {
+        let block_hash = B256::with_last_byte(7);
+
+        let request = build_block_header_request(9, block_hash);
+
+        assert_eq!(
+            request,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "eth_getBlockByHash",
+                "params": [block_hash, false]
+            })
+        );
+    }
+
+    #[test]
+    fn block_header_response_decodes_matching_header_and_extra_fields() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": block_header_result(block_hash)
+        });
+
+        let result = parse_block_header_response(&response, 9, block_hash);
+
+        assert!(matches!(
+            result,
+            Ok(Some(header))
+                if header.inner.hash == block_hash
+                    && header.inner.inner.parent_hash == B256::with_last_byte(2)
+                    && header.inner.inner.number == 9
+                    && matches!(
+                        header.other.get_deserialized::<String>("providerTag"),
+                        Some(Ok(ref tag)) if tag == "observed"
+                    )
+        ));
+    }
+
+    #[test]
+    fn block_header_response_returns_none_for_null_result() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": null
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn block_header_response_parses_json_rpc_error() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "error": {
+                "code": -32000,
+                "message": "block unavailable"
+            }
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Err(ClientEvmError::JsonRpcError(ref message))
+                if message == "-32000: block unavailable"
+        ));
+    }
+
+    #[test]
+    fn block_header_response_rejects_unexpected_request_id() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "result": block_header_result(block_hash)
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_response_rejects_missing_result_and_error() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_response_rejects_result_and_error_together() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": block_header_result(block_hash),
+            "error": {
+                "code": -32000,
+                "message": "conflicting response"
+            }
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_response_rejects_malformed_header() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {
+                "hash": block_hash
+            }
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Err(ClientEvmError::JsonError(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_response_rejects_mismatched_hash() {
+        let requested_hash = B256::with_last_byte(1);
+        let returned_hash = B256::with_last_byte(2);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": block_header_result(returned_hash)
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, requested_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_response_rejects_invalid_json_rpc_version() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "1.0",
+            "id": 9,
+            "result": block_header_result(block_hash)
+        });
+
+        assert!(matches!(
+            parse_block_header_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
         ));
     }
 
@@ -381,6 +667,50 @@ mod tests {
         }
 
         #[test]
+        fn compose_http_endpoint_preserves_non_empty_parts(
+            http_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}/*",
+            api_key in "[A-Za-z0-9_-]{1,40}",
+        ) {
+            let config = rpc_config_with_http(
+                &format!(" {http_url} "),
+                &format!(" {api_key} "),
+            );
+            let expected = format!(
+                "{}/ethereum/{}",
+                http_url.trim_end_matches('/'),
+                api_key
+            );
+
+            prop_assert_eq!(compose_http_endpoint(&config)?, expected);
+        }
+
+        #[test]
+        fn compose_http_endpoint_ignores_ws_url(
+            ws_url in "\\PC*",
+            http_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}/*",
+            api_key in "[A-Za-z0-9_-]{1,40}",
+        ) {
+            let mut config = rpc_config_with_http(&http_url, &api_key);
+            let expected = compose_http_endpoint(&config)?;
+            config.ws_url = ws_url;
+
+            prop_assert_eq!(compose_http_endpoint(&config)?, expected);
+        }
+
+        #[test]
+        fn block_header_request_preserves_request_id_and_hash(
+            request_id in any::<u64>(),
+            block_hash in any::<[u8; 32]>(),
+        ) {
+            let block_hash = B256::from(block_hash);
+            let request = build_block_header_request(request_id, block_hash);
+
+            prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
+            prop_assert_eq!(request.get("method"), Some(&json!("eth_getBlockByHash")));
+            prop_assert_eq!(request.get("params"), Some(&json!([block_hash, false])));
+        }
+
+        #[test]
         fn subscribe_request_preserves_request_id(request_id in any::<u64>()) {
             let request = build_pool_events_subscribe_request(request_id);
 
@@ -445,5 +775,36 @@ mod tests {
             ws_url: ws_url.to_owned(),
             api_key: api_key.to_owned(),
         }
+    }
+
+    fn rpc_config_with_http(http_url: &str, api_key: &str) -> RpcConfig {
+        RpcConfig {
+            network: EvmNetwork::Ethereum,
+            http_url: http_url.to_owned(),
+            ws_url: "wss://lb.drpc.live/".to_owned(),
+            api_key: api_key.to_owned(),
+        }
+    }
+
+    fn block_header_result(block_hash: B256) -> Value {
+        json!({
+            "hash": block_hash,
+            "parentHash": B256::with_last_byte(2),
+            "sha3Uncles": B256::with_last_byte(3),
+            "miner": "0x0000000000000000000000000000000000000004",
+            "stateRoot": B256::with_last_byte(5),
+            "transactionsRoot": B256::with_last_byte(6),
+            "receiptsRoot": B256::with_last_byte(7),
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "difficulty": "0xd",
+            "number": "0x9",
+            "gasLimit": "0xb",
+            "gasUsed": "0xa",
+            "timestamp": "0xc",
+            "extraData": "0x010203",
+            "mixHash": B256::with_last_byte(14),
+            "nonce": "0x000000000000000f",
+            "providerTag": "observed"
+        })
     }
 }

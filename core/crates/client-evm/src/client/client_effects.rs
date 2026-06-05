@@ -1,6 +1,6 @@
 use std::{net::TcpStream, str, sync::mpsc::Sender};
 
-use alloy::rpc::types::Log;
+use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde::Deserialize;
 use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
@@ -10,11 +10,13 @@ use crate::{ClientEvmError, RpcConfig};
 use super::{
     ClientEvent, ClientHead,
     client_utils::{
-        build_new_heads_subscribe_request, build_pool_events_subscribe_request,
-        compose_ws_endpoint, parse_subscription_response,
+        build_block_header_request, build_new_heads_subscribe_request,
+        build_pool_events_subscribe_request, compose_http_endpoint, compose_ws_endpoint,
+        parse_block_header_response, parse_subscription_response,
     },
 };
 
+const HTTP_REQUEST_ID: u64 = 1;
 const SUBSCRIBE_REQUEST_ID: u64 = 1;
 
 type BlockingWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -28,6 +30,25 @@ struct SubscriptionDataParams<T> {
 #[derive(Debug, Deserialize)]
 struct SubscriptionNotification<T> {
     params: SubscriptionDataParams<T>,
+}
+
+pub fn fetch_block_header(
+    agent: &ureq::Agent,
+    config: &RpcConfig,
+    block_hash: BlockHash,
+) -> Result<Option<ClientHead>, ClientEvmError> {
+    let endpoint = compose_http_endpoint(config)?;
+    let request = build_block_header_request(HTTP_REQUEST_ID, block_hash);
+    let mut response = agent
+        .post(endpoint.as_str())
+        .send_json(&request)
+        .map_err(ClientEvmError::HttpError)?;
+    let response_value = response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(ClientEvmError::HttpError)?;
+
+    parse_block_header_response(&response_value, HTTP_REQUEST_ID, block_hash)
 }
 
 pub fn subscribe_pool_events(
@@ -201,10 +222,69 @@ fn send_event(sender: &Sender<ClientEvent>, event: ClientEvent) -> Result<(), Cl
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc::{Receiver, channel},
+        thread::{self, JoinHandle},
+    };
+
     use alloy::{primitives::B256, rpc::types::Log as RpcLog};
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn fetch_block_header_posts_expected_request_and_decodes_response() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": block_header_result(block_hash)
+        });
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_block_header(&agent, &config, block_hash);
+
+        assert!(matches!(
+            result,
+            Ok(Some(header))
+                if header.inner.hash == block_hash
+                    && header.inner.inner.parent_hash == B256::with_last_byte(2)
+        ));
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        assert_eq!(request.path, "/ethereum/api-key");
+        assert_eq!(
+            request.body,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getBlockByHash",
+                "params": [block_hash, false]
+            })
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_block_header_maps_transport_failure_to_http_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener must have local address");
+        drop(listener);
+        let config = rpc_config(&format!("http://{address}"));
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_block_header(&agent, &config, B256::with_last_byte(1));
+
+        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+    }
 
     #[test]
     fn subscription_notification_preserves_rpc_log_metadata() {
@@ -365,5 +445,122 @@ mod tests {
 
     fn zero_logs_bloom() -> String {
         format!("0x{}", "00".repeat(256))
+    }
+
+    struct ReceivedHttpRequest {
+        path: String,
+        body: Value,
+    }
+
+    fn spawn_json_rpc_server(
+        response: Value,
+    ) -> (String, Receiver<ReceivedHttpRequest>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server must bind");
+        let address = listener
+            .local_addr()
+            .expect("test server must have local address");
+        let (sender, receiver) = channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server must accept request");
+            let request = read_http_request(&mut stream);
+            sender
+                .send(request)
+                .expect("test server must report received request");
+
+            let response_body =
+                serde_json::to_vec(&response).expect("test response must serialize");
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+
+            stream
+                .write_all(response_headers.as_bytes())
+                .expect("test server must write response headers");
+            stream
+                .write_all(&response_body)
+                .expect("test server must write response body");
+        });
+
+        (format!("http://{address}"), receiver, handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> ReceivedHttpRequest {
+        let mut request_bytes = Vec::new();
+        let mut buffer = [0; 1024];
+        let (body_start, content_length) = loop {
+            let bytes_read = stream
+                .read(&mut buffer)
+                .expect("test server must read request");
+            assert!(bytes_read > 0, "request must contain headers and body");
+            request_bytes.extend_from_slice(&buffer[..bytes_read]);
+
+            if let Some(header_end) = request_bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            {
+                let body_start = header_end + 4;
+                let headers = str::from_utf8(&request_bytes[..header_end])
+                    .expect("request headers must be utf-8");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .expect("request must contain content-length");
+
+                if request_bytes.len() >= body_start + content_length {
+                    break (body_start, content_length);
+                }
+            }
+        };
+
+        let headers =
+            str::from_utf8(&request_bytes[..body_start]).expect("request headers must be utf-8");
+        let path = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("request line must contain path")
+            .to_owned();
+        let body = serde_json::from_slice(&request_bytes[body_start..body_start + content_length])
+            .expect("request body must be json");
+
+        ReceivedHttpRequest { path, body }
+    }
+
+    fn rpc_config(http_url: &str) -> RpcConfig {
+        RpcConfig {
+            network: crate::EvmNetwork::Ethereum,
+            http_url: http_url.to_owned(),
+            ws_url: "wss://example.invalid".to_owned(),
+            api_key: "api-key".to_owned(),
+        }
+    }
+
+    fn block_header_result(block_hash: B256) -> Value {
+        json!({
+            "hash": block_hash,
+            "parentHash": B256::with_last_byte(2),
+            "sha3Uncles": B256::with_last_byte(3),
+            "miner": "0x0000000000000000000000000000000000000004",
+            "stateRoot": B256::with_last_byte(5),
+            "transactionsRoot": B256::with_last_byte(6),
+            "receiptsRoot": B256::with_last_byte(7),
+            "logsBloom": zero_logs_bloom(),
+            "difficulty": "0xd",
+            "number": "0x9",
+            "gasLimit": "0xb",
+            "gasUsed": "0xa",
+            "timestamp": "0xc",
+            "extraData": "0x010203",
+            "mixHash": B256::with_last_byte(14),
+            "nonce": "0x000000000000000f",
+            "providerTag": "observed"
+        })
     }
 }
