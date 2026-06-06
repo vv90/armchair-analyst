@@ -19,6 +19,9 @@ pub(crate) enum CliError {
         prompt: &'static str,
         message: String,
     },
+    ClientInitializationFailed {
+        message: String,
+    },
     SubscriptionFailed {
         message: String,
     },
@@ -32,6 +35,9 @@ impl fmt::Display for CliError {
             }
             Self::PromptFailed { prompt, message } => {
                 write!(formatter, "failed to read {prompt} {message}")
+            }
+            Self::ClientInitializationFailed { message } => {
+                write!(formatter, "client initialization failed: {message}")
             }
             Self::SubscriptionFailed { message } => {
                 write!(formatter, "subscription failed: {message}")
@@ -342,6 +348,17 @@ mod tests {
             }
             .to_string(),
             "subscription failed: websocket error"
+        );
+    }
+
+    #[test]
+    fn client_initialization_failed_display_is_stable() {
+        assert_eq!(
+            CliError::ClientInitializationFailed {
+                message: "finalized block header was not returned".to_owned(),
+            }
+            .to_string(),
+            "client initialization failed: finalized block header was not returned"
         );
     }
 

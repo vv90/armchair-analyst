@@ -83,12 +83,21 @@ impl BlocksGraph {
     }
 }
 
-struct FinalizedState {
-    block_hash: BlockHash,
+pub struct FinalizedState {
+    pub block_hash: BlockHash,
     pool_snapshots: HashMap<PoolAddress, PoolState>,
 }
 
-struct State {
+impl FinalizedState {
+    pub fn empty_at(block_hash: BlockHash) -> FinalizedState {
+        FinalizedState {
+            block_hash,
+            pool_snapshots: HashMap::new(),
+        }
+    }
+}
+
+pub struct State {
     blocks: BlocksGraph,
     canonical_tip: BlockHash,
     pending_requests: PendingRequests,
@@ -97,7 +106,16 @@ struct State {
 }
 
 impl State {
-    fn init(finalized_state: FinalizedState, tick: Tick) -> State {
+    pub fn init(finalized_state: FinalizedState) -> State {
+        State {
+            blocks: BlocksGraph::new(),
+            canonical_tip: finalized_state.block_hash,
+            pending_requests: PendingRequests::new(),
+            finalized_state,
+            tick: Tick::initial(),
+        }
+    }
+    fn reset(finalized_state: FinalizedState, tick: Tick) -> State {
         State {
             blocks: BlocksGraph::new(),
             canonical_tip: finalized_state.block_hash,
@@ -108,7 +126,7 @@ impl State {
     }
 }
 
-enum Event {
+pub enum Event {
     HeadObserved {
         hash: BlockHash,
         parent_hash: BlockHash,
@@ -135,13 +153,13 @@ enum Event {
     Tick,
 }
 
-enum Effect {
+pub enum Effect {
     Request(AnyIssuedRequest),
 }
 
 struct BlocksGraphCycleError;
 
-fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
+pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
     match event {
         Event::HeadObserved { hash, parent_hash } => {
             match state
@@ -211,14 +229,14 @@ fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests: state.pending_requests,
-                        ..State::init(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
                 ),
                 Err(NewBlockError::CycleDetected) => (
                     State {
                         pending_requests: state.pending_requests,
-                        ..State::init(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
                 ),
@@ -305,14 +323,14 @@ fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests,
-                        ..State::init(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
                 ),
                 Err(NewBlockError::CycleDetected) => (
                     State {
                         pending_requests,
-                        ..State::init(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
                 ),
@@ -352,7 +370,7 @@ fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 (
                     State {
                         pending_requests,
-                        ..State::init(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
                 )
@@ -740,6 +758,28 @@ mod tests {
         Event::RequestFailed {
             request_id: AnyRequestId::BlockHeader(request_id),
         }
+    }
+
+    #[test]
+    fn finalized_state_empty_at_stores_hash_with_empty_pool_snapshots() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+
+        let finalized_state = FinalizedState::empty_at(finalized_hash);
+
+        assert_eq!(finalized_state.block_hash, finalized_hash);
+        assert!(finalized_state.pool_snapshots.is_empty());
+    }
+
+    #[test]
+    fn state_init_from_finalized_state_starts_with_empty_tracking() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+
+        let state = State::init(FinalizedState::empty_at(finalized_hash));
+
+        assert_empty_initial_state_at(&state, finalized_hash);
+        assert!(state.blocks.0.is_empty());
+        assert!(state.finalized_state.pool_snapshots.is_empty());
+        assert_eq!(state.tick.raw_for_test(), Tick::initial().raw_for_test());
     }
 
     fn issue_expected_request(

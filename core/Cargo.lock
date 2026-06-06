@@ -6,9 +6,11 @@ version = 4
 name = "aa-cli"
 version = "0.1.0"
 dependencies = [
+ "aa-framework",
  "client-evm",
  "rustls",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

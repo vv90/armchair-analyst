@@ -94,6 +94,15 @@ pub(crate) fn build_block_header_request(request_id: u64, block_hash: BlockHash)
     })
 }
 
+pub(crate) fn build_finalized_block_header_request(request_id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_getBlockByNumber",
+        "params": ["finalized", false]
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_unsubscribe_request(request_id: u64, subscription_id: &str) -> Value {
     json!({
@@ -149,6 +158,23 @@ pub(crate) fn parse_block_header_response(
     expected_request_id: u64,
     expected_block_hash: BlockHash,
 ) -> Result<Option<ClientHead>, ClientEvmError> {
+    let header = parse_block_header_response_by_id(value, expected_request_id)?;
+
+    if let Some(header) = &header {
+        if header.inner.hash != expected_block_hash {
+            return Err(ClientEvmError::MalformedJsonRpcResponse(
+                "returned block hash does not match requested block hash".to_owned(),
+            ));
+        }
+    }
+
+    Ok(header)
+}
+
+pub(crate) fn parse_block_header_response_by_id(
+    value: &Value,
+    expected_request_id: u64,
+) -> Result<Option<ClientHead>, ClientEvmError> {
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(ClientEvmError::MalformedJsonRpcResponse(
             "block header response must use json-rpc 2.0".to_owned(),
@@ -179,12 +205,6 @@ pub(crate) fn parse_block_header_response(
         (Some(result), None) => {
             let header = serde_json::from_value::<ClientHead>(result.clone())
                 .map_err(ClientEvmError::JsonError)?;
-
-            if header.inner.hash != expected_block_hash {
-                return Err(ClientEvmError::MalformedJsonRpcResponse(
-                    "returned block hash does not match requested block hash".to_owned(),
-                ));
-            }
 
             Ok(Some(header))
         }
@@ -283,6 +303,21 @@ mod tests {
     }
 
     #[test]
+    fn finalized_block_header_request_uses_finalized_tag_without_full_transactions() {
+        let request = build_finalized_block_header_request(9);
+
+        assert_eq!(
+            request,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "eth_getBlockByNumber",
+                "params": ["finalized", false]
+            })
+        );
+    }
+
+    #[test]
     fn block_header_response_decodes_matching_header_and_extra_fields() {
         let block_hash = B256::with_last_byte(1);
         let response = json!({
@@ -303,6 +338,85 @@ mod tests {
                         header.other.get_deserialized::<String>("providerTag"),
                         Some(Ok(ref tag)) if tag == "observed"
                     )
+        ));
+    }
+
+    #[test]
+    fn block_header_response_by_id_decodes_header_without_expected_hash() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": block_header_result(block_hash)
+        });
+
+        let result = parse_block_header_response_by_id(&response, 9);
+
+        assert!(matches!(
+            result,
+            Ok(Some(header))
+                if header.inner.hash == block_hash
+                    && header.inner.inner.parent_hash == B256::with_last_byte(2)
+                    && header.inner.inner.number == 9
+        ));
+    }
+
+    #[test]
+    fn block_header_response_by_id_returns_none_for_null_result() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": null
+        });
+
+        assert!(matches!(
+            parse_block_header_response_by_id(&response, 9),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn block_header_response_by_id_parses_json_rpc_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "error": {
+                "code": -32000,
+                "message": "block unavailable"
+            }
+        });
+
+        assert!(matches!(
+            parse_block_header_response_by_id(&response, 9),
+            Err(ClientEvmError::JsonRpcError(ref message))
+                if message == "-32000: block unavailable"
+        ));
+    }
+
+    #[test]
+    fn block_header_response_by_id_rejects_unexpected_request_id() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "result": block_header_result(B256::with_last_byte(1))
+        });
+
+        assert!(matches!(
+            parse_block_header_response_by_id(&response, 9),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_header_response_by_id_rejects_malformed_response() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9
+        });
+
+        assert!(matches!(
+            parse_block_header_response_by_id(&response, 9),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
         ));
     }
 
@@ -708,6 +822,15 @@ mod tests {
             prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
             prop_assert_eq!(request.get("method"), Some(&json!("eth_getBlockByHash")));
             prop_assert_eq!(request.get("params"), Some(&json!([block_hash, false])));
+        }
+
+        #[test]
+        fn finalized_block_header_request_preserves_request_id(request_id in any::<u64>()) {
+            let request = build_finalized_block_header_request(request_id);
+
+            prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
+            prop_assert_eq!(request.get("method"), Some(&json!("eth_getBlockByNumber")));
+            prop_assert_eq!(request.get("params"), Some(&json!(["finalized", false])));
         }
 
         #[test]

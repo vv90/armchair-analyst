@@ -4,6 +4,9 @@ pub struct Tick(u64);
 const REQUEST_TTL: u64 = 10;
 
 impl Tick {
+    pub fn initial() -> Self {
+        Tick(0)
+    }
     pub fn next(self) -> Self {
         Tick(self.0.wrapping_add(1))
     }

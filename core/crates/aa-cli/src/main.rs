@@ -3,7 +3,9 @@ use std::{
     process::ExitCode,
 };
 
+mod app;
 mod effects;
+mod runtime;
 mod utils;
 
 fn main() -> ExitCode {
