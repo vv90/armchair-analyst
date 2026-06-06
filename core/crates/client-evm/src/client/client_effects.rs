@@ -10,9 +10,10 @@ use crate::{ClientEvmError, RpcConfig};
 use super::{
     ClientEvent, ClientHead,
     client_utils::{
-        build_block_header_request, build_new_heads_subscribe_request,
-        build_pool_events_subscribe_request, compose_http_endpoint, compose_ws_endpoint,
-        parse_block_header_response, parse_subscription_response,
+        build_block_header_request, build_finalized_block_header_request,
+        build_new_heads_subscribe_request, build_pool_events_subscribe_request,
+        compose_http_endpoint, compose_ws_endpoint, parse_block_header_response,
+        parse_block_header_response_by_id, parse_subscription_response,
     },
 };
 
@@ -49,6 +50,24 @@ pub fn fetch_block_header(
         .map_err(ClientEvmError::HttpError)?;
 
     parse_block_header_response(&response_value, HTTP_REQUEST_ID, block_hash)
+}
+
+pub fn fetch_finalized_block_header(
+    agent: &ureq::Agent,
+    config: &RpcConfig,
+) -> Result<Option<ClientHead>, ClientEvmError> {
+    let endpoint = compose_http_endpoint(config)?;
+    let request = build_finalized_block_header_request(HTTP_REQUEST_ID);
+    let mut response = agent
+        .post(endpoint.as_str())
+        .send_json(&request)
+        .map_err(ClientEvmError::HttpError)?;
+    let response_value = response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(ClientEvmError::HttpError)?;
+
+    parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)
 }
 
 pub fn subscribe_pool_events(
@@ -282,6 +301,58 @@ mod tests {
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_block_header(&agent, &config, B256::with_last_byte(1));
+
+        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+    }
+
+    #[test]
+    fn fetch_finalized_block_header_posts_expected_request_and_decodes_response() {
+        let block_hash = B256::with_last_byte(1);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": block_header_result(block_hash)
+        });
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_finalized_block_header(&agent, &config);
+
+        assert!(matches!(
+            result,
+            Ok(Some(header))
+                if header.inner.hash == block_hash
+                    && header.inner.inner.parent_hash == B256::with_last_byte(2)
+        ));
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        assert_eq!(request.path, "/ethereum/api-key");
+        assert_eq!(
+            request.body,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getBlockByNumber",
+                "params": ["finalized", false]
+            })
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_finalized_block_header_maps_transport_failure_to_http_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener must have local address");
+        drop(listener);
+        let config = rpc_config(&format!("http://{address}"));
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_finalized_block_header(&agent, &config);
 
         assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
     }
