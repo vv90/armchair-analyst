@@ -77,8 +77,4 @@ impl Runtime<Kernel> for ProductionRuntime {
         _subscription: <Kernel as Application>::Subscription,
     ) {
     }
-
-    fn log(&self, error: ApplicationError<<Kernel as Application>::Input>) {
-        eprintln!("{:?}", error);
-    }
 }

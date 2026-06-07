@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     marker::PhantomData,
 };
 
@@ -37,6 +38,12 @@ impl<R> Eq for RequestId<R> {}
 impl<R> std::hash::Hash for RequestId<R> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.raw.hash(state);
+    }
+}
+
+impl<R> fmt::Debug for RequestId<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.raw.0)
     }
 }
 
@@ -99,6 +106,18 @@ pub enum AnyRequestId {
     BlockHeader(RequestId<GetBlockHeader>),
     BlockLogs(RequestId<GetBlockLogs>),
     PoolData(RequestId<GetPoolData>),
+}
+
+impl fmt::Debug for AnyRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AnyRequestId::BlockHeader(request_id) => {
+                write!(formatter, "block_header#{request_id:?}")
+            }
+            AnyRequestId::BlockLogs(request_id) => write!(formatter, "block_logs#{request_id:?}"),
+            AnyRequestId::PoolData(request_id) => write!(formatter, "pool_data#{request_id:?}"),
+        }
+    }
 }
 
 pub enum AnyIssuedRequest {
