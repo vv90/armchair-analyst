@@ -44,7 +44,8 @@ pub trait Application {
 pub trait Runtime<App: Application>: Sized + Send + Sync + 'static {
     fn execute_effect(&self, effect: App::Effect) -> Vec<App::Input>;
     fn spawn_subscription(&self, sender: &Sender<App::Input>, subscription: App::Subscription);
-    fn log(&self, error: ApplicationError<App::Input>);
+    fn log_input(&self, _input: &App::Input) {}
+    fn log_error(&self, _error: ApplicationError<App::Input>) {}
 
     fn run(self) -> (Sender<App::Input>, JoinHandle<()>)
     where
@@ -86,6 +87,7 @@ fn run<App: Application, R: Runtime<App>>(
     ));
 
     let _final_state = input_receiver.into_iter().fold(state, |s, i| {
+        runtime.log_input(&i);
         let Transition {
             state: next_state,
             effects,
@@ -117,7 +119,7 @@ fn spawn_effects<App: Application, R: Runtime<App>>(
                 .into_iter()
                 .for_each(|i| match sender_clone.send(i) {
                     Ok(_) => (),
-                    Err(e) => runtime.log(ApplicationError::SendError(e)),
+                    Err(e) => runtime.log_error(ApplicationError::SendError(e)),
                 })
         });
     })
@@ -173,6 +175,10 @@ mod tests {
     struct EffectDeliveryApp;
 
     struct EffectDeliveryRuntime;
+
+    struct SendErrorLoggingRuntime {
+        failed_inputs: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+    }
 
     impl Application for AccumulatorApp {
         type State = AccumulatorState;
@@ -260,8 +266,22 @@ mod tests {
         }
 
         fn spawn_subscription(&self, _sender: &Sender<u16>, _subscription: ()) {}
+    }
 
-        fn log(&self, _error: ApplicationError<u16>) {}
+    impl Runtime<EffectDeliveryApp> for SendErrorLoggingRuntime {
+        fn execute_effect(&self, effect: DeliveryEffect) -> Vec<u16> {
+            effect.0
+        }
+
+        fn spawn_subscription(&self, _sender: &Sender<u16>, _subscription: ()) {}
+
+        fn log_error(&self, error: ApplicationError<u16>) {
+            match error {
+                ApplicationError::SendError(error) => {
+                    self.failed_inputs.lock().unwrap().push(error.0);
+                }
+            }
+        }
     }
 
     proptest! {
@@ -297,6 +317,25 @@ mod tests {
 
             prop_assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn spawn_effects_logs_send_error_when_receiver_is_dropped() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        let failed_inputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = std::sync::Arc::new(SendErrorLoggingRuntime {
+            failed_inputs: failed_inputs.clone(),
+        });
+
+        let handle = spawn_effects::<EffectDeliveryApp, SendErrorLoggingRuntime>(
+            runtime,
+            &sender,
+            vec![DeliveryEffect(vec![7])],
+        );
+
+        assert!(handle.join().is_ok());
+        assert_eq!(failed_inputs.lock().unwrap().as_slice(), &[7]);
     }
 
     fn accumulator_input() -> impl Strategy<Value = AccumulatorInput> {

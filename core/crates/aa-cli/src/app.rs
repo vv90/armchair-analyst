@@ -1,7 +1,7 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent, ClientEvmError, ClientHead,
-    PoolAddress, PoolState, RpcConfig, fetch_block_header, fetch_block_logs,
+    PoolAddress, PoolState, RequestId, RpcConfig, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_data, kernel,
     multi_chain_kernel::{Effect, Event, State, transition},
     subscribe_new_heads,
@@ -13,14 +13,21 @@ use std::{
     time,
 };
 
-struct ClientEvmApp {}
+pub(crate) struct ClientEvmApp {}
 
-struct ClientEvmRuntime {
+pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     ethereum_config: RpcConfig,
 }
 
 impl ClientEvmRuntime {
+    pub(crate) fn new(ethereum_config: RpcConfig) -> ClientEvmRuntime {
+        ClientEvmRuntime {
+            agent: ureq::Agent::new_with_defaults(),
+            ethereum_config,
+        }
+    }
+
     fn get_config(&self, chain: ChainKey) -> &RpcConfig {
         match chain {
             ChainKey::Ethereum => &self.ethereum_config,
@@ -28,7 +35,7 @@ impl ClientEvmRuntime {
     }
 }
 
-enum ClientEvmSubscription {
+pub(crate) enum ClientEvmSubscription {
     NewHeadsSubscription(ChainKey),
     TickSubscription(time::Duration),
 }
@@ -100,7 +107,80 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
         }
     }
 
-    fn log(&self, _error: ApplicationError<<ClientEvmApp as Application>::Input>) {}
+    fn log_input(&self, input: &<ClientEvmApp as Application>::Input) {
+        eprintln!("{}", format_input_log(input));
+    }
+
+    fn log_error(&self, error: ApplicationError<<ClientEvmApp as Application>::Input>) {
+        match error {
+            ApplicationError::SendError(error) => {
+                eprintln!("error send_failed input={}", format_input_log(&error.0));
+            }
+        }
+    }
+}
+
+pub(crate) fn start_runtime(config: RpcConfig) -> JoinHandle<()> {
+    let (_sender, handle) =
+        <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(ClientEvmRuntime::new(config));
+
+    handle
+}
+
+fn format_input_log(input: &Event) -> String {
+    match input {
+        Event::FinalizedHeaderReceived { chain, block_hash } => {
+            format!("input finalized_header_received chain={chain:?} block={block_hash}")
+        }
+        Event::FinalizedHeaderUnavailable { chain } => {
+            format!("input finalized_header_unavailable chain={chain:?}")
+        }
+        Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
+        Event::Tick => "input tick".to_owned(),
+    }
+}
+
+fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
+    match event {
+        kernel::Event::HeadObserved { hash, parent_hash } => {
+            format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}")
+        }
+        kernel::Event::BlockHeaderReceived {
+            request_id,
+            hash,
+            parent_hash,
+        } => format!(
+            "input chain={chain:?} block_header_received request={} hash={hash} parent={parent_hash}",
+            format_typed_request_id_log(request_id),
+        ),
+        kernel::Event::BlockHeaderNotFound { request_id } => format!(
+            "input chain={chain:?} block_header_not_found request={}",
+            format_typed_request_id_log(request_id),
+        ),
+        kernel::Event::BlockLogsReceived { request_id, logs } => format!(
+            "input chain={chain:?} block_logs_received request={} pools={}",
+            format_typed_request_id_log(request_id),
+            logs.len(),
+        ),
+        kernel::Event::PoolDataReceived { request_id, pools } => format!(
+            "input chain={chain:?} pool_data_received request={} pools={}",
+            format_typed_request_id_log(request_id),
+            pools.len(),
+        ),
+        kernel::Event::RequestFailed { request_id } => format!(
+            "input chain={chain:?} request_failed request={}",
+            format_request_id_log(request_id),
+        ),
+        kernel::Event::Tick => format!("input chain={chain:?} tick"),
+    }
+}
+
+fn format_typed_request_id_log<R>(request_id: &RequestId<R>) -> String {
+    format!("{request_id:?}")
+}
+
+fn format_request_id_log(request_id: &AnyRequestId) -> String {
+    format!("{request_id:?}")
 }
 
 impl ClientEvmRuntime {
@@ -228,6 +308,145 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn runtime_constructor_stores_ethereum_config() {
+        let config = rpc_config();
+        let runtime = ClientEvmRuntime::new(config.clone());
+
+        assert_eq!(runtime.get_config(ChainKey::Ethereum), &config);
+    }
+
+    #[test]
+    fn input_log_formats_global_multi_chain_events() {
+        let block_hash = hash(1);
+
+        assert_eq!(format_input_log(&Event::Tick), "input tick");
+        assert_eq!(
+            format_input_log(&Event::FinalizedHeaderReceived {
+                chain: ChainKey::Ethereum,
+                block_hash,
+            }),
+            format!("input finalized_header_received chain=Ethereum block={block_hash}")
+        );
+        assert_eq!(
+            format_input_log(&Event::FinalizedHeaderUnavailable {
+                chain: ChainKey::Ethereum,
+            }),
+            "input finalized_header_unavailable chain=Ethereum"
+        );
+    }
+
+    #[test]
+    fn input_log_formats_chain_events() {
+        let block_hash = hash(1);
+        let parent_hash = hash(2);
+        let request_id = RequestId::<GetBlockHeader>::from_raw_for_test(7);
+
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::HeadObserved {
+                    hash: block_hash,
+                    parent_hash,
+                },
+            }),
+            format!("input chain=Ethereum head_observed hash={block_hash} parent={parent_hash}")
+        );
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::BlockHeaderReceived {
+                    request_id,
+                    hash: block_hash,
+                    parent_hash,
+                },
+            }),
+            format!(
+                "input chain=Ethereum block_header_received request=7 hash={block_hash} parent={parent_hash}"
+            )
+        );
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::Tick,
+            }),
+            "input chain=Ethereum tick"
+        );
+    }
+
+    #[test]
+    fn input_log_formats_request_result_counts() {
+        let logs_request_id = RequestId::<GetBlockLogs>::from_raw_for_test(8);
+        let pool_request_id = RequestId::<GetPoolData>::from_raw_for_test(9);
+
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::BlockLogsReceived {
+                    request_id: logs_request_id,
+                    logs: HashSet::new(),
+                },
+            }),
+            "input chain=Ethereum block_logs_received request=8 pools=0"
+        );
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::PoolDataReceived {
+                    request_id: pool_request_id,
+                    pools: HashMap::new(),
+                },
+            }),
+            "input chain=Ethereum pool_data_received request=9 pools=0"
+        );
+    }
+
+    #[test]
+    fn input_log_formats_request_failures_and_not_found() {
+        let header_request_id = RequestId::<GetBlockHeader>::from_raw_for_test(7);
+
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::BlockHeaderNotFound {
+                    request_id: header_request_id,
+                },
+            }),
+            "input chain=Ethereum block_header_not_found request=7"
+        );
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::RequestFailed {
+                    request_id: AnyRequestId::BlockHeader(header_request_id),
+                },
+            }),
+            "input chain=Ethereum request_failed request=block_header#7"
+        );
+    }
+
+    #[test]
+    fn request_id_log_formats_request_kind_and_id() {
+        assert_eq!(
+            format_request_id_log(&AnyRequestId::BlockHeader(
+                RequestId::<GetBlockHeader>::from_raw_for_test(7),
+            )),
+            "block_header#7"
+        );
+        assert_eq!(
+            format_request_id_log(&AnyRequestId::BlockLogs(
+                RequestId::<GetBlockLogs>::from_raw_for_test(8),
+            )),
+            "block_logs#8"
+        );
+        assert_eq!(
+            format_request_id_log(&AnyRequestId::PoolData(
+                RequestId::<GetPoolData>::from_raw_for_test(9),
+            )),
+            "pool_data#9"
+        );
+    }
 
     #[test]
     fn tick_subscription_worker_sends_tick_event() {
@@ -573,5 +792,14 @@ mod tests {
 
     fn zero_logs_bloom() -> String {
         format!("0x{}", "00".repeat(256))
+    }
+
+    fn rpc_config() -> RpcConfig {
+        RpcConfig {
+            chain: ChainKey::Ethereum,
+            http_url: "https://example.invalid/http".to_owned(),
+            ws_url: "wss://example.invalid/ws".to_owned(),
+            api_key: "api-key".to_owned(),
+        }
     }
 }
