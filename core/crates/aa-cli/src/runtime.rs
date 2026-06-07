@@ -39,7 +39,7 @@ fn finalized_state_from_header(header: ClientHead) -> FinalizedState {
 
 #[cfg(test)]
 mod tests {
-    use client_evm::{ClientEvmError, ClientHead, EvmNetwork, RpcConfig};
+    use client_evm::{ChainKey, ClientEvmError, ClientHead, RpcConfig};
     use serde_json::json;
 
     use super::*;
@@ -114,7 +114,7 @@ mod tests {
 
     fn rpc_config() -> RpcConfig {
         RpcConfig {
-            network: EvmNetwork::Ethereum,
+            chain: ChainKey::Ethereum,
             http_url: "https://example.invalid/http".to_owned(),
             ws_url: "wss://example.invalid/ws".to_owned(),
             api_key: "api-key".to_owned(),

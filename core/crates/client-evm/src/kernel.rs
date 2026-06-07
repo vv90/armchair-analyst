@@ -1,17 +1,8 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-};
+use std::collections::{HashMap, HashSet};
 
-use alloy::primitives::{Address, BlockHash};
+use alloy::primitives::BlockHash;
 
-use crate::{pending_requests::*, tick::Tick};
-
-// placeholder for pool state
-struct PoolState {}
-
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
-struct PoolAddress(Address);
+use crate::{pending_requests::*, pool_state::*, tick::Tick};
 
 enum PoolLogsStatus {
     Unknown,

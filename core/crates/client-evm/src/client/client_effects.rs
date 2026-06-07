@@ -1,19 +1,26 @@
-use std::{net::TcpStream, str, sync::mpsc::Sender};
+use std::{
+    collections::{HashMap, HashSet},
+    net::TcpStream,
+    str,
+    sync::mpsc::Sender,
+};
 
-use alloy::{primitives::BlockHash, rpc::types::Log};
+use alloy::primitives::BlockHash;
 use serde::Deserialize;
 use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
-use crate::{ClientEvmError, RpcConfig};
+use crate::{
+    ClientEvmError, PoolAddress, PoolState, RpcConfig,
+    config::{compose_http_endpoint, compose_ws_endpoint},
+};
 
 use super::{
     ClientEvent, ClientHead,
     client_utils::{
-        build_block_header_request, build_finalized_block_header_request,
-        build_new_heads_subscribe_request, build_pool_events_subscribe_request,
-        compose_http_endpoint, compose_ws_endpoint, parse_block_header_response,
-        parse_block_header_response_by_id, parse_subscription_response,
+        build_block_header_request, build_block_logs_request, build_finalized_block_header_request,
+        build_new_heads_subscribe_request, parse_block_header_response,
+        parse_block_header_response_by_id, parse_block_logs_response, parse_subscription_response,
     },
 };
 
@@ -52,6 +59,34 @@ pub fn fetch_block_header(
     parse_block_header_response(&response_value, HTTP_REQUEST_ID, block_hash)
 }
 
+pub fn fetch_block_logs(
+    agent: &ureq::Agent,
+    config: &RpcConfig,
+    block_hash: BlockHash,
+) -> Result<HashSet<PoolAddress>, ClientEvmError> {
+    let endpoint = compose_http_endpoint(config)?;
+    let request = build_block_logs_request(HTTP_REQUEST_ID, block_hash);
+    let mut response = agent
+        .post(endpoint.as_str())
+        .send_json(&request)
+        .map_err(ClientEvmError::HttpError)?;
+    let response_value = response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(ClientEvmError::HttpError)?;
+
+    parse_block_logs_response(&response_value, HTTP_REQUEST_ID, block_hash)
+}
+
+pub fn fetch_pool_data(
+    _agent: &ureq::Agent,
+    _config: &RpcConfig,
+    _at: BlockHash,
+    _pools: HashSet<PoolAddress>,
+) -> Result<HashMap<PoolAddress, PoolState>, ClientEvmError> {
+    Ok(HashMap::new())
+}
+
 pub fn fetch_finalized_block_header(
     agent: &ureq::Agent,
     config: &RpcConfig,
@@ -70,34 +105,14 @@ pub fn fetch_finalized_block_header(
     parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)
 }
 
-pub fn subscribe_pool_events(
-    config: RpcConfig,
-    sender: Sender<ClientEvent>,
-) -> Result<(), ClientEvmError> {
-    let endpoint = compose_ws_endpoint(&config)?;
-    let (mut socket, _) =
-        connect(endpoint.as_str()).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
-
-    let subscribe_request = build_pool_events_subscribe_request(SUBSCRIBE_REQUEST_ID);
-    socket
-        .send(Message::text(subscribe_request.to_string()))
-        .map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
-
-    let subscription_id = read_subscription_id(&mut socket, SUBSCRIBE_REQUEST_ID)?;
-    send_event(
-        &sender,
-        ClientEvent::Subscribed {
-            subscription_id: subscription_id.clone(),
-        },
-    )?;
-
-    read_subscription_events(&mut socket, &subscription_id, &sender)
-}
-
-pub fn subscribe_new_heads(
-    config: RpcConfig,
-    sender: Sender<ClientEvent>,
-) -> Result<(), ClientEvmError> {
+pub fn subscribe_new_heads<T, F>(
+    config: &RpcConfig,
+    sender: &Sender<T>,
+    map_event: F,
+) -> Result<(), ClientEvmError>
+where
+    F: Fn(ClientEvent) -> Option<T>,
+{
     let endpoint = compose_ws_endpoint(&config)?;
     let (mut socket, _) =
         connect(endpoint.as_str()).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
@@ -109,13 +124,14 @@ pub fn subscribe_new_heads(
 
     let subscription_id = read_subscription_id(&mut socket, SUBSCRIBE_REQUEST_ID)?;
     send_event(
-        &sender,
+        sender,
         ClientEvent::Subscribed {
             subscription_id: subscription_id.clone(),
         },
+        &map_event,
     )?;
 
-    read_new_head_events(&mut socket, &subscription_id, &sender)
+    read_new_head_events(&mut socket, &subscription_id, sender, &map_event)
 }
 
 fn read_subscription_id(
@@ -135,47 +151,15 @@ fn read_subscription_id(
     }
 }
 
-fn read_subscription_events(
+fn read_new_head_events<T, F>(
     socket: &mut BlockingWebSocket,
     subscription_id: &str,
-    sender: &Sender<ClientEvent>,
-) -> Result<(), ClientEvmError> {
-    loop {
-        let Some(sub_notification) =
-            read_json_rpc_message::<SubscriptionNotification<Log>>(socket)?
-        else {
-            send_event(
-                sender,
-                ClientEvent::Closed {
-                    subscription_id: subscription_id.to_owned(),
-                },
-            )?;
-            return Ok(());
-        };
-
-        if sub_notification.params.subscription != subscription_id {
-            println!(
-                "Received notification for unexpected subscription: {}. Expected: {}. Ignoring.",
-                sub_notification.params.subscription, subscription_id
-            );
-            continue;
-        }
-
-        send_event(
-            sender,
-            ClientEvent::Notification {
-                subscription_id: sub_notification.params.subscription,
-                result: sub_notification.params.result,
-            },
-        )?;
-    }
-}
-
-fn read_new_head_events(
-    socket: &mut BlockingWebSocket,
-    subscription_id: &str,
-    sender: &Sender<ClientEvent>,
-) -> Result<(), ClientEvmError> {
+    sender: &Sender<T>,
+    map_event: &F,
+) -> Result<(), ClientEvmError>
+where
+    F: Fn(ClientEvent) -> Option<T>,
+{
     loop {
         let Some(sub_notification) =
             read_json_rpc_message::<SubscriptionNotification<ClientHead>>(socket)?
@@ -185,6 +169,7 @@ fn read_new_head_events(
                 ClientEvent::Closed {
                     subscription_id: subscription_id.to_owned(),
                 },
+                map_event,
             )?;
             return Ok(());
         };
@@ -203,6 +188,7 @@ fn read_new_head_events(
                 subscription_id: sub_notification.params.subscription,
                 header: sub_notification.params.result,
             },
+            map_event,
         )?;
     }
 }
@@ -233,23 +219,36 @@ where
     }
 }
 
-fn send_event(sender: &Sender<ClientEvent>, event: ClientEvent) -> Result<(), ClientEvmError> {
-    sender
-        .send(event)
-        .map_err(|_| ClientEvmError::EventReceiverDropped)
+fn send_event<T, F>(
+    sender: &Sender<T>,
+    event: ClientEvent,
+    map_event: &F,
+) -> Result<(), ClientEvmError>
+where
+    F: Fn(ClientEvent) -> Option<T>,
+{
+    match map_event(event) {
+        Some(e) => sender
+            .send(e)
+            .map_err(|_| ClientEvmError::EventReceiverDropped),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         io::{Read, Write},
         net::TcpListener,
         sync::mpsc::{Receiver, channel},
         thread::{self, JoinHandle},
     };
 
-    use alloy::{primitives::B256, rpc::types::Log as RpcLog};
+    use alloy::primitives::{Address, B256};
     use serde_json::{Value, json};
+
+    use crate::PoolAddress;
 
     use super::*;
 
@@ -306,6 +305,82 @@ mod tests {
     }
 
     #[test]
+    fn fetch_block_logs_posts_expected_request_and_decodes_pool_addresses() {
+        let block_hash = B256::with_last_byte(1);
+        let first_pool = Address::with_last_byte(2);
+        let second_pool = Address::with_last_byte(3);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                log_result(first_pool, block_hash),
+                log_result(second_pool, block_hash),
+                log_result(first_pool, block_hash)
+            ]
+        });
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_block_logs(&agent, &config, block_hash);
+
+        assert!(matches!(
+            result,
+            Ok(ref pools)
+                if pools.len() == 2
+                    && pools.contains(&PoolAddress(first_pool))
+                    && pools.contains(&PoolAddress(second_pool))
+        ));
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        assert_eq!(request.path, "/ethereum/api-key");
+        assert_eq!(
+            request.body,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getLogs",
+                "params": [{
+                    "blockHash": block_hash,
+                    "topics": [crate::uniswap_v3::pool_event_signature_hashes()
+                        .into_iter()
+                        .map(|topic| topic.to_string())
+                        .collect::<Vec<_>>()]
+                }]
+            })
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_block_logs_maps_transport_failure_to_http_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener must have local address");
+        drop(listener);
+        let config = rpc_config(&format!("http://{address}"));
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_block_logs(&agent, &config, B256::with_last_byte(1));
+
+        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+    }
+
+    #[test]
+    fn fetch_pool_data_placeholder_returns_empty_results() {
+        let config = rpc_config("http://127.0.0.1:9");
+        let agent = ureq::Agent::new_with_defaults();
+        let requested_pools = HashSet::from([PoolAddress(Address::with_last_byte(2))]);
+
+        let result = fetch_pool_data(&agent, &config, B256::with_last_byte(1), requested_pools);
+
+        assert!(matches!(result, Ok(ref pools) if pools.is_empty()));
+    }
+
+    #[test]
     fn fetch_finalized_block_header_posts_expected_request_and_decodes_response() {
         let block_hash = B256::with_last_byte(1);
         let response = json!({
@@ -355,82 +430,6 @@ mod tests {
         let result = fetch_finalized_block_header(&agent, &config);
 
         assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
-    }
-
-    #[test]
-    fn subscription_notification_preserves_rpc_log_metadata() {
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_subscription",
-            "params": {
-                "subscription": "0xsubscription",
-                "result": {
-                    "address": "0x0000000000000000000000000000000000000001",
-                    "topics": [
-                        "0x0000000000000000000000000000000000000000000000000000000000000002"
-                    ],
-                    "data": "0x",
-                    "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000003",
-                    "blockNumber": "0x4",
-                    "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000005",
-                    "transactionIndex": "0x6",
-                    "logIndex": "0x7",
-                    "removed": true
-                }
-            }
-        });
-
-        let result = serde_json::from_value::<SubscriptionNotification<RpcLog>>(notification);
-
-        assert!(matches!(
-            result,
-            Ok(SubscriptionNotification {
-                params: SubscriptionDataParams {
-                    subscription,
-                    result,
-                },
-            }) if subscription == "0xsubscription"
-                && result.address().to_string()
-                    == "0x0000000000000000000000000000000000000001"
-                && result.topic0() == Some(&B256::with_last_byte(2))
-                && result.block_hash == Some(B256::with_last_byte(3))
-                && result.block_number == Some(4)
-                && result.transaction_hash == Some(B256::with_last_byte(5))
-                && result.transaction_index == Some(6)
-                && result.log_index == Some(7)
-                && result.removed
-        ));
-    }
-
-    #[test]
-    fn client_notification_carries_rpc_log() {
-        let notification = json!({
-            "params": {
-                "subscription": "0xsubscription",
-                "result": {
-                    "address": "0x0000000000000000000000000000000000000001",
-                    "topics": [],
-                    "data": "0x",
-                    "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000003",
-                    "blockNumber": "0x4",
-                    "transactionHash": null,
-                    "transactionIndex": null,
-                    "logIndex": null,
-                    "removed": false
-                }
-            }
-        });
-        let parsed = serde_json::from_value::<SubscriptionNotification<RpcLog>>(notification);
-
-        assert!(matches!(
-            parsed.map(|notification| ClientEvent::Notification {
-                subscription_id: notification.params.subscription,
-                result: notification.params.result,
-            }),
-            Ok(ClientEvent::Notification { result, .. })
-                if result.block_hash == Some(B256::with_last_byte(3))
-                    && result.block_number == Some(4)
-        ));
     }
 
     #[test]
@@ -606,7 +605,7 @@ mod tests {
 
     fn rpc_config(http_url: &str) -> RpcConfig {
         RpcConfig {
-            network: crate::EvmNetwork::Ethereum,
+            chain: crate::ChainKey::Ethereum,
             http_url: http_url.to_owned(),
             ws_url: "wss://example.invalid".to_owned(),
             api_key: "api-key".to_owned(),
@@ -632,6 +631,22 @@ mod tests {
             "mixHash": B256::with_last_byte(14),
             "nonce": "0x000000000000000f",
             "providerTag": "observed"
+        })
+    }
+
+    fn log_result(address: Address, block_hash: B256) -> Value {
+        json!({
+            "address": address,
+            "topics": [
+                crate::uniswap_v3::pool_event_signature_hashes()[0]
+            ],
+            "data": "0x",
+            "blockHash": block_hash,
+            "blockNumber": "0x4",
+            "transactionHash": B256::with_last_byte(5),
+            "transactionIndex": "0x6",
+            "logIndex": "0x7",
+            "removed": false
         })
     }
 }

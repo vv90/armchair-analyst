@@ -1,7 +1,4 @@
-use alloy::{
-    rpc::types::{Header, Log},
-    serde::WithOtherFields,
-};
+use alloy::{rpc::types::Header, serde::WithOtherFields};
 
 pub type ClientHead = WithOtherFields<Header>;
 
@@ -9,10 +6,6 @@ pub type ClientHead = WithOtherFields<Header>;
 pub enum ClientEvent {
     Subscribed {
         subscription_id: String,
-    },
-    Notification {
-        subscription_id: String,
-        result: Log,
     },
     NewHead {
         subscription_id: String,

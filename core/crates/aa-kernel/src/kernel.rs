@@ -18,9 +18,9 @@ enum Effect {
     GetCount,
 }
 
-// enum Subscription {
-//     TickSubscription,
-// }
+enum Subscription {
+    TickSubscription,
+}
 
 impl Application for Kernel {
     type State = State;
@@ -29,7 +29,7 @@ impl Application for Kernel {
 
     type Effect = Effect;
 
-    // type Subscription = Subscription;
+    type Subscription = Subscription;
 
     fn init() -> Transition<Self::State, Self::Effect> {
         Transition {
@@ -52,10 +52,15 @@ impl Application for Kernel {
             },
         }
     }
+
+    fn subscriptions() -> Vec<Self::Subscription> {
+        Vec::new()
+    }
 }
 
 impl Runtime<Kernel> for ProductionRuntime {
     fn execute_effect(
+        &self,
         effect: <Kernel as Application>::Effect,
     ) -> Vec<<Kernel as Application>::Input> {
         match effect {
@@ -66,7 +71,14 @@ impl Runtime<Kernel> for ProductionRuntime {
         }
     }
 
-    fn log(error: ApplicationError<<Kernel as Application>::Input>) {
+    fn spawn_subscription(
+        &self,
+        _sender: &std::sync::mpsc::Sender<<Kernel as Application>::Input>,
+        _subscription: <Kernel as Application>::Subscription,
+    ) {
+    }
+
+    fn log(&self, error: ApplicationError<<Kernel as Application>::Input>) {
         eprintln!("{:?}", error);
     }
 }

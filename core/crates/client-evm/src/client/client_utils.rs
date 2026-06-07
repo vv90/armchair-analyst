@@ -1,67 +1,20 @@
-use alloy::primitives::BlockHash;
+use std::collections::HashSet;
+
+use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
-use crate::{
-    ClientEvmError, ClientHead, EvmNetwork, RpcConfig, uniswap_v3::pool_event_signature_hashes,
-};
+use crate::{ClientEvmError, ClientHead, PoolAddress, uniswap_v3::pool_event_signature_hashes};
 
-pub(crate) fn compose_ws_endpoint(config: &RpcConfig) -> Result<String, ClientEvmError> {
-    let ws_url = config.ws_url.trim();
-    if ws_url.is_empty() {
-        return Err(ClientEvmError::InvalidSubscriptionConfig(
-            "websocket url is required".to_owned(),
-        ));
-    }
-
-    let api_key = config.api_key.trim();
-    if api_key.is_empty() {
-        return Err(ClientEvmError::InvalidSubscriptionConfig(
-            "rpc api key is required".to_owned(),
-        ));
-    }
-
-    Ok(format!(
-        "{}/{}/{}",
-        ws_url.trim_end_matches('/'),
-        network_path(config.network),
-        api_key
-    ))
-}
-
-pub(crate) fn compose_http_endpoint(config: &RpcConfig) -> Result<String, ClientEvmError> {
-    let http_url = config.http_url.trim();
-    if http_url.is_empty() {
-        return Err(ClientEvmError::InvalidHttpConfig(
-            "http url is required".to_owned(),
-        ));
-    }
-
-    let api_key = config.api_key.trim();
-    if api_key.is_empty() {
-        return Err(ClientEvmError::InvalidHttpConfig(
-            "rpc api key is required".to_owned(),
-        ));
-    }
-
-    Ok(format!(
-        "{}/{}/{}",
-        http_url.trim_end_matches('/'),
-        network_path(config.network),
-        api_key
-    ))
-}
-
-fn network_path(network: EvmNetwork) -> &'static str {
-    match network {
-        EvmNetwork::Ethereum => "ethereum",
-    }
-}
-
-pub(crate) fn build_pool_events_subscribe_request(request_id: u64) -> Value {
-    let event_topics = pool_event_signature_hashes()
+fn pool_event_topic_filter() -> Vec<String> {
+    pool_event_signature_hashes()
         .into_iter()
         .map(|topic| topic.to_string())
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_pool_events_subscribe_request(request_id: u64) -> Value {
+    let event_topics = pool_event_topic_filter();
 
     json!({
         "jsonrpc": "2.0",
@@ -91,6 +44,20 @@ pub(crate) fn build_block_header_request(request_id: u64, block_hash: BlockHash)
         "id": request_id,
         "method": "eth_getBlockByHash",
         "params": [block_hash, false]
+    })
+}
+
+pub(crate) fn build_block_logs_request(request_id: u64, block_hash: BlockHash) -> Value {
+    let event_topics = pool_event_topic_filter();
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_getLogs",
+        "params": [{
+            "blockHash": block_hash,
+            "topics": [event_topics]
+        }]
     })
 }
 
@@ -211,79 +178,75 @@ pub(crate) fn parse_block_header_response_by_id(
     }
 }
 
+pub(crate) fn parse_block_logs_response(
+    value: &Value,
+    expected_request_id: u64,
+    expected_block_hash: BlockHash,
+) -> Result<HashSet<PoolAddress>, ClientEvmError> {
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block logs response must use json-rpc 2.0".to_owned(),
+        ));
+    }
+
+    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        ClientEvmError::MalformedJsonRpcResponse(
+            "block logs response must contain a numeric request id".to_owned(),
+        )
+    })?;
+
+    if response_id != expected_request_id {
+        return Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block logs response request id does not match request".to_owned(),
+        ));
+    }
+
+    match (value.get("result"), value.get("error")) {
+        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block logs response must not contain both result and error".to_owned(),
+        )),
+        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
+            "block logs response must contain result or error".to_owned(),
+        )),
+        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
+        (Some(result), None) => {
+            if !result.is_array() {
+                return Err(ClientEvmError::MalformedJsonRpcResponse(
+                    "block logs response result must be an array".to_owned(),
+                ));
+            }
+
+            let logs = serde_json::from_value::<Vec<Log>>(result.clone())
+                .map_err(ClientEvmError::JsonError)?;
+
+            if logs
+                .iter()
+                .any(|log| log.block_hash != Some(expected_block_hash))
+            {
+                return Err(ClientEvmError::MalformedJsonRpcResponse(
+                    "returned log block hash does not match requested block hash".to_owned(),
+                ));
+            }
+
+            Ok(logs
+                .into_iter()
+                .map(|log| PoolAddress(log.address()))
+                .collect())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use alloy::primitives::B256;
+    use alloy::primitives::{Address, B256};
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
+    use crate::PoolAddress;
+
     use super::*;
-
-    #[test]
-    fn compose_ws_endpoint_appends_network_and_key() {
-        let config = rpc_config(" wss://lb.drpc.org/ ", " api-key ");
-
-        let result = compose_ws_endpoint(&config);
-
-        assert!(matches!(
-            result.as_deref(),
-            Ok("wss://lb.drpc.org/ethereum/api-key")
-        ));
-    }
-
-    #[test]
-    fn compose_ws_endpoint_rejects_empty_ws_url() {
-        let config = rpc_config(" ", "api-key");
-
-        assert!(matches!(
-            compose_ws_endpoint(&config),
-            Err(ClientEvmError::InvalidSubscriptionConfig(_))
-        ));
-    }
-
-    #[test]
-    fn compose_ws_endpoint_rejects_empty_api_key() {
-        let config = rpc_config("wss://lb.drpc.org", "\t");
-
-        assert!(matches!(
-            compose_ws_endpoint(&config),
-            Err(ClientEvmError::InvalidSubscriptionConfig(_))
-        ));
-    }
-
-    #[test]
-    fn compose_http_endpoint_appends_network_and_key() {
-        let config = rpc_config_with_http(" https://lb.drpc.org/ ", " api-key ");
-
-        let result = compose_http_endpoint(&config);
-
-        assert!(matches!(
-            result.as_deref(),
-            Ok("https://lb.drpc.org/ethereum/api-key")
-        ));
-    }
-
-    #[test]
-    fn compose_http_endpoint_rejects_empty_http_url() {
-        let config = rpc_config_with_http(" ", "api-key");
-
-        assert!(matches!(
-            compose_http_endpoint(&config),
-            Err(ClientEvmError::InvalidHttpConfig(_))
-        ));
-    }
-
-    #[test]
-    fn compose_http_endpoint_rejects_empty_api_key() {
-        let config = rpc_config_with_http("https://lb.drpc.org", "\t");
-
-        assert!(matches!(
-            compose_http_endpoint(&config),
-            Err(ClientEvmError::InvalidHttpConfig(_))
-        ));
-    }
 
     #[test]
     fn block_header_request_uses_hash_without_full_transactions() {
@@ -315,6 +278,200 @@ mod tests {
                 "params": ["finalized", false]
             })
         );
+    }
+
+    #[test]
+    fn block_logs_request_uses_block_hash_and_pool_event_topics() {
+        let block_hash = B256::with_last_byte(7);
+        let request = build_block_logs_request(9, block_hash);
+        let expected_topics = pool_event_signature_hashes()
+            .into_iter()
+            .map(|topic| topic.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            request,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "eth_getLogs",
+                "params": [{
+                    "blockHash": block_hash,
+                    "topics": [expected_topics]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn block_logs_request_does_not_filter_by_address() {
+        let request = build_block_logs_request(9, B256::with_last_byte(7));
+        let address_filter = request
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.first())
+            .and_then(|filter| filter.get("address"));
+
+        assert_eq!(address_filter, None);
+    }
+
+    #[test]
+    fn block_logs_response_decodes_pool_addresses() {
+        let block_hash = B256::with_last_byte(7);
+        let first_pool = Address::with_last_byte(1);
+        let second_pool = Address::with_last_byte(2);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [
+                log_result(first_pool, block_hash),
+                log_result(second_pool, block_hash),
+                log_result(first_pool, block_hash)
+            ]
+        });
+
+        let result = parse_block_logs_response(&response, 9, block_hash);
+
+        assert!(matches!(
+            result,
+            Ok(ref pools)
+                if pools.len() == 2
+                    && pools.contains(&PoolAddress(first_pool))
+                    && pools.contains(&PoolAddress(second_pool))
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_returns_empty_set_for_empty_result() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": []
+        });
+
+        let result = parse_block_logs_response(&response, 9, block_hash);
+
+        assert!(matches!(result, Ok(ref pools) if pools.is_empty()));
+    }
+
+    #[test]
+    fn block_logs_response_parses_json_rpc_error() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "error": {
+                "code": -32000,
+                "message": "logs unavailable"
+            }
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::JsonRpcError(ref message))
+                if message == "-32000: logs unavailable"
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_rejects_unexpected_request_id() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "result": []
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_rejects_missing_result_and_error() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_rejects_result_and_error_together() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [],
+            "error": {
+                "code": -32000,
+                "message": "conflicting response"
+            }
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_rejects_malformed_log() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [
+                {
+                    "address": Address::with_last_byte(1)
+                }
+            ]
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::JsonError(_))
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_rejects_mismatched_block_hash() {
+        let requested_hash = B256::with_last_byte(7);
+        let returned_hash = B256::with_last_byte(8);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [
+                log_result(Address::with_last_byte(1), returned_hash)
+            ]
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, requested_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn block_logs_response_rejects_invalid_json_rpc_version() {
+        let block_hash = B256::with_last_byte(7);
+        let response = json!({
+            "jsonrpc": "1.0",
+            "id": 9,
+            "result": []
+        });
+
+        assert!(matches!(
+            parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
     }
 
     #[test]
@@ -724,94 +881,6 @@ mod tests {
 
     proptest! {
         #[test]
-        fn compose_ws_endpoint_preserves_non_empty_parts(
-            ws_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}/*",
-            api_key in "[A-Za-z0-9_-]{1,40}",
-        ) {
-            let config = rpc_config(
-                &format!(" {ws_url} "),
-                &format!(" {api_key} "),
-            );
-            let expected = format!(
-                "{}/ethereum/{}",
-                ws_url.trim_end_matches('/'),
-                api_key
-            );
-
-            prop_assert_eq!(compose_ws_endpoint(&config)?, expected);
-        }
-
-        #[test]
-        fn compose_ws_endpoint_rejects_whitespace_ws_url(
-            whitespace in "[ \\t\\n\\r]{1,12}",
-            api_key in "[A-Za-z0-9_-]{1,40}",
-        ) {
-            let config = rpc_config(&whitespace, &api_key);
-
-            prop_assert!(matches!(
-                compose_ws_endpoint(&config),
-                Err(ClientEvmError::InvalidSubscriptionConfig(_))
-            ));
-        }
-
-        #[test]
-        fn compose_ws_endpoint_rejects_whitespace_api_key(
-            ws_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}",
-            whitespace in "[ \\t\\n\\r]{1,12}",
-        ) {
-            let config = rpc_config(&ws_url, &whitespace);
-
-            prop_assert!(matches!(
-                compose_ws_endpoint(&config),
-                Err(ClientEvmError::InvalidSubscriptionConfig(_))
-            ));
-        }
-
-        #[test]
-        fn compose_ws_endpoint_ignores_http_url(
-            http_url in "\\PC*",
-            ws_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}/*",
-            api_key in "[A-Za-z0-9_-]{1,40}",
-        ) {
-            let mut config = rpc_config(&ws_url, &api_key);
-            let expected = compose_ws_endpoint(&config)?;
-            config.http_url = http_url;
-
-            prop_assert_eq!(compose_ws_endpoint(&config)?, expected);
-        }
-
-        #[test]
-        fn compose_http_endpoint_preserves_non_empty_parts(
-            http_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}/*",
-            api_key in "[A-Za-z0-9_-]{1,40}",
-        ) {
-            let config = rpc_config_with_http(
-                &format!(" {http_url} "),
-                &format!(" {api_key} "),
-            );
-            let expected = format!(
-                "{}/ethereum/{}",
-                http_url.trim_end_matches('/'),
-                api_key
-            );
-
-            prop_assert_eq!(compose_http_endpoint(&config)?, expected);
-        }
-
-        #[test]
-        fn compose_http_endpoint_ignores_ws_url(
-            ws_url in "\\PC*",
-            http_url in "[a-z]{3,10}://[a-z0-9.-]{1,30}/*",
-            api_key in "[A-Za-z0-9_-]{1,40}",
-        ) {
-            let mut config = rpc_config_with_http(&http_url, &api_key);
-            let expected = compose_http_endpoint(&config)?;
-            config.ws_url = ws_url;
-
-            prop_assert_eq!(compose_http_endpoint(&config)?, expected);
-        }
-
-        #[test]
         fn block_header_request_preserves_request_id_and_hash(
             request_id in any::<u64>(),
             block_hash in any::<[u8; 32]>(),
@@ -822,6 +891,26 @@ mod tests {
             prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
             prop_assert_eq!(request.get("method"), Some(&json!("eth_getBlockByHash")));
             prop_assert_eq!(request.get("params"), Some(&json!([block_hash, false])));
+        }
+
+        #[test]
+        fn block_logs_request_preserves_request_id_and_hash(
+            request_id in any::<u64>(),
+            block_hash in any::<[u8; 32]>(),
+        ) {
+            let block_hash = B256::from(block_hash);
+            let request = build_block_logs_request(request_id, block_hash);
+
+            prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
+            prop_assert_eq!(request.get("method"), Some(&json!("eth_getLogs")));
+            prop_assert_eq!(
+                request
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(|filter| filter.get("blockHash")),
+                Some(&json!(block_hash))
+            );
         }
 
         #[test]
@@ -891,22 +980,20 @@ mod tests {
 
     }
 
-    fn rpc_config(ws_url: &str, api_key: &str) -> RpcConfig {
-        RpcConfig {
-            network: EvmNetwork::Ethereum,
-            http_url: "https://lb.drpc.live/".to_owned(),
-            ws_url: ws_url.to_owned(),
-            api_key: api_key.to_owned(),
-        }
-    }
-
-    fn rpc_config_with_http(http_url: &str, api_key: &str) -> RpcConfig {
-        RpcConfig {
-            network: EvmNetwork::Ethereum,
-            http_url: http_url.to_owned(),
-            ws_url: "wss://lb.drpc.live/".to_owned(),
-            api_key: api_key.to_owned(),
-        }
+    fn log_result(address: Address, block_hash: B256) -> Value {
+        json!({
+            "address": address,
+            "topics": [
+                pool_event_signature_hashes()[0]
+            ],
+            "data": "0x",
+            "blockHash": block_hash,
+            "blockNumber": "0x4",
+            "transactionHash": B256::with_last_byte(5),
+            "transactionIndex": "0x6",
+            "logIndex": "0x7",
+            "removed": false
+        })
     }
 
     fn block_header_result(block_hash: B256) -> Value {

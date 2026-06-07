@@ -3,12 +3,9 @@ use std::{
     marker::PhantomData,
 };
 
-use alloy::primitives::{Address, BlockHash};
+use alloy::primitives::BlockHash;
 
-use crate::tick::Tick;
-
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
-struct PoolAddress(Address);
+use crate::{pool_state::PoolAddress, tick::Tick};
 
 // #[derive(Hash, PartialEq, Eq, Clone, PartialOrd, Ord, Copy)]
 // struct RequestId<T>(u64, PhantomData<T>);
@@ -43,13 +40,13 @@ impl<R> std::hash::Hash for RequestId<R> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<R> RequestId<R> {
-    pub(crate) fn from_raw_for_test(value: u64) -> Self {
+    pub fn from_raw_for_test(value: u64) -> Self {
         RawRequestId(value).typed()
     }
 
-    pub(crate) fn raw_for_test(self) -> u64 {
+    pub fn raw_for_test(self) -> u64 {
         self.raw.0
     }
 }

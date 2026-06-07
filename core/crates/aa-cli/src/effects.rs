@@ -7,9 +7,7 @@ use std::{
     time::Duration,
 };
 
-use client_evm::{
-    ClientEvent, ClientEvmError, RpcConfig, subscribe_new_heads, subscribe_pool_events,
-};
+use client_evm::{ClientEvent, ClientEvmError, RpcConfig, subscribe_new_heads};
 
 use crate::utils::{CliError, EventFeedback, format_event_feedback, load_rpc_config_with};
 
@@ -36,17 +34,10 @@ fn load_rpc_config() -> Result<RpcConfig, CliError> {
 
 fn run_subscriptions(config: RpcConfig) -> Result<(), CliError> {
     let (sender, receiver) = mpsc::channel();
-    let pool_sender = sender.clone();
     let heads_sender = sender;
-    let pool_config = config.clone();
-    let workers = vec![
-        SubscriptionWorker::spawn("pool events", move || {
-            subscribe_pool_events(pool_config, pool_sender)
-        }),
-        SubscriptionWorker::spawn("new heads", move || {
-            subscribe_new_heads(config, heads_sender)
-        }),
-    ];
+    let workers = vec![SubscriptionWorker::spawn("new heads", move || {
+        subscribe_new_heads(&config, &heads_sender, Some)
+    })];
     let mut output = io::stdout();
 
     receive_subscription_events(receiver, workers, &mut output)

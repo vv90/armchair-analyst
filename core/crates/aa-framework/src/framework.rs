@@ -1,5 +1,8 @@
 use std::{
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender},
+    },
     thread::JoinHandle,
 };
 
@@ -29,38 +32,58 @@ pub trait Application {
     type State;
     type Input: Send + 'static;
     type Effect: Send + 'static;
-    // type Subscription;
+    type Subscription: Send + 'static;
 
     fn init() -> Transition<Self::State, Self::Effect>;
 
     fn transition(state: Self::State, input: Self::Input) -> Transition<Self::State, Self::Effect>;
 
-    // fn subscriptions(state: &Self::State) -> Vec<Self::Subscription>;
+    fn subscriptions() -> Vec<Self::Subscription>;
 }
 
-pub trait Runtime<App: Application> {
-    fn execute_effect(effect: App::Effect) -> Vec<App::Input>;
-    fn log(error: ApplicationError<App::Input>);
+pub trait Runtime<App: Application>: Sized + Send + Sync + 'static {
+    fn execute_effect(&self, effect: App::Effect) -> Vec<App::Input>;
+    fn spawn_subscription(&self, sender: &Sender<App::Input>, subscription: App::Subscription);
+    fn log(&self, error: ApplicationError<App::Input>);
 
-    fn run() -> (Sender<App::Input>, JoinHandle<()>)
+    fn run(self) -> (Sender<App::Input>, JoinHandle<()>)
     where
-        Self: Sized + 'static,
         App: 'static,
     {
+        let runtime = Arc::new(self);
         let (input_sender, input_receiver) = std::sync::mpsc::channel();
         let runtime_sender = input_sender.clone();
-        let handle = std::thread::spawn(move || run::<App, Self>(runtime_sender, input_receiver));
+        let handle = std::thread::spawn(move || {
+            run::<App, Self>(
+                runtime,
+                runtime_sender,
+                input_receiver,
+                <App as Application>::subscriptions(),
+            )
+        });
         (input_sender, handle)
     }
 }
 
 fn run<App: Application, R: Runtime<App>>(
+    runtime: Arc<R>,
     input_sender: Sender<App::Input>,
     input_receiver: Receiver<App::Input>,
+    subscriptions: Vec<App::Subscription>,
 ) -> () {
     let Transition { state, effects } = App::init();
 
-    drop(spawn_effects::<App, R>(&input_sender, effects));
+    drop(spawn_effects::<App, R>(
+        runtime.clone(),
+        &input_sender,
+        effects,
+    ));
+
+    drop(spawn_subscriptions(
+        runtime.clone(),
+        &input_sender,
+        subscriptions,
+    ));
 
     let _final_state = input_receiver.into_iter().fold(state, |s, i| {
         let Transition {
@@ -69,7 +92,11 @@ fn run<App: Application, R: Runtime<App>>(
         } = App::transition(s, i);
 
         // spawn a thread to execute effects in parallel
-        drop(spawn_effects::<App, R>(&input_sender, effects));
+        drop(spawn_effects::<App, R>(
+            runtime.clone(),
+            &input_sender,
+            effects,
+        ));
 
         next_state
     });
@@ -78,20 +105,40 @@ fn run<App: Application, R: Runtime<App>>(
 }
 
 fn spawn_effects<App: Application, R: Runtime<App>>(
+    runtime: Arc<R>,
     sender: &Sender<App::Input>,
     effects: Vec<App::Effect>,
 ) -> JoinHandle<()> {
     let sender_clone = sender.clone();
     std::thread::spawn(move || {
         effects.into_par_iter().for_each(|effect| {
-            R::execute_effect(effect)
+            runtime
+                .execute_effect(effect)
                 .into_iter()
                 .for_each(|i| match sender_clone.send(i) {
                     Ok(_) => (),
-                    Err(e) => R::log(ApplicationError::SendError(e)),
+                    Err(e) => runtime.log(ApplicationError::SendError(e)),
                 })
         });
     })
+}
+
+fn spawn_subscriptions<App: Application, R: Runtime<App>>(
+    runtime: Arc<R>,
+    sender: &Sender<App::Input>,
+    subscriptions: Vec<App::Subscription>,
+) -> Vec<JoinHandle<()>> {
+    subscriptions
+        .into_iter()
+        .map(|subscription| {
+            let runtime = runtime.clone();
+            let sender = sender.clone();
+
+            std::thread::spawn(move || {
+                runtime.spawn_subscription(&sender, subscription);
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -131,6 +178,7 @@ mod tests {
         type State = AccumulatorState;
         type Input = AccumulatorInput;
         type Effect = AccumulatorEffect;
+        type Subscription = ();
 
         fn init() -> Transition<Self::State, Self::Effect> {
             Transition {
@@ -172,12 +220,17 @@ mod tests {
                 },
             }
         }
+
+        fn subscriptions() -> Vec<Self::Subscription> {
+            Vec::new()
+        }
     }
 
     impl Application for EffectDeliveryApp {
         type State = ();
         type Input = u16;
         type Effect = DeliveryEffect;
+        type Subscription = ();
 
         fn init() -> Transition<Self::State, Self::Effect> {
             Transition {
@@ -195,14 +248,20 @@ mod tests {
                 effects: Vec::new(),
             }
         }
+
+        fn subscriptions() -> Vec<Self::Subscription> {
+            Vec::new()
+        }
     }
 
     impl Runtime<EffectDeliveryApp> for EffectDeliveryRuntime {
-        fn execute_effect(effect: DeliveryEffect) -> Vec<u16> {
+        fn execute_effect(&self, effect: DeliveryEffect) -> Vec<u16> {
             effect.0
         }
 
-        fn log(_error: ApplicationError<u16>) {}
+        fn spawn_subscription(&self, _sender: &Sender<u16>, _subscription: ()) {}
+
+        fn log(&self, _error: ApplicationError<u16>) {}
     }
 
     proptest! {
@@ -222,7 +281,12 @@ mod tests {
         ) {
             let expected = delivered_inputs(&effects);
             let (sender, receiver) = std::sync::mpsc::channel();
-            let handle = spawn_effects::<EffectDeliveryApp, EffectDeliveryRuntime>(&sender, effects);
+            let runtime = std::sync::Arc::new(EffectDeliveryRuntime);
+            let handle = spawn_effects::<EffectDeliveryApp, EffectDeliveryRuntime>(
+                runtime,
+                &sender,
+                effects,
+            );
 
             prop_assert!(handle.join().is_ok());
 
