@@ -9,6 +9,7 @@ use client_evm::{
 use std::{
     collections::{HashMap, HashSet},
     sync::mpsc::Sender,
+    thread::{self, JoinHandle},
     time,
 };
 
@@ -93,7 +94,9 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 };
                 let _ = subscribe_new_heads(self.get_config(chain), sender, map_client_event);
             }
-            ClientEvmSubscription::TickSubscription(_interval) => {}
+            ClientEvmSubscription::TickSubscription(interval) => {
+                drop(spawn_tick_subscription(sender.clone(), interval));
+            }
         }
     }
 
@@ -121,6 +124,18 @@ fn map_client_chain_event(client_chain_event: ClientEvent) -> Option<client_evm:
         ClientEvent::Subscribed { .. } => None,
         ClientEvent::Closed { .. } => None,
     }
+}
+
+fn spawn_tick_subscription(sender: Sender<Event>, interval: time::Duration) -> JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+
+            if sender.send(Event::Tick).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn execute_chain_effect_with<FetchBlockHeader, FetchBlockLogs, FetchPoolData>(
@@ -210,8 +225,33 @@ mod tests {
         GetBlockHeader, GetBlockLogs, GetPoolData, IssuedRequest, PoolAddress, PoolState, RequestId,
     };
     use serde_json::json;
+    use std::{sync::mpsc, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn tick_subscription_worker_sends_tick_event() {
+        let (sender, receiver) = mpsc::channel();
+        let handle = spawn_tick_subscription(sender, Duration::from_millis(1));
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(250)),
+            Ok(Event::Tick)
+        ));
+
+        drop(receiver);
+        assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn tick_subscription_worker_exits_when_receiver_is_dropped() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+
+        let handle = spawn_tick_subscription(sender, Duration::from_millis(1));
+
+        assert!(handle.join().is_ok());
+    }
 
     #[test]
     fn block_header_request_success_maps_to_chain_event() -> Result<(), serde_json::Error> {

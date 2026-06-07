@@ -57,6 +57,7 @@ pub enum Event {
         chain: ChainKey,
         event: kernel::Event,
     },
+    Tick,
 }
 
 pub enum Effect {
@@ -76,6 +77,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
         }
         Event::FinalizedHeaderUnavailable { chain } => finalized_header_unavailable(state, chain),
         Event::ChainEvent { chain, event } => chain_event(state, chain, event),
+        Event::Tick => tick(state),
     }
 }
 
@@ -135,6 +137,33 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
         }
         None => (State { chains }, Vec::new()),
     }
+}
+
+fn tick(state: State) -> (State, Vec<Effect>) {
+    let (chains, effects) = state.chains.into_iter().fold(
+        (BTreeMap::new(), Vec::new()),
+        |(mut chains, mut effects), (chain, chain_state)| {
+            match chain_state {
+                ChainLifecycle::Initializing => {
+                    chains.insert(chain, ChainLifecycle::Initializing);
+                }
+                ChainLifecycle::Active(chain_state) => {
+                    let (chain_state, chain_effects) =
+                        kernel::transition(chain_state, kernel::Event::Tick);
+                    chains.insert(chain, ChainLifecycle::Active(chain_state));
+                    effects.extend(
+                        chain_effects
+                            .into_iter()
+                            .map(|effect| Effect::ChainEffect { chain, effect }),
+                    );
+                }
+            }
+
+            (chains, effects)
+        },
+    );
+
+    (State { chains }, effects)
 }
 
 #[cfg(test)]
@@ -239,6 +268,52 @@ mod tests {
             },
         );
 
+        assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
+    }
+
+    #[test]
+    fn tick_is_ignored_for_initializing_chains() {
+        let chain = ChainKey::Ethereum;
+        let (state, _) = State::init(chain);
+
+        let (state, effects) = transition(state, Event::Tick);
+
+        assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn tick_routes_inner_effects_with_chain_key() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(1);
+        let missing_parent_hash = hash(2);
+        let observed_hash = hash(3);
+        let (state, _) = State::init(chain);
+        let (state, _) = transition(
+            state,
+            Event::FinalizedHeaderReceived {
+                chain,
+                block_hash: finalized_hash,
+            },
+        );
+        let (state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain,
+                event: kernel::Event::HeadObserved {
+                    hash: observed_hash,
+                    parent_hash: missing_parent_hash,
+                },
+            },
+        );
+        assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
+
+        let (state, effects) = (0..crate::tick::REQUEST_TTL_FOR_TEST)
+            .fold((state, Vec::new()), |(state, _effects), _| {
+                transition(state, Event::Tick)
+            });
+
+        assert_eq!(state.status(chain), Some(ChainStatus::Active));
         assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
     }
 
