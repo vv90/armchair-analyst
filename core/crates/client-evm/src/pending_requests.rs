@@ -256,6 +256,14 @@ impl PendingRequests {
         (self_mut, new_request_id.typed())
     }
 
+    pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
+        self.block_logs
+            .requests
+            .values()
+            .map(|request| request.payload.block_hash)
+            .collect()
+    }
+
     pub fn retry_expired(self, tick: Tick) -> (Self, Vec<AnyIssuedRequest>) {
         let expired_ids = self.expired_ids(tick);
 

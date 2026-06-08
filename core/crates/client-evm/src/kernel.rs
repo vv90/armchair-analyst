@@ -72,6 +72,47 @@ impl BlocksGraph {
             Err(BlocksGraphCycleError) => Err(NewBlockError::CycleDetected),
         }
     }
+
+    fn with_pool_logs(self, block_hash: BlockHash, logs: HashSet<PoolAddress>) -> BlocksGraph {
+        let BlocksGraph(mut blocks) = self;
+
+        if let Some(block) = blocks.get_mut(&block_hash) {
+            block.pool_logs = PoolLogsStatus::Resolved(logs);
+        }
+
+        BlocksGraph(blocks)
+    }
+
+    fn unknown_present_canonical_log_hashes(
+        &self,
+        tip_hash: BlockHash,
+        finalized_hash: BlockHash,
+        pending_log_hashes: &HashSet<BlockHash>,
+    ) -> Vec<BlockHash> {
+        let mut current_hash = tip_hash;
+        let mut hashes = Vec::new();
+        let mut visited = HashSet::new();
+
+        while current_hash != finalized_hash {
+            if !visited.insert(current_hash) {
+                return Vec::new();
+            }
+
+            let Some(block) = self.get(&current_hash) else {
+                break;
+            };
+
+            if matches!(block.pool_logs, PoolLogsStatus::Unknown)
+                && !pending_log_hashes.contains(&current_hash)
+            {
+                hashes.push(current_hash);
+            }
+
+            current_hash = block.parent_hash;
+        }
+
+        hashes
+    }
 }
 
 pub struct FinalizedState {
@@ -150,6 +191,52 @@ pub enum Effect {
 
 struct BlocksGraphCycleError;
 
+fn schedule_unknown_canonical_log_requests(
+    state: State,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    let State {
+        blocks,
+        canonical_tip,
+        pending_requests,
+        finalized_state,
+        tick,
+    } = state;
+
+    let pending_log_hashes = pending_requests.pending_block_log_hashes();
+    let block_hashes = blocks.unknown_present_canonical_log_hashes(
+        canonical_tip,
+        finalized_state.block_hash,
+        &pending_log_hashes,
+    );
+    let mut pending_requests = pending_requests;
+
+    for block_hash in block_hashes {
+        let request_payload = GetBlockLogs { block_hash };
+        let (next_pending_requests, request_id) =
+            pending_requests.with_new_request(request_payload.clone(), tick);
+
+        pending_requests = next_pending_requests;
+        effects.push(Effect::Request(AnyIssuedRequest::BlockLogs(
+            IssuedRequest {
+                request_id,
+                request_payload,
+            },
+        )));
+    }
+
+    (
+        State {
+            blocks,
+            canonical_tip,
+            pending_requests,
+            finalized_state,
+            tick,
+        },
+        effects,
+    )
+}
+
 pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
     match event {
         Event::HeadObserved { hash, parent_hash } => {
@@ -157,7 +244,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 .blocks
                 .with_new_block(hash, parent_hash, state.finalized_state.block_hash)
             {
-                Ok((blocks, None)) => (
+                Ok((blocks, None)) => schedule_unknown_canonical_log_requests(
                     State {
                         blocks,
                         canonical_tip: hash,
@@ -173,7 +260,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         .pending_requests
                         .with_new_request(request_payload.clone(), state.tick);
 
-                    (
+                    schedule_unknown_canonical_log_requests(
                         State {
                             blocks,
                             canonical_tip: hash,
@@ -209,14 +296,16 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         ))],
                     )
                 }
-                Err(NewBlockError::ExistingBlock(blocks)) => (
-                    State {
-                        blocks,
-                        canonical_tip: hash,
-                        ..state
-                    },
-                    vec![],
-                ),
+                Err(NewBlockError::ExistingBlock(blocks)) => {
+                    schedule_unknown_canonical_log_requests(
+                        State {
+                            blocks,
+                            canonical_tip: hash,
+                            ..state
+                        },
+                        vec![],
+                    )
+                }
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests: state.pending_requests,
@@ -249,11 +338,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 None => None,
             };
 
-            let (new_state, effects) = match state.blocks.with_new_block(
-                hash,
-                parent_hash,
-                state.finalized_state.block_hash,
-            ) {
+            let (new_state, effects, should_schedule_log_requests) = match state
+                .blocks
+                .with_new_block(hash, parent_hash, state.finalized_state.block_hash)
+            {
                 Ok((blocks, None)) => (
                     State {
                         blocks,
@@ -261,6 +349,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         ..state
                     },
                     vec![],
+                    true,
                 ),
                 Ok((blocks, Some(missing_hash))) => {
                     let request_payload = GetBlockHeader {
@@ -281,6 +370,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                                 request_payload,
                             },
                         ))],
+                        true,
                     )
                 }
                 Err(NewBlockError::SelfParentBlock(missing_hash, blocks)) => {
@@ -301,6 +391,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                                 request_payload,
                             },
                         ))],
+                        false,
                     )
                 }
                 Err(NewBlockError::ExistingBlock(blocks)) => (
@@ -310,6 +401,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         ..state
                     },
                     vec![],
+                    true,
                 ),
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
@@ -317,6 +409,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
+                    false,
                 ),
                 Err(NewBlockError::CycleDetected) => (
                     State {
@@ -324,10 +417,11 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         ..State::reset(state.finalized_state, state.tick)
                     },
                     vec![],
+                    false,
                 ),
             };
 
-            if let Some(PendingPayload {
+            let (new_state, effects) = if let Some(PendingPayload {
                 payload: request_payload,
                 ..
             }) = retry_request_payload
@@ -353,6 +447,12 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 )
             } else {
                 (new_state, effects)
+            };
+
+            if should_schedule_log_requests {
+                schedule_unknown_canonical_log_requests(new_state, effects)
+            } else {
+                (new_state, effects)
             }
         }
         Event::BlockHeaderNotFound { request_id } => {
@@ -375,7 +475,33 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 )
             }
         }
-        Event::BlockLogsReceived { request_id, logs } => (state, vec![]),
+        Event::BlockLogsReceived { request_id, logs } => {
+            let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
+            match request_payload {
+                Some(PendingPayload {
+                    payload: GetBlockLogs { block_hash },
+                    ..
+                }) => {
+                    let blocks = state.blocks.with_pool_logs(block_hash, logs);
+
+                    (
+                        State {
+                            blocks,
+                            pending_requests,
+                            ..state
+                        },
+                        vec![],
+                    )
+                }
+                None => (
+                    State {
+                        pending_requests,
+                        ..state
+                    },
+                    vec![],
+                ),
+            }
+        }
         Event::PoolDataReceived { request_id, pools } => (state, vec![]),
         Event::RequestFailed { request_id } => {
             let (pending_requests, issued_request) =
@@ -431,6 +557,8 @@ fn find_missing_block_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use alloy::primitives::Address;
 
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
     use proptest::prelude::*;
@@ -578,6 +706,55 @@ mod tests {
         assert_no_self_parent_blocks(state);
         assert_canonical_tip_is_known_or_finalized(state);
         assert_parent_walks_do_not_cycle(state);
+    }
+
+    fn assert_canonical_unknown_logs_are_pending(state: &State) {
+        let pending_log_hashes = state.pending_requests.pending_block_log_hashes();
+        let mut visited = HashSet::new();
+        let mut current_hash = state.canonical_tip;
+
+        while current_hash != state.finalized_state.block_hash {
+            assert!(
+                visited.insert(current_hash),
+                "canonical walk must not cycle"
+            );
+
+            let Some(block) = state.blocks.get(&current_hash) else {
+                break;
+            };
+
+            if matches!(block.pool_logs, PoolLogsStatus::Unknown) {
+                assert!(
+                    pending_log_hashes.contains(&current_hash),
+                    "canonical block with unknown logs must have a pending log request"
+                );
+            }
+
+            current_hash = block.parent_hash;
+        }
+    }
+
+    fn assert_present_canonical_logs_are_resolved(state: &State) {
+        let mut visited = HashSet::new();
+        let mut current_hash = state.canonical_tip;
+
+        while current_hash != state.finalized_state.block_hash {
+            assert!(
+                visited.insert(current_hash),
+                "canonical walk must not cycle"
+            );
+
+            let Some(block) = state.blocks.get(&current_hash) else {
+                break;
+            };
+
+            assert!(
+                matches!(block.pool_logs, PoolLogsStatus::Resolved(_)),
+                "present canonical block logs must be resolved"
+            );
+
+            current_hash = block.parent_hash;
+        }
     }
 
     fn assert_effects_are_well_formed(state: &State, effects: &[Effect]) {
@@ -860,31 +1037,46 @@ mod tests {
         let mut pending_effects = effects;
 
         while let Some(effect) = pending_effects.pop() {
-            let Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
-                request_id,
-                request_payload: GetBlockHeader { block_hash },
-            })) = effect
-            else {
-                continue;
-            };
-
-            let block_index = node_index_for_hash(chain, block_hash)
-                .expect("requested block header must belong to generated chain");
-            assert_ne!(block_index, 0, "finalized header must not be requested");
-
-            let parent_hash = hash_for_node(parent_index(chain, block_index));
-            let (next_state, effects) = transition(
-                state,
-                Event::BlockHeaderReceived {
+            match effect {
+                Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
                     request_id,
-                    hash: block_hash,
-                    parent_hash,
-                },
-            );
+                    request_payload: GetBlockHeader { block_hash },
+                })) => {
+                    let block_index = node_index_for_hash(chain, block_hash)
+                        .expect("requested block header must belong to generated chain");
+                    assert_ne!(block_index, 0, "finalized header must not be requested");
 
-            state = next_state;
-            assert_state_invariants(&state);
-            pending_effects.extend(effects);
+                    let parent_hash = hash_for_node(parent_index(chain, block_index));
+                    let (next_state, effects) = transition(
+                        state,
+                        Event::BlockHeaderReceived {
+                            request_id,
+                            hash: block_hash,
+                            parent_hash,
+                        },
+                    );
+
+                    state = next_state;
+                    assert_state_invariants(&state);
+                    pending_effects.extend(effects);
+                }
+                Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                    request_id, ..
+                })) => {
+                    let (next_state, effects) = transition(
+                        state,
+                        Event::BlockLogsReceived {
+                            request_id,
+                            logs: HashSet::new(),
+                        },
+                    );
+
+                    state = next_state;
+                    assert_state_invariants(&state);
+                    pending_effects.extend(effects);
+                }
+                Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
+            }
         }
 
         state
@@ -903,48 +1095,64 @@ mod tests {
         let mut pending_effects = effects;
 
         while let Some(effect) = pending_effects.pop() {
-            let Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
-                request_id,
-                request_payload: GetBlockHeader { block_hash },
-            })) = effect
-            else {
-                continue;
-            };
+            match effect {
+                Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
+                    request_id,
+                    request_payload: GetBlockHeader { block_hash },
+                })) => {
+                    let block_index = node_index_for_hash(chain, block_hash)
+                        .expect("requested block header must belong to generated chain");
+                    let parent_hash = hash_for_node(parent_index(chain, block_index));
+                    let mut current_request_id = request_id;
 
-            let block_index = node_index_for_hash(chain, block_hash)
-                .expect("requested block header must belong to generated chain");
-            let parent_hash = hash_for_node(parent_index(chain, block_index));
-            let mut current_request_id = request_id;
+                    for retry in retry_plans.get(block_index).into_iter().flatten() {
+                        let (next_state, effects) = match retry {
+                            GeneratedRetry::Failure => {
+                                transition(state, request_failed_for_header(current_request_id))
+                            }
+                            GeneratedRetry::Expiration => advance_ticks(state, REQUEST_TTL),
+                        };
 
-            for retry in retry_plans.get(block_index).into_iter().flatten() {
-                let (next_state, effects) = match retry {
-                    GeneratedRetry::Failure => {
-                        transition(state, request_failed_for_header(current_request_id))
+                        state = next_state;
+                        current_request_id =
+                            assert_single_block_header_request_effect(&effects, block_hash);
+                        assert_state_invariants(&state);
+                        assert_effects_are_well_formed(&state, &effects);
+                        assert_missing_parents_for_known_blocks_are_pending(&state);
                     }
-                    GeneratedRetry::Expiration => advance_ticks(state, REQUEST_TTL),
-                };
 
-                state = next_state;
-                current_request_id =
-                    assert_single_block_header_request_effect(&effects, block_hash);
-                assert_state_invariants(&state);
-                assert_effects_are_well_formed(&state, &effects);
-                assert_missing_parents_for_known_blocks_are_pending(&state);
+                    let (next_state, effects) = transition(
+                        state,
+                        Event::BlockHeaderReceived {
+                            request_id: current_request_id,
+                            hash: block_hash,
+                            parent_hash,
+                        },
+                    );
+
+                    state = next_state;
+                    assert_state_invariants(&state);
+                    assert_effects_are_well_formed(&state, &effects);
+                    pending_effects.extend(effects);
+                }
+                Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                    request_id, ..
+                })) => {
+                    let (next_state, effects) = transition(
+                        state,
+                        Event::BlockLogsReceived {
+                            request_id,
+                            logs: HashSet::new(),
+                        },
+                    );
+
+                    state = next_state;
+                    assert_state_invariants(&state);
+                    assert_effects_are_well_formed(&state, &effects);
+                    pending_effects.extend(effects);
+                }
+                Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
             }
-
-            let (next_state, effects) = transition(
-                state,
-                Event::BlockHeaderReceived {
-                    request_id: current_request_id,
-                    hash: block_hash,
-                    parent_hash,
-                },
-            );
-
-            state = next_state;
-            assert_state_invariants(&state);
-            assert_effects_are_well_formed(&state, &effects);
-            pending_effects.extend(effects);
         }
 
         state
@@ -993,25 +1201,82 @@ mod tests {
         assert!(block.pool_snapshots.is_empty());
     }
 
+    fn assert_single_block_with_parent(state: &State, hash: BlockHash, parent_hash: BlockHash) {
+        let block = state
+            .blocks
+            .get(&hash)
+            .expect("expected block to be present");
+
+        assert_eq!(block.parent_hash, parent_hash);
+        assert!(block.pool_snapshots.is_empty());
+    }
+
+    fn assert_resolved_pool_logs(
+        state: &State,
+        hash: BlockHash,
+        parent_hash: BlockHash,
+        expected_logs: &HashSet<PoolAddress>,
+    ) {
+        let block = state
+            .blocks
+            .get(&hash)
+            .expect("expected block to be present");
+
+        assert_eq!(block.parent_hash, parent_hash);
+        assert!(block.pool_snapshots.is_empty());
+
+        let PoolLogsStatus::Resolved(logs) = &block.pool_logs else {
+            panic!("expected resolved pool logs");
+        };
+
+        assert_eq!(logs.len(), expected_logs.len());
+        for pool_address in expected_logs {
+            assert!(logs.contains(pool_address));
+        }
+    }
+
     fn assert_single_block_header_request_effect(
         effects: &[Effect],
         block_hash: BlockHash,
     ) -> RequestId<GetBlockHeader> {
-        assert_eq!(effects.len(), 1);
+        let request_ids = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
+                    request_id,
+                    request_payload:
+                        GetBlockHeader {
+                            block_hash: requested_hash,
+                        },
+                })) if *requested_hash == block_hash => Some(*request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
 
-        match &effects[0] {
-            Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
-                request_id,
-                request_payload:
-                    GetBlockHeader {
-                        block_hash: requested_hash,
-                    },
-            })) => {
-                assert_eq!(*requested_hash, block_hash);
-                *request_id
-            }
-            _ => panic!("expected single block header request effect"),
-        }
+        assert_eq!(request_ids.len(), 1);
+        request_ids[0]
+    }
+
+    fn assert_single_block_log_request_effect(
+        effects: &[Effect],
+        block_hash: BlockHash,
+    ) -> RequestId<GetBlockLogs> {
+        let request_ids = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                    request_id,
+                    request_payload:
+                        GetBlockLogs {
+                            block_hash: requested_hash,
+                        },
+                })) if *requested_hash == block_hash => Some(*request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(request_ids.len(), 1);
+        request_ids[0]
     }
 
     fn assert_single_request_effect(
@@ -1057,6 +1322,30 @@ mod tests {
         (state, effects)
     }
 
+    fn drain_block_log_effects(mut state: State, effects: &[Effect]) -> State {
+        for effect in effects {
+            let Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest { request_id, .. })) =
+                effect
+            else {
+                continue;
+            };
+
+            let (next_state, effects) = transition(
+                state,
+                Event::BlockLogsReceived {
+                    request_id: *request_id,
+                    logs: HashSet::new(),
+                },
+            );
+
+            state = next_state;
+            assert!(effects.is_empty());
+            assert_state_invariants(&state);
+        }
+
+        state
+    }
+
     fn header_hashes_from_effects(effects: &[Effect]) -> HashSet<BlockHash> {
         effects
             .iter()
@@ -1071,6 +1360,57 @@ mod tests {
                 _ => panic!("expected block header request effect"),
             })
             .collect()
+    }
+
+    fn header_request_hashes_from_effects(effects: &[Effect]) -> HashSet<BlockHash> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
+                    request_payload:
+                        GetBlockHeader {
+                            block_hash: requested_hash,
+                        },
+                    ..
+                })) => Some(*requested_hash),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn block_log_request_hashes_from_effects(effects: &[Effect]) -> HashSet<BlockHash> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                    request_payload:
+                        GetBlockLogs {
+                            block_hash: requested_hash,
+                        },
+                    ..
+                })) => Some(*requested_hash),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_request_hashes(
+        effects: &[Effect],
+        expected_header_hashes: HashSet<BlockHash>,
+        expected_log_hashes: HashSet<BlockHash>,
+    ) {
+        assert_eq!(
+            header_request_hashes_from_effects(effects),
+            expected_header_hashes
+        );
+        assert_eq!(
+            block_log_request_hashes_from_effects(effects),
+            expected_log_hashes
+        );
+        assert_eq!(
+            effects.len(),
+            expected_header_hashes.len() + expected_log_hashes.len()
+        );
     }
 
     fn pending_header_hashes(state: &State) -> HashSet<BlockHash> {
@@ -1236,7 +1576,7 @@ mod tests {
         assert_eq!(next_state.blocks.0.len(), 1);
         assert_eq!(next_state.canonical_tip, head_hash);
         assert_single_unknown_block(&next_state, head_hash, finalized_hash);
-        assert!(effects.is_empty());
+        assert_request_hashes(&effects, HashSet::new(), HashSet::from([head_hash]));
         assert_state_invariants(&next_state);
     }
 
@@ -1292,6 +1632,375 @@ mod tests {
     }
 
     #[test]
+    fn connected_head_observed_requests_logs_for_head() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let state = empty_state_at(finalized_hash);
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+
+        assert_request_hashes(&effects, HashSet::new(), HashSet::from([head_hash]));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn disconnected_head_observed_requests_head_logs_and_missing_parent_header() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let state = empty_state_at(finalized_hash);
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: missing_parent_hash,
+            },
+        );
+
+        assert_request_hashes(
+            &effects,
+            HashSet::from([missing_parent_hash]),
+            HashSet::from([head_hash]),
+        );
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn missing_parent_header_received_requests_logs_for_parent() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let state = empty_state_at(finalized_hash);
+
+        let (state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: missing_parent_hash,
+            },
+        );
+        let header_request_id =
+            assert_single_block_header_request_effect(&effects, missing_parent_hash);
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockHeaderReceived {
+                request_id: header_request_id,
+                hash: missing_parent_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn present_canonical_prefix_schedules_logs_for_all_unknown_blocks() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let grandparent_hash = BlockHash::with_last_byte(2);
+        let parent_hash = BlockHash::with_last_byte(3);
+        let head_hash = BlockHash::with_last_byte(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = head_hash;
+        state
+            .blocks
+            .0
+            .insert(grandparent_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .insert(parent_hash, block_with_parent(grandparent_hash));
+        state
+            .blocks
+            .0
+            .insert(head_hash, block_with_parent(parent_hash));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash,
+            },
+        );
+
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([head_hash, parent_hash, grandparent_hash]),
+        );
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn duplicate_header_response_does_not_duplicate_pending_log_requests() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let state = empty_state_at(finalized_hash);
+
+        let (state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash,
+            },
+        );
+        let header_request_id = assert_single_block_header_request_effect(&effects, parent_hash);
+
+        let (state, effects) = transition(
+            state,
+            Event::BlockHeaderReceived {
+                request_id: header_request_id,
+                hash: parent_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+        assert_request_hashes(&effects, HashSet::new(), HashSet::from([parent_hash]));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockHeaderReceived {
+                request_id: header_request_id,
+                hash: parent_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pending_log_request_suppresses_duplicate_log_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let mut state = empty_state_at(finalized_hash);
+        state.canonical_tip = head_hash;
+        state
+            .blocks
+            .0
+            .insert(head_hash, block_with_parent(finalized_hash));
+        let (pending_requests, _request_id) = state.pending_requests.with_new_request(
+            GetBlockLogs {
+                block_hash: head_hash,
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn resolved_log_status_suppresses_duplicate_log_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let mut state = empty_state_at(finalized_hash);
+        state.canonical_tip = head_hash;
+        state.blocks.0.insert(
+            head_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
+                pool_snapshots: HashMap::new(),
+            },
+        );
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn block_logs_received_for_matching_request_marks_logs_and_removes_pending_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let first_pool = PoolAddress(Address::with_last_byte(3));
+        let second_pool = PoolAddress(Address::with_last_byte(4));
+        let logs = HashSet::from([first_pool, second_pool]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: logs.clone(),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert_resolved_pool_logs(&next_state, block_hash, finalized_hash, &logs);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn block_logs_received_with_empty_logs_marks_block_resolved() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let logs = HashSet::new();
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: logs.clone(),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert_resolved_pool_logs(&next_state, block_hash, finalized_hash, &logs);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn block_logs_received_for_unknown_request_is_noop() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let logs = HashSet::from([PoolAddress(Address::with_last_byte(3))]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id: RequestId::from_raw_for_test(99),
+                logs,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(next_state.pending_requests.is_empty_for_test());
+        assert_single_unknown_block(&next_state, block_hash, finalized_hash);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn block_logs_received_for_missing_block_consumes_request_without_inserting_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_block_hash = BlockHash::with_last_byte(2);
+        let logs = HashSet::from([PoolAddress(Address::with_last_byte(3))]);
+        let mut state = empty_state_at(finalized_hash);
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetBlockLogs {
+                block_hash: missing_block_hash,
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) =
+            transition(state, Event::BlockLogsReceived { request_id, logs });
+
+        assert!(effects.is_empty());
+        assert_empty_initial_state_at(&next_state, finalized_hash);
+        assert!(!next_state.blocks.0.contains_key(&missing_block_hash));
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn stale_block_logs_response_after_reset_does_not_resurrect_removed_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let conflicting_parent_hash = BlockHash::with_last_byte(3);
+        let logs = HashSet::from([PoolAddress(Address::with_last_byte(4))]);
+        let state = empty_state_at(finalized_hash);
+
+        let (state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+        let log_request_id = assert_single_block_log_request_effect(&effects, head_hash);
+
+        let (state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: conflicting_parent_hash,
+            },
+        );
+        assert!(effects.is_empty());
+        assert_chain_reset_at(&state, finalized_hash);
+        assert!(state.pending_requests.contains(&log_request_id));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id: log_request_id,
+                logs,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_empty_initial_state_at(&next_state, finalized_hash);
+        assert!(!next_state.blocks.0.contains_key(&head_hash));
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
     fn block_header_received_for_matching_request_removes_pending_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let missing_parent_hash = BlockHash::with_last_byte(2);
@@ -1317,10 +2026,14 @@ mod tests {
         );
 
         assert_eq!(next_state.blocks.0.len(), 2);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
         assert!(!next_state.pending_requests.contains(&request_id));
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
         assert_state_invariants(&next_state);
     }
 
@@ -1342,6 +2055,7 @@ mod tests {
         );
         let missing_header_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        state = drain_block_log_effects(state, &effects);
         let unrelated_payload = GetBlockLogs {
             block_hash: unrelated_hash,
         };
@@ -1395,6 +2109,7 @@ mod tests {
         );
         let pending_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let last_request_id = state.pending_requests.last_request_id_for_test();
         let dispatch_tick =
             active_request_dispatch_tick(&state.pending_requests, pending_request_id);
@@ -1408,7 +2123,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&pending_request_id));
         assert!(next_state.pending_requests.last_request_id_for_test() == last_request_id);
@@ -1435,6 +2150,7 @@ mod tests {
             },
         );
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(
             state,
             Event::BlockHeaderReceived {
@@ -1443,14 +2159,19 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(state, Event::BlockHeaderNotFound { request_id });
 
         assert!(effects.is_empty());
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
-        assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, missing_parent_hash, finalized_hash);
         assert!(next_state.pending_requests.is_empty_for_test());
         assert_state_invariants(&next_state);
     }
@@ -1471,6 +2192,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -1484,7 +2206,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&retry_request_id));
         assert_state_invariants(&next_state);
@@ -1507,6 +2229,7 @@ mod tests {
         );
         let expired_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL);
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -1520,7 +2243,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&retry_request_id));
         assert_state_invariants(&next_state);
@@ -1543,6 +2266,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -1574,6 +2298,7 @@ mod tests {
             },
         );
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
         let (state, effects) = transition(state, Event::BlockHeaderNotFound { request_id });
@@ -1615,7 +2340,7 @@ mod tests {
         );
 
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert!(
             next_state
                 .pending_requests
@@ -1736,6 +2461,7 @@ mod tests {
             },
         );
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = advance_ticks(state, REQUEST_TTL - 1);
 
@@ -1762,6 +2488,7 @@ mod tests {
         );
         let expired_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = advance_ticks(state, REQUEST_TTL);
 
@@ -1794,6 +2521,7 @@ mod tests {
         );
         let expired_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
 
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
@@ -1826,6 +2554,7 @@ mod tests {
         );
         let first_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL);
         let first_retry_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -1969,6 +2698,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(state, request_failed_for_header(failed_request_id));
 
@@ -1979,7 +2709,7 @@ mod tests {
         assert!(!next_state.pending_requests.contains(&failed_request_id));
         assert!(next_state.pending_requests.contains(&retry_request_id));
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_state_invariants(&next_state);
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
@@ -2000,6 +2730,7 @@ mod tests {
         );
         let pending_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let last_request_id = state.pending_requests.last_request_id_for_test();
 
         let (next_state, effects) = transition(
@@ -2012,7 +2743,7 @@ mod tests {
         assert!(next_state.pending_requests.contains(&pending_request_id));
         assert!(next_state.pending_requests.last_request_id_for_test() == last_request_id);
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_state_invariants(&next_state);
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
@@ -2033,6 +2764,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -2057,7 +2789,7 @@ mod tests {
         let head_hash = BlockHash::with_last_byte(3);
         let state = empty_state_at(finalized_hash);
 
-        let (mut state, effects) = transition(
+        let (state, effects) = transition(
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -2066,6 +2798,7 @@ mod tests {
         );
         let mut failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let mut state = drain_block_log_effects(state, &effects);
 
         for _ in 0..4 {
             let (next_state, effects) =
@@ -2102,6 +2835,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(
             state,
             Event::HeadObserved {
@@ -2138,6 +2872,7 @@ mod tests {
             },
         );
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(
             state,
             Event::BlockHeaderReceived {
@@ -2146,15 +2881,20 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(state, request_failed_for_header(request_id));
 
         assert!(effects.is_empty());
         assert!(next_state.pending_requests.is_empty_for_test());
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
-        assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, missing_parent_hash, finalized_hash);
         assert_state_invariants(&next_state);
     }
 
@@ -2174,6 +2914,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -2187,12 +2928,17 @@ mod tests {
             },
         );
 
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        let next_state = drain_block_log_effects(next_state, &effects);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&retry_request_id));
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
-        assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, missing_parent_hash, finalized_hash);
         assert_state_invariants(&next_state);
     }
 
@@ -2212,6 +2958,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -2223,15 +2970,20 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(state, request_failed_for_header(failed_request_id));
 
         assert!(effects.is_empty());
         assert!(next_state.pending_requests.is_empty_for_test());
         assert_eq!(next_state.canonical_tip, head_hash);
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
-        assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, missing_parent_hash, finalized_hash);
         assert_state_invariants(&next_state);
     }
 
@@ -2250,6 +3002,7 @@ mod tests {
             },
         );
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
         let (state, effects) = transition(
@@ -2260,15 +3013,20 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(state, Event::Tick);
 
         assert!(effects.is_empty());
         assert!(next_state.tick == tick(REQUEST_TTL));
         assert!(next_state.pending_requests.is_empty_for_test());
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
-        assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, missing_parent_hash, finalized_hash);
         assert_state_invariants(&next_state);
     }
 
@@ -2288,6 +3046,7 @@ mod tests {
         );
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
         let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
@@ -2326,6 +3085,7 @@ mod tests {
         );
         let expired_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL);
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -2339,11 +3099,16 @@ mod tests {
             },
         );
 
-        assert!(effects.is_empty());
+        assert_request_hashes(
+            &effects,
+            HashSet::new(),
+            HashSet::from([missing_parent_hash]),
+        );
+        let next_state = drain_block_log_effects(next_state, &effects);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&retry_request_id));
-        assert_single_unknown_block(&next_state, head_hash, missing_parent_hash);
-        assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
+        assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
+        assert_single_block_with_parent(&next_state, missing_parent_hash, finalized_hash);
         assert_state_invariants(&next_state);
     }
 
@@ -2364,6 +3129,7 @@ mod tests {
         );
         let expired_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
         let (state, effects) = transition(
@@ -2455,6 +3221,86 @@ mod tests {
         }
 
         #[test]
+        fn duplicate_head_observation_does_not_duplicate_pending_log_requests(
+            chain_len in 1usize..16,
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let tip_hash = hash_for_node(chain_len);
+            let tip_parent_hash = hash_for_node(chain_len - 1);
+            let expected_log_hashes = (1..=chain_len)
+                .map(hash_for_node)
+                .collect::<HashSet<_>>();
+            let mut state = empty_state_at(finalized_hash);
+
+            state.canonical_tip = tip_hash;
+            for node_index in 1..=chain_len {
+                state
+                    .blocks
+                    .0
+                    .insert(hash_for_node(node_index), block_with_parent(hash_for_node(node_index - 1)));
+            }
+
+            let (state, effects) = transition(
+                state,
+                Event::HeadObserved {
+                    hash: tip_hash,
+                    parent_hash: tip_parent_hash,
+                },
+            );
+
+            prop_assert_eq!(
+                block_log_request_hashes_from_effects(&effects),
+                expected_log_hashes.clone()
+            );
+            prop_assert!(header_request_hashes_from_effects(&effects).is_empty());
+            prop_assert_eq!(state.pending_requests.len_for_test(), chain_len);
+            prop_assert_eq!(
+                state.pending_requests.pending_block_log_hashes(),
+                expected_log_hashes.clone()
+            );
+            assert_effects_are_well_formed(&state, &effects);
+            assert_state_invariants(&state);
+
+            let (next_state, effects) = transition(
+                state,
+                Event::HeadObserved {
+                    hash: tip_hash,
+                    parent_hash: tip_parent_hash,
+                },
+            );
+
+            prop_assert!(effects.is_empty());
+            prop_assert_eq!(next_state.pending_requests.len_for_test(), chain_len);
+            prop_assert_eq!(
+                next_state.pending_requests.pending_block_log_hashes(),
+                expected_log_hashes
+            );
+            assert_state_invariants(&next_state);
+        }
+
+        #[test]
+        fn drained_present_canonical_path_never_leaves_logs_unknown(
+            chain in generated_chain_strategy(),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let mut state = empty_state_at(finalized_hash);
+
+            for head_index in &chain.observed_heads {
+                let hash = hash_for_node(*head_index);
+                let parent_hash = hash_for_node(parent_index(&chain, *head_index));
+
+                state = apply_event_and_drain_block_headers(
+                    state,
+                    &chain,
+                    Event::HeadObserved { hash, parent_hash },
+                );
+
+                assert_present_canonical_logs_are_resolved(&state);
+                assert_state_invariants(&state);
+            }
+        }
+
+        #[test]
         fn transition_reconstructs_observed_valid_chain(chain in generated_chain_strategy()) {
             let finalized_hash = hash_for_node(0);
             let mut state = empty_state_at(finalized_hash);
@@ -2480,7 +3326,7 @@ mod tests {
                     .ok_or_else(|| TestCaseError::fail("expected block to be present"))?;
 
                 prop_assert_eq!(block.parent_hash, parent_hash);
-                prop_assert!(matches!(block.pool_logs, PoolLogsStatus::Unknown));
+                prop_assert!(matches!(block.pool_logs, PoolLogsStatus::Resolved(_)));
                 prop_assert!(block.pool_snapshots.is_empty());
             }
 
@@ -2514,28 +3360,42 @@ mod tests {
             }
 
             while let Some(effect) = pending_effects.pop() {
-                let Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
-                    request_id,
-                    request_payload: GetBlockHeader { block_hash },
-                })) = effect
-                else {
-                    continue;
-                };
-
-                let block_index = node_index_for_hash(&chain, block_hash)
-                    .ok_or_else(|| TestCaseError::fail("requested header must be in chain"))?;
-                let parent_hash = hash_for_node(parent_index(&chain, block_index));
-                let (next_state, effects) = transition(
-                    state,
-                    Event::BlockHeaderReceived {
+                match effect {
+                    Effect::Request(AnyIssuedRequest::BlockHeader(IssuedRequest {
                         request_id,
-                        hash: block_hash,
-                        parent_hash,
-                    },
-                );
+                        request_payload: GetBlockHeader { block_hash },
+                    })) => {
+                        let block_index = node_index_for_hash(&chain, block_hash)
+                            .ok_or_else(|| TestCaseError::fail("requested header must be in chain"))?;
+                        let parent_hash = hash_for_node(parent_index(&chain, block_index));
+                        let (next_state, effects) = transition(
+                            state,
+                            Event::BlockHeaderReceived {
+                                request_id,
+                                hash: block_hash,
+                                parent_hash,
+                            },
+                        );
 
-                state = next_state;
-                pending_effects.extend(effects);
+                        state = next_state;
+                        pending_effects.extend(effects);
+                    }
+                    Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                        request_id, ..
+                    })) => {
+                        let (next_state, effects) = transition(
+                            state,
+                            Event::BlockLogsReceived {
+                                request_id,
+                                logs: HashSet::new(),
+                            },
+                        );
+
+                        state = next_state;
+                        pending_effects.extend(effects);
+                    }
+                    Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
+                }
             }
 
             let expected_blocks = expected_observed_ancestor_closure(&chain);
@@ -2755,6 +3615,7 @@ mod tests {
                 },
             );
             let request_id = assert_single_block_header_request_effect(&effects, first_parent_hash);
+            let state = drain_block_log_effects(state, &effects);
 
             let (mut state, effects) =
                 transition(state, Event::BlockHeaderNotFound { request_id });
@@ -2891,6 +3752,7 @@ mod tests {
                 }
 
                 assert_state_invariants(&next_state);
+                assert_canonical_unknown_logs_are_pending(&next_state);
                 assert_effects_are_well_formed(&next_state, &effects);
                 assert_missing_parents_for_known_blocks_are_pending(&next_state);
                 assert_active_requests_have_exactly_one_dispatch_tick(&next_state);

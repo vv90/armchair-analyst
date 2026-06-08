@@ -210,7 +210,7 @@ mod tests {
                 },
             },
         );
-        assert!(effects.is_empty());
+        assert_single_log_request_chain_effect(&effects, chain, child_hash);
     }
 
     #[test]
@@ -335,19 +335,46 @@ mod tests {
         chain: ChainKey,
         block_hash: BlockHash,
     ) {
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            Effect::ChainEffect {
-                chain: effect_chain,
-                effect:
-                    kernel::Effect::Request(crate::pending_requests::AnyIssuedRequest::BlockHeader(
-                        request,
-                    )),
-            } => {
-                assert_eq!(*effect_chain, chain);
-                assert_eq!(request.request_payload.block_hash, block_hash);
-            }
-            _ => panic!("expected single chain-tagged block header request"),
-        }
+        let matching_effects = effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    Effect::ChainEffect {
+                        chain: effect_chain,
+                        effect:
+                            kernel::Effect::Request(
+                                crate::pending_requests::AnyIssuedRequest::BlockHeader(request),
+                            ),
+                    } if *effect_chain == chain && request.request_payload.block_hash == block_hash
+                )
+            })
+            .count();
+
+        assert_eq!(matching_effects, 1);
+    }
+
+    fn assert_single_log_request_chain_effect(
+        effects: &[Effect],
+        chain: ChainKey,
+        block_hash: BlockHash,
+    ) {
+        let matching_effects = effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    Effect::ChainEffect {
+                        chain: effect_chain,
+                        effect:
+                            kernel::Effect::Request(
+                                crate::pending_requests::AnyIssuedRequest::BlockLogs(request),
+                            ),
+                    } if *effect_chain == chain && request.request_payload.block_hash == block_hash
+                )
+            })
+            .count();
+
+        assert_eq!(matching_effects, 1);
     }
 }
