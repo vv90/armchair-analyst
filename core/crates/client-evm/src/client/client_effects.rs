@@ -5,13 +5,17 @@ use std::{
     sync::mpsc::Sender,
 };
 
-use alloy::primitives::BlockHash;
+use alloy::{
+    primitives::{BlockHash, Bytes},
+    sol_types::SolCall,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 use crate::{
-    ClientEvmError, PoolAddress, PoolState, RpcConfig,
+    ClientEvmError, PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState,
+    RpcConfig,
     config::{compose_http_endpoint, compose_ws_endpoint},
 };
 
@@ -21,6 +25,9 @@ use super::{
         build_block_header_request, build_block_logs_request, build_finalized_block_header_request,
         build_new_heads_subscribe_request, parse_block_header_response,
         parse_block_header_response_by_id, parse_block_logs_response, parse_subscription_response,
+    },
+    multicall3::{
+        MulticallCall, MulticallCallResult, build_multicall3_request, parse_multicall3_response,
     },
 };
 
@@ -79,12 +86,116 @@ pub fn fetch_block_logs(
 }
 
 pub fn fetch_pool_data(
-    _agent: &ureq::Agent,
-    _config: &RpcConfig,
-    _at: BlockHash,
-    _pools: HashSet<PoolAddress>,
-) -> Result<HashMap<PoolAddress, PoolState>, ClientEvmError> {
-    Ok(HashMap::new())
+    agent: &ureq::Agent,
+    config: &RpcConfig,
+    at: BlockHash,
+    pools: HashSet<PoolAddress>,
+) -> Result<HashMap<PoolAddress, PoolDataResult>, ClientEvmError> {
+    if pools.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let endpoint = compose_http_endpoint(config)?;
+    let pools = sorted_pool_addresses(pools);
+    let calls = pool_data_multicall_calls(&pools);
+    let request = build_multicall3_request(HTTP_REQUEST_ID, at, &calls);
+    let mut response = agent
+        .post(endpoint.as_str())
+        .send_json(&request)
+        .map_err(ClientEvmError::HttpError)?;
+    let response_value = response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(ClientEvmError::HttpError)?;
+    let results = parse_multicall3_response(&response_value, HTTP_REQUEST_ID, calls.len())?;
+
+    Ok(decode_pool_data_results(&pools, &results))
+}
+
+fn sorted_pool_addresses(pools: HashSet<PoolAddress>) -> Vec<PoolAddress> {
+    let mut pools = pools.into_iter().collect::<Vec<_>>();
+    pools.sort_by(|left, right| left.0.cmp(&right.0));
+    pools
+}
+
+fn pool_data_multicall_calls(pools: &[PoolAddress]) -> Vec<MulticallCall> {
+    pools
+        .iter()
+        .flat_map(|pool| {
+            [
+                MulticallCall {
+                    target: pool.0,
+                    call_data: Bytes::from(crate::uniswap_v3::slot0Call {}.abi_encode()),
+                },
+                MulticallCall {
+                    target: pool.0,
+                    call_data: Bytes::from(crate::uniswap_v3::liquidityCall {}.abi_encode()),
+                },
+            ]
+        })
+        .collect()
+}
+
+fn decode_pool_data_results(
+    pools: &[PoolAddress],
+    results: &[MulticallCallResult],
+) -> HashMap<PoolAddress, PoolDataResult> {
+    let mut result_chunks = results.chunks(2);
+
+    pools
+        .iter()
+        .map(|pool| {
+            let result_chunk = result_chunks.next().unwrap_or(&[]);
+            (
+                *pool,
+                decode_pool_data_result(result_chunk.first(), result_chunk.get(1)),
+            )
+        })
+        .collect()
+}
+
+fn decode_pool_data_result(
+    slot0: Option<&MulticallCallResult>,
+    liquidity: Option<&MulticallCallResult>,
+) -> PoolDataResult {
+    let slot0 = decode_slot0(slot0)?;
+    let liquidity = decode_liquidity(liquidity)?;
+    let tick = i32::try_from(slot0.tick)
+        .map_err(|_| PoolDataFailure::DecodeFailed(PoolDataCall::Slot0))?;
+
+    Ok(PoolState {
+        sqrt_price_x96: slot0.sqrtPriceX96,
+        tick,
+        liquidity,
+    })
+}
+
+fn decode_slot0(
+    result: Option<&MulticallCallResult>,
+) -> Result<crate::uniswap_v3::slot0Return, PoolDataFailure> {
+    decode_multicall_result(result, PoolDataCall::Slot0, |return_data| {
+        crate::uniswap_v3::slot0Call::abi_decode_returns(return_data)
+    })
+}
+
+fn decode_liquidity(result: Option<&MulticallCallResult>) -> Result<u128, PoolDataFailure> {
+    decode_multicall_result(result, PoolDataCall::Liquidity, |return_data| {
+        crate::uniswap_v3::liquidityCall::abi_decode_returns(return_data)
+    })
+}
+
+fn decode_multicall_result<T>(
+    result: Option<&MulticallCallResult>,
+    call: PoolDataCall,
+    decode: impl FnOnce(&[u8]) -> alloy::sol_types::Result<T>,
+) -> Result<T, PoolDataFailure> {
+    match result {
+        None => Err(PoolDataFailure::MissingResponse(call)),
+        Some(result) if !result.success => Err(PoolDataFailure::CallFailed(call)),
+        Some(result) => {
+            decode(result.return_data.as_ref()).map_err(|_| PoolDataFailure::DecodeFailed(call))
+        }
+    }
 }
 
 pub fn fetch_finalized_block_header(
@@ -245,10 +356,19 @@ mod tests {
         thread::{self, JoinHandle},
     };
 
-    use alloy::primitives::{Address, B256};
+    use alloy::{
+        primitives::{Address, B256, Bytes, U160, aliases::I24},
+        sol_types::SolCall,
+    };
     use serde_json::{Value, json};
 
-    use crate::PoolAddress;
+    use crate::{
+        PoolAddress, PoolDataCall, PoolDataFailure, PoolState,
+        client::multicall3::{
+            MULTICALL3_ADDRESS, MulticallCallResult, aggregate3_return_data_for_test,
+            decode_aggregate3_call_data_for_test,
+        },
+    };
 
     use super::*;
 
@@ -370,14 +490,167 @@ mod tests {
     }
 
     #[test]
-    fn fetch_pool_data_placeholder_returns_empty_results() {
+    fn fetch_pool_data_with_empty_pool_set_returns_empty_results_without_http() {
         let config = rpc_config("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
-        let requested_pools = HashSet::from([PoolAddress(Address::with_last_byte(2))]);
 
-        let result = fetch_pool_data(&agent, &config, B256::with_last_byte(1), requested_pools);
+        let result = fetch_pool_data(&agent, &config, B256::with_last_byte(1), HashSet::new());
 
         assert!(matches!(result, Ok(ref pools) if pools.is_empty()));
+    }
+
+    #[test]
+    fn fetch_pool_data_posts_multicall3_request_and_decodes_pool_states() {
+        let at = B256::with_last_byte(1);
+        let first_pool = PoolAddress(Address::with_last_byte(2));
+        let second_pool = PoolAddress(Address::with_last_byte(3));
+        let first_state = pool_state(11, -12, 13);
+        let second_state = pool_state(21, 22, 23);
+        let response = multicall3_response([
+            successful_multicall_result(slot0_return_data(&first_state)),
+            successful_multicall_result(liquidity_return_data(first_state.liquidity)),
+            successful_multicall_result(slot0_return_data(&second_state)),
+            successful_multicall_result(liquidity_return_data(second_state.liquidity)),
+        ]);
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(
+            &agent,
+            &config,
+            at,
+            HashSet::from([second_pool, first_pool]),
+        );
+
+        let pools = result.expect("pool data fetch must succeed");
+        assert_eq!(pools.get(&first_pool), Some(&Ok(first_state.clone())));
+        assert_eq!(pools.get(&second_pool), Some(&Ok(second_state.clone())));
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        assert_eq!(request.path, "/ethereum/api-key");
+        assert_eq!(request.body.get("method"), Some(&json!("eth_call")));
+        assert_eq!(
+            request
+                .body
+                .get("params")
+                .and_then(Value::as_array)
+                .and_then(|params| params.first())
+                .and_then(|call| call.get("to")),
+            Some(&json!(MULTICALL3_ADDRESS))
+        );
+        assert_eq!(
+            request
+                .body
+                .get("params")
+                .and_then(Value::as_array)
+                .and_then(|params| params.get(1)),
+            Some(&json!({ "blockHash": at }))
+        );
+
+        let multicall_data = request
+            .body
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.first())
+            .and_then(|call| call.get("data"))
+            .cloned()
+            .and_then(|data| serde_json::from_value::<Bytes>(data).ok())
+            .expect("pool data request must contain multicall data");
+        let calls = decode_aggregate3_call_data_for_test(&multicall_data)
+            .expect("pool data request must decode as aggregate3");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| (call.target, call.call_data.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (first_pool.0, slot0_call_data()),
+                (first_pool.0, liquidity_call_data()),
+                (second_pool.0, slot0_call_data()),
+                (second_pool.0, liquidity_call_data()),
+            ]
+        );
+
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_data_returns_per_pool_failure_for_failed_inner_call() {
+        let at = B256::with_last_byte(1);
+        let first_pool = PoolAddress(Address::with_last_byte(2));
+        let second_pool = PoolAddress(Address::with_last_byte(3));
+        let first_state = pool_state(11, -12, 13);
+        let second_state = pool_state(21, 22, 23);
+        let response = multicall3_response([
+            successful_multicall_result(slot0_return_data(&first_state)),
+            successful_multicall_result(liquidity_return_data(first_state.liquidity)),
+            successful_multicall_result(slot0_return_data(&second_state)),
+            failed_multicall_result(),
+        ]);
+        let (http_url, _received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(
+            &agent,
+            &config,
+            at,
+            HashSet::from([first_pool, second_pool]),
+        );
+
+        let pools = result.expect("outer multicall must succeed");
+        assert_eq!(pools.get(&first_pool), Some(&Ok(first_state)));
+        assert_eq!(
+            pools.get(&second_pool),
+            Some(&Err(PoolDataFailure::CallFailed(PoolDataCall::Liquidity)))
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_data_returns_per_pool_failure_for_malformed_inner_return_data() {
+        let at = B256::with_last_byte(1);
+        let pool = PoolAddress(Address::with_last_byte(2));
+        let state = pool_state(11, -12, 13);
+        let response = multicall3_response([
+            successful_multicall_result(Bytes::from(vec![0x12])),
+            successful_multicall_result(liquidity_return_data(state.liquidity)),
+        ]);
+        let (http_url, _received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(&agent, &config, at, HashSet::from([pool]));
+
+        let pools = result.expect("outer multicall must succeed");
+        assert_eq!(
+            pools.get(&pool),
+            Some(&Err(PoolDataFailure::DecodeFailed(PoolDataCall::Slot0)))
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_data_maps_transport_failure_to_http_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener must have local address");
+        drop(listener);
+        let config = rpc_config(&format!("http://{address}"));
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(
+            &agent,
+            &config,
+            B256::with_last_byte(1),
+            HashSet::from([PoolAddress(Address::with_last_byte(2))]),
+        );
+
+        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
     }
 
     #[test]
@@ -515,6 +788,64 @@ mod tests {
 
     fn zero_logs_bloom() -> String {
         format!("0x{}", "00".repeat(256))
+    }
+
+    fn multicall3_response<const N: usize>(results: [MulticallCallResult; N]) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": aggregate3_return_data_for_test(&results)
+        })
+    }
+
+    fn successful_multicall_result(return_data: Bytes) -> MulticallCallResult {
+        MulticallCallResult {
+            success: true,
+            return_data,
+        }
+    }
+
+    fn failed_multicall_result() -> MulticallCallResult {
+        MulticallCallResult {
+            success: false,
+            return_data: Bytes::from(Vec::<u8>::new()),
+        }
+    }
+
+    fn pool_state(sqrt_price_x96: u64, tick: i32, liquidity: u128) -> PoolState {
+        PoolState {
+            sqrt_price_x96: U160::from(sqrt_price_x96),
+            tick,
+            liquidity,
+        }
+    }
+
+    fn slot0_call_data() -> Bytes {
+        Bytes::from(crate::uniswap_v3::slot0Call {}.abi_encode())
+    }
+
+    fn liquidity_call_data() -> Bytes {
+        Bytes::from(crate::uniswap_v3::liquidityCall {}.abi_encode())
+    }
+
+    fn slot0_return_data(pool_state: &PoolState) -> Bytes {
+        Bytes::from(crate::uniswap_v3::slot0Call::abi_encode_returns(
+            &crate::uniswap_v3::slot0Return {
+                sqrtPriceX96: pool_state.sqrt_price_x96,
+                tick: I24::try_from(pool_state.tick).expect("test tick must fit int24"),
+                observationIndex: 0,
+                observationCardinality: 0,
+                observationCardinalityNext: 0,
+                feeProtocol: 0,
+                unlocked: true,
+            },
+        ))
+    }
+
+    fn liquidity_return_data(liquidity: u128) -> Bytes {
+        Bytes::from(crate::uniswap_v3::liquidityCall::abi_encode_returns(
+            &liquidity,
+        ))
     }
 
     struct ReceivedHttpRequest {

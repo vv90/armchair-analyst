@@ -177,7 +177,7 @@ pub enum Event {
     },
     PoolDataReceived {
         request_id: RequestId<GetPoolData>,
-        pools: HashMap<PoolAddress, PoolState>,
+        pools: HashMap<PoolAddress, PoolDataResult>,
     },
     RequestFailed {
         request_id: AnyRequestId,

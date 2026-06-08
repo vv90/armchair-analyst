@@ -3,6 +3,18 @@
 use alloy::{primitives::B256, sol, sol_types::SolEvent};
 
 sol! {
+    function slot0() external view returns (
+        uint160 sqrtPriceX96,
+        int24 tick,
+        uint16 observationIndex,
+        uint16 observationCardinality,
+        uint16 observationCardinalityNext,
+        uint8 feeProtocol,
+        bool unlocked
+    );
+
+    function liquidity() external view returns (uint128);
+
     #[derive(Debug, PartialEq, Eq)]
     event Initialize(uint160 sqrtPriceX96, int24 tick);
 

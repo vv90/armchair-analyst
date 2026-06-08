@@ -1,7 +1,26 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U160};
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct PoolAddress(pub Address);
 
-// Placeholder until full pool state fields are modeled.
-pub struct PoolState {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolState {
+    pub sqrt_price_x96: U160,
+    pub tick: i32,
+    pub liquidity: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolDataCall {
+    Slot0,
+    Liquidity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PoolDataFailure {
+    CallFailed(PoolDataCall),
+    DecodeFailed(PoolDataCall),
+    MissingResponse(PoolDataCall),
+}
+
+pub type PoolDataResult = Result<PoolState, PoolDataFailure>;

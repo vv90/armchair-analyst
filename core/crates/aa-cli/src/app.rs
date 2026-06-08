@@ -1,7 +1,7 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent, ClientEvmError, ClientHead,
-    PoolAddress, PoolState, RequestId, RpcConfig, fetch_block_header, fetch_block_logs,
+    PoolAddress, PoolDataResult, RequestId, RpcConfig, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_data, kernel,
     multi_chain_kernel::{Effect, Event, State, transition},
     subscribe_new_heads,
@@ -231,7 +231,7 @@ where
     FetchPoolData: FnOnce(
         BlockHash,
         HashSet<PoolAddress>,
-    ) -> Result<HashMap<PoolAddress, PoolState>, ClientEvmError>,
+    ) -> Result<HashMap<PoolAddress, PoolDataResult>, ClientEvmError>,
 {
     match effect {
         kernel::Effect::Request(request) => match request {
@@ -302,7 +302,8 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        GetBlockHeader, GetBlockLogs, GetPoolData, IssuedRequest, PoolAddress, PoolState, RequestId,
+        GetBlockHeader, GetBlockLogs, GetPoolData, IssuedRequest, PoolAddress, PoolDataResult,
+        RequestId,
     };
     use serde_json::json;
     use std::{sync::mpsc, time::Duration};
@@ -758,7 +759,7 @@ mod tests {
     fn unexpected_pool_data_fetch(
         _at: BlockHash,
         _pools: HashSet<PoolAddress>,
-    ) -> Result<HashMap<PoolAddress, PoolState>, ClientEvmError> {
+    ) -> Result<HashMap<PoolAddress, PoolDataResult>, ClientEvmError> {
         panic!("pool data fetch must not be called")
     }
 

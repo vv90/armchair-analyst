@@ -24,4 +24,4 @@ pub use pending_requests::{
     AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetPoolData, IssuedRequest,
     RequestId,
 };
-pub use pool_state::{PoolAddress, PoolState};
+pub use pool_state::{PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState};
