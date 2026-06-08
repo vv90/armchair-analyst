@@ -13,6 +13,7 @@ struct BlockNode {
     parent_hash: BlockHash,
     pool_logs: PoolLogsStatus,
     pool_snapshots: HashMap<PoolAddress, PoolState>,
+    pool_data_failures: HashMap<PoolAddress, PoolDataFailure>,
 }
 
 enum NewBlockError {
@@ -63,6 +64,7 @@ impl BlocksGraph {
                 parent_hash,
                 pool_logs: PoolLogsStatus::Unknown,
                 pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
             },
         );
 
@@ -78,6 +80,36 @@ impl BlocksGraph {
 
         if let Some(block) = blocks.get_mut(&block_hash) {
             block.pool_logs = PoolLogsStatus::Resolved(logs);
+        }
+
+        BlocksGraph(blocks)
+    }
+
+    fn with_pool_data(
+        self,
+        block_hash: BlockHash,
+        requested_pools: HashSet<PoolAddress>,
+        pool_results: HashMap<PoolAddress, PoolDataResult>,
+    ) -> BlocksGraph {
+        let BlocksGraph(mut blocks) = self;
+
+        if let Some(block) = blocks.get_mut(&block_hash) {
+            for pool in requested_pools {
+                let Some(pool_result) = pool_results.get(&pool) else {
+                    continue;
+                };
+
+                match pool_result {
+                    Ok(pool_state) => {
+                        block.pool_snapshots.insert(pool, pool_state.clone());
+                        block.pool_data_failures.remove(&pool);
+                    }
+                    Err(pool_failure) if !block.pool_snapshots.contains_key(&pool) => {
+                        block.pool_data_failures.insert(pool, pool_failure.clone());
+                    }
+                    Err(_) => {}
+                }
+            }
         }
 
         BlocksGraph(blocks)
@@ -502,7 +534,37 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 ),
             }
         }
-        Event::PoolDataReceived { request_id, pools } => (state, vec![]),
+        Event::PoolDataReceived { request_id, pools } => {
+            let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
+            match request_payload {
+                Some(PendingPayload {
+                    payload:
+                        GetPoolData {
+                            at,
+                            pools: requested_pools,
+                        },
+                    ..
+                }) => {
+                    let blocks = state.blocks.with_pool_data(at, requested_pools, pools);
+
+                    (
+                        State {
+                            blocks,
+                            pending_requests,
+                            ..state
+                        },
+                        vec![],
+                    )
+                }
+                None => (
+                    State {
+                        pending_requests,
+                        ..state
+                    },
+                    vec![],
+                ),
+            }
+        }
         Event::RequestFailed { request_id } => {
             let (pending_requests, issued_request) =
                 state.pending_requests.retry(request_id, state.tick);
@@ -558,7 +620,7 @@ fn find_missing_block_hash(
 mod tests {
     use super::*;
 
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, U160};
 
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
     use proptest::prelude::*;
@@ -706,6 +768,7 @@ mod tests {
         assert_no_self_parent_blocks(state);
         assert_canonical_tip_is_known_or_finalized(state);
         assert_parent_walks_do_not_cycle(state);
+        assert_pool_snapshots_and_failures_do_not_overlap(state);
     }
 
     fn assert_canonical_unknown_logs_are_pending(state: &State) {
@@ -865,6 +928,17 @@ mod tests {
             while let Some(block) = state.blocks.get(&current_hash) {
                 assert!(visited.insert(current_hash), "parent walk must not cycle");
                 current_hash = block.parent_hash;
+            }
+        }
+    }
+
+    fn assert_pool_snapshots_and_failures_do_not_overlap(state: &State) {
+        for block in state.blocks.0.values() {
+            for pool in block.pool_snapshots.keys() {
+                assert!(
+                    !block.pool_data_failures.contains_key(pool),
+                    "pool snapshot and pool data failure must not overlap"
+                );
             }
         }
     }
@@ -1163,6 +1237,7 @@ mod tests {
             parent_hash,
             pool_logs: PoolLogsStatus::Unknown,
             pool_snapshots: HashMap::new(),
+            pool_data_failures: HashMap::new(),
         }
     }
 
@@ -1279,6 +1354,30 @@ mod tests {
         request_ids[0]
     }
 
+    fn assert_single_pool_data_request_effect(
+        effects: &[Effect],
+        at: BlockHash,
+        pools: &HashSet<PoolAddress>,
+    ) -> RequestId<GetPoolData> {
+        let request_ids = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+                    request_id,
+                    request_payload:
+                        GetPoolData {
+                            at: requested_at,
+                            pools: requested_pools,
+                        },
+                })) if *requested_at == at && requested_pools == pools => Some(*request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(request_ids.len(), 1);
+        request_ids[0]
+    }
+
     fn assert_single_request_effect(
         effects: &[Effect],
         expected_payload: &ExpectedRequestPayload,
@@ -1308,6 +1407,72 @@ mod tests {
             }
             _ => panic!("expected single matching request effect"),
         }
+    }
+
+    fn pool_address(last_byte: u8) -> PoolAddress {
+        PoolAddress(Address::with_last_byte(last_byte))
+    }
+
+    fn pool_state(last_byte: u8) -> PoolState {
+        PoolState {
+            sqrt_price_x96: U160::from(u64::from(last_byte) + 1),
+            tick: i32::from(last_byte),
+            liquidity: u128::from(last_byte) + 10,
+        }
+    }
+
+    fn pool_data_result_for_byte(last_byte: u8) -> PoolDataResult {
+        if last_byte % 2 == 0 {
+            Ok(pool_state(last_byte))
+        } else {
+            Err(PoolDataFailure::CallFailed(PoolDataCall::Slot0))
+        }
+    }
+
+    fn assert_pool_snapshot(
+        state: &State,
+        block_hash: BlockHash,
+        pool: PoolAddress,
+        expected: &PoolState,
+    ) {
+        let block = state
+            .blocks
+            .get(&block_hash)
+            .expect("expected block to be present");
+
+        assert_eq!(block.pool_snapshots.get(&pool), Some(expected));
+    }
+
+    fn assert_no_pool_snapshot(state: &State, block_hash: BlockHash, pool: PoolAddress) {
+        let block = state
+            .blocks
+            .get(&block_hash)
+            .expect("expected block to be present");
+
+        assert!(!block.pool_snapshots.contains_key(&pool));
+    }
+
+    fn assert_pool_failure(
+        state: &State,
+        block_hash: BlockHash,
+        pool: PoolAddress,
+        expected: &PoolDataFailure,
+    ) {
+        let block = state
+            .blocks
+            .get(&block_hash)
+            .expect("expected block to be present");
+
+        assert_eq!(block.pool_data_failures.get(&pool), Some(expected));
+    }
+
+    fn assert_no_pool_failure(state: &State, block_hash: BlockHash, pool: PoolAddress) {
+        let block = state
+            .blocks
+            .get(&block_hash)
+            .expect("expected block to be present");
+
+        assert!(!block.pool_data_failures.contains_key(&pool));
     }
 
     fn advance_ticks(mut state: State, count: u64) -> (State, Vec<Effect>) {
@@ -1829,6 +1994,7 @@ mod tests {
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
                 pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
             },
         );
 
@@ -1955,6 +2121,353 @@ mod tests {
         assert!(effects.is_empty());
         assert_empty_initial_state_at(&next_state, finalized_hash);
         assert!(!next_state.blocks.0.contains_key(&missing_block_hash));
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_stores_snapshots_and_removes_pending_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let first_pool = pool_address(3);
+        let second_pool = pool_address(4);
+        let first_state = pool_state(5);
+        let second_state = pool_state(6);
+        let requested_pools = HashSet::from([first_pool, second_pool]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: requested_pools,
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([
+                    (first_pool, Ok(first_state.clone())),
+                    (second_pool, Ok(second_state.clone())),
+                ]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert_pool_snapshot(&next_state, block_hash, first_pool, &first_state);
+        assert_pool_snapshot(&next_state, block_hash, second_pool, &second_state);
+        assert_no_pool_failure(&next_state, block_hash, first_pool);
+        assert_no_pool_failure(&next_state, block_hash, second_pool);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_applies_requested_snapshots_not_present_in_block_logs() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let logged_pool = pool_address(3);
+        let requested_pool = pool_address(4);
+        let requested_state = pool_state(5);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([logged_pool])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: HashSet::from([requested_pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([(requested_pool, Ok(requested_state.clone()))]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_pool_snapshot(&next_state, block_hash, requested_pool, &requested_state);
+        assert_no_pool_snapshot(&next_state, block_hash, logged_pool);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_ignores_unrequested_result_entries() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let requested_pool = pool_address(3);
+        let extra_pool = pool_address(4);
+        let requested_state = pool_state(5);
+        let extra_state = pool_state(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: HashSet::from([requested_pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([
+                    (requested_pool, Ok(requested_state.clone())),
+                    (extra_pool, Ok(extra_state)),
+                ]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_pool_snapshot(&next_state, block_hash, requested_pool, &requested_state);
+        assert_no_pool_snapshot(&next_state, block_hash, extra_pool);
+        assert_no_pool_failure(&next_state, block_hash, extra_pool);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_stores_requested_failures_without_retry_effects() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let pool = pool_address(3);
+        let failure = PoolDataFailure::CallFailed(PoolDataCall::Slot0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: HashSet::from([pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([(pool, Err(failure.clone()))]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert_no_pool_snapshot(&next_state, block_hash, pool);
+        assert_pool_failure(&next_state, block_hash, pool, &failure);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_success_replaces_previous_failure() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let pool = pool_address(3);
+        let state_snapshot = pool_state(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .get_mut(&block_hash)
+            .expect("block must be present")
+            .pool_data_failures
+            .insert(pool, PoolDataFailure::DecodeFailed(PoolDataCall::Liquidity));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: HashSet::from([pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([(pool, Ok(state_snapshot.clone()))]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_pool_snapshot(&next_state, block_hash, pool, &state_snapshot);
+        assert_no_pool_failure(&next_state, block_hash, pool);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_failure_does_not_overwrite_existing_success() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let pool = pool_address(3);
+        let existing_state = pool_state(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .get_mut(&block_hash)
+            .expect("block must be present")
+            .pool_snapshots
+            .insert(pool, existing_state.clone());
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: HashSet::from([pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([(
+                    pool,
+                    Err(PoolDataFailure::DecodeFailed(PoolDataCall::Slot0)),
+                )]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_pool_snapshot(&next_state, block_hash, pool, &existing_state);
+        assert_no_pool_failure(&next_state, block_hash, pool);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_for_unknown_request_is_noop() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let pool = pool_address(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id: RequestId::from_raw_for_test(99),
+                pools: HashMap::from([(pool, Ok(pool_state(4)))]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(next_state.pending_requests.is_empty_for_test());
+        assert_no_pool_snapshot(&next_state, block_hash, pool);
+        assert_no_pool_failure(&next_state, block_hash, pool);
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_received_for_missing_block_consumes_request_without_inserting_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_block_hash = BlockHash::with_last_byte(2);
+        let pool = pool_address(3);
+        let mut state = empty_state_at(finalized_hash);
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: missing_block_hash,
+                pools: HashSet::from([pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([(pool, Ok(pool_state(4)))]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_empty_initial_state_at(&next_state, finalized_hash);
+        assert!(!next_state.blocks.0.contains_key(&missing_block_hash));
+        assert_state_invariants(&next_state);
+    }
+
+    #[test]
+    fn pool_data_request_failure_retries_original_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let pools = HashSet::from([pool_address(3), pool_address(4)]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: pools.clone(),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::RequestFailed {
+                request_id: AnyRequestId::PoolData(request_id),
+            },
+        );
+
+        let retry_request_id = assert_single_pool_data_request_effect(&effects, block_hash, &pools);
+        assert_ne!(retry_request_id, request_id);
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert!(next_state.pending_requests.contains(&retry_request_id));
         assert_state_invariants(&next_state);
     }
 
@@ -3657,6 +4170,79 @@ mod tests {
             prop_assert_eq!(state.canonical_tip, last_observed_head);
             prop_assert!(state.pending_requests.is_empty_for_test());
             assert_state_invariants(&state);
+        }
+
+        #[test]
+        fn pool_data_received_never_applies_unrequested_results(
+            requested_bytes in prop::collection::hash_set(any::<u8>(), 0..16),
+            result_bytes in prop::collection::hash_set(any::<u8>(), 0..32),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let block_hash = hash_for_node(1);
+            let requested_pools = requested_bytes
+                .into_iter()
+                .map(pool_address)
+                .collect::<HashSet<_>>();
+            let result_pools = result_bytes
+                .into_iter()
+                .map(|last_byte| (pool_address(last_byte), pool_data_result_for_byte(last_byte)))
+                .collect::<HashMap<_, _>>();
+            let mut state = empty_state_at(finalized_hash);
+
+            state.canonical_tip = block_hash;
+            state
+                .blocks
+                .0
+                .insert(block_hash, block_with_parent(finalized_hash));
+            let (pending_requests, request_id) = state.pending_requests.with_new_request(
+                GetPoolData {
+                    at: block_hash,
+                    pools: requested_pools.clone(),
+                },
+                state.tick,
+            );
+            state.pending_requests = pending_requests;
+
+            let (next_state, effects) = transition(
+                state,
+                Event::PoolDataReceived {
+                    request_id,
+                    pools: result_pools.clone(),
+                },
+            );
+
+            prop_assert!(effects.is_empty());
+            let block = next_state
+                .blocks
+                .get(&block_hash)
+                .ok_or_else(|| TestCaseError::fail("block must remain present"))?;
+
+            for (pool, result) in &result_pools {
+                if requested_pools.contains(pool) {
+                    match result {
+                        Ok(pool_state) => {
+                            prop_assert_eq!(block.pool_snapshots.get(pool), Some(pool_state));
+                            prop_assert!(!block.pool_data_failures.contains_key(pool));
+                        }
+                        Err(failure) => {
+                            prop_assert!(!block.pool_snapshots.contains_key(pool));
+                            prop_assert_eq!(block.pool_data_failures.get(pool), Some(failure));
+                        }
+                    }
+                } else {
+                    prop_assert!(!block.pool_snapshots.contains_key(pool));
+                    prop_assert!(!block.pool_data_failures.contains_key(pool));
+                }
+            }
+
+            for pool in requested_pools {
+                if !result_pools.contains_key(&pool) {
+                    prop_assert!(!block.pool_snapshots.contains_key(&pool));
+                    prop_assert!(!block.pool_data_failures.contains_key(&pool));
+                }
+            }
+
+            assert_state_invariants(&next_state);
         }
 
         #[test]
