@@ -7,8 +7,8 @@ use burn::{
     tensor::{Distribution, activation::softmax, backend::AutodiffBackend, cast::ToElement},
 };
 
+use crate::OptimizationError;
 use crate::pool_reserves::{PoolReserves, VirtualReserveValues};
-use anyhow::{Result, anyhow};
 use petgraph::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -433,7 +433,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
         init_asset: I,
         pool_reserves: Vec<PoolReserves<U, I>>,
         bridges: &HashSet<(I, I)>,
-    ) -> Result<Self> {
+    ) -> Result<Self, OptimizationError> {
         let device = &B::Device::default();
         let model_layout = pool_reserves
             .into_iter()
@@ -458,7 +458,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
             .input_indexes
             .get(&init_asset)
             .map(|ColumnIndex(col_index)| *col_index)
-            .ok_or(anyhow!("init_asset not found"))?;
+            .ok_or(OptimizationError::InitAssetNotFound)?;
 
         let size_tokens: usize = model_layout.input_indexes.len();
         let size_pools = model_layout.rows.len();
@@ -616,7 +616,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
         &self,
         layout_value_map: F,
         min_weight: f32,
-    ) -> Result<Graph<I, (f32, L1), Directed>> {
+    ) -> Result<Graph<I, (f32, L1), Directed>, OptimizationError> {
         let graph: Graph<I, (f32, L1), Directed> = Graph::new();
 
         let inputs = self.layout.inputs();
@@ -624,7 +624,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
 
         let init_asset = inputs
             .get(self.block.init_asset_index as usize)
-            .ok_or(anyhow::Error::msg("Invalid init asset index"))?;
+            .ok_or(OptimizationError::InvalidInitAssetIndex)?;
 
         let (graph, init_asset_node_index) = {
             let mut graph = graph;
@@ -638,9 +638,9 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
             .iter()
             .map(|row| {
                 row.get(self.block.init_asset_index as usize)
-                    .ok_or(anyhow::Error::msg("Invalid layout index"))
+                    .ok_or(OptimizationError::InvalidLayoutIndex)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, OptimizationError>>()?;
 
         let check_and_map_layout_value =
             |token_in: I, token_out: I, layout_value: &Option<U>| -> Option<(I, I, L1)> {
@@ -731,10 +731,10 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                     .layout
                     .rows
                     .get(output_index as usize)
-                    .ok_or(anyhow!("Invalid output index"));
+                    .ok_or(OptimizationError::InvalidOutputIndex);
                 r
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, OptimizationError>>()?;
 
         let (graph, output_asset_node_index) = {
             let mut graph = graph;
@@ -814,7 +814,7 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use crate::dex::pool_reserves::test::plant_arbitrage;
+    use crate::pool_reserves::test::plant_arbitrage;
     use crate::tokens::test::{self as tokens, TokenAddress};
     use crate::utils::Invertible;
 
