@@ -824,6 +824,7 @@ mod tests {
     use burn::tensor::{Int, Tensor};
     use proptest::prelude::*;
 
+    #[cfg_attr(not(feature = "wgpu-tests"), ignore = "requires WGPU adapter")]
     #[test]
     fn scatter_example() {
         let device = burn::backend::wgpu::WgpuDevice::default();
@@ -1043,6 +1044,7 @@ mod tests {
         )
     }
 
+    #[cfg_attr(not(feature = "wgpu-tests"), ignore = "requires WGPU adapter")]
     #[test]
     fn test_model_v4_arbitrage() {
         // "USDC"-"WETH" | PoolVirtualReserves { token_0: 262218805704089.0, token_1: 6.871874430049188e22, fee_multiplier: 0.9995, max_swap_0: 10192072198.0, max_swap_1: 3.1694012912707076e19 }
@@ -1222,6 +1224,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(not(feature = "wgpu-tests"), ignore = "requires WGPU adapter")]
     #[test]
     fn test_model_v4_update() {
         // "USDC"-"WETH" | PoolVirtualReserves { token_0: 262218805704089.0, token_1: 6.871874430049188e22, fee_multiplier: 0.9995, max_swap_0: 10192072198.0, max_swap_1: 3.1694012912707076e19 }

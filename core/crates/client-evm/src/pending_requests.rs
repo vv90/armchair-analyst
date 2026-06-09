@@ -6,7 +6,7 @@ use std::{
 
 use alloy::primitives::BlockHash;
 
-use crate::{pool_state::PoolAddress, tick::Tick};
+use crate::{pool_registry::PoolCandidateAddress, pool_state::PoolAddress, tick::Tick};
 
 // #[derive(Hash, PartialEq, Eq, Clone, PartialOrd, Ord, Copy)]
 // struct RequestId<T>(u64, PhantomData<T>);
@@ -101,11 +101,18 @@ pub struct GetPoolData {
     pub pools: HashSet<PoolAddress>,
 }
 
+#[derive(Clone)]
+pub struct GetPoolMetadata {
+    pub at: BlockHash,
+    pub candidates: HashSet<PoolCandidateAddress>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnyRequestId {
     BlockHeader(RequestId<GetBlockHeader>),
     BlockLogs(RequestId<GetBlockLogs>),
     PoolData(RequestId<GetPoolData>),
+    PoolMetadata(RequestId<GetPoolMetadata>),
 }
 
 impl fmt::Debug for AnyRequestId {
@@ -116,6 +123,9 @@ impl fmt::Debug for AnyRequestId {
             }
             AnyRequestId::BlockLogs(request_id) => write!(formatter, "block_logs#{request_id:?}"),
             AnyRequestId::PoolData(request_id) => write!(formatter, "pool_data#{request_id:?}"),
+            AnyRequestId::PoolMetadata(request_id) => {
+                write!(formatter, "pool_metadata#{request_id:?}")
+            }
         }
     }
 }
@@ -124,12 +134,14 @@ pub enum AnyIssuedRequest {
     BlockHeader(IssuedRequest<GetBlockHeader>),
     BlockLogs(IssuedRequest<GetBlockLogs>),
     PoolData(IssuedRequest<GetPoolData>),
+    PoolMetadata(IssuedRequest<GetPoolMetadata>),
 }
 
 pub enum AnyPendingPayload {
     BlockHeader(PendingPayload<GetBlockHeader>),
     BlockLogs(PendingPayload<GetBlockLogs>),
     PoolData(PendingPayload<GetPoolData>),
+    PoolMetadata(PendingPayload<GetPoolMetadata>),
 }
 
 pub struct PendingRequests {
@@ -137,6 +149,7 @@ pub struct PendingRequests {
     block_logs: PendingRequestsCollection<GetBlockLogs>,
     block_headers: PendingRequestsCollection<GetBlockHeader>,
     pool_data: PendingRequestsCollection<GetPoolData>,
+    pool_metadata: PendingRequestsCollection<GetPoolMetadata>,
 }
 
 pub trait RequestKind: Sized {
@@ -155,6 +168,9 @@ impl PendingRequests {
                 requests: HashMap::new(),
             },
             pool_data: PendingRequestsCollection {
+                requests: HashMap::new(),
+            },
+            pool_metadata: PendingRequestsCollection {
                 requests: HashMap::new(),
             },
         }
@@ -235,6 +251,13 @@ impl PendingRequests {
                     .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
                     .map(|(id, _)| AnyRequestId::PoolData(*id)),
             )
+            .chain(
+                self.pool_metadata
+                    .requests
+                    .iter()
+                    .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
+                    .map(|(id, _)| AnyRequestId::PoolMetadata(*id)),
+            )
             .collect()
     }
 
@@ -264,6 +287,14 @@ impl PendingRequests {
             .collect()
     }
 
+    pub(crate) fn pending_pool_metadata_candidates(&self) -> HashSet<PoolCandidateAddress> {
+        self.pool_metadata
+            .requests
+            .values()
+            .flat_map(|request| request.payload.candidates.iter().copied())
+            .collect()
+    }
+
     pub fn retry_expired(self, tick: Tick) -> (Self, Vec<AnyIssuedRequest>) {
         let expired_ids = self.expired_ids(tick);
 
@@ -286,6 +317,9 @@ impl PendingRequests {
             }
             AnyRequestId::PoolData(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::PoolData)
+            }
+            AnyRequestId::PoolMetadata(request_id) => {
+                self.retry_typed(request_id, tick, AnyIssuedRequest::PoolMetadata)
             }
         }
     }
@@ -322,6 +356,7 @@ impl PendingRequests {
         self.block_headers.requests.len()
             + self.block_logs.requests.len()
             + self.pool_data.requests.len()
+            + self.pool_metadata.requests.len()
     }
 
     pub(crate) fn is_empty_for_test(&self) -> bool {
@@ -341,6 +376,7 @@ impl PendingRequests {
             AnyRequestId::BlockHeader(request_id) => self.contains(&request_id),
             AnyRequestId::BlockLogs(request_id) => self.contains(&request_id),
             AnyRequestId::PoolData(request_id) => self.contains(&request_id),
+            AnyRequestId::PoolMetadata(request_id) => self.contains(&request_id),
         }
     }
 
@@ -379,6 +415,12 @@ impl PendingRequests {
                     .values()
                     .map(|request| request.dispatched_at),
             )
+            .chain(
+                self.pool_metadata
+                    .requests
+                    .values()
+                    .map(|request| request.dispatched_at),
+            )
             .collect()
     }
 }
@@ -410,5 +452,15 @@ impl RequestKind for GetPoolData {
 
     fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
         &mut requests.pool_data
+    }
+}
+
+impl RequestKind for GetPoolMetadata {
+    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+        &requests.pool_metadata
+    }
+
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+        &mut requests.pool_metadata
     }
 }

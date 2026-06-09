@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
-use crate::{ClientEvmError, ClientHead, PoolAddress, uniswap_v3::pool_event_signature_hashes};
+use crate::{
+    ClientEvmError, ClientHead, PoolCandidateAddress, uniswap_v3::pool_event_signature_hashes,
+};
 
 fn pool_event_topic_filter() -> Vec<String> {
     pool_event_signature_hashes()
@@ -182,7 +184,7 @@ pub(crate) fn parse_block_logs_response(
     value: &Value,
     expected_request_id: u64,
     expected_block_hash: BlockHash,
-) -> Result<HashSet<PoolAddress>, ClientEvmError> {
+) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError> {
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(ClientEvmError::MalformedJsonRpcResponse(
             "block logs response must use json-rpc 2.0".to_owned(),
@@ -230,7 +232,7 @@ pub(crate) fn parse_block_logs_response(
 
             Ok(logs
                 .into_iter()
-                .map(|log| PoolAddress(log.address()))
+                .map(|log| PoolCandidateAddress(log.address()))
                 .collect())
         }
     }
@@ -244,7 +246,7 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
-    use crate::PoolAddress;
+    use crate::PoolCandidateAddress;
 
     use super::*;
 
@@ -316,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn block_logs_response_decodes_pool_addresses() {
+    fn block_logs_response_decodes_pool_candidate_addresses() {
         let block_hash = B256::with_last_byte(7);
         let first_pool = Address::with_last_byte(1);
         let second_pool = Address::with_last_byte(2);
@@ -336,8 +338,8 @@ mod tests {
             result,
             Ok(ref pools)
                 if pools.len() == 2
-                    && pools.contains(&PoolAddress(first_pool))
-                    && pools.contains(&PoolAddress(second_pool))
+                    && pools.contains(&PoolCandidateAddress(first_pool))
+                    && pools.contains(&PoolCandidateAddress(second_pool))
         ));
     }
 

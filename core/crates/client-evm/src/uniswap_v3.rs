@@ -1,8 +1,23 @@
 //! Uniswap v3 integration helpers.
 
-use alloy::{primitives::B256, sol, sol_types::SolEvent};
+use alloy::{
+    primitives::{Address, B256, address},
+    sol,
+    sol_types::SolEvent,
+};
+
+pub const ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS: Address =
+    address!("1F98431c8aD98523631AE4a59f267346ea31F984");
 
 sol! {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function fee() external view returns (uint32);
+
+    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+
     function slot0() external view returns (
         uint160 sqrtPriceX96,
         int24 tick,
