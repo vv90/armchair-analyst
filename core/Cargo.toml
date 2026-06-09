@@ -5,6 +5,7 @@ members = [
     "crates/aa-framework",
     "crates/aa-kernel",
     "crates/client-evm",
+    "crates/optimization",
 ]
 
 [workspace.package]
