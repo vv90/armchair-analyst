@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::BlockHash;
 
-use crate::{pending_requests::*, pool_registry::*, pool_state::*, tick::Tick};
+use crate::{pending_requests::*, pool_registry::*, pool_state::*, tick::Tick, token_registry::*};
 
 enum PoolLogsStatus {
     Unknown,
@@ -212,6 +212,54 @@ impl BlocksGraph {
 
         requests
     }
+
+    /// Groups unresolved canonical pool tokens into metadata requests.
+    fn unknown_present_canonical_token_metadata_requests(
+        &self,
+        tip_hash: BlockHash,
+        finalized_hash: BlockHash,
+        pool_registry: &TrustedPoolRegistry,
+        token_registry: &TokenRegistry,
+        pending_tokens: &HashSet<TokenAddress>,
+    ) -> Vec<(BlockHash, HashSet<TokenAddress>)> {
+        let mut current_hash = tip_hash;
+        let mut requests = Vec::new();
+        let mut visited = HashSet::new();
+        let mut unavailable_tokens = pending_tokens.clone();
+
+        while current_hash != finalized_hash {
+            if !visited.insert(current_hash) {
+                return Vec::new();
+            }
+
+            let Some(block) = self.get(&current_hash) else {
+                break;
+            };
+
+            if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+                let tokens = candidates
+                    .iter()
+                    .filter_map(|candidate| pool_registry.verified_pool(*candidate))
+                    .filter_map(|pool| pool_registry.verified_metadata(pool))
+                    .flat_map(|metadata| {
+                        [TokenAddress(metadata.token0), TokenAddress(metadata.token1)]
+                    })
+                    .filter(|token| {
+                        !token_registry.is_known(*token) && !unavailable_tokens.contains(token)
+                    })
+                    .collect::<HashSet<_>>();
+
+                if !tokens.is_empty() {
+                    unavailable_tokens.extend(tokens.iter().copied());
+                    requests.push((current_hash, tokens));
+                }
+            }
+
+            current_hash = block.parent_hash;
+        }
+
+        requests
+    }
 }
 
 pub struct FinalizedState {
@@ -235,6 +283,7 @@ pub struct State {
     pending_requests: PendingRequests,
     finalized_state: FinalizedState,
     pool_registry: TrustedPoolRegistry,
+    token_registry: TokenRegistry,
     tick: Tick,
 }
 
@@ -247,15 +296,17 @@ impl State {
             pending_requests: PendingRequests::new(),
             finalized_state,
             pool_registry: TrustedPoolRegistry::new(),
+            token_registry: TokenRegistry::new(),
             tick: Tick::initial(),
         }
     }
 
-    /// Rebuilds volatile chain state while preserving immutable pool registry facts.
+    /// Rebuilds volatile chain state while preserving immutable registry facts.
     fn reset(
         finalized_state: FinalizedState,
         tick: Tick,
         pool_registry: TrustedPoolRegistry,
+        token_registry: TokenRegistry,
     ) -> State {
         State {
             blocks: BlocksGraph::new(),
@@ -263,6 +314,7 @@ impl State {
             pending_requests: PendingRequests::new(),
             finalized_state,
             pool_registry,
+            token_registry,
             tick,
         }
     }
@@ -288,6 +340,10 @@ pub enum Event {
     PoolMetadataReceived {
         request_id: RequestId<GetPoolMetadata>,
         metadata: HashMap<PoolCandidateAddress, PoolMetadataResult>,
+    },
+    TokenMetadataReceived {
+        request_id: RequestId<GetTokenMetadata>,
+        metadata: HashMap<TokenAddress, TokenMetadataResult>,
     },
     PoolDataReceived {
         request_id: RequestId<GetPoolData>,
@@ -316,6 +372,7 @@ fn schedule_unknown_canonical_log_requests(
         pending_requests,
         finalized_state,
         pool_registry,
+        token_registry,
         tick,
     } = state;
 
@@ -348,6 +405,7 @@ fn schedule_unknown_canonical_log_requests(
             pending_requests,
             finalized_state,
             pool_registry,
+            token_registry,
             tick,
         },
         effects,
@@ -365,6 +423,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
         pending_requests,
         finalized_state,
         pool_registry,
+        token_registry,
         tick,
     } = state;
 
@@ -401,6 +460,63 @@ fn schedule_unknown_canonical_pool_metadata_requests(
             pending_requests,
             finalized_state,
             pool_registry,
+            token_registry,
+            tick,
+        },
+        effects,
+    )
+}
+
+/// Schedules token metadata validation for canonical verified pool tokens not known by the registry.
+fn schedule_unknown_canonical_token_metadata_requests(
+    state: State,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    let State {
+        blocks,
+        canonical_tip,
+        pending_requests,
+        finalized_state,
+        pool_registry,
+        token_registry,
+        tick,
+    } = state;
+
+    let pending_tokens = pending_requests.pending_token_metadata_tokens();
+    let requests = blocks.unknown_present_canonical_token_metadata_requests(
+        canonical_tip,
+        finalized_state.block_hash,
+        &pool_registry,
+        &token_registry,
+        &pending_tokens,
+    );
+    let mut pending_requests = pending_requests;
+
+    for (block_hash, tokens) in requests {
+        let request_payload = GetTokenMetadata {
+            at: block_hash,
+            tokens,
+        };
+        let (next_pending_requests, request_id) =
+            pending_requests.with_new_request(request_payload.clone(), tick);
+
+        pending_requests = next_pending_requests;
+        effects.push(Effect::Request(AnyIssuedRequest::TokenMetadata(
+            IssuedRequest {
+                request_id,
+                request_payload,
+            },
+        )));
+    }
+
+    (
+        State {
+            blocks,
+            canonical_tip,
+            pending_requests,
+            finalized_state,
+            pool_registry,
+            token_registry,
             tick,
         },
         effects,
@@ -410,7 +526,8 @@ fn schedule_unknown_canonical_pool_metadata_requests(
 /// Schedules all currently actionable canonical follow-up requests.
 fn schedule_unknown_canonical_requests(state: State, effects: Vec<Effect>) -> (State, Vec<Effect>) {
     let (state, effects) = schedule_unknown_canonical_log_requests(state, effects);
-    schedule_unknown_canonical_pool_metadata_requests(state, effects)
+    let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(state, effects);
+    schedule_unknown_canonical_token_metadata_requests(state, effects)
 }
 
 /// Advances the pure client kernel state machine by one event and emits required effects.
@@ -484,14 +601,24 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests: state.pending_requests,
-                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
+                        ..State::reset(
+                            state.finalized_state,
+                            state.tick,
+                            state.pool_registry,
+                            state.token_registry,
+                        )
                     },
                     vec![],
                 ),
                 Err(NewBlockError::CycleDetected) => (
                     State {
                         pending_requests: state.pending_requests,
-                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
+                        ..State::reset(
+                            state.finalized_state,
+                            state.tick,
+                            state.pool_registry,
+                            state.token_registry,
+                        )
                     },
                     vec![],
                 ),
@@ -581,7 +708,12 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests,
-                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
+                        ..State::reset(
+                            state.finalized_state,
+                            state.tick,
+                            state.pool_registry,
+                            state.token_registry,
+                        )
                     },
                     vec![],
                     false,
@@ -589,7 +721,12 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::CycleDetected) => (
                     State {
                         pending_requests,
-                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
+                        ..State::reset(
+                            state.finalized_state,
+                            state.tick,
+                            state.pool_registry,
+                            state.token_registry,
+                        )
                     },
                     vec![],
                     false,
@@ -636,7 +773,12 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 (
                     State {
                         pending_requests,
-                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
+                        ..State::reset(
+                            state.finalized_state,
+                            state.tick,
+                            state.pool_registry,
+                            state.token_registry,
+                        )
                     },
                     vec![],
                 )
@@ -659,7 +801,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 }) => {
                     let blocks = state.blocks.with_pool_logs(block_hash, logs);
 
-                    schedule_unknown_canonical_pool_metadata_requests(
+                    schedule_unknown_canonical_requests(
                         State {
                             blocks,
                             pending_requests,
@@ -697,10 +839,48 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         .collect::<HashMap<_, _>>();
                     let pool_registry = state.pool_registry.with_metadata_results(metadata);
 
-                    schedule_unknown_canonical_pool_metadata_requests(
+                    schedule_unknown_canonical_requests(
                         State {
                             pending_requests,
                             pool_registry,
+                            ..state
+                        },
+                        vec![],
+                    )
+                }
+                None => (
+                    State {
+                        pending_requests,
+                        ..state
+                    },
+                    vec![],
+                ),
+            }
+        }
+        Event::TokenMetadataReceived {
+            request_id,
+            metadata,
+        } => {
+            let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
+            match request_payload {
+                Some(PendingPayload {
+                    payload:
+                        GetTokenMetadata {
+                            tokens: requested_tokens,
+                            ..
+                        },
+                    ..
+                }) => {
+                    let metadata = metadata
+                        .into_iter()
+                        .filter(|(token, _)| requested_tokens.contains(token))
+                        .collect::<HashMap<_, _>>();
+                    let token_registry = state.token_registry.with_metadata_results(metadata);
+
+                    schedule_unknown_canonical_requests(
+                        State {
+                            pending_requests,
+                            token_registry,
                             ..state
                         },
                         vec![],
@@ -802,7 +982,7 @@ fn find_missing_block_hash(
 mod tests {
     use super::*;
 
-    use alloy::primitives::{Address, U160, aliases::I24};
+    use alloy::primitives::{Address, U160, U256, aliases::I24};
 
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
     use proptest::prelude::*;
@@ -1099,6 +1279,18 @@ mod tests {
                         request_payload.candidates
                     );
                 }
+                Effect::Request(AnyIssuedRequest::TokenMetadata(IssuedRequest {
+                    request_id,
+                    request_payload,
+                })) => {
+                    let pending_request = state
+                        .pending_requests
+                        .get(request_id)
+                        .expect("emitted token metadata request must be recorded as pending");
+
+                    assert_eq!(pending_request.payload.at, request_payload.at);
+                    assert_eq!(pending_request.payload.tokens, request_payload.tokens);
+                }
             }
         }
     }
@@ -1327,6 +1519,7 @@ mod tests {
             AnyRequestId::BlockLogs(request_id) => request_id.raw_for_test(),
             AnyRequestId::PoolData(request_id) => request_id.raw_for_test(),
             AnyRequestId::PoolMetadata(request_id) => request_id.raw_for_test(),
+            AnyRequestId::TokenMetadata(request_id) => request_id.raw_for_test(),
         }
     }
 
@@ -1410,6 +1603,7 @@ mod tests {
                 }
                 Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                 Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
+                Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
             }
         }
 
@@ -1488,6 +1682,7 @@ mod tests {
                 }
                 Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                 Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
+                Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
             }
         }
 
@@ -1515,6 +1710,7 @@ mod tests {
                 pool_snapshots: HashMap::new(),
             },
             pool_registry: TrustedPoolRegistry::new(),
+            token_registry: TokenRegistry::new(),
             tick: tick(0),
         }
     }
@@ -1715,6 +1911,31 @@ mod tests {
         request_ids[0]
     }
 
+    /// Extracts the only token-metadata request effect for a specific block and token set.
+    fn assert_single_token_metadata_request_effect(
+        effects: &[Effect],
+        at: BlockHash,
+        tokens: &HashSet<TokenAddress>,
+    ) -> RequestId<GetTokenMetadata> {
+        let request_ids = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::TokenMetadata(IssuedRequest {
+                    request_id,
+                    request_payload:
+                        GetTokenMetadata {
+                            at: requested_at,
+                            tokens: requested_tokens,
+                        },
+                })) if *requested_at == at && requested_tokens == tokens => Some(*request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(request_ids.len(), 1);
+        request_ids[0]
+    }
+
     /// Extracts the only request effect matching an expected generic request payload.
     fn assert_single_request_effect(
         effects: &[Effect],
@@ -1763,6 +1984,19 @@ mod tests {
             token0: Address::with_last_byte(token0),
             token1: Address::with_last_byte(token1),
             fee,
+        }
+    }
+
+    /// Builds deterministic token addresses from a byte.
+    fn token_address(last_byte: u8) -> TokenAddress {
+        TokenAddress(Address::with_last_byte(last_byte))
+    }
+
+    /// Builds deterministic token metadata for tests.
+    fn token_metadata(decimals: u8) -> TokenMetadata {
+        TokenMetadata {
+            decimals: TokenDecimals::try_from_u256(U256::from(decimals))
+                .expect("test decimals must be supported"),
         }
     }
 
@@ -2135,6 +2369,51 @@ mod tests {
             Some(&metadata)
         );
         assert!(next_state.pool_registry.is_rejected(rejected_candidate));
+        assert_state_invariants(&next_state);
+    }
+
+    // Verifies chain resets preserve immutable token registry facts.
+    #[test]
+    fn chain_reset_preserves_token_registry() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let original_parent_hash = finalized_hash;
+        let conflicting_parent_hash = BlockHash::with_last_byte(3);
+        let verified_token = token_address(4);
+        let unsupported_token = token_address(5);
+        let metadata = token_metadata(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (verified_token, Ok(metadata.clone())),
+            (
+                unsupported_token,
+                Err(TokenMetadataFailure::CallFailed(
+                    TokenMetadataCall::Decimals,
+                )),
+            ),
+        ]));
+        state.canonical_tip = head_hash;
+        state
+            .blocks
+            .0
+            .insert(head_hash, block_with_parent(original_parent_hash));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: conflicting_parent_hash,
+            },
+        );
+
+        assert_chain_reset_at(&next_state, finalized_hash);
+        assert!(effects.is_empty());
+        assert_eq!(
+            next_state.token_registry.verified_metadata(verified_token),
+            Some(&metadata)
+        );
+        assert!(next_state.token_registry.is_unsupported(unsupported_token));
         assert_state_invariants(&next_state);
     }
 
@@ -2620,7 +2899,12 @@ mod tests {
         let (next_state, effects) =
             transition(state, Event::BlockLogsReceived { request_id, logs });
 
-        assert!(effects.is_empty());
+        let token_request_id = assert_single_token_metadata_request_effect(
+            &effects,
+            block_hash,
+            &HashSet::from([token_address(1), token_address(2)]),
+        );
+        assert!(next_state.pending_requests.contains(&token_request_id));
         assert_trusted_pool_logs_resolved(
             &next_state,
             block_hash,
@@ -2815,7 +3099,12 @@ mod tests {
             },
         );
 
-        assert!(effects.is_empty());
+        let token_request_id = assert_single_token_metadata_request_effect(
+            &effects,
+            block_hash,
+            &HashSet::from([token_address(1), token_address(2)]),
+        );
+        assert!(next_state.pending_requests.contains(&token_request_id));
         assert!(!next_state.pending_requests.contains(&request_id));
         assert_eq!(
             next_state
@@ -2868,6 +3157,129 @@ mod tests {
         );
         assert_eq!(next_state.pool_registry.verified_pool(unrequested), None);
         assert!(!next_state.pool_registry.is_rejected(unrequested));
+        assert_state_invariants(&next_state);
+    }
+
+    // Verifies token metadata responses update only requested token entries.
+    #[test]
+    fn token_metadata_received_updates_registry_and_ignores_unrequested_entries() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let requested = token_address(3);
+        let unrequested = token_address(4);
+        let mut state = empty_state_at(finalized_hash);
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetTokenMetadata {
+                at: block_hash,
+                tokens: HashSet::from([requested]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::TokenMetadataReceived {
+                request_id,
+                metadata: HashMap::from([
+                    (requested, Ok(token_metadata(6))),
+                    (unrequested, Ok(token_metadata(18))),
+                ]),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert_eq!(
+            next_state.token_registry.verified_metadata(requested),
+            Some(&token_metadata(6))
+        );
+        assert_eq!(
+            next_state.token_registry.verified_metadata(unrequested),
+            None
+        );
+        assert!(!next_state.token_registry.is_unsupported(unrequested));
+        assert_state_invariants(&next_state);
+    }
+
+    // Verifies verified and unsupported tokens suppress token metadata requests.
+    #[test]
+    fn known_tokens_do_not_request_token_metadata() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let logs = HashSet::from([candidate]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (
+                token_address(2),
+                Err(TokenMetadataFailure::CallFailed(
+                    TokenMetadataCall::Decimals,
+                )),
+            ),
+        ]));
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) =
+            transition(state, Event::BlockLogsReceived { request_id, logs });
+
+        assert!(effects.is_empty());
+        assert_state_invariants(&next_state);
+    }
+
+    // Verifies duplicate tokens across verified pools are requested once.
+    #[test]
+    fn duplicate_tokens_across_verified_pools_share_one_token_metadata_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let first_candidate = pool_candidate_address(3);
+        let second_candidate = pool_candidate_address(4);
+        let logs = HashSet::from([first_candidate, second_candidate]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (
+                first_candidate,
+                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+            ),
+            (
+                second_candidate,
+                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
+            ),
+        ]));
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) =
+            transition(state, Event::BlockLogsReceived { request_id, logs });
+
+        let token_request_id = assert_single_token_metadata_request_effect(
+            &effects,
+            block_hash,
+            &HashSet::from([token_address(1), token_address(2)]),
+        );
+        assert!(next_state.pending_requests.contains(&token_request_id));
         assert_state_invariants(&next_state);
     }
 
@@ -3324,6 +3736,43 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
+    // Verifies token-metadata request failures retry the original request payload.
+    #[test]
+    fn token_metadata_request_failure_retries_original_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let tokens = HashSet::from([token_address(3), token_address(4)]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetTokenMetadata {
+                at: block_hash,
+                tokens: tokens.clone(),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::RequestFailed {
+                request_id: AnyRequestId::TokenMetadata(request_id),
+            },
+        );
+
+        let retry_request_id =
+            assert_single_token_metadata_request_effect(&effects, block_hash, &tokens);
+        assert_ne!(retry_request_id, request_id);
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert!(next_state.pending_requests.contains(&retry_request_id));
+        assert_state_invariants(&next_state);
+    }
+
     // Verifies expired pool-metadata requests retry the original request payload.
     #[test]
     fn pool_metadata_request_expiration_retries_original_request() {
@@ -3350,6 +3799,39 @@ mod tests {
 
         let retry_request_id =
             assert_single_pool_metadata_request_effect(&effects, block_hash, &candidates);
+        assert_ne!(retry_request_id, request_id);
+        assert!(!next_state.pending_requests.contains(&request_id));
+        assert!(next_state.pending_requests.contains(&retry_request_id));
+        assert_no_active_request_is_expired(&next_state);
+        assert_state_invariants(&next_state);
+    }
+
+    // Verifies expired token-metadata requests retry the original request payload.
+    #[test]
+    fn token_metadata_request_expiration_retries_original_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let tokens = HashSet::from([token_address(3), token_address(4)]);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetTokenMetadata {
+                at: block_hash,
+                tokens: tokens.clone(),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = advance_ticks(state, REQUEST_TTL);
+
+        let retry_request_id =
+            assert_single_token_metadata_request_effect(&effects, block_hash, &tokens);
         assert_ne!(retry_request_id, request_id);
         assert!(!next_state.pending_requests.contains(&request_id));
         assert!(next_state.pending_requests.contains(&retry_request_id));
@@ -4658,6 +5140,35 @@ mod tests {
                     },
                 );
 
+                state = apply_token_metadata_effects_for_property(next_state, effects);
+            }
+        }
+
+        state
+    }
+
+    /// Fulfills emitted token-metadata effects with deterministic successful decimals.
+    fn apply_token_metadata_effects_for_property(mut state: State, effects: Vec<Effect>) -> State {
+        for effect in effects {
+            if let Effect::Request(AnyIssuedRequest::TokenMetadata(IssuedRequest {
+                request_id,
+                request_payload,
+            })) = effect
+            {
+                let metadata = request_payload
+                    .tokens
+                    .iter()
+                    .copied()
+                    .map(|token| (token, Ok(token_metadata(18))))
+                    .collect::<HashMap<_, _>>();
+                let (next_state, effects) = transition(
+                    state,
+                    Event::TokenMetadataReceived {
+                        request_id,
+                        metadata,
+                    },
+                );
+
                 state = next_state;
                 assert!(effects.is_empty());
             }
@@ -4874,6 +5385,85 @@ mod tests {
             }
         }
 
+        // Verifies tokens from verified canonical pools are always known or pending metadata.
+        #[test]
+        fn canonical_verified_pool_tokens_are_known_or_pending(
+            block_candidate_bytes in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..6),
+                0..32,
+            ),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let mut state = empty_state_at(finalized_hash);
+            let mut parent_hash = finalized_hash;
+            let mut pool_metadata_results = HashMap::new();
+
+            for (block_index, candidate_bytes) in block_candidate_bytes.iter().enumerate() {
+                let block_hash = hash_for_node(block_index + 1);
+                let candidates = candidate_bytes
+                    .iter()
+                    .copied()
+                    .map(pool_candidate_address)
+                    .collect::<HashSet<_>>();
+
+                for candidate in &candidates {
+                    let byte = candidate.0.as_slice()[19];
+                    pool_metadata_results.insert(
+                        *candidate,
+                        Ok(pool_metadata(
+                            byte,
+                            byte.wrapping_add(64),
+                            UniswapV3Fee::Fee3000,
+                        )),
+                    );
+                }
+
+                state.blocks.0.insert(
+                    block_hash,
+                    BlockNode {
+                        parent_hash,
+                        pool_logs: PoolLogsStatus::Resolved(candidates),
+                        pool_snapshots: HashMap::new(),
+                        pool_data_failures: HashMap::new(),
+                    },
+                );
+                state.canonical_tip = block_hash;
+                parent_hash = block_hash;
+            }
+
+            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+            let (state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+            assert_effects_are_well_formed(&state, &effects);
+            let pending_tokens = state.pending_requests.pending_token_metadata_tokens();
+
+            let mut current_hash = state.canonical_tip;
+            while current_hash != state.finalized_state.block_hash {
+                let Some(block) = state.blocks.get(&current_hash) else {
+                    break;
+                };
+
+                if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+                    for candidate in candidates {
+                        if let Some(pool) = state.pool_registry.verified_pool(*candidate) {
+                            if let Some(metadata) = state.pool_registry.verified_metadata(pool) {
+                                for token in [
+                                    TokenAddress(metadata.token0),
+                                    TokenAddress(metadata.token1),
+                                ] {
+                                    prop_assert!(
+                                        state.token_registry.is_known(token)
+                                            || pending_tokens.contains(&token)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                current_hash = block.parent_hash;
+            }
+        }
+
         // Verifies trusted log projections never expose unverified pool candidates.
         #[test]
         fn derived_resolved_trusted_pool_logs_never_include_unverified_pools(
@@ -5034,6 +5624,7 @@ mod tests {
                     }
                     Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                     Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
+                    Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                 }
             }
 

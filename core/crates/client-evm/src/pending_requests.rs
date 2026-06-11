@@ -6,7 +6,10 @@ use std::{
 
 use alloy::primitives::BlockHash;
 
-use crate::{pool_registry::PoolCandidateAddress, pool_state::PoolAddress, tick::Tick};
+use crate::{
+    pool_registry::PoolCandidateAddress, pool_state::PoolAddress, tick::Tick,
+    token_registry::TokenAddress,
+};
 
 // #[derive(Hash, PartialEq, Eq, Clone, PartialOrd, Ord, Copy)]
 // struct RequestId<T>(u64, PhantomData<T>);
@@ -107,12 +110,19 @@ pub struct GetPoolMetadata {
     pub candidates: HashSet<PoolCandidateAddress>,
 }
 
+#[derive(Clone)]
+pub struct GetTokenMetadata {
+    pub at: BlockHash,
+    pub tokens: HashSet<TokenAddress>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnyRequestId {
     BlockHeader(RequestId<GetBlockHeader>),
     BlockLogs(RequestId<GetBlockLogs>),
     PoolData(RequestId<GetPoolData>),
     PoolMetadata(RequestId<GetPoolMetadata>),
+    TokenMetadata(RequestId<GetTokenMetadata>),
 }
 
 impl fmt::Debug for AnyRequestId {
@@ -126,6 +136,9 @@ impl fmt::Debug for AnyRequestId {
             AnyRequestId::PoolMetadata(request_id) => {
                 write!(formatter, "pool_metadata#{request_id:?}")
             }
+            AnyRequestId::TokenMetadata(request_id) => {
+                write!(formatter, "token_metadata#{request_id:?}")
+            }
         }
     }
 }
@@ -135,6 +148,7 @@ pub enum AnyIssuedRequest {
     BlockLogs(IssuedRequest<GetBlockLogs>),
     PoolData(IssuedRequest<GetPoolData>),
     PoolMetadata(IssuedRequest<GetPoolMetadata>),
+    TokenMetadata(IssuedRequest<GetTokenMetadata>),
 }
 
 pub enum AnyPendingPayload {
@@ -142,6 +156,7 @@ pub enum AnyPendingPayload {
     BlockLogs(PendingPayload<GetBlockLogs>),
     PoolData(PendingPayload<GetPoolData>),
     PoolMetadata(PendingPayload<GetPoolMetadata>),
+    TokenMetadata(PendingPayload<GetTokenMetadata>),
 }
 
 pub struct PendingRequests {
@@ -150,6 +165,7 @@ pub struct PendingRequests {
     block_headers: PendingRequestsCollection<GetBlockHeader>,
     pool_data: PendingRequestsCollection<GetPoolData>,
     pool_metadata: PendingRequestsCollection<GetPoolMetadata>,
+    token_metadata: PendingRequestsCollection<GetTokenMetadata>,
 }
 
 pub trait RequestKind: Sized {
@@ -171,6 +187,9 @@ impl PendingRequests {
                 requests: HashMap::new(),
             },
             pool_metadata: PendingRequestsCollection {
+                requests: HashMap::new(),
+            },
+            token_metadata: PendingRequestsCollection {
                 requests: HashMap::new(),
             },
         }
@@ -258,6 +277,13 @@ impl PendingRequests {
                     .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
                     .map(|(id, _)| AnyRequestId::PoolMetadata(*id)),
             )
+            .chain(
+                self.token_metadata
+                    .requests
+                    .iter()
+                    .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
+                    .map(|(id, _)| AnyRequestId::TokenMetadata(*id)),
+            )
             .collect()
     }
 
@@ -295,6 +321,14 @@ impl PendingRequests {
             .collect()
     }
 
+    pub(crate) fn pending_token_metadata_tokens(&self) -> HashSet<TokenAddress> {
+        self.token_metadata
+            .requests
+            .values()
+            .flat_map(|request| request.payload.tokens.iter().copied())
+            .collect()
+    }
+
     pub fn retry_expired(self, tick: Tick) -> (Self, Vec<AnyIssuedRequest>) {
         let expired_ids = self.expired_ids(tick);
 
@@ -320,6 +354,9 @@ impl PendingRequests {
             }
             AnyRequestId::PoolMetadata(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::PoolMetadata)
+            }
+            AnyRequestId::TokenMetadata(request_id) => {
+                self.retry_typed(request_id, tick, AnyIssuedRequest::TokenMetadata)
             }
         }
     }
@@ -357,6 +394,7 @@ impl PendingRequests {
             + self.block_logs.requests.len()
             + self.pool_data.requests.len()
             + self.pool_metadata.requests.len()
+            + self.token_metadata.requests.len()
     }
 
     pub(crate) fn is_empty_for_test(&self) -> bool {
@@ -377,6 +415,7 @@ impl PendingRequests {
             AnyRequestId::BlockLogs(request_id) => self.contains(&request_id),
             AnyRequestId::PoolData(request_id) => self.contains(&request_id),
             AnyRequestId::PoolMetadata(request_id) => self.contains(&request_id),
+            AnyRequestId::TokenMetadata(request_id) => self.contains(&request_id),
         }
     }
 
@@ -417,6 +456,12 @@ impl PendingRequests {
             )
             .chain(
                 self.pool_metadata
+                    .requests
+                    .values()
+                    .map(|request| request.dispatched_at),
+            )
+            .chain(
+                self.token_metadata
                     .requests
                     .values()
                     .map(|request| request.dispatched_at),
@@ -462,5 +507,15 @@ impl RequestKind for GetPoolMetadata {
 
     fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
         &mut requests.pool_metadata
+    }
+}
+
+impl RequestKind for GetTokenMetadata {
+    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+        &requests.token_metadata
+    }
+
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+        &mut requests.token_metadata
     }
 }

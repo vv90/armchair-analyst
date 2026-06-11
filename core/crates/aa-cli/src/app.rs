@@ -2,8 +2,9 @@ use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent, ClientEvmError, ClientHead,
     PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult, RequestId, RpcConfig,
-    fetch_block_header, fetch_block_logs, fetch_finalized_block_header, fetch_pool_data,
-    fetch_pool_metadata, kernel,
+    TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
+    fetch_finalized_block_header, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
+    kernel,
     multi_chain_kernel::{Effect, Event, State, transition},
     subscribe_new_heads,
 };
@@ -176,6 +177,14 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             format_typed_request_id_log(request_id),
             metadata.len(),
         ),
+        kernel::Event::TokenMetadataReceived {
+            request_id,
+            metadata,
+        } => format!(
+            "input chain={chain:?} token_metadata_received request={} tokens={}",
+            format_typed_request_id_log(request_id),
+            metadata.len(),
+        ),
         kernel::Event::RequestFailed { request_id } => format!(
             "input chain={chain:?} request_failed request={}",
             format_request_id_log(request_id),
@@ -203,6 +212,7 @@ impl ClientEvmRuntime {
             |at, candidates| {
                 fetch_pool_metadata(&self.agent, self.get_config(chain), at, candidates)
             },
+            |at, tokens| fetch_token_metadata(&self.agent, self.get_config(chain), at, tokens),
         )
     }
 }
@@ -230,13 +240,20 @@ fn spawn_tick_subscription(sender: Sender<Event>, interval: time::Duration) -> J
     })
 }
 
-fn execute_chain_effect_with<FetchBlockHeader, FetchBlockLogs, FetchPoolData, FetchPoolMetadata>(
+fn execute_chain_effect_with<
+    FetchBlockHeader,
+    FetchBlockLogs,
+    FetchPoolData,
+    FetchPoolMetadata,
+    FetchTokenMetadata,
+>(
     chain: ChainKey,
     effect: kernel::Effect,
     fetch_block_header: FetchBlockHeader,
     fetch_block_logs: FetchBlockLogs,
     fetch_pool_data: FetchPoolData,
     fetch_pool_metadata: FetchPoolMetadata,
+    fetch_token_metadata: FetchTokenMetadata,
 ) -> Vec<Event>
 where
     FetchBlockHeader: FnOnce(BlockHash) -> Result<Option<ClientHead>, ClientEvmError>,
@@ -251,6 +268,11 @@ where
             HashSet<PoolCandidateAddress>,
         )
             -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError>,
+    FetchTokenMetadata:
+        FnOnce(
+            BlockHash,
+            HashSet<TokenAddress>,
+        ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError>,
 {
     match effect {
         kernel::Effect::Request(request) => match request {
@@ -335,6 +357,27 @@ where
                     }],
                 }
             }
+            AnyIssuedRequest::TokenMetadata(request) => {
+                let request_id = request.request_id;
+                let at = request.request_payload.at;
+                let tokens = request.request_payload.tokens;
+
+                match fetch_token_metadata(at, tokens) {
+                    Ok(metadata) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::TokenMetadataReceived {
+                            request_id,
+                            metadata,
+                        },
+                    }],
+                    Err(_) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::RequestFailed {
+                            request_id: AnyRequestId::TokenMetadata(request_id),
+                        },
+                    }],
+                }
+            }
         },
     }
 }
@@ -342,8 +385,9 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata, IssuedRequest, PoolAddress,
-        PoolCandidateAddress, PoolDataResult, PoolMetadataResult, RequestId,
+        GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata, GetTokenMetadata,
+        IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult,
+        RequestId, TokenAddress, TokenMetadataResult,
     };
     use serde_json::json;
     use std::{sync::mpsc, time::Duration};
@@ -421,6 +465,7 @@ mod tests {
         let logs_request_id = RequestId::<GetBlockLogs>::from_raw_for_test(8);
         let pool_request_id = RequestId::<GetPoolData>::from_raw_for_test(9);
         let metadata_request_id = RequestId::<GetPoolMetadata>::from_raw_for_test(10);
+        let token_metadata_request_id = RequestId::<GetTokenMetadata>::from_raw_for_test(11);
 
         assert_eq!(
             format_input_log(&Event::ChainEvent {
@@ -451,6 +496,16 @@ mod tests {
                 },
             }),
             "input chain=Ethereum pool_metadata_received request=10 candidates=0"
+        );
+        assert_eq!(
+            format_input_log(&Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::TokenMetadataReceived {
+                    request_id: token_metadata_request_id,
+                    metadata: HashMap::new(),
+                },
+            }),
+            "input chain=Ethereum token_metadata_received request=11 tokens=0"
         );
     }
 
@@ -548,6 +603,7 @@ mod tests {
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -585,6 +641,7 @@ mod tests {
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -612,6 +669,7 @@ mod tests {
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -642,6 +700,7 @@ mod tests {
             },
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -675,6 +734,7 @@ mod tests {
             },
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -706,6 +766,7 @@ mod tests {
                 Ok(HashMap::new())
             },
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -740,6 +801,7 @@ mod tests {
                 Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
             },
             unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -773,6 +835,7 @@ mod tests {
                 assert_eq!(requested_candidates, HashSet::from([candidate]));
                 Ok(HashMap::new())
             },
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -808,6 +871,7 @@ mod tests {
                 assert_eq!(requested_candidates, candidates);
                 Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
             },
+            unexpected_token_metadata_fetch,
         );
 
         assert!(matches!(
@@ -817,6 +881,76 @@ mod tests {
                 event:
                     kernel::Event::RequestFailed {
                         request_id: client_evm::AnyRequestId::PoolMetadata(request_id),
+                    },
+            }] if *event_chain == chain && *request_id == expected_request_id
+        ));
+    }
+
+    #[test]
+    fn token_metadata_request_success_maps_to_chain_event() {
+        let chain = ChainKey::Ethereum;
+        let at = hash(2);
+        let token = token_address(3);
+        let (effect, expected_request_id) =
+            token_metadata_request_effect(at, HashSet::from([token]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_pool_metadata_fetch,
+            |requested_at, requested_tokens| {
+                assert_eq!(requested_at, at);
+                assert_eq!(requested_tokens, HashSet::from([token]));
+                Ok(HashMap::new())
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::TokenMetadataReceived {
+                        request_id,
+                        metadata,
+                    },
+            }] if *event_chain == chain
+                && *request_id == expected_request_id
+                && metadata.is_empty()
+        ));
+    }
+
+    #[test]
+    fn token_metadata_request_failure_maps_to_request_failed_event() {
+        let chain = ChainKey::Ethereum;
+        let at = hash(2);
+        let tokens = HashSet::from([token_address(3)]);
+        let (effect, expected_request_id) = token_metadata_request_effect(at, tokens.clone());
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_pool_metadata_fetch,
+            |requested_at, requested_tokens| {
+                assert_eq!(requested_at, at);
+                assert_eq!(requested_tokens, tokens);
+                Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::RequestFailed {
+                        request_id: client_evm::AnyRequestId::TokenMetadata(request_id),
                     },
             }] if *event_chain == chain && *request_id == expected_request_id
         ));
@@ -890,6 +1024,20 @@ mod tests {
         )
     }
 
+    fn token_metadata_request_effect(
+        at: BlockHash,
+        tokens: HashSet<TokenAddress>,
+    ) -> (kernel::Effect, RequestId<GetTokenMetadata>) {
+        let request_id = RequestId::from_raw_for_test(10);
+        (
+            kernel::Effect::Request(AnyIssuedRequest::TokenMetadata(IssuedRequest {
+                request_id,
+                request_payload: GetTokenMetadata { at, tokens },
+            })),
+            request_id,
+        )
+    }
+
     fn unexpected_block_header_fetch(
         _block_hash: BlockHash,
     ) -> Result<Option<ClientHead>, ClientEvmError> {
@@ -916,12 +1064,27 @@ mod tests {
         panic!("pool metadata fetch must not be called")
     }
 
+    fn unexpected_token_metadata_fetch(
+        _at: BlockHash,
+        _tokens: HashSet<TokenAddress>,
+    ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
+        panic!("token metadata fetch must not be called")
+    }
+
     fn pool_candidate_address(last_byte: u8) -> PoolCandidateAddress {
         let address = format!("0x{}", format!("{last_byte:040x}"))
             .parse()
             .expect("test address must parse");
 
         PoolCandidateAddress(address)
+    }
+
+    fn token_address(last_byte: u8) -> TokenAddress {
+        let address = format!("0x{}", format!("{last_byte:040x}"))
+            .parse()
+            .expect("test address must parse");
+
+        TokenAddress(address)
     }
 
     fn block_header(

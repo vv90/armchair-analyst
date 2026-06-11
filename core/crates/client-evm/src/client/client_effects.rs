@@ -6,7 +6,7 @@ use std::{
 };
 
 use alloy::{
-    primitives::{Address, BlockHash, Bytes, Uint},
+    primitives::{Address, BlockHash, Bytes, U256, Uint},
     sol_types::SolCall,
 };
 use serde::Deserialize;
@@ -16,7 +16,8 @@ use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 use crate::{
     ClientEvmError, PoolAddress, PoolCandidateAddress, PoolDataCall, PoolDataFailure,
     PoolDataResult, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
-    PoolState, RpcConfig, UniswapV3Fee,
+    PoolState, RpcConfig, TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall,
+    TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
     config::{compose_http_endpoint, compose_ws_endpoint},
 };
 
@@ -164,12 +165,94 @@ pub fn fetch_pool_metadata(
     Ok(metadata_results)
 }
 
+pub fn fetch_token_metadata(
+    agent: &ureq::Agent,
+    config: &RpcConfig,
+    at: BlockHash,
+    tokens: HashSet<TokenAddress>,
+) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
+    if tokens.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let endpoint = compose_http_endpoint(config)?;
+    let tokens = sorted_token_addresses(tokens);
+    let calls = token_metadata_multicall_calls(&tokens);
+    let request = build_multicall3_request(HTTP_REQUEST_ID, at, &calls);
+    let mut response = agent
+        .post(endpoint.as_str())
+        .send_json(&request)
+        .map_err(ClientEvmError::HttpError)?;
+    let response_value = response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(ClientEvmError::HttpError)?;
+    let results = parse_multicall3_response(&response_value, HTTP_REQUEST_ID, calls.len())?;
+
+    Ok(decode_token_metadata_results(&tokens, &results))
+}
+
 fn sorted_pool_candidate_addresses(
     candidates: HashSet<PoolCandidateAddress>,
 ) -> Vec<PoolCandidateAddress> {
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
     candidates
+}
+
+fn sorted_token_addresses(tokens: HashSet<TokenAddress>) -> Vec<TokenAddress> {
+    let mut tokens = tokens.into_iter().collect::<Vec<_>>();
+    tokens.sort_by(|left, right| left.0.cmp(&right.0));
+    tokens
+}
+
+fn token_metadata_multicall_calls(tokens: &[TokenAddress]) -> Vec<MulticallCall> {
+    tokens
+        .iter()
+        .map(|token| MulticallCall {
+            target: token.0,
+            call_data: Bytes::from(crate::erc20::decimalsCall {}.abi_encode()),
+        })
+        .collect()
+}
+
+fn decode_token_metadata_results(
+    tokens: &[TokenAddress],
+    results: &[MulticallCallResult],
+) -> HashMap<TokenAddress, TokenMetadataResult> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| (*token, decode_token_metadata_result(results.get(index))))
+        .collect()
+}
+
+fn decode_token_metadata_result(result: Option<&MulticallCallResult>) -> TokenMetadataResult {
+    let decimals = decode_token_decimals(result)?;
+    let decimals = TokenDecimals::try_from_u256(decimals)?;
+
+    Ok(TokenMetadata { decimals })
+}
+
+fn decode_token_decimals(
+    result: Option<&MulticallCallResult>,
+) -> Result<U256, TokenMetadataFailure> {
+    decode_token_metadata_multicall_result(result, TokenMetadataCall::Decimals, |return_data| {
+        crate::erc20::decimalsCall::abi_decode_returns(return_data)
+    })
+}
+
+fn decode_token_metadata_multicall_result<T>(
+    result: Option<&MulticallCallResult>,
+    call: TokenMetadataCall,
+    decode: impl FnOnce(&[u8]) -> alloy::sol_types::Result<T>,
+) -> Result<T, TokenMetadataFailure> {
+    match result {
+        None => Err(TokenMetadataFailure::MissingResponse(call)),
+        Some(result) if !result.success => Err(TokenMetadataFailure::CallFailed(call)),
+        Some(result) => decode(result.return_data.as_ref())
+            .map_err(|_| TokenMetadataFailure::DecodeFailed(call)),
+    }
 }
 
 fn pool_metadata_candidate_multicall_calls(
@@ -583,14 +666,15 @@ mod tests {
     };
 
     use alloy::{
-        primitives::{Address, B256, Bytes, U160, aliases::I24},
+        primitives::{Address, B256, Bytes, U160, U256, aliases::I24},
         sol_types::SolCall,
     };
     use serde_json::{Value, json};
 
     use crate::{
         PoolAddress, PoolCandidateAddress, PoolDataCall, PoolDataFailure, PoolMetadataCall,
-        PoolMetadataFailure, PoolState, UniswapV3Fee,
+        PoolMetadataFailure, PoolState, TokenAddress, TokenDecimals, TokenMetadata,
+        TokenMetadataCall, TokenMetadataFailure, UniswapV3Fee,
         client::multicall3::{
             MULTICALL3_ADDRESS, MulticallCall, MulticallCallResult,
             aggregate3_return_data_for_test, decode_aggregate3_call_data_for_test,
@@ -1131,6 +1215,133 @@ mod tests {
     }
 
     #[test]
+    fn fetch_token_metadata_with_empty_token_set_returns_empty_results_without_http() {
+        let config = rpc_config("http://127.0.0.1:9");
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_token_metadata(&agent, &config, B256::with_last_byte(1), HashSet::new());
+
+        assert!(matches!(result, Ok(ref metadata) if metadata.is_empty()));
+    }
+
+    #[test]
+    fn fetch_token_metadata_posts_multicall3_request_and_decodes_decimals() {
+        let at = B256::with_last_byte(1);
+        let first_token = TokenAddress(Address::with_last_byte(2));
+        let second_token = TokenAddress(Address::with_last_byte(3));
+        let response = multicall3_response([
+            successful_multicall_result(decimals_return_data(6)),
+            successful_multicall_result(decimals_return_data(18)),
+        ]);
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_token_metadata(
+            &agent,
+            &config,
+            at,
+            HashSet::from([second_token, first_token]),
+        )
+        .expect("token metadata fetch must succeed");
+
+        assert_eq!(
+            result.get(&first_token),
+            Some(&Ok(TokenMetadata {
+                decimals: TokenDecimals::try_from_u256(U256::from(6)).unwrap(),
+            }))
+        );
+        assert_eq!(
+            result.get(&second_token),
+            Some(&Ok(TokenMetadata {
+                decimals: TokenDecimals::try_from_u256(U256::from(18)).unwrap(),
+            }))
+        );
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        assert_eq!(request.path, "/ethereum/api-key");
+        assert_multicall_request_at(&request.body, at);
+        let calls = multicall_calls_from_request(&request.body);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| (call.target, call.call_data.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (first_token.0, decimals_call_data()),
+                (second_token.0, decimals_call_data()),
+            ]
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_token_metadata_returns_per_token_failures() {
+        let at = B256::with_last_byte(1);
+        let failed_token = TokenAddress(Address::with_last_byte(2));
+        let malformed_token = TokenAddress(Address::with_last_byte(3));
+        let unsupported_token = TokenAddress(Address::with_last_byte(4));
+        let response = multicall3_response([
+            failed_multicall_result(),
+            successful_multicall_result(Bytes::from(vec![0x12])),
+            successful_multicall_result(decimals_return_data(37)),
+        ]);
+        let (http_url, _received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_token_metadata(
+            &agent,
+            &config,
+            at,
+            HashSet::from([failed_token, malformed_token, unsupported_token]),
+        )
+        .expect("outer multicall must succeed");
+
+        assert_eq!(
+            result.get(&failed_token),
+            Some(&Err(TokenMetadataFailure::CallFailed(
+                TokenMetadataCall::Decimals
+            )))
+        );
+        assert_eq!(
+            result.get(&malformed_token),
+            Some(&Err(TokenMetadataFailure::DecodeFailed(
+                TokenMetadataCall::Decimals
+            )))
+        );
+        assert_eq!(
+            result.get(&unsupported_token),
+            Some(&Err(TokenMetadataFailure::UnsupportedDecimals(U256::from(
+                37
+            ))))
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_token_metadata_maps_transport_failure_to_http_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener must have local address");
+        drop(listener);
+        let config = rpc_config(&format!("http://{address}"));
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_token_metadata(
+            &agent,
+            &config,
+            B256::with_last_byte(1),
+            HashSet::from([TokenAddress(Address::with_last_byte(2))]),
+        );
+
+        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+    }
+
+    #[test]
     fn fetch_finalized_block_header_posts_expected_request_and_decodes_response() {
         let block_hash = B256::with_last_byte(1);
         let response = json!({
@@ -1335,6 +1546,16 @@ mod tests {
 
     fn fee_call_data() -> Bytes {
         Bytes::from(crate::uniswap_v3::feeCall {}.abi_encode())
+    }
+
+    fn decimals_call_data() -> Bytes {
+        Bytes::from(crate::erc20::decimalsCall {}.abi_encode())
+    }
+
+    fn decimals_return_data(decimals: u8) -> Bytes {
+        Bytes::from(crate::erc20::decimalsCall::abi_encode_returns(&U256::from(
+            decimals,
+        )))
     }
 
     fn get_pool_call_data(token0: Address, token1: Address, fee: UniswapV3Fee) -> Bytes {
