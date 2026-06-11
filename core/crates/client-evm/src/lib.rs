@@ -16,6 +16,7 @@ mod tick;
 mod tick_math;
 mod token_registry;
 pub mod uniswap_v3;
+mod utils;
 
 pub use chain::{ChainKey, drpc_network_path};
 pub use client::{
@@ -40,3 +41,4 @@ pub use token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
     TokenMetadataResult, TokenRegistry,
 };
+pub use utils::{TokenAmountConversionError, u256_token_amount_to_f32};
