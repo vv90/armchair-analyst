@@ -12,6 +12,7 @@ mod pending_requests;
 mod pool_registry;
 mod pool_state;
 mod tick;
+mod tick_math;
 pub mod uniswap_v3;
 
 pub use chain::{ChainKey, drpc_network_path};
@@ -29,4 +30,7 @@ pub use pool_registry::{
     PoolCandidateAddress, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
     TrustedPoolLogs, TrustedPoolRegistry, UniswapV3Fee,
 };
-pub use pool_state::{PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState};
+pub use pool_state::{
+    PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState, PoolStateError,
+};
+pub use tick_math::TickMathError;

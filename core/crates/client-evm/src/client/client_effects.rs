@@ -388,12 +388,10 @@ fn decode_pool_data_result(
 ) -> PoolDataResult {
     let slot0 = decode_slot0(slot0)?;
     let liquidity = decode_liquidity(liquidity)?;
-    let tick = i32::try_from(slot0.tick)
-        .map_err(|_| PoolDataFailure::DecodeFailed(PoolDataCall::Slot0))?;
 
     Ok(PoolState {
         sqrt_price_x96: slot0.sqrtPriceX96,
-        tick,
+        tick: slot0.tick,
         liquidity,
     })
 }
@@ -1294,7 +1292,7 @@ mod tests {
     fn pool_state(sqrt_price_x96: u64, tick: i32, liquidity: u128) -> PoolState {
         PoolState {
             sqrt_price_x96: U160::from(sqrt_price_x96),
-            tick,
+            tick: I24::try_from(tick).expect("test tick must fit int24"),
             liquidity,
         }
     }

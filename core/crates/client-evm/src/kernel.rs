@@ -802,7 +802,7 @@ fn find_missing_block_hash(
 mod tests {
     use super::*;
 
-    use alloy::primitives::{Address, U160};
+    use alloy::primitives::{Address, U160, aliases::I24};
 
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
     use proptest::prelude::*;
@@ -1770,7 +1770,7 @@ mod tests {
     fn pool_state(last_byte: u8) -> PoolState {
         PoolState {
             sqrt_price_x96: U160::from(u64::from(last_byte) + 1),
-            tick: i32::from(last_byte),
+            tick: I24::try_from(i32::from(last_byte)).expect("test tick must fit int24"),
             liquidity: u128::from(last_byte) + 10,
         }
     }
