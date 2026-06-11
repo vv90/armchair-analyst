@@ -26,17 +26,20 @@ enum NewBlockError {
 struct BlocksGraph(HashMap<BlockHash, BlockNode>);
 
 impl BlocksGraph {
-    /// Builds an empty in-memory graph of recent, non-finalized blocks.
+    /// Creates the volatile graph for recent, non-finalized blocks.
+    /// Added so resets can discard reorg-prone block state without touching finalized or registry state.
     fn new() -> BlocksGraph {
         BlocksGraph(HashMap::new())
     }
 
-    /// Looks up a recent block node by hash without changing graph state.
+    /// Looks up a tracked recent block without exposing the backing map.
+    /// Keeps graph access centralized so future refactors can preserve graph invariants behind this type.
     fn get(&self, hash: &BlockHash) -> Option<&BlockNode> {
         self.0.get(hash)
     }
 
-    /// Adds a block header and reports the first missing parent on its path to finality.
+    /// Inserts a block header and returns the first missing parent, if the ancestry is incomplete.
+    /// Added to make header ingestion validate duplicate, conflicting, self-parent, and cyclic ancestry before state is accepted.
     fn with_new_block(
         self,
         hash: BlockHash,
@@ -78,7 +81,8 @@ impl BlocksGraph {
         }
     }
 
-    /// Records fetched log-derived pool candidates for an existing recent block.
+    /// Stores fetched log-derived candidate pool addresses on an existing block.
+    /// Added to keep raw log observations separate from trusted pool validation in the registry.
     fn with_pool_logs(
         self,
         block_hash: BlockHash,
@@ -94,7 +98,8 @@ impl BlocksGraph {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    /// Derives the trusted pool-log view for a block from stored candidates and the registry.
+    /// Projects a block's raw candidate logs into trusted pool logs using the current registry.
+    /// Added so validation state stays in `TrustedPoolRegistry` and block state does not duplicate trusted/rejected facts.
     fn trusted_pool_logs(
         &self,
         block_hash: BlockHash,
@@ -106,7 +111,36 @@ impl BlocksGraph {
         })
     }
 
-    /// Applies requested pool state results to the target block snapshot.
+    /// Returns the present canonical suffix from oldest known block to tip.
+    /// Added for schedulers that need chronological context while safely stopping at missing parents or cycles.
+    fn present_canonical_hashes_oldest_to_newest(
+        &self,
+        tip_hash: BlockHash,
+        finalized_hash: BlockHash,
+    ) -> Vec<BlockHash> {
+        let mut current_hash = tip_hash;
+        let mut hashes = Vec::new();
+        let mut visited = HashSet::new();
+
+        while current_hash != finalized_hash {
+            if !visited.insert(current_hash) {
+                return Vec::new();
+            }
+
+            let Some(block) = self.get(&current_hash) else {
+                break;
+            };
+
+            hashes.push(current_hash);
+            current_hash = block.parent_hash;
+        }
+
+        hashes.reverse();
+        hashes
+    }
+
+    /// Applies requested pool-state results to a target block snapshot.
+    /// Added to ensure stale, missing-block, or overbroad RPC responses cannot write unrequested pool state.
     fn with_pool_data(
         self,
         block_hash: BlockHash,
@@ -137,7 +171,45 @@ impl BlocksGraph {
         BlocksGraph(blocks)
     }
 
-    /// Finds present canonical blocks whose log requests are neither resolved nor pending.
+    /// Builds the next pool-state request for verified dirty pools on the canonical path.
+    /// Added to batch accumulated affected pools at the latest tip while skipping pools already snapshotted, failed, or pending there.
+    fn unknown_present_canonical_pool_data_request(
+        &self,
+        tip_hash: BlockHash,
+        finalized_hash: BlockHash,
+        registry: &TrustedPoolRegistry,
+        pending_pool_data_by_block: &HashMap<BlockHash, HashSet<PoolAddress>>,
+    ) -> Option<(BlockHash, HashSet<PoolAddress>)> {
+        let hashes = self.present_canonical_hashes_oldest_to_newest(tip_hash, finalized_hash);
+        let target_hash = hashes.last().copied()?;
+        let target_block = self.get(&target_hash)?;
+        let pending_pools = pending_pool_data_by_block.get(&target_hash);
+        let mut dirty_pools = HashSet::new();
+
+        for block_hash in hashes {
+            let Some(block) = self.get(&block_hash) else {
+                continue;
+            };
+
+            if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+                if let TrustedPoolLogs::Resolved(pools) = registry.trusted_pool_logs(candidates) {
+                    dirty_pools.extend(pools);
+                }
+            }
+        }
+
+        let pools = dirty_pools
+            .into_iter()
+            .filter(|pool| !target_block.pool_snapshots.contains_key(pool))
+            .filter(|pool| !target_block.pool_data_failures.contains_key(pool))
+            .filter(|pool| !pending_pools.is_some_and(|pools| pools.contains(pool)))
+            .collect::<HashSet<_>>();
+
+        (!pools.is_empty()).then_some((target_hash, pools))
+    }
+
+    /// Finds present canonical blocks whose logs are still unknown and not pending.
+    /// Added so every connected canonical block eventually gets log data without duplicating in-flight requests.
     fn unknown_present_canonical_log_hashes(
         &self,
         tip_hash: BlockHash,
@@ -169,7 +241,8 @@ impl BlocksGraph {
         hashes
     }
 
-    /// Groups unresolved canonical pool candidates into metadata validation requests.
+    /// Groups unknown canonical log candidates into metadata validation requests.
+    /// Added to prevent arbitrary contracts that emit matching topics from being treated as real Uniswap pools.
     fn unknown_present_canonical_pool_metadata_requests(
         &self,
         tip_hash: BlockHash,
@@ -213,7 +286,8 @@ impl BlocksGraph {
         requests
     }
 
-    /// Groups unresolved canonical pool tokens into metadata requests.
+    /// Groups verified-pool tokens whose metadata is not known into token metadata requests.
+    /// Added so later reserve projection can scale exact on-chain amounts by trusted token decimals.
     fn unknown_present_canonical_token_metadata_requests(
         &self,
         tip_hash: BlockHash,
@@ -268,7 +342,8 @@ pub struct FinalizedState {
 }
 
 impl FinalizedState {
-    /// Creates an empty finalized snapshot anchored at the provided block hash.
+    /// Creates a finalized snapshot with only its block hash and no pool snapshots.
+    /// Added as the bootstrap path before finalized pool-state persistence exists.
     pub fn empty_at(block_hash: BlockHash) -> FinalizedState {
         FinalizedState {
             block_hash,
@@ -288,7 +363,8 @@ pub struct State {
 }
 
 impl State {
-    /// Initializes kernel state from the finalized snapshot with no pending work.
+    /// Creates kernel state from a finalized snapshot with no pending requests or recent blocks.
+    /// Added as the pure state-machine entry point for runtimes that will feed events and execute effects.
     pub fn init(finalized_state: FinalizedState) -> State {
         State {
             blocks: BlocksGraph::new(),
@@ -301,7 +377,8 @@ impl State {
         }
     }
 
-    /// Rebuilds volatile chain state while preserving immutable registry facts.
+    /// Rebuilds volatile chain state around a finalized anchor while preserving registries and tick.
+    /// Added for reorg/inconsistency recovery where recent blocks are unsafe but immutable pool/token facts remain valid.
     fn reset(
         finalized_state: FinalizedState,
         tick: Tick,
@@ -361,7 +438,8 @@ pub enum Effect {
 
 struct BlocksGraphCycleError;
 
-/// Schedules log fetches for canonical blocks that are present but still unknown.
+/// Emits log-fetch requests for present canonical blocks whose logs are unknown.
+/// Added so header connectivity automatically drives pool-affecting log discovery.
 fn schedule_unknown_canonical_log_requests(
     state: State,
     mut effects: Vec<Effect>,
@@ -412,7 +490,8 @@ fn schedule_unknown_canonical_log_requests(
     )
 }
 
-/// Schedules metadata validation for canonical log candidates not known by the registry.
+/// Emits pool metadata requests for unvalidated candidate addresses on the canonical path.
+/// Added to turn log emitters into verified/rejected registry entries before using them as pools.
 fn schedule_unknown_canonical_pool_metadata_requests(
     state: State,
     mut effects: Vec<Effect>,
@@ -467,7 +546,8 @@ fn schedule_unknown_canonical_pool_metadata_requests(
     )
 }
 
-/// Schedules token metadata validation for canonical verified pool tokens not known by the registry.
+/// Emits token metadata requests for tokens referenced by verified canonical pools.
+/// Added so reserve projection can use known decimals and avoid guessing token scale.
 fn schedule_unknown_canonical_token_metadata_requests(
     state: State,
     mut effects: Vec<Effect>,
@@ -523,14 +603,68 @@ fn schedule_unknown_canonical_token_metadata_requests(
     )
 }
 
-/// Schedules all currently actionable canonical follow-up requests.
+/// Emits a pool-state request for trusted dirty pools accumulated on the canonical path.
+/// Added so affected pools get fresh snapshots that can later feed reserve projection and optimization.
+fn schedule_unknown_canonical_pool_data_request(
+    state: State,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    let State {
+        blocks,
+        canonical_tip,
+        pending_requests,
+        finalized_state,
+        pool_registry,
+        token_registry,
+        tick,
+    } = state;
+
+    let pending_pool_data_by_block = pending_requests.pending_pool_data_pools_by_block();
+    let request = blocks.unknown_present_canonical_pool_data_request(
+        canonical_tip,
+        finalized_state.block_hash,
+        &pool_registry,
+        &pending_pool_data_by_block,
+    );
+    let mut pending_requests = pending_requests;
+
+    if let Some((at, pools)) = request {
+        let request_payload = GetPoolData { at, pools };
+        let (next_pending_requests, request_id) =
+            pending_requests.with_new_request(request_payload.clone(), tick);
+
+        pending_requests = next_pending_requests;
+        effects.push(Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+            request_id,
+            request_payload,
+        })));
+    }
+
+    (
+        State {
+            blocks,
+            canonical_tip,
+            pending_requests,
+            finalized_state,
+            pool_registry,
+            token_registry,
+            tick,
+        },
+        effects,
+    )
+}
+
+/// Runs every canonical follow-up scheduler in the order needed for dependencies between requests.
+/// Added so all transitions converge through one scheduling path instead of duplicating follow-up logic per event arm.
 fn schedule_unknown_canonical_requests(state: State, effects: Vec<Effect>) -> (State, Vec<Effect>) {
     let (state, effects) = schedule_unknown_canonical_log_requests(state, effects);
     let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(state, effects);
-    schedule_unknown_canonical_token_metadata_requests(state, effects)
+    let (state, effects) = schedule_unknown_canonical_token_metadata_requests(state, effects);
+    schedule_unknown_canonical_pool_data_request(state, effects)
 }
 
-/// Advances the pure client kernel state machine by one event and emits required effects.
+/// Applies one kernel event to state and returns the side effects the runtime must execute.
+/// Added as the pure deterministic boundary between EVM client state transitions and impure RPC/runtime work.
 pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
     match event {
         Event::HeadObserved { hash, parent_hash } => {
@@ -954,7 +1088,8 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
     }
 }
 
-/// Walks from a tip toward finality, returning the first missing block hash if any.
+/// Walks from a tip toward finality and returns the first missing block hash, if any.
+/// Added so disconnected heads can request exactly the next ancestry gap needed for reconstruction.
 fn find_missing_block_hash(
     blocks: &HashMap<BlockHash, BlockNode>,
     tip_hash: BlockHash,
@@ -1031,7 +1166,8 @@ mod tests {
         GetBlockHeader { block_hash: BlockHash },
     }
 
-    /// Generates arbitrary rooted block graphs with observed heads.
+    /// Generates varied rooted block graphs and observed heads.
+    /// These inputs drive ancestry reconstruction properties without hard-coding only linear chains.
     fn generated_chain_strategy() -> impl Strategy<Value = GeneratedChain> {
         (2usize..24)
             .prop_flat_map(|node_count| {
@@ -1063,7 +1199,8 @@ mod tests {
             })
     }
 
-    /// Generates rooted linear chains for reset-and-reobserve properties.
+    /// Generates linear chains with reobserved heads.
+    /// This keeps recovery properties focused on reset behavior rather than branch selection.
     fn generated_linear_chain_strategy() -> impl Strategy<Value = GeneratedChain> {
         (3usize..24)
             .prop_flat_map(|node_count| {
@@ -1080,7 +1217,8 @@ mod tests {
             })
     }
 
-    /// Generates arbitrary kernel events that should preserve safety invariants.
+    /// Generates mixed kernel events with arbitrary ids and hashes.
+    /// The sequence properties use it to shake out safety invariant violations across unexpected event orderings.
     fn generated_event_strategy() -> impl Strategy<Value = GeneratedEvent> {
         prop_oneof![
             (0usize..16, 0usize..16).prop_map(|(hash_index, parent_index)| {
@@ -1102,12 +1240,14 @@ mod tests {
         ]
     }
 
-    /// Generates finite sequences of arbitrary kernel events.
+    /// Builds bounded random event histories.
+    /// This is the shared input for state-machine properties that need many transitions but finite shrinking.
     fn generated_event_sequence_strategy() -> impl Strategy<Value = Vec<GeneratedEvent>> {
         prop::collection::vec(generated_event_strategy(), 1..128)
     }
 
-    /// Generates retry plans for delayed header-response properties.
+    /// Generates retry plans made of failures and expirations.
+    /// Header reconstruction properties use it to prove delayed success still works after retry churn.
     fn generated_retry_plans_strategy() -> impl Strategy<Value = Vec<Vec<GeneratedRetry>>> {
         prop::collection::vec(
             prop::collection::vec(
@@ -1121,7 +1261,8 @@ mod tests {
         )
     }
 
-    /// Generates request payload shapes used by retry and not-found properties.
+    /// Generates request payload cases for retry tests.
+    /// This keeps payload-identity assertions covering both header and log request types.
     fn generated_request_payload_strategy() -> impl Strategy<Value = GeneratedRequestPayload> {
         prop_oneof![
             any::<u8>()
@@ -1131,7 +1272,8 @@ mod tests {
         ]
     }
 
-    /// Checks the global structural invariants expected after every transition.
+    /// Asserts the core shape invariants for kernel state.
+    /// Centralizing these checks makes each transition test catch graph, tip, and pool-data bookkeeping regressions.
     fn assert_state_invariants(state: &State) {
         assert_finalized_block_not_in_recent_blocks(state);
         assert_no_self_parent_blocks(state);
@@ -1140,7 +1282,8 @@ mod tests {
         assert_pool_snapshots_and_failures_do_not_overlap(state);
     }
 
-    /// Ensures unknown canonical logs are always backed by pending log requests.
+    /// Asserts every present canonical block with unknown logs has an active log request.
+    /// This protects the log scheduler from leaving canonical blocks permanently unqueried.
     fn assert_canonical_unknown_logs_are_pending(state: &State) {
         let pending_log_hashes = state.pending_requests.pending_block_log_hashes();
         let mut visited = HashSet::new();
@@ -1167,7 +1310,8 @@ mod tests {
         }
     }
 
-    /// Ensures resolved canonical log candidates are either known or pending validation.
+    /// Asserts resolved canonical log candidates are either known by the registry or pending validation.
+    /// This keeps candidate discovery connected to the trust boundary.
     fn assert_canonical_resolved_candidates_are_known_or_pending(state: &State) {
         let pending_candidates = state.pending_requests.pending_pool_metadata_candidates();
         let mut visited = HashSet::new();
@@ -1197,7 +1341,8 @@ mod tests {
         }
     }
 
-    /// Ensures every present block on the canonical path has resolved log status.
+    /// Asserts every present canonical block has resolved logs after log-draining helpers run.
+    /// Properties use it to distinguish incomplete draining from scheduler bugs.
     fn assert_present_canonical_logs_are_resolved(state: &State) {
         let mut visited = HashSet::new();
         let mut current_hash = state.canonical_tip;
@@ -1221,7 +1366,8 @@ mod tests {
         }
     }
 
-    /// Verifies every emitted request effect is recorded in pending state.
+    /// Checks that every emitted request effect is recorded as pending with the same payload.
+    /// This guards the runtime/kernel contract that effects are executable work, not orphan notifications.
     fn assert_effects_are_well_formed(state: &State, effects: &[Effect]) {
         for effect in effects {
             match effect {
@@ -1263,6 +1409,7 @@ mod tests {
                         .expect("emitted pool data request must be recorded as pending");
 
                     assert_eq!(pending_request.payload.at, request_payload.at);
+                    assert_eq!(pending_request.payload.pools, request_payload.pools);
                 }
                 Effect::Request(AnyIssuedRequest::PoolMetadata(IssuedRequest {
                     request_id,
@@ -1295,7 +1442,8 @@ mod tests {
         }
     }
 
-    /// Ensures a known tip's first missing parent is represented by a pending header request.
+    /// Asserts the first missing ancestor for a tracked tip has a pending header request.
+    /// This keeps disconnected canonical paths from stalling.
     fn assert_missing_parent_is_pending(state: &State, tip_hash: BlockHash) {
         let missing_hash = match find_missing_block_hash(
             &state.blocks.0,
@@ -1317,14 +1465,16 @@ mod tests {
         }
     }
 
-    /// Ensures every known block with a missing ancestor has that ancestor pending.
+    /// Applies the missing-parent assertion to every tracked recent block.
+    /// This broadens ancestry progress checks beyond the canonical tip.
     fn assert_missing_parents_for_known_blocks_are_pending(state: &State) {
         for block_hash in state.blocks.0.keys() {
             assert_missing_parent_is_pending(state, *block_hash);
         }
     }
 
-    /// Ensures finalized state is not duplicated in the recent block graph.
+    /// Asserts finalized block hash is absent from recent block storage.
+    /// This preserves the boundary between immutable finalized state and volatile reorg state.
     fn assert_finalized_block_not_in_recent_blocks(state: &State) {
         assert!(
             !state
@@ -1335,7 +1485,8 @@ mod tests {
         );
     }
 
-    /// Ensures no recent block directly points to itself.
+    /// Asserts no recent block points to itself as parent.
+    /// This catches the smallest ancestry cycle before graph walks depend on the data.
     fn assert_no_self_parent_blocks(state: &State) {
         for (hash, block) in &state.blocks.0 {
             assert_ne!(
@@ -1345,7 +1496,8 @@ mod tests {
         }
     }
 
-    /// Ensures the canonical tip is either finalized or present in recent blocks.
+    /// Asserts canonical tip is either finalized or present in recent blocks.
+    /// This keeps schedulers anchored to inspectable state.
     fn assert_canonical_tip_is_known_or_finalized(state: &State) {
         assert!(
             state.canonical_tip == state.finalized_state.block_hash
@@ -1354,7 +1506,8 @@ mod tests {
         );
     }
 
-    /// Ensures no parent walk through recent blocks cycles.
+    /// Walks every parent chain and asserts it terminates without cycles.
+    /// This protects canonical and scheduler traversals from non-termination.
     fn assert_parent_walks_do_not_cycle(state: &State) {
         for start_hash in state.blocks.0.keys() {
             let mut visited = HashSet::new();
@@ -1367,7 +1520,8 @@ mod tests {
         }
     }
 
-    /// Ensures successful and failed pool snapshots do not coexist for the same block/pool.
+    /// Asserts no pool has both a snapshot and failure marker on the same block.
+    /// This keeps pool-data state interpretable when scheduling retries or projecting reserves.
     fn assert_pool_snapshots_and_failures_do_not_overlap(state: &State) {
         for block in state.blocks.0.values() {
             for pool in block.pool_snapshots.keys() {
@@ -1379,12 +1533,14 @@ mod tests {
         }
     }
 
-    /// Maps compact generated node indexes into deterministic block hashes.
+    /// Maps generated node indexes to deterministic block hashes.
+    /// This gives properties stable, compact hash fixtures without arbitrary hash construction.
     fn hash_for_node(node_index: usize) -> BlockHash {
         BlockHash::with_last_byte((node_index + 1) as u8)
     }
 
-    /// Converts generated events into concrete kernel events.
+    /// Converts generated event cases into real kernel events.
+    /// This separates shrinking-friendly inputs from the concrete transition API.
     fn event_from_generated(generated_event: GeneratedEvent) -> Event {
         match generated_event {
             GeneratedEvent::HeadObserved {
@@ -1415,7 +1571,8 @@ mod tests {
         }
     }
 
-    /// Converts generated request descriptions into concrete expected request payloads.
+    /// Converts generated request payload cases into real expected payloads.
+    /// Retry properties use this to compare payload identity after ids are replaced.
     fn request_payload_from_generated(payload: GeneratedRequestPayload) -> ExpectedRequestPayload {
         match payload {
             GeneratedRequestPayload::GetBlockLogs { block_index } => {
@@ -1431,19 +1588,22 @@ mod tests {
         }
     }
 
-    /// Builds test ticks from raw integer values.
+    /// Builds a test tick from a raw counter.
+    /// This keeps timing scenarios readable while staying behind the test-only Tick constructor.
     fn tick(value: u64) -> Tick {
         Tick::from_raw_for_test(value)
     }
 
-    /// Wraps a header request id in a typed request-failed event.
+    /// Wraps a header request id in a request-failed event.
+    /// This keeps retry tests focused on behavior instead of enum plumbing.
     fn request_failed_for_header(request_id: RequestId<GetBlockHeader>) -> Event {
         Event::RequestFailed {
             request_id: AnyRequestId::BlockHeader(request_id),
         }
     }
 
-    // Verifies finalized-state initialization keeps only the finalized hash.
+    // Exercises the empty finalized-state constructor.
+    // This locks down the bootstrap shape before recent chain tracking or persisted pool snapshots exist.
     #[test]
     fn finalized_state_empty_at_stores_hash_with_empty_pool_snapshots() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -1454,7 +1614,8 @@ mod tests {
         assert!(finalized_state.pool_snapshots.is_empty());
     }
 
-    // Verifies state initialization starts with empty volatile tracking.
+    // Exercises State::init from a finalized anchor.
+    // This confirms initialization itself does not schedule work or create recent blocks.
     #[test]
     fn state_init_from_finalized_state_starts_with_empty_tracking() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -1467,7 +1628,8 @@ mod tests {
         assert_eq!(state.tick.raw_for_test(), Tick::initial().raw_for_test());
     }
 
-    /// Inserts an expected request payload into pending state and returns its typed id.
+    /// Issues an expected request through PendingRequests.
+    /// Retry tests use this to create fixtures through the same path as production scheduling.
     fn issue_expected_request(
         pending_requests: PendingRequests,
         payload: ExpectedRequestPayload,
@@ -1489,7 +1651,8 @@ mod tests {
         }
     }
 
-    /// Checks whether a pending request id still contains the expected request payload.
+    /// Checks whether a pending request still carries the expected payload.
+    /// This catches retries that preserve only the request kind while losing the original target.
     fn pending_payload_matches(
         pending_requests: &PendingRequests,
         request_id: AnyRequestId,
@@ -1512,7 +1675,8 @@ mod tests {
         }
     }
 
-    /// Extracts the raw numeric id from any typed request id.
+    /// Extracts raw ids from typed request wrappers.
+    /// Reset and retry tests use this to compare freshness across request kinds.
     fn any_request_id_raw(request_id: AnyRequestId) -> u64 {
         match request_id {
             AnyRequestId::BlockHeader(request_id) => request_id.raw_for_test(),
@@ -1523,17 +1687,20 @@ mod tests {
         }
     }
 
-    /// Reads a generated node's parent index, defaulting missing indexes to finalized.
+    /// Returns a generated node's parent index with finality as the fallback.
+    /// This makes ancestry helpers total for fuzzed indexes.
     fn parent_index(chain: &GeneratedChain, node_index: usize) -> usize {
         chain.parents.get(node_index).copied().unwrap_or_default()
     }
 
-    /// Finds the generated node index represented by a concrete block hash.
+    /// Finds the generated node index for a concrete block hash.
+    /// Replay properties need this to answer emitted header requests from generated chains.
     fn node_index_for_hash(chain: &GeneratedChain, hash: BlockHash) -> Option<usize> {
         (0..chain.parents.len()).find(|node_index| hash_for_node(*node_index) == hash)
     }
 
-    /// Computes all observed heads and ancestors expected to be reconstructed.
+    /// Computes the parent map that should exist after observing and reconstructing generated heads.
+    /// This is the oracle for chain-replay properties.
     fn expected_observed_ancestor_closure(chain: &GeneratedChain) -> HashMap<BlockHash, BlockHash> {
         let mut expected = HashMap::new();
 
@@ -1550,7 +1717,8 @@ mod tests {
         expected
     }
 
-    /// Applies one event and drains all header/log effects with successful generated responses.
+    /// Applies an event and recursively answers header requests from the generated chain.
+    /// This models a healthy RPC layer so reconstruction properties can focus on kernel state.
     fn apply_event_and_drain_block_headers(
         mut state: State,
         chain: &GeneratedChain,
@@ -1610,7 +1778,8 @@ mod tests {
         state
     }
 
-    /// Applies one event while exercising generated failure and expiration retry plans.
+    /// Applies an event while injecting configured failures or expirations before header success.
+    /// This proves ancestry reconstruction survives retry churn.
     fn apply_event_and_drain_block_headers_with_retries(
         mut state: State,
         chain: &GeneratedChain,
@@ -1689,7 +1858,8 @@ mod tests {
         state
     }
 
-    /// Builds a recent block fixture with unknown logs and empty pool state.
+    /// Builds a minimal recent block with unknown logs.
+    /// Scheduler and invariant tests use it when pool contents are irrelevant.
     fn block_with_parent(parent_hash: BlockHash) -> BlockNode {
         BlockNode {
             parent_hash,
@@ -1699,7 +1869,8 @@ mod tests {
         }
     }
 
-    /// Builds an initialized test state at a finalized hash.
+    /// Builds a clean kernel state anchored at a finalized hash.
+    /// This gives tests empty registries, no pending work, and deterministic tick state.
     fn empty_state_at(finalized_hash: BlockHash) -> State {
         State {
             blocks: BlocksGraph::new(),
@@ -1715,20 +1886,23 @@ mod tests {
         }
     }
 
-    /// Checks that volatile chain state has reset back to a finalized anchor.
+    /// Asserts chain state was reset to the finalized anchor.
+    /// This captures the expected recovery shape after unsafe ancestry observations.
     fn assert_chain_reset_at(state: &State, finalized_hash: BlockHash) {
         assert!(state.blocks.0.is_empty());
         assert_eq!(state.canonical_tip, finalized_hash);
         assert_eq!(state.finalized_state.block_hash, finalized_hash);
     }
 
-    /// Checks the empty state shape expected immediately after initialization.
+    /// Asserts the common empty-state baseline.
+    /// This keeps initialization tests aligned with reset expectations without duplicating fields.
     fn assert_empty_initial_state_at(state: &State, finalized_hash: BlockHash) {
         assert_chain_reset_at(state, finalized_hash);
         assert!(state.pending_requests.is_empty_for_test());
     }
 
-    /// Checks a single block fixture is present with unknown logs.
+    /// Asserts a single inserted block has unknown logs and no pool data.
+    /// This verifies header ingestion before log/data fetches enrich the block.
     fn assert_single_unknown_block(state: &State, hash: BlockHash, parent_hash: BlockHash) {
         let block = state
             .blocks
@@ -1740,7 +1914,8 @@ mod tests {
         assert!(block.pool_snapshots.is_empty());
     }
 
-    /// Checks a single block fixture is present with the expected parent.
+    /// Asserts a tracked block has the expected parent and no pool snapshots.
+    /// This lets ancestry tests ignore log status when it is scenario-specific.
     fn assert_single_block_with_parent(state: &State, hash: BlockHash, parent_hash: BlockHash) {
         let block = state
             .blocks
@@ -1751,7 +1926,8 @@ mod tests {
         assert!(block.pool_snapshots.is_empty());
     }
 
-    /// Checks a block contains exactly the expected resolved pool candidate logs.
+    /// Asserts resolved log candidates were stored on one block.
+    /// This catches decoded-log application bugs without depending on candidate ordering.
     fn assert_resolved_pool_logs(
         state: &State,
         hash: BlockHash,
@@ -1776,7 +1952,8 @@ mod tests {
         }
     }
 
-    /// Checks resolved candidate logs by direct set equality.
+    /// Asserts the resolved candidate set matches exactly.
+    /// This is used when ordering is irrelevant but membership/cardinality must be preserved.
     fn assert_resolved_candidate_logs(
         state: &State,
         hash: BlockHash,
@@ -1798,7 +1975,8 @@ mod tests {
         assert_eq!(logs, expected_logs);
     }
 
-    /// Checks the trusted-pool projection for a block resolves to the expected pools.
+    /// Asserts trusted logs are derived from resolved candidates and registry state.
+    /// This keeps block storage from duplicating trust decisions.
     fn assert_trusted_pool_logs_resolved(
         state: &State,
         hash: BlockHash,
@@ -1813,7 +1991,8 @@ mod tests {
         );
     }
 
-    /// Extracts the only header request effect for a specific block hash.
+    /// Extracts the single expected header request for a block.
+    /// Tests use it to fail on missing or duplicate scheduling.
     fn assert_single_block_header_request_effect(
         effects: &[Effect],
         block_hash: BlockHash,
@@ -1836,7 +2015,8 @@ mod tests {
         request_ids[0]
     }
 
-    /// Extracts the only block-log request effect for a specific block hash.
+    /// Extracts the single expected log request for a block.
+    /// Tests use it to fail on missing or duplicate log scheduling.
     fn assert_single_block_log_request_effect(
         effects: &[Effect],
         block_hash: BlockHash,
@@ -1859,7 +2039,8 @@ mod tests {
         request_ids[0]
     }
 
-    /// Extracts the only pool-data request effect for a specific block and pool set.
+    /// Extracts the single expected pool-data request for a block and pool set.
+    /// This locks scheduler targeting to one snapshot block and exact pools.
     fn assert_single_pool_data_request_effect(
         effects: &[Effect],
         at: BlockHash,
@@ -1884,7 +2065,31 @@ mod tests {
         request_ids[0]
     }
 
-    /// Extracts the only pool-metadata request effect for a specific block and candidate set.
+    /// Collects pool-data request payloads from effects.
+    /// Property tests use it to reason about all emitted snapshot work.
+    fn pool_data_request_payloads_from_effects(
+        effects: &[Effect],
+    ) -> Vec<(BlockHash, HashSet<PoolAddress>)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+                    request_payload: GetPoolData { at, pools },
+                    ..
+                })) => Some((*at, pools.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Asserts no pool-data requests were emitted.
+    /// This documents scenarios where scheduling is blocked, unnecessary, or already covered.
+    fn assert_no_pool_data_request_effect(effects: &[Effect]) {
+        assert!(pool_data_request_payloads_from_effects(effects).is_empty());
+    }
+
+    /// Extracts the single expected pool-metadata request.
+    /// This keeps validation scheduler tests strict about block and candidate batching.
     fn assert_single_pool_metadata_request_effect(
         effects: &[Effect],
         at: BlockHash,
@@ -1911,7 +2116,8 @@ mod tests {
         request_ids[0]
     }
 
-    /// Extracts the only token-metadata request effect for a specific block and token set.
+    /// Extracts the single expected token-metadata request.
+    /// This keeps token scheduler tests strict about block and token batching.
     fn assert_single_token_metadata_request_effect(
         effects: &[Effect],
         at: BlockHash,
@@ -1936,7 +2142,8 @@ mod tests {
         request_ids[0]
     }
 
-    /// Extracts the only request effect matching an expected generic request payload.
+    /// Extracts a single header or log request and checks its payload.
+    /// Retry tests use it when request kind is generated.
     fn assert_single_request_effect(
         effects: &[Effect],
         expected_payload: &ExpectedRequestPayload,
@@ -1968,17 +2175,20 @@ mod tests {
         }
     }
 
-    /// Builds deterministic test pool addresses from a byte.
+    /// Builds a deterministic pool address fixture.
+    /// This keeps unit and property tests compact while avoiding repeated Address construction.
     fn pool_address(last_byte: u8) -> PoolAddress {
         PoolAddress(Address::with_last_byte(last_byte))
     }
 
-    /// Builds deterministic test pool candidate addresses from a byte.
+    /// Builds a deterministic candidate address fixture.
+    /// This preserves the identity relationship between a log emitter and its potential pool.
     fn pool_candidate_address(last_byte: u8) -> PoolCandidateAddress {
         PoolCandidateAddress(Address::with_last_byte(last_byte))
     }
 
-    /// Builds deterministic immutable pool metadata for tests.
+    /// Builds pool metadata fixtures directly.
+    /// This lets registry/kernel tests avoid exercising RPC metadata decoding.
     fn pool_metadata(token0: u8, token1: u8, fee: UniswapV3Fee) -> PoolMetadata {
         PoolMetadata {
             token0: Address::with_last_byte(token0),
@@ -1987,12 +2197,14 @@ mod tests {
         }
     }
 
-    /// Builds deterministic token addresses from a byte.
+    /// Builds a deterministic token address fixture.
+    /// Scheduler tests use it as a stable key for token registry state.
     fn token_address(last_byte: u8) -> TokenAddress {
         TokenAddress(Address::with_last_byte(last_byte))
     }
 
-    /// Builds deterministic token metadata for tests.
+    /// Builds token metadata with supported decimals.
+    /// This lets token-registry tests set known metadata without decoding RPC results.
     fn token_metadata(decimals: u8) -> TokenMetadata {
         TokenMetadata {
             decimals: TokenDecimals::try_from_u256(U256::from(decimals))
@@ -2000,7 +2212,8 @@ mod tests {
         }
     }
 
-    /// Builds deterministic mutable pool state for tests.
+    /// Builds a distinguishable pool state fixture.
+    /// Pool-data tests use it to confirm the right snapshot lands on the right block and pool.
     fn pool_state(last_byte: u8) -> PoolState {
         PoolState {
             sqrt_price_x96: U160::from(u64::from(last_byte) + 1),
@@ -2009,7 +2222,8 @@ mod tests {
         }
     }
 
-    /// Alternates deterministic pool-data successes and failures by byte parity.
+    /// Creates deterministic mixed pool-data results from a byte.
+    /// Properties use it to cover success and failure entries without separate generators.
     fn pool_data_result_for_byte(last_byte: u8) -> PoolDataResult {
         if last_byte % 2 == 0 {
             Ok(pool_state(last_byte))
@@ -2018,7 +2232,8 @@ mod tests {
         }
     }
 
-    /// Checks that a block stores the expected pool snapshot.
+    /// Asserts a pool snapshot equals the expected state on a block.
+    /// This confirms successful pool-data responses mutate the intended target only.
     fn assert_pool_snapshot(
         state: &State,
         block_hash: BlockHash,
@@ -2033,7 +2248,8 @@ mod tests {
         assert_eq!(block.pool_snapshots.get(&pool), Some(expected));
     }
 
-    /// Checks that a block does not store a snapshot for a pool.
+    /// Asserts a block has no snapshot for a pool.
+    /// This catches stale, failed, and unrequested pool-data writes.
     fn assert_no_pool_snapshot(state: &State, block_hash: BlockHash, pool: PoolAddress) {
         let block = state
             .blocks
@@ -2043,7 +2259,8 @@ mod tests {
         assert!(!block.pool_snapshots.contains_key(&pool));
     }
 
-    /// Checks that a block stores the expected pool-data failure.
+    /// Asserts a block records the expected pool-data failure for a pool.
+    /// This protects retry-suppression semantics for deterministic per-pool failures.
     fn assert_pool_failure(
         state: &State,
         block_hash: BlockHash,
@@ -2058,7 +2275,8 @@ mod tests {
         assert_eq!(block.pool_data_failures.get(&pool), Some(expected));
     }
 
-    /// Checks that a block does not store a failure for a pool.
+    /// Asserts a block has no failure marker for a pool.
+    /// This keeps successes and unrequested entries from leaving misleading failure state.
     fn assert_no_pool_failure(state: &State, block_hash: BlockHash, pool: PoolAddress) {
         let block = state
             .blocks
@@ -2068,7 +2286,8 @@ mod tests {
         assert!(!block.pool_data_failures.contains_key(&pool));
     }
 
-    /// Advances the kernel by repeated tick events and accumulates emitted effects.
+    /// Advances the state by a fixed number of ticks and returns emitted effects.
+    /// Retry tests use it to drive TTL scenarios without duplicating loops.
     fn advance_ticks(mut state: State, count: u64) -> (State, Vec<Effect>) {
         let mut effects = Vec::new();
 
@@ -2081,7 +2300,8 @@ mod tests {
         (state, effects)
     }
 
-    /// Responds to all block-log request effects with empty log sets.
+    /// Satisfies emitted log requests with empty results.
+    /// Chain-reconstruction properties use it when only ancestry, not pool contents, matters.
     fn drain_block_log_effects(mut state: State, effects: &[Effect]) -> State {
         for effect in effects {
             let Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest { request_id, .. })) =
@@ -2106,7 +2326,8 @@ mod tests {
         state
     }
 
-    /// Extracts block hashes from effects that are expected to all be header requests.
+    /// Converts effects into the set of requested header hashes, panicking on other effect kinds.
+    /// This is for scenarios expected to emit only header work.
     fn header_hashes_from_effects(effects: &[Effect]) -> HashSet<BlockHash> {
         effects
             .iter()
@@ -2123,7 +2344,8 @@ mod tests {
             .collect()
     }
 
-    /// Extracts all block hashes requested by header effects.
+    /// Collects header request hashes from mixed effects.
+    /// This lets assertions inspect header scheduling without rejecting unrelated follow-up effects.
     fn header_request_hashes_from_effects(effects: &[Effect]) -> HashSet<BlockHash> {
         effects
             .iter()
@@ -2140,7 +2362,8 @@ mod tests {
             .collect()
     }
 
-    /// Extracts all block hashes requested by block-log effects.
+    /// Collects block-log request hashes from mixed effects.
+    /// This lets assertions inspect log scheduling without rejecting unrelated follow-up effects.
     fn block_log_request_hashes_from_effects(effects: &[Effect]) -> HashSet<BlockHash> {
         effects
             .iter()
@@ -2157,7 +2380,8 @@ mod tests {
             .collect()
     }
 
-    /// Checks that emitted header and log requests target exactly the expected hashes.
+    /// Asserts the exact header and log request sets in an effect batch.
+    /// This keeps scheduler-output tests concise while still detecting extra work.
     fn assert_request_hashes(
         effects: &[Effect],
         expected_header_hashes: HashSet<BlockHash>,
@@ -2177,12 +2401,14 @@ mod tests {
         );
     }
 
-    /// Returns pending header request hashes for tests.
+    /// Returns pending header hashes through the test-only API.
+    /// This keeps tests independent of PendingRequests' internal map layout.
     fn pending_header_hashes(state: &State) -> HashSet<BlockHash> {
         state.pending_requests.pending_header_hashes_for_test()
     }
 
     /// Reads the dispatch tick for an active header request.
+    /// Retry tests use it to prove timing is based on the current request id.
     fn active_request_dispatch_tick(
         pending_requests: &PendingRequests,
         request_id: RequestId<GetBlockHeader>,
@@ -2192,7 +2418,8 @@ mod tests {
             .expect("active request must have a dispatch tick")
     }
 
-    /// Ensures request bookkeeping has one dispatch tick per active request.
+    /// Asserts every active request has exactly one dispatch tick.
+    /// This catches bookkeeping leaks when retries replace ids.
     fn assert_active_requests_have_exactly_one_dispatch_tick(state: &State) {
         assert_eq!(
             state.pending_requests.dispatch_ticks_for_test().len(),
@@ -2201,7 +2428,8 @@ mod tests {
         );
     }
 
-    /// Ensures retry expiration cleanup leaves no active request already expired.
+    /// Asserts no active request is already expired at the current tick.
+    /// This proves retry processing refreshes dispatch age for all active work.
     fn assert_no_active_request_is_expired(state: &State) {
         for dispatch_tick in state.pending_requests.dispatch_ticks_for_test() {
             assert!(
@@ -2211,7 +2439,8 @@ mod tests {
         }
     }
 
-    // Verifies the invariant guard rejects finalized-block duplication.
+    // Corrupts state by inserting the finalized hash into recent blocks.
+    // This keeps the invariant checker enforcing the finalized/recent-state boundary.
     #[test]
     #[should_panic(expected = "finalized block must not be present in recent blocks")]
     fn state_invariants_reject_finalized_block_in_recent_blocks() {
@@ -2226,7 +2455,8 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // Verifies the invariant guard rejects direct self-parent blocks.
+    // Corrupts state with a direct self-parent edge.
+    // This ensures invariant checks catch the smallest parent cycle before schedulers traverse it.
     #[test]
     #[should_panic(expected = "block must not reference itself as parent")]
     fn state_invariants_reject_self_parent_block() {
@@ -2243,7 +2473,8 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // Verifies the invariant guard rejects unknown canonical tips.
+    // Points the canonical tip at an absent block.
+    // This keeps invariant checks from accepting scheduler state that cannot be inspected.
     #[test]
     #[should_panic(expected = "canonical tip must be finalized or present in recent blocks")]
     fn state_invariants_reject_unknown_canonical_tip() {
@@ -2255,7 +2486,8 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // Verifies the invariant guard rejects parent-link cycles.
+    // Creates a two-block parent cycle.
+    // This ensures graph invariants reject ancestry that would make walks non-terminating.
     #[test]
     #[should_panic(expected = "parent walk must not cycle")]
     fn state_invariants_reject_parent_cycle() {
@@ -2276,7 +2508,8 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // Verifies self-parent head observations fall back to fetching the header.
+    // Observes a malformed head whose parent is itself.
+    // This preserves the recovery behavior of fetching the header without accepting unsafe graph state.
     #[test]
     fn head_observed_with_self_parent_fetches_header_without_changing_state() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2298,7 +2531,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies conflicting parent observations reset volatile chain state.
+    // Observes a known block with a conflicting parent.
+    // This ensures contradictory ancestry resets volatile chain state instead of merging histories.
     #[test]
     fn head_observed_with_conflicting_parent_resets_to_initial_finalized_state() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2327,7 +2561,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies chain resets preserve immutable pool registry facts.
+    // Forces a reset with verified and rejected pool registry entries present.
+    // This protects immutable pool metadata from being discarded with volatile blocks.
     #[test]
     fn chain_reset_preserves_pool_registry() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2372,7 +2607,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies chain resets preserve immutable token registry facts.
+    // Forces a reset with token registry entries present.
+    // This protects token decimals and terminal token failures because they are independent of recent reorg state.
     #[test]
     fn chain_reset_preserves_token_registry() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2417,7 +2653,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies duplicate matching head observations only schedule missing work.
+    // Reobserves an already tracked head with the same parent.
+    // This keeps block graph updates idempotent while still allowing follow-up scheduling.
     #[test]
     fn head_observed_with_duplicate_matching_block_does_not_change_state() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2445,7 +2682,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies newly introduced cycles reset volatile chain state.
+    // Observes a head that would close an ancestry cycle.
+    // This keeps cycle detection on the reset path instead of retaining corrupt graph state.
     #[test]
     fn head_observed_that_introduces_cycle_resets_to_initial_finalized_state() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2478,7 +2716,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies finalized hashes are never inserted as recent blocks.
+    // Observes the finalized hash as a new head.
+    // This prevents finalized and recent storage from representing the same block.
     #[test]
     fn head_observed_with_finalized_hash_does_not_insert_finalized_block() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2498,7 +2737,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies a connected new head schedules log fetching.
+    // Observes a head directly on finalized.
+    // This ensures connected canonical heads immediately start block-log discovery.
     #[test]
     fn connected_head_observed_requests_logs_for_head() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2518,7 +2758,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies a disconnected new head schedules its logs and missing parent header.
+    // Observes a head with an unknown parent.
+    // This ensures the kernel fetches both head logs and the missing parent header.
     #[test]
     fn disconnected_head_observed_requests_head_logs_and_missing_parent_header() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2543,7 +2784,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies receiving a missing parent schedules logs for that parent.
+    // Delivers the requested parent header for a disconnected head.
+    // This ensures newly connected ancestors enter log discovery.
     #[test]
     fn missing_parent_header_received_requests_logs_for_parent() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2579,7 +2821,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies all present canonical blocks with unknown logs get scheduled.
+    // Starts with a fully present canonical chain whose logs are unknown.
+    // This ensures the scheduler backfills log requests for every present canonical block.
     #[test]
     fn present_canonical_prefix_schedules_logs_for_all_unknown_blocks() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2619,7 +2862,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies duplicate header responses do not duplicate pending log requests.
+    // Delivers the same header response twice.
+    // This prevents late or duplicate responses from multiplying pending log work.
     #[test]
     fn duplicate_header_response_does_not_duplicate_pending_log_requests() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2659,7 +2903,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies pending log requests suppress duplicate scheduling.
+    // Schedules with an existing log request for the same block.
+    // This ensures pending work suppresses duplicate log RPCs.
     #[test]
     fn pending_log_request_suppresses_duplicate_log_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2690,7 +2935,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies resolved log status suppresses duplicate scheduling.
+    // Schedules after a block's logs are already resolved.
+    // This ensures completed log fetches are not repeated without new block data.
     #[test]
     fn resolved_log_status_suppresses_duplicate_log_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2719,7 +2965,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies matching log responses mark logs and clear pending state.
+    // Delivers logs for an active block-log request.
+    // This ties successful log application to request retirement and candidate validation scheduling.
     #[test]
     fn block_logs_received_for_matching_request_marks_logs_and_removes_pending_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2753,7 +3000,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies empty log responses still resolve the block log status.
+    // Delivers an empty log response for an active request.
+    // This ensures no-log blocks become resolved instead of remaining unknown.
     #[test]
     fn block_logs_received_with_empty_logs_marks_block_resolved() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2785,7 +3033,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies unsolicited log responses do not mutate block state.
+    // Delivers logs with no active matching request.
+    // This protects state from stale or unsolicited RPC responses.
     #[test]
     fn block_logs_received_for_unknown_request_is_noop() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2813,7 +3062,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies stale log responses for missing blocks consume only the pending request.
+    // Delivers a log response after the target block was removed by reset.
+    // This prevents late responses from recreating volatile block state.
     #[test]
     fn block_logs_received_for_missing_block_consumes_request_without_inserting_block() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2837,7 +3087,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies log candidates are stored and scheduled for metadata validation.
+    // Resolves logs containing an unknown candidate.
+    // This connects raw log discovery to pool metadata validation instead of trusting emitters immediately.
     #[test]
     fn block_logs_received_stores_candidates_and_requests_metadata_for_unknown_candidates() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2873,7 +3124,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies already verified pool candidates skip metadata requests.
+    // Resolves logs for a candidate already verified in the pool registry.
+    // This avoids redundant metadata RPC and lets trusted pools proceed directly.
     #[test]
     fn known_verified_candidates_do_not_request_metadata() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2913,7 +3165,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies already rejected pool candidates skip metadata requests.
+    // Resolves logs for a candidate already rejected by the pool registry.
+    // This prevents retrying validation for deterministic non-pool emitters.
     #[test]
     fn known_rejected_candidates_do_not_request_metadata() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -2949,7 +3202,133 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies one pending metadata request covers duplicate unknown candidates.
+    // Resolves logs for a trusted pool with known token metadata.
+    // This ensures affected pools start pool-data fetching immediately.
+    #[test]
+    fn block_logs_received_for_verified_pool_requests_pool_data_at_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: HashSet::from([candidate]),
+            },
+        );
+
+        let pool_data_request_id =
+            assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([pool]));
+        assert!(next_state.pending_requests.contains(&pool_data_request_id));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Resolves logs for an unvalidated candidate.
+    // This prevents candidate emitters from driving pool-data RPC before registry trust is established.
+    #[test]
+    fn block_logs_received_does_not_request_pool_data_for_pending_candidate() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: HashSet::from([candidate]),
+            },
+        );
+
+        assert_single_pool_metadata_request_effect(
+            &effects,
+            block_hash,
+            &HashSet::from([candidate]),
+        );
+        assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Resolves logs containing a rejected candidate.
+    // This ensures rejected emitters cannot leak into pool-data scheduling.
+    #[test]
+    fn block_logs_received_excludes_rejected_candidates_from_pool_data_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let verified = pool_candidate_address(3);
+        let rejected = pool_candidate_address(4);
+        let verified_pool = PoolAddress(verified.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000))),
+            (rejected, Err(PoolMetadataFailure::FactoryReturnedZero)),
+        ]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: HashSet::from([verified, rejected]),
+            },
+        );
+
+        assert_single_pool_data_request_effect(
+            &effects,
+            block_hash,
+            &HashSet::from([verified_pool]),
+        );
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Resolves the same unknown candidate on multiple blocks.
+    // This suppresses duplicate validation RPC while one metadata request is pending.
     #[test]
     fn duplicate_unknown_candidates_across_blocks_do_not_create_duplicate_pending_metadata_requests()
      {
@@ -3002,7 +3381,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies partial metadata responses reschedule omitted requested candidates.
+    // Returns metadata for only part of a requested candidate batch.
+    // This keeps omitted entries pending by rescheduling them instead of marking them done.
     #[test]
     fn pool_metadata_received_reschedules_missing_requested_candidates() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3061,7 +3441,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies metadata responses update the registry and trusted-log projection.
+    // Applies successful pool metadata for a resolved candidate.
+    // This proves trusted-log projections update from registry state without rewriting block logs.
     #[test]
     fn pool_metadata_received_updates_registry_and_derived_trusted_logs() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3120,7 +3501,59 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies unrequested metadata response entries are ignored.
+    // Applies successful metadata for a candidate while token decimals are already available.
+    // This ensures newly trusted affected pools flow into pool-data scheduling.
+    #[test]
+    fn pool_metadata_received_requests_pool_data_for_verified_candidate() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = block_hash;
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetPoolMetadata {
+                at: block_hash,
+                candidates: HashSet::from([candidate]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            state,
+            Event::PoolMetadataReceived {
+                request_id,
+                metadata: HashMap::from([(
+                    candidate,
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+                )]),
+            },
+        );
+
+        let pool_data_request_id =
+            assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([pool]));
+        assert!(next_state.pending_requests.contains(&pool_data_request_id));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Returns pool metadata for an address outside the request payload.
+    // This protects the registry from stale or overbroad RPC responses.
     #[test]
     fn pool_metadata_received_ignores_unrequested_result_entries() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3160,7 +3593,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies token metadata responses update only requested token entries.
+    // Returns token metadata with both requested and unrequested entries.
+    // This ensures only requested token facts enter the registry.
     #[test]
     fn token_metadata_received_updates_registry_and_ignores_unrequested_entries() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3202,12 +3636,14 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies verified and unsupported tokens suppress token metadata requests.
+    // Schedules after verified pool tokens are already known or terminal.
+    // This avoids repeated token metadata RPC before pool-data fetching.
     #[test]
     fn known_tokens_do_not_request_token_metadata() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0);
         let logs = HashSet::from([candidate]);
         let mut state = empty_state_at(finalized_hash);
 
@@ -3237,11 +3673,225 @@ mod tests {
         let (next_state, effects) =
             transition(state, Event::BlockLogsReceived { request_id, logs });
 
+        let pool_data_request_id =
+            assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([pool]));
+        assert!(next_state.pending_requests.contains(&pool_data_request_id));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Schedules pool data after multiple canonical blocks affected different trusted pools.
+    // This batches accumulated dirty pools into a current-tip snapshot.
+    #[test]
+    fn pool_data_scheduler_accumulates_dirty_pools_at_canonical_tip() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let first_candidate = pool_candidate_address(4);
+        let second_candidate = pool_candidate_address(5);
+        let first_pool = PoolAddress(first_candidate.0);
+        let second_pool = PoolAddress(second_candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (
+                first_candidate,
+                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+            ),
+            (
+                second_candidate,
+                Ok(pool_metadata(3, 4, UniswapV3Fee::Fee500)),
+            ),
+        ]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+            (token_address(3), Ok(token_metadata(6))),
+            (token_address(4), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = head_hash;
+        state.blocks.0.insert(
+            parent_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([first_candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        state.blocks.0.insert(
+            head_hash,
+            BlockNode {
+                parent_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([second_candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+
+        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+
+        let pool_data_request_id = assert_single_pool_data_request_effect(
+            &effects,
+            head_hash,
+            &HashSet::from([first_pool, second_pool]),
+        );
+        assert!(next_state.pending_requests.contains(&pool_data_request_id));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Schedules with one pool already pending at the target block.
+    // This prevents duplicate same-block pool-data requests while allowing uncovered pools to proceed.
+    #[test]
+    fn pending_pool_data_request_suppresses_duplicate_pool_at_same_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let first_candidate = pool_candidate_address(3);
+        let second_candidate = pool_candidate_address(4);
+        let first_pool = PoolAddress(first_candidate.0);
+        let second_pool = PoolAddress(second_candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (
+                first_candidate,
+                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+            ),
+            (
+                second_candidate,
+                Ok(pool_metadata(3, 4, UniswapV3Fee::Fee500)),
+            ),
+        ]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+            (token_address(3), Ok(token_metadata(6))),
+            (token_address(4), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = block_hash;
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([
+                    first_candidate,
+                    second_candidate,
+                ])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        let (pending_requests, _) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: block_hash,
+                pools: HashSet::from([first_pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+
+        assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([second_pool]));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Adds a newer canonical dirty block while an older snapshot request is pending.
+    // This ensures fresh canonical changes can still schedule current-tip data.
+    #[test]
+    fn newer_dirty_block_schedules_fresh_pool_data_request_despite_older_pending_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = PoolAddress(candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = head_hash;
+        state.blocks.0.insert(
+            parent_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        state.blocks.0.insert(
+            head_hash,
+            BlockNode {
+                parent_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        let (pending_requests, _) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: parent_hash,
+                pools: HashSet::from([pool]),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+
+        assert_single_pool_data_request_effect(&effects, head_hash, &HashSet::from([pool]));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Schedules after a deterministic pool-data failure is recorded at the target block.
+    // This prevents automatic retry loops until a new dirty block appears.
+    #[test]
+    fn pool_data_scheduler_does_not_retry_pool_failure_at_same_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = block_hash;
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::from([(
+                    pool,
+                    PoolDataFailure::CallFailed(PoolDataCall::Slot0),
+                )]),
+            },
+        );
+
+        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+
         assert!(effects.is_empty());
         assert_state_invariants(&next_state);
     }
 
-    // Verifies duplicate tokens across verified pools are requested once.
+    // Schedules token metadata for multiple verified pools sharing token needs.
+    // This batches missing token decimals across pools into one request.
     #[test]
     fn duplicate_tokens_across_verified_pools_share_one_token_metadata_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3283,7 +3933,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies rejected candidates are excluded from trusted-log projection.
+    // Projects trusted logs from mixed verified and rejected candidates.
+    // This proves derived trusted logs expose only registry-verified pools.
     #[test]
     fn rejected_candidates_never_appear_in_derived_trusted_pool_logs() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3320,7 +3971,8 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // Verifies unknown block logs derive an unknown trusted-log status.
+    // Projects trusted logs for unknown and resolved-empty blocks.
+    // This preserves the distinction between unresolved logs and resolved logs with no trusted pools.
     #[test]
     fn trusted_pool_logs_for_unknown_block_logs_is_unknown() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3342,7 +3994,8 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // Verifies matching pool-data responses store snapshots and clear pending state.
+    // Delivers successful pool-data results for an active request.
+    // This ensures snapshots are stored and the matching pending request is retired.
     #[test]
     fn pool_data_received_stores_snapshots_and_removes_pending_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3388,7 +4041,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies requested pool snapshots are not limited to pools logged in that block.
+    // Delivers pool data for pools accumulated over multiple affected blocks.
+    // This ensures all requested results apply to the target snapshot block.
     #[test]
     fn pool_data_received_applies_requested_snapshots_not_present_in_block_logs() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3432,7 +4086,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies unrequested pool-data response entries are ignored.
+    // Delivers pool-data results containing unrequested entries.
+    // This protects block snapshots from stale or overbroad response data.
     #[test]
     fn pool_data_received_ignores_unrequested_result_entries() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3475,7 +4130,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies requested pool-data failures are recorded without immediate retry effects.
+    // Delivers a requested per-pool failure.
+    // This records deterministic failures while avoiding immediate retry loops.
     #[test]
     fn pool_data_received_stores_requested_failures_without_retry_effects() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3513,7 +4169,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies a later successful pool-data result replaces a previous failure.
+    // Records a failure on one block and then observes a newer dirty block.
+    // This allows later current-tip requests to recover from earlier failures.
     #[test]
     fn pool_data_received_success_replaces_previous_failure() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3557,7 +4214,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies a later pool-data failure does not overwrite an existing snapshot.
+    // Delivers a later failure for a pool that already has a snapshot.
+    // This keeps the last successful snapshot instead of replacing it with failure state.
     #[test]
     fn pool_data_received_failure_does_not_overwrite_existing_success() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3604,7 +4262,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies unsolicited pool-data responses do not mutate block state.
+    // Delivers pool-data results without an active request.
+    // This protects snapshots from unsolicited or stale responses.
     #[test]
     fn pool_data_received_for_unknown_request_is_noop() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3633,7 +4292,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies stale pool-data responses for missing blocks consume only the request.
+    // Delivers pool-data after its target block was reset away.
+    // This prevents late responses from recreating removed block snapshots.
     #[test]
     fn pool_data_received_for_missing_block_consumes_request_without_inserting_block() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3663,7 +4323,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies pool-data request failures retry the original request payload.
+    // Fails an active pool-data request at the transport level.
+    // This keeps the same block and pool scope retryable with a fresh id.
     #[test]
     fn pool_data_request_failure_retries_original_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3699,7 +4360,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies pool-metadata request failures retry the original request payload.
+    // Fails an active pool-metadata request at the transport level.
+    // This preserves candidate validation scope across retry replacement.
     #[test]
     fn pool_metadata_request_failure_retries_original_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3736,7 +4398,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies token-metadata request failures retry the original request payload.
+    // Fails an active token-metadata request at the transport level.
+    // This preserves token metadata scope across retry replacement.
     #[test]
     fn token_metadata_request_failure_retries_original_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3773,7 +4436,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies expired pool-metadata requests retry the original request payload.
+    // Expires an active pool-metadata request.
+    // This refreshes validation work without dropping candidates.
     #[test]
     fn pool_metadata_request_expiration_retries_original_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3806,7 +4470,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies expired token-metadata requests retry the original request payload.
+    // Expires an active token-metadata request.
+    // This refreshes token lookup work without dropping tokens.
     #[test]
     fn token_metadata_request_expiration_retries_original_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3839,7 +4504,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies duplicate failure for an old pool-metadata request id is ignored.
+    // Sends a failure for an old pool-metadata id after retry replacement.
+    // This prevents stale failures from creating duplicate validation retries.
     #[test]
     fn duplicate_pool_metadata_request_failure_for_old_id_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3883,7 +4549,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies stale log responses after reset do not resurrect removed blocks.
+    // Fails a log request after reset removed its block.
+    // This keeps late request handling from mutating reset chain state.
     #[test]
     fn stale_block_logs_response_after_reset_does_not_resurrect_removed_block() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3926,7 +4593,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies a matching header response clears its pending request.
+    // Delivers a matching header response for an active request.
+    // This ensures success retires the header request that produced it.
     #[test]
     fn block_header_received_for_matching_request_removes_pending_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3964,7 +4632,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies a matching header-not-found resets chain state and removes that request.
+    // Reports not-found for an active header request.
+    // This treats missing canonical ancestry as a reset-worthy inconsistency.
     #[test]
     fn block_header_not_found_for_matching_request_resets_chain() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4021,7 +4690,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies an unknown header-not-found response is ignored.
+    // Reports not-found for an unknown request id.
+    // This protects state from unsolicited failure notifications.
     #[test]
     fn block_header_not_found_for_unknown_request_is_noop() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4064,7 +4734,8 @@ mod tests {
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
 
-    // Verifies late header-not-found after a successful response is ignored.
+    // Reports not-found after the request already completed successfully.
+    // This avoids resetting chain state from a stale terminal response.
     #[test]
     fn late_block_header_not_found_after_success_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4106,7 +4777,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies late header-not-found for a failed request is ignored.
+    // Sends a second failure for a request already replaced by retry.
+    // This avoids duplicate failure handling for obsolete ids.
     #[test]
     fn late_block_header_not_found_for_failed_request_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4144,7 +4816,8 @@ mod tests {
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
 
-    // Verifies late header-not-found for an expired request is ignored.
+    // Reports not-found for an expired request after retry created a newer id.
+    // This prevents stale expiration-era responses from affecting active work.
     #[test]
     fn late_block_header_not_found_for_expired_request_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4182,7 +4855,8 @@ mod tests {
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
 
-    // Verifies header-not-found for the current retry resets chain state.
+    // Reports not-found for the active retry request.
+    // This ensures the canonical reset signal still applies after retry replacement.
     #[test]
     fn block_header_not_found_for_current_retry_resets_chain() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4216,7 +4890,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies header-not-found requests are not retried at their original expiration.
+    // Reports not-found and then ticks past the old dispatch time.
+    // This ensures consumed requests cannot retry from stale TTL bookkeeping.
     #[test]
     fn block_header_not_found_request_is_not_retried_at_original_expiration() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4247,7 +4922,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies mismatched header responses preserve the missing canonical parent request.
+    // Returns a different header than the one requested.
+    // This keeps the original ancestry gap pending because the needed header was not supplied.
     #[test]
     fn mismatched_header_response_does_not_lose_missing_canonical_parent_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4289,7 +4965,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies conflicting mismatched header responses reset and retry the original request.
+    // Returns an unexpected header that makes chain state unsafe.
+    // This combines reset recovery with preserving the still-needed header request.
     #[test]
     fn conflicting_mismatched_header_response_resets_chain_and_retries_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4335,7 +5012,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies reset does not reuse request ids while old effects may still arrive.
+    // Processes late effects after a reset and fresh request issuance.
+    // This prevents stale responses from colliding with new request ids.
     #[test]
     fn request_ids_are_not_reused_after_reset_while_old_effects_may_be_in_flight() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4383,7 +5061,8 @@ mod tests {
         );
     }
 
-    // Verifies ticks before TTL do not retry active requests.
+    // Advances to just before request TTL.
+    // This locks the lower bound so requests are not retried early.
     #[test]
     fn tick_before_ttl_does_not_retry_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4410,7 +5089,8 @@ mod tests {
         assert_active_requests_have_exactly_one_dispatch_tick(&next_state);
     }
 
-    // Verifies a request is retried exactly once when it reaches TTL.
+    // Advances exactly to the request TTL boundary.
+    // This locks the first retry point and ensures it emits one replacement effect.
     #[test]
     fn tick_at_ttl_retries_request_exactly_once() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4442,7 +5122,8 @@ mod tests {
         assert_no_active_request_is_expired(&next_state);
     }
 
-    // Verifies expiration arithmetic works across tick wraparound.
+    // Starts near tick overflow and advances past TTL.
+    // This ensures wrapping tick arithmetic still expires requests correctly.
     #[test]
     fn expiration_works_across_tick_wraparound() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4478,7 +5159,8 @@ mod tests {
         assert_no_active_request_is_expired(&next_state);
     }
 
-    // Verifies a retry uses a fresh TTL window.
+    // Retries an expired request and then ticks again.
+    // This ensures the replacement dispatch tick prevents immediate re-expiration.
     #[test]
     fn retry_does_not_expire_again_until_another_ttl() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4515,7 +5197,8 @@ mod tests {
         assert_no_active_request_is_expired(&next_state);
     }
 
-    // Verifies requests dispatched at different ticks expire independently.
+    // Creates requests dispatched at different ticks.
+    // This ensures retry scheduling is based on each request's own age.
     #[test]
     fn requests_dispatched_at_different_ticks_expire_separately() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4566,7 +5249,8 @@ mod tests {
         assert_no_active_request_is_expired(&next_state);
     }
 
-    // Verifies multiple requests dispatched together each expire once.
+    // Expires multiple requests dispatched on the same tick.
+    // This ensures each expired request is replaced exactly once.
     #[test]
     fn multiple_requests_dispatched_together_all_expire_once() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4602,7 +5286,8 @@ mod tests {
         assert_no_active_request_is_expired(&next_state);
     }
 
-    // Verifies a tick with no expired requests only advances time.
+    // Ticks with no active requests.
+    // This ensures time advancement does not emit spurious effects.
     #[test]
     fn empty_tick_only_advances_tick() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4626,7 +5311,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies an explicit request failure retries a known request with a fresh id.
+    // Fails an active request through the generic failure event.
+    // This ensures transport errors preserve payload scope while replacing request identity.
     #[test]
     fn request_failed_retries_known_request_with_fresh_id() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4659,7 +5345,8 @@ mod tests {
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
 
-    // Verifies explicit failure for an unknown request id is ignored.
+    // Sends a failure for an unknown request id.
+    // This protects state and pending work from stale or unsolicited notifications.
     #[test]
     fn request_failed_for_unknown_id_is_noop() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4694,7 +5381,8 @@ mod tests {
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
 
-    // Verifies duplicate failure for an old request id is ignored.
+    // Sends a failure for an old id after retry already created a replacement.
+    // This prevents duplicate active requests for the same original work.
     #[test]
     fn duplicate_request_failed_for_old_id_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4729,7 +5417,8 @@ mod tests {
         assert_missing_parents_for_known_blocks_are_pending(&next_state);
     }
 
-    // Verifies repeated retry failures do not grow active pending request count.
+    // Repeatedly fails the active retry request.
+    // This keeps retry replacement one-for-one under persistent transport errors.
     #[test]
     fn failed_retry_can_be_retried_again_without_growing_pending_requests() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4766,7 +5455,8 @@ mod tests {
         }
     }
 
-    // Verifies failures for preserved requests still retry after chain reset.
+    // Resets chain state while a request is in flight, then fails that old id.
+    // This preserves retry handling for request ids still tracked across reset.
     #[test]
     fn request_failed_after_chain_reset_retries_preserved_request() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4806,7 +5496,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies failure after successful completion of the same id is ignored.
+    // Completes a request successfully and then receives a late failure for it.
+    // This avoids retrying work already removed from pending state.
     #[test]
     fn successful_response_followed_by_failure_for_old_id_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4848,7 +5539,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies late success for a failed original request is accepted.
+    // Accepts a late successful response after a retry was already issued.
+    // This uses useful data while keeping the newer request pending for safety.
     #[test]
     fn late_success_for_failed_request_is_accepted_while_retry_remains_pending() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4893,7 +5585,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies duplicate failure after successful retry is ignored.
+    // Fails the original request after a retry response already succeeded.
+    // This prevents obsolete failures from mutating state or issuing more work.
     #[test]
     fn successful_retry_followed_by_duplicate_failure_for_original_id_is_ignored() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4939,7 +5632,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies completed requests are not retried at their original expiration.
+    // Completes a request successfully.
+    // This ensures TTL bookkeeping is removed with the pending request.
     #[test]
     fn completed_request_is_not_retried_at_original_expiration() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -4983,7 +5677,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies failed requests are not retried at their original expiration.
+    // Fails an active request and creates a retry.
+    // This ensures the old request's dispatch tick is removed during replacement.
     #[test]
     fn failed_request_is_not_retried_at_original_expiration() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -5023,7 +5718,8 @@ mod tests {
         assert_no_active_request_is_expired(&next_state);
     }
 
-    // Verifies late success after expiration is accepted while retry remains pending.
+    // Accepts a late header response for an old id after retry replacement.
+    // This keeps useful chain data without discarding the active retry request.
     #[test]
     fn late_success_after_expiration_is_accepted_while_retry_remains_pending() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -5067,7 +5763,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Verifies chain reset preserves pending request expiration age.
+    // Resets chain state while requests remain pending.
+    // This keeps in-flight request TTL accounting stable across resets.
     #[test]
     fn chain_reset_preserves_request_expiration_age() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -5110,7 +5807,8 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    /// Fulfills emitted pool-metadata effects with deterministic validation outcomes.
+    /// Applies emitted pool-metadata effects with deterministic validation outcomes.
+    /// Properties use this to close the validation loop without depending on RPC decoding.
     fn apply_pool_metadata_effects_for_property(mut state: State, effects: Vec<Effect>) -> State {
         for effect in effects {
             if let Effect::Request(AnyIssuedRequest::PoolMetadata(IssuedRequest {
@@ -5147,7 +5845,8 @@ mod tests {
         state
     }
 
-    /// Fulfills emitted token-metadata effects with deterministic successful decimals.
+    /// Applies emitted token-metadata effects with deterministic successful decimals.
+    /// Properties use this to make verified pools schedulable for pool-data without external calls.
     fn apply_token_metadata_effects_for_property(mut state: State, effects: Vec<Effect>) -> State {
         for effect in effects {
             if let Effect::Request(AnyIssuedRequest::TokenMetadata(IssuedRequest {
@@ -5177,9 +5876,11 @@ mod tests {
         state
     }
 
-    // Property tests below use descriptive function names as their scenario annotations.
+    // Property tests below document cross-event invariants where example tests would miss
+    // shrinking-friendly edge cases.
     proptest! {
-        // Verifies wrapping tick arithmetic matches elapsed-time expiration.
+        // Generates dispatch ticks and elapsed durations across wrapping boundaries.
+        // This keeps Tick expiration tied to elapsed time instead of raw numeric ordering.
         #[test]
         fn tick_expiration_matches_wrapping_elapsed_time(
             dispatch_tick in any::<u64>(),
@@ -5194,7 +5895,8 @@ mod tests {
             );
         }
 
-        // Verifies each expired request is replaced once on tick.
+        // Builds pending requests with arbitrary ages before a tick.
+        // This ensures each expired request is replaced once and unexpired requests stay pending.
         #[test]
         fn tick_replaces_each_expired_request_once(
             tick_before in any::<u64>(),
@@ -5246,7 +5948,8 @@ mod tests {
             assert_no_active_request_is_expired(&next_state);
         }
 
-        // Verifies duplicate head observations do not duplicate pending log work.
+        // Generates linear canonical prefixes and reobserves their tip.
+        // This catches duplicate log scheduling across variable chain lengths.
         #[test]
         fn duplicate_head_observation_does_not_duplicate_pending_log_requests(
             chain_len in 1usize..16,
@@ -5305,7 +6008,8 @@ mod tests {
             assert_state_invariants(&next_state);
         }
 
-        // Verifies drained canonical paths never retain unknown log status.
+        // Replays generated head observations while draining header and log effects.
+        // This ensures no present canonical block is left with unknown logs after emitted work is handled.
         #[test]
         fn drained_present_canonical_path_never_leaves_logs_unknown(
             chain in generated_chain_strategy(),
@@ -5328,7 +6032,8 @@ mod tests {
             }
         }
 
-        // Verifies canonical resolved candidates are always known or pending validation.
+        // Generates per-block candidate sets and feeds them through log and metadata handling.
+        // This keeps resolved canonical candidates either known or pending validation.
         #[test]
         fn canonical_resolved_pool_candidates_are_known_or_pending(
             block_candidate_bytes in proptest::collection::vec(
@@ -5385,7 +6090,8 @@ mod tests {
             }
         }
 
-        // Verifies tokens from verified canonical pools are always known or pending metadata.
+        // Generates verified-pool candidates with deterministic metadata results.
+        // This ensures token scheduling keeps verified canonical pool tokens known or pending.
         #[test]
         fn canonical_verified_pool_tokens_are_known_or_pending(
             block_candidate_bytes in proptest::collection::vec(
@@ -5464,7 +6170,123 @@ mod tests {
             }
         }
 
-        // Verifies trusted log projections never expose unverified pool candidates.
+        // Generates registry, block, snapshot, failure, and pending-pool combinations.
+        // This ensures pool-data scheduling asks only for verified pools still uncovered at the target block.
+        #[test]
+        fn scheduled_pool_data_requests_include_only_verified_uncovered_pools(
+            verified_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
+            rejected_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
+            logged_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
+            snapshot_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
+            failure_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
+            pending_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let block_hash = hash_for_node(1);
+            let mut state = empty_state_at(finalized_hash);
+            let mut pool_metadata_results = HashMap::new();
+            let mut token_metadata_results = HashMap::new();
+
+            for byte in &verified_bytes {
+                let candidate = pool_candidate_address(*byte);
+                pool_metadata_results.insert(
+                    candidate,
+                    Ok(pool_metadata(*byte, byte.wrapping_add(64), UniswapV3Fee::Fee3000)),
+                );
+                token_metadata_results.insert(token_address(*byte), Ok(token_metadata(18)));
+                token_metadata_results.insert(token_address(byte.wrapping_add(64)), Ok(token_metadata(18)));
+            }
+
+            for byte in rejected_bytes.iter().filter(|byte| !verified_bytes.contains(byte)) {
+                pool_metadata_results.insert(
+                    pool_candidate_address(*byte),
+                    Err(PoolMetadataFailure::FactoryReturnedZero),
+                );
+            }
+
+            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+            state.token_registry = state.token_registry.with_metadata_results(token_metadata_results);
+            state.canonical_tip = block_hash;
+            state.blocks.0.insert(
+                block_hash,
+                BlockNode {
+                    parent_hash: finalized_hash,
+                    pool_logs: PoolLogsStatus::Resolved(
+                        logged_bytes
+                            .iter()
+                            .copied()
+                            .map(pool_candidate_address)
+                            .collect(),
+                    ),
+                    pool_snapshots: snapshot_bytes
+                        .iter()
+                        .copied()
+                        .map(|byte| (pool_address(byte), pool_state(byte)))
+                        .collect(),
+                    pool_data_failures: failure_bytes
+                        .iter()
+                        .filter(|byte| !snapshot_bytes.contains(byte))
+                        .copied()
+                        .map(|byte| {
+                            (
+                                pool_address(byte),
+                                PoolDataFailure::CallFailed(PoolDataCall::Slot0),
+                            )
+                        })
+                        .collect(),
+                },
+            );
+
+            let pending_pools = pending_bytes
+                .iter()
+                .copied()
+                .map(pool_address)
+                .collect::<HashSet<_>>();
+            if !pending_pools.is_empty() {
+                let (pending_requests, _) = state.pending_requests.with_new_request(
+                    GetPoolData {
+                        at: block_hash,
+                        pools: pending_pools.clone(),
+                    },
+                    state.tick,
+                );
+                state.pending_requests = pending_requests;
+            }
+
+            let has_unknown_logged_candidate = logged_bytes
+                .iter()
+                .copied()
+                .map(pool_candidate_address)
+                .any(|candidate| !state.pool_registry.is_known(candidate));
+            let expected_pools = if has_unknown_logged_candidate {
+                HashSet::new()
+            } else {
+                logged_bytes
+                    .iter()
+                    .filter(|byte| verified_bytes.contains(byte))
+                    .filter(|byte| !snapshot_bytes.contains(byte))
+                    .filter(|byte| !failure_bytes.contains(byte))
+                    .map(|byte| pool_address(*byte))
+                    .filter(|pool| !pending_pools.contains(pool))
+                    .collect::<HashSet<_>>()
+            };
+
+            let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+            assert_effects_are_well_formed(&next_state, &effects);
+            let pool_data_payloads = pool_data_request_payloads_from_effects(&effects);
+
+            if expected_pools.is_empty() {
+                prop_assert!(pool_data_payloads.is_empty());
+            } else {
+                prop_assert_eq!(pool_data_payloads, vec![(block_hash, expected_pools.clone())]);
+                for pool in expected_pools {
+                    prop_assert!(next_state.pool_registry.verified_metadata(pool).is_some());
+                }
+            }
+        }
+
+        // Generates candidate logs with mixed registry outcomes.
+        // This ensures trusted-log projection never exposes unverified candidates as pools.
         #[test]
         fn derived_resolved_trusted_pool_logs_never_include_unverified_pools(
             block_candidate_bytes in proptest::collection::vec(
@@ -5526,7 +6348,8 @@ mod tests {
             }
         }
 
-        // Verifies transition reconstructs observed valid chain ancestry.
+        // Replays generated valid heads and immediately drains header/log work.
+        // This proves the kernel reconstructs the observed ancestry closure with resolved logs.
         #[test]
         fn transition_reconstructs_observed_valid_chain(chain in generated_chain_strategy()) {
             let finalized_hash = hash_for_node(0);
@@ -5568,7 +6391,8 @@ mod tests {
             prop_assert!(!state.blocks.0.contains_key(&finalized_hash));
         }
 
-        // Verifies delayed header responses still reconstruct valid chain ancestry.
+        // Replays generated heads while delaying emitted header/log responses.
+        // This proves reconstruction does not depend on immediate RPC completion order.
         #[test]
         fn transition_reconstructs_valid_chain_with_delayed_header_responses(
             chain in generated_chain_strategy(),
@@ -5644,7 +6468,8 @@ mod tests {
             assert_state_invariants(&state);
         }
 
-        // Verifies finite retry plans still reconstruct valid chain ancestry.
+        // Replays generated heads with bounded failure and expiration plans before header success.
+        // This proves retry churn does not prevent eventual ancestry reconstruction.
         #[test]
         fn transition_reconstructs_valid_chain_after_arbitrary_finite_retries(
             chain in generated_chain_strategy(),
@@ -5689,7 +6514,8 @@ mod tests {
             assert_state_invariants(&state);
         }
 
-        // Verifies actionable not-found responses reset only matching request state.
+        // Generates unrelated pending requests around one missing-header request.
+        // This ensures actionable not-found resets chain state while preserving unrelated pending work.
         #[test]
         fn actionable_block_header_not_found_resets_and_removes_only_matching_request(
             tick_value in any::<u64>(),
@@ -5761,7 +6587,8 @@ mod tests {
             assert_state_invariants(&next_state);
         }
 
-        // Verifies unknown not-found responses preserve existing state.
+        // Generates arbitrary pending requests and reports not-found for an unused id.
+        // This ensures unsolicited not-found responses leave state and pending work untouched.
         #[test]
         fn unknown_block_header_not_found_preserves_state(
             tick_value in any::<u64>(),
@@ -5828,7 +6655,8 @@ mod tests {
             assert_state_invariants(&next_state);
         }
 
-        // Verifies chain reconstruction after not-found reset and reobservation.
+        // Generates a linear chain, forces a not-found reset, then reobserves heads.
+        // This proves reconstruction can recover after canonical ancestry was cleared.
         #[test]
         fn chain_reconstructs_after_not_found_reset_and_reobservation(
             chain in generated_linear_chain_strategy(),
@@ -5893,7 +6721,8 @@ mod tests {
             assert_state_invariants(&state);
         }
 
-        // Verifies pool-data responses never apply unrequested result entries.
+        // Generates requested and returned pool-data sets independently.
+        // This ensures response handling applies only requested result entries.
         #[test]
         fn pool_data_received_never_applies_unrequested_results(
             requested_bytes in prop::collection::hash_set(any::<u8>(), 0..16),
@@ -5967,7 +6796,8 @@ mod tests {
             assert_state_invariants(&next_state);
         }
 
-        // Verifies request failures preserve payload identity across retry.
+        // Generates request payloads and fails their active ids.
+        // This ensures retry effects keep the exact original payload while issuing fresh ids.
         #[test]
         fn request_failure_preserves_any_request_payload(
             generated_payload in generated_request_payload_strategy(),
@@ -6040,7 +6870,8 @@ mod tests {
             assert_state_invariants(&next_state);
         }
 
-        // Verifies arbitrary events preserve core state-safety invariants.
+        // Generates arbitrary event sequences.
+        // This broad state-machine property keeps safety invariants true across unexpected event orderings.
         #[test]
         fn arbitrary_header_result_failure_not_found_and_tick_events_preserve_state_safety(
             generated_events in generated_event_sequence_strategy(),

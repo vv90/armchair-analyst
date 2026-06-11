@@ -329,6 +329,22 @@ impl PendingRequests {
             .collect()
     }
 
+    pub(crate) fn pending_pool_data_pools_by_block(
+        &self,
+    ) -> HashMap<BlockHash, HashSet<PoolAddress>> {
+        self.pool_data
+            .requests
+            .values()
+            .fold(HashMap::new(), |mut pools_by_block, request| {
+                pools_by_block
+                    .entry(request.payload.at)
+                    .or_default()
+                    .extend(request.payload.pools.iter().copied());
+
+                pools_by_block
+            })
+    }
+
     pub fn retry_expired(self, tick: Tick) -> (Self, Vec<AnyIssuedRequest>) {
         let expired_ids = self.expired_ids(tick);
 
