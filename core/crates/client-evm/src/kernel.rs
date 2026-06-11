@@ -251,14 +251,18 @@ impl State {
         }
     }
 
-    /// Rebuilds volatile chain state after an unrecoverable graph inconsistency.
-    fn reset(finalized_state: FinalizedState, tick: Tick) -> State {
+    /// Rebuilds volatile chain state while preserving immutable pool registry facts.
+    fn reset(
+        finalized_state: FinalizedState,
+        tick: Tick,
+        pool_registry: TrustedPoolRegistry,
+    ) -> State {
         State {
             blocks: BlocksGraph::new(),
             canonical_tip: finalized_state.block_hash,
             pending_requests: PendingRequests::new(),
             finalized_state,
-            pool_registry: TrustedPoolRegistry::new(),
+            pool_registry,
             tick,
         }
     }
@@ -480,14 +484,14 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests: state.pending_requests,
-                        ..State::reset(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
                     },
                     vec![],
                 ),
                 Err(NewBlockError::CycleDetected) => (
                     State {
                         pending_requests: state.pending_requests,
-                        ..State::reset(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
                     },
                     vec![],
                 ),
@@ -577,7 +581,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::ConflictingBlockParent) => (
                     State {
                         pending_requests,
-                        ..State::reset(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
                     },
                     vec![],
                     false,
@@ -585,7 +589,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 Err(NewBlockError::CycleDetected) => (
                     State {
                         pending_requests,
-                        ..State::reset(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
                     },
                     vec![],
                     false,
@@ -632,7 +636,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 (
                     State {
                         pending_requests,
-                        ..State::reset(state.finalized_state, state.tick)
+                        ..State::reset(state.finalized_state, state.tick, state.pool_registry)
                     },
                     vec![],
                 )
@@ -2086,6 +2090,51 @@ mod tests {
         assert_chain_reset_at(&next_state, finalized_hash);
         assert!(next_state.pending_requests.is_empty_for_test());
         assert!(effects.is_empty());
+        assert_state_invariants(&next_state);
+    }
+
+    // Verifies chain resets preserve immutable pool registry facts.
+    #[test]
+    fn chain_reset_preserves_pool_registry() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let original_parent_hash = finalized_hash;
+        let conflicting_parent_hash = BlockHash::with_last_byte(3);
+        let verified_candidate = pool_candidate_address(4);
+        let rejected_candidate = pool_candidate_address(5);
+        let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (verified_candidate, Ok(metadata.clone())),
+            (
+                rejected_candidate,
+                Err(PoolMetadataFailure::FactoryReturnedZero),
+            ),
+        ]));
+        state.canonical_tip = head_hash;
+        state
+            .blocks
+            .0
+            .insert(head_hash, block_with_parent(original_parent_hash));
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: head_hash,
+                parent_hash: conflicting_parent_hash,
+            },
+        );
+
+        assert_chain_reset_at(&next_state, finalized_hash);
+        assert!(effects.is_empty());
+        assert_eq!(
+            next_state
+                .pool_registry
+                .verified_metadata(PoolAddress(verified_candidate.0)),
+            Some(&metadata)
+        );
+        assert!(next_state.pool_registry.is_rejected(rejected_candidate));
         assert_state_invariants(&next_state);
     }
 
