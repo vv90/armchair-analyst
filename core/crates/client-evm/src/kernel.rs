@@ -139,6 +139,32 @@ impl BlocksGraph {
         hashes
     }
 
+    /// Returns a complete parent path from finalized exclusive to the requested block.
+    /// Added for pure queries that must reject disconnected or cyclic ancestry instead of using a partial prefix.
+    fn connected_path_hashes_oldest_to_newest(
+        &self,
+        start_hash: BlockHash,
+        finalized_hash: BlockHash,
+    ) -> Option<Vec<BlockHash>> {
+        let mut current_hash = start_hash;
+        let mut hashes = Vec::new();
+        let mut visited = HashSet::new();
+
+        while current_hash != finalized_hash {
+            if !visited.insert(current_hash) {
+                return None;
+            }
+
+            let block = self.get(&current_hash)?;
+
+            hashes.push(current_hash);
+            current_hash = block.parent_hash;
+        }
+
+        hashes.reverse();
+        Some(hashes)
+    }
+
     /// Applies requested pool-state results to a target block snapshot.
     /// Added to ensure stale, missing-block, or overbroad RPC responses cannot write unrequested pool state.
     fn with_pool_data(
@@ -341,6 +367,12 @@ pub struct FinalizedState {
     pool_snapshots: HashMap<PoolAddress, PoolState>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletePoolStateUpdate {
+    pub block_hash: BlockHash,
+    pub pool_states: HashMap<PoolAddress, PoolState>,
+}
+
 impl FinalizedState {
     /// Creates a finalized snapshot with only its block hash and no pool snapshots.
     /// Added as the bootstrap path before finalized pool-state persistence exists.
@@ -394,6 +426,59 @@ impl State {
             token_registry,
             tick,
         }
+    }
+
+    /// Finds the latest complete pool-state overlay on a connected path from an arbitrary block.
+    /// Added so optimization and compaction can share one readiness query without triggering effects.
+    pub fn latest_complete_pool_state_update_from(
+        &self,
+        start_block_hash: BlockHash,
+    ) -> Option<CompletePoolStateUpdate> {
+        let hashes = self.blocks.connected_path_hashes_oldest_to_newest(
+            start_block_hash,
+            self.finalized_state.block_hash,
+        )?;
+        let mut affected_pools = HashSet::new();
+        let mut invalid_pools = HashSet::new();
+        let mut latest_pool_states = HashMap::new();
+        let mut latest_complete = CompletePoolStateUpdate {
+            block_hash: self.finalized_state.block_hash,
+            pool_states: HashMap::new(),
+        };
+
+        for block_hash in hashes {
+            let block = self.blocks.get(&block_hash)?;
+            let trusted_pools = match &block.pool_logs {
+                PoolLogsStatus::Unknown => break,
+                PoolLogsStatus::Resolved(candidates) => {
+                    match self.pool_registry.trusted_pool_logs(candidates) {
+                        TrustedPoolLogs::Resolved(pools) => pools,
+                        TrustedPoolLogs::Unknown | TrustedPoolLogs::PendingValidation => break,
+                    }
+                }
+            };
+
+            for pool in trusted_pools {
+                affected_pools.insert(pool);
+                invalid_pools.insert(pool);
+            }
+
+            for (pool, pool_state) in &block.pool_snapshots {
+                if affected_pools.contains(pool) {
+                    latest_pool_states.insert(*pool, pool_state.clone());
+                    invalid_pools.remove(pool);
+                }
+            }
+
+            if invalid_pools.is_empty() {
+                latest_complete = CompletePoolStateUpdate {
+                    block_hash,
+                    pool_states: latest_pool_states.clone(),
+                };
+            }
+        }
+
+        Some(latest_complete)
     }
 }
 
@@ -2232,6 +2317,33 @@ mod tests {
         }
     }
 
+    /// Builds a resolved block with explicit log candidates and pool snapshots.
+    /// Latest-complete-query tests use it to shape path readiness directly.
+    fn resolved_block_with_snapshots(
+        parent_hash: BlockHash,
+        candidates: HashSet<PoolCandidateAddress>,
+        pool_snapshots: HashMap<PoolAddress, PoolState>,
+    ) -> BlockNode {
+        BlockNode {
+            parent_hash,
+            pool_logs: PoolLogsStatus::Resolved(candidates),
+            pool_snapshots,
+            pool_data_failures: HashMap::new(),
+        }
+    }
+
+    /// Builds the expected complete-pool-state overlay.
+    /// This keeps query tests focused on block and pool-state semantics.
+    fn complete_pool_state_update(
+        block_hash: BlockHash,
+        pool_states: HashMap<PoolAddress, PoolState>,
+    ) -> CompletePoolStateUpdate {
+        CompletePoolStateUpdate {
+            block_hash,
+            pool_states,
+        }
+    }
+
     /// Asserts a pool snapshot equals the expected state on a block.
     /// This confirms successful pool-data responses mutate the intended target only.
     fn assert_pool_snapshot(
@@ -3992,6 +4104,459 @@ mod tests {
             Some(TrustedPoolLogs::Unknown)
         );
         assert_state_invariants(&state);
+    }
+
+    // Queries from the finalized anchor.
+    // This establishes the empty overlay baseline for callers that already have the finalized snapshot.
+    #[test]
+    fn latest_complete_pool_state_update_from_finalized_returns_empty_update() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let state = empty_state_at(finalized_hash);
+
+        let update = state.latest_complete_pool_state_update_from(finalized_hash);
+
+        assert_eq!(
+            update,
+            Some(complete_pool_state_update(finalized_hash, HashMap::new()))
+        );
+    }
+
+    // Queries an absent block hash.
+    // This prevents callers from treating unknown ancestry as a usable optimization point.
+    #[test]
+    fn latest_complete_pool_state_update_from_absent_block_returns_none() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let state = empty_state_at(finalized_hash);
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(BlockHash::with_last_byte(2)),
+            None
+        );
+    }
+
+    // Queries a block whose parent is not tracked and not finalized.
+    // This keeps disconnected ancestry from producing partial overlays.
+    #[test]
+    fn latest_complete_pool_state_update_from_disconnected_path_returns_none() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_parent_hash = BlockHash::with_last_byte(2);
+        let block_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(missing_parent_hash));
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(block_hash),
+            None
+        );
+    }
+
+    // Queries a cyclic parent graph.
+    // This protects the pure query from returning data from non-terminating ancestry.
+    #[test]
+    fn latest_complete_pool_state_update_from_cyclic_path_returns_none() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state
+            .blocks
+            .0
+            .insert(first_hash, block_with_parent(second_hash));
+        state
+            .blocks
+            .0
+            .insert(second_hash, block_with_parent(first_hash));
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(first_hash),
+            None
+        );
+    }
+
+    // Stops at the last complete block before unknown logs.
+    // This lets optimization use the freshest known-good prefix without waiting for later blocks.
+    #[test]
+    fn latest_complete_pool_state_update_stops_before_unknown_logs() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let complete_hash = BlockHash::with_last_byte(2);
+        let unknown_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = PoolAddress(candidate.0);
+        let snapshot = pool_state(5);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            complete_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, snapshot.clone())]),
+            ),
+        );
+        state
+            .blocks
+            .0
+            .insert(unknown_hash, block_with_parent(complete_hash));
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(unknown_hash),
+            Some(complete_pool_state_update(
+                complete_hash,
+                HashMap::from([(pool, snapshot)])
+            ))
+        );
+    }
+
+    // Stops at the last complete block before an unvalidated pool candidate.
+    // This prevents a topic-matching emitter from being treated as a ready pool.
+    #[test]
+    fn latest_complete_pool_state_update_stops_before_pending_pool_validation() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let complete_hash = BlockHash::with_last_byte(2);
+        let pending_hash = BlockHash::with_last_byte(3);
+        let verified = pool_candidate_address(4);
+        let pending = pool_candidate_address(5);
+        let pool = PoolAddress(verified.0);
+        let snapshot = pool_state(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            verified,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            complete_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([verified]),
+                HashMap::from([(pool, snapshot.clone())]),
+            ),
+        );
+        state.blocks.0.insert(
+            pending_hash,
+            resolved_block_with_snapshots(complete_hash, HashSet::from([pending]), HashMap::new()),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(pending_hash),
+            Some(complete_pool_state_update(
+                complete_hash,
+                HashMap::from([(pool, snapshot)])
+            ))
+        );
+    }
+
+    // Resolves rejected candidates without requiring pool data.
+    // This keeps non-pool emitters from blocking the latest complete block.
+    #[test]
+    fn latest_complete_pool_state_update_accepts_rejected_candidates_without_snapshots() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let rejected = pool_candidate_address(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            rejected,
+            Err(PoolMetadataFailure::FactoryReturnedZero),
+        )]));
+        state.blocks.0.insert(
+            block_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([rejected]),
+                HashMap::new(),
+            ),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(block_hash),
+            Some(complete_pool_state_update(block_hash, HashMap::new()))
+        );
+    }
+
+    // Uses a snapshot from the same block that first marks the pool affected.
+    // This is the common case for pool-data requests made at the affected block.
+    #[test]
+    fn latest_complete_pool_state_update_same_block_snapshot_satisfies_log() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0);
+        let snapshot = pool_state(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            block_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, snapshot.clone())]),
+            ),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(block_hash),
+            Some(complete_pool_state_update(
+                block_hash,
+                HashMap::from([(pool, snapshot)])
+            ))
+        );
+    }
+
+    // Carries a valid snapshot forward across later blocks where the pool is not affected.
+    // This lets callers use the newest complete block without refetching unchanged pools.
+    #[test]
+    fn latest_complete_pool_state_update_carries_snapshot_until_pool_is_affected_again() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let affected_hash = BlockHash::with_last_byte(2);
+        let later_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = PoolAddress(candidate.0);
+        let snapshot = pool_state(5);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            affected_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, snapshot.clone())]),
+            ),
+        );
+        state.blocks.0.insert(
+            later_hash,
+            resolved_block_with_snapshots(affected_hash, HashSet::new(), HashMap::new()),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(later_hash),
+            Some(complete_pool_state_update(
+                later_hash,
+                HashMap::from([(pool, snapshot)])
+            ))
+        );
+    }
+
+    // Invalidates a prior snapshot when the pool is affected again.
+    // This prevents stale pool states from being used for newer complete blocks.
+    #[test]
+    fn latest_complete_pool_state_update_later_log_requires_new_snapshot() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let third_hash = BlockHash::with_last_byte(4);
+        let candidate = pool_candidate_address(5);
+        let pool = PoolAddress(candidate.0);
+        let first_snapshot = pool_state(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            first_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, first_snapshot.clone())]),
+            ),
+        );
+        state.blocks.0.insert(
+            second_hash,
+            resolved_block_with_snapshots(first_hash, HashSet::from([candidate]), HashMap::new()),
+        );
+        state.blocks.0.insert(
+            third_hash,
+            resolved_block_with_snapshots(second_hash, HashSet::new(), HashMap::new()),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(third_hash),
+            Some(complete_pool_state_update(
+                first_hash,
+                HashMap::from([(pool, first_snapshot)])
+            ))
+        );
+    }
+
+    // Restores completeness once a newer snapshot appears after a later pool log.
+    // This checks the overlay uses the latest usable state in the scanned prefix.
+    #[test]
+    fn latest_complete_pool_state_update_uses_new_snapshot_after_later_log() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let third_hash = BlockHash::with_last_byte(4);
+        let candidate = pool_candidate_address(5);
+        let pool = PoolAddress(candidate.0);
+        let first_snapshot = pool_state(6);
+        let third_snapshot = pool_state(7);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            first_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, first_snapshot)]),
+            ),
+        );
+        state.blocks.0.insert(
+            second_hash,
+            resolved_block_with_snapshots(first_hash, HashSet::from([candidate]), HashMap::new()),
+        );
+        state.blocks.0.insert(
+            third_hash,
+            resolved_block_with_snapshots(
+                second_hash,
+                HashSet::new(),
+                HashMap::from([(pool, third_snapshot.clone())]),
+            ),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(third_hash),
+            Some(complete_pool_state_update(
+                third_hash,
+                HashMap::from([(pool, third_snapshot)])
+            ))
+        );
+    }
+
+    // Ignores pool-data failures when deciding whether a pool is covered.
+    // This keeps failed snapshots from masquerading as usable pool state.
+    #[test]
+    fn latest_complete_pool_state_update_does_not_count_pool_data_failure_as_snapshot() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::from([(
+                    pool,
+                    PoolDataFailure::CallFailed(PoolDataCall::Slot0),
+                )]),
+            },
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(block_hash),
+            Some(complete_pool_state_update(finalized_hash, HashMap::new()))
+        );
+    }
+
+    // Ignores snapshots for pools that were not affected in the scanned path.
+    // This keeps the returned overlay limited to changes since the finalized snapshot.
+    #[test]
+    fn latest_complete_pool_state_update_excludes_unaffected_pool_snapshots() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let affected_pool = PoolAddress(candidate.0);
+        let unaffected_pool = pool_address(4);
+        let affected_snapshot = pool_state(5);
+        let unaffected_snapshot = pool_state(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            block_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([
+                    (affected_pool, affected_snapshot.clone()),
+                    (unaffected_pool, unaffected_snapshot),
+                ]),
+            ),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(block_hash),
+            Some(complete_pool_state_update(
+                block_hash,
+                HashMap::from([(affected_pool, affected_snapshot)])
+            ))
+        );
+    }
+
+    // Starts the query from an older non-tip block.
+    // This ensures newer descendant data is ignored when callers request an earlier point.
+    #[test]
+    fn latest_complete_pool_state_update_from_older_start_ignores_newer_descendants() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = PoolAddress(candidate.0);
+        let first_snapshot = pool_state(5);
+        let second_snapshot = pool_state(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            first_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, first_snapshot.clone())]),
+            ),
+        );
+        state.blocks.0.insert(
+            second_hash,
+            resolved_block_with_snapshots(
+                first_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, second_snapshot)]),
+            ),
+        );
+
+        assert_eq!(
+            state.latest_complete_pool_state_update_from(first_hash),
+            Some(complete_pool_state_update(
+                first_hash,
+                HashMap::from([(pool, first_snapshot)])
+            ))
+        );
     }
 
     // Delivers successful pool-data results for an active request.
@@ -6283,6 +6848,99 @@ mod tests {
                     prop_assert!(next_state.pool_registry.verified_metadata(pool).is_some());
                 }
             }
+        }
+
+        // Generates connected paths with known pools and arbitrary snapshot placement.
+        // This checks latest-complete overlays against an independent invalidation oracle.
+        #[test]
+        fn latest_complete_pool_state_update_matches_incremental_validity_oracle(
+            blocks in proptest::collection::vec(
+                (
+                    proptest::collection::hash_set(0u8..16, 0..6),
+                    proptest::collection::hash_set(0u8..16, 0..6),
+                ),
+                0..16,
+            ),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let mut state = empty_state_at(finalized_hash);
+            let pool_metadata_results = (0u8..16)
+                .map(|byte| {
+                    (
+                        pool_candidate_address(byte),
+                        Ok(pool_metadata(
+                            byte,
+                            byte.wrapping_add(64),
+                            UniswapV3Fee::Fee3000,
+                        )),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut parent_hash = finalized_hash;
+
+            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+
+            for (block_index, (candidate_bytes, snapshot_bytes)) in blocks.iter().enumerate() {
+                let block_hash = hash_for_node(block_index + 1);
+                state.blocks.0.insert(
+                    block_hash,
+                    BlockNode {
+                        parent_hash,
+                        pool_logs: PoolLogsStatus::Resolved(
+                            candidate_bytes
+                                .iter()
+                                .copied()
+                                .map(pool_candidate_address)
+                                .collect(),
+                        ),
+                        pool_snapshots: snapshot_bytes
+                            .iter()
+                            .copied()
+                            .map(|byte| (pool_address(byte), pool_state(byte)))
+                            .collect(),
+                        pool_data_failures: HashMap::new(),
+                    },
+                );
+                parent_hash = block_hash;
+            }
+
+            let start_hash = if blocks.is_empty() {
+                finalized_hash
+            } else {
+                hash_for_node(blocks.len())
+            };
+            let mut affected_pools = HashSet::new();
+            let mut invalid_pools = HashSet::new();
+            let mut latest_pool_states = HashMap::new();
+            let mut expected_update = complete_pool_state_update(finalized_hash, HashMap::new());
+
+            for (block_index, (candidate_bytes, snapshot_bytes)) in blocks.iter().enumerate() {
+                let block_hash = hash_for_node(block_index + 1);
+
+                for byte in candidate_bytes {
+                    let pool = pool_address(*byte);
+                    affected_pools.insert(pool);
+                    invalid_pools.insert(pool);
+                }
+
+                for byte in snapshot_bytes {
+                    let pool = pool_address(*byte);
+                    if affected_pools.contains(&pool) {
+                        latest_pool_states.insert(pool, pool_state(*byte));
+                        invalid_pools.remove(&pool);
+                    }
+                }
+
+                if invalid_pools.is_empty() {
+                    expected_update =
+                        complete_pool_state_update(block_hash, latest_pool_states.clone());
+                }
+            }
+
+            prop_assert_eq!(
+                state.latest_complete_pool_state_update_from(start_hash),
+                Some(expected_update)
+            );
         }
 
         // Generates candidate logs with mixed registry outcomes.
