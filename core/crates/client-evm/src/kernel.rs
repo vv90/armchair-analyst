@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::ControlFlow,
+};
 
 use alloy::primitives::BlockHash;
 
@@ -373,6 +376,13 @@ pub struct CompletePoolStateUpdate {
     pub pool_states: HashMap<PoolAddress, PoolState>,
 }
 
+struct CompletePoolStateScan {
+    affected_pools: HashSet<PoolAddress>,
+    invalid_pools: HashSet<PoolAddress>,
+    latest_pool_states: HashMap<PoolAddress, PoolState>,
+    latest_complete: CompletePoolStateUpdate,
+}
+
 impl FinalizedState {
     /// Creates a finalized snapshot with only its block hash and no pool snapshots.
     /// Added as the bootstrap path before finalized pool-state persistence exists.
@@ -381,6 +391,63 @@ impl FinalizedState {
             block_hash,
             pool_snapshots: HashMap::new(),
         }
+    }
+}
+
+impl CompletePoolStateScan {
+    /// Starts a readiness scan from the finalized anchor.
+    /// Added so path scanning can keep the finalized empty overlay as the fallback complete result.
+    fn initial(finalized_hash: BlockHash) -> CompletePoolStateScan {
+        CompletePoolStateScan {
+            affected_pools: HashSet::new(),
+            invalid_pools: HashSet::new(),
+            latest_pool_states: HashMap::new(),
+            latest_complete: CompletePoolStateUpdate {
+                block_hash: finalized_hash,
+                pool_states: HashMap::new(),
+            },
+        }
+    }
+
+    /// Applies one resolved block to the readiness scan.
+    /// Added to isolate affected-pool invalidation, same-block snapshot application, and complete-block promotion.
+    fn with_resolved_block(
+        mut self,
+        block_hash: BlockHash,
+        trusted_pools: HashSet<PoolAddress>,
+        pool_snapshots: &HashMap<PoolAddress, PoolState>,
+    ) -> CompletePoolStateScan {
+        self.affected_pools.extend(trusted_pools.iter().copied());
+        self.invalid_pools.extend(trusted_pools);
+
+        let affected_snapshots = pool_snapshots
+            .iter()
+            .filter(|(pool, _)| self.affected_pools.contains(pool))
+            .map(|(pool, pool_state)| (*pool, pool_state.clone()))
+            .collect::<Vec<_>>();
+        let snapshotted_pools = affected_snapshots
+            .iter()
+            .map(|(pool, _)| *pool)
+            .collect::<HashSet<_>>();
+
+        self.latest_pool_states.extend(affected_snapshots);
+        self.invalid_pools
+            .retain(|pool| !snapshotted_pools.contains(pool));
+
+        if self.invalid_pools.is_empty() {
+            self.latest_complete = CompletePoolStateUpdate {
+                block_hash,
+                pool_states: self.latest_pool_states.clone(),
+            };
+        }
+
+        self
+    }
+
+    /// Finishes the readiness scan.
+    /// Added to make early-stop and full-path scans return through the same finalization path.
+    fn into_latest_complete(self) -> CompletePoolStateUpdate {
+        self.latest_complete
     }
 }
 
@@ -438,47 +505,50 @@ impl State {
             start_block_hash,
             self.finalized_state.block_hash,
         )?;
-        let mut affected_pools = HashSet::new();
-        let mut invalid_pools = HashSet::new();
-        let mut latest_pool_states = HashMap::new();
-        let mut latest_complete = CompletePoolStateUpdate {
-            block_hash: self.finalized_state.block_hash,
-            pool_states: HashMap::new(),
-        };
 
-        for block_hash in hashes {
-            let block = self.blocks.get(&block_hash)?;
-            let trusted_pools = match &block.pool_logs {
-                PoolLogsStatus::Unknown => break,
-                PoolLogsStatus::Resolved(candidates) => {
-                    match self.pool_registry.trusted_pool_logs(candidates) {
-                        TrustedPoolLogs::Resolved(pools) => pools,
-                        TrustedPoolLogs::Unknown | TrustedPoolLogs::PendingValidation => break,
-                    }
-                }
-            };
-
-            for pool in trusted_pools {
-                affected_pools.insert(pool);
-                invalid_pools.insert(pool);
-            }
-
-            for (pool, pool_state) in &block.pool_snapshots {
-                if affected_pools.contains(pool) {
-                    latest_pool_states.insert(*pool, pool_state.clone());
-                    invalid_pools.remove(pool);
-                }
-            }
-
-            if invalid_pools.is_empty() {
-                latest_complete = CompletePoolStateUpdate {
-                    block_hash,
-                    pool_states: latest_pool_states.clone(),
+        let scan_result = hashes.into_iter().try_fold(
+            CompletePoolStateScan::initial(self.finalized_state.block_hash),
+            |scan, block_hash| {
+                let Some(block) = self.blocks.get(&block_hash) else {
+                    return ControlFlow::Break(None);
                 };
+
+                let Some(trusted_pools) = self.trusted_pools_for_complete_pool_state_scan(block)
+                else {
+                    return ControlFlow::Break(Some(scan));
+                };
+
+                ControlFlow::Continue(scan.with_resolved_block(
+                    block_hash,
+                    trusted_pools,
+                    &block.pool_snapshots,
+                ))
+            },
+        );
+
+        match scan_result {
+            ControlFlow::Continue(scan) | ControlFlow::Break(Some(scan)) => {
+                Some(scan.into_latest_complete())
+            }
+            ControlFlow::Break(None) => None,
+        }
+    }
+
+    /// Resolves a block's pool logs into trusted pools for readiness scanning.
+    /// Added so unresolved logs or pending candidate validation stop the scan without losing the latest prior complete overlay.
+    fn trusted_pools_for_complete_pool_state_scan(
+        &self,
+        block: &BlockNode,
+    ) -> Option<HashSet<PoolAddress>> {
+        match &block.pool_logs {
+            PoolLogsStatus::Unknown => None,
+            PoolLogsStatus::Resolved(candidates) => {
+                match self.pool_registry.trusted_pool_logs(candidates) {
+                    TrustedPoolLogs::Resolved(pools) => Some(pools),
+                    TrustedPoolLogs::Unknown | TrustedPoolLogs::PendingValidation => None,
+                }
             }
         }
-
-        Some(latest_complete)
     }
 }
 
