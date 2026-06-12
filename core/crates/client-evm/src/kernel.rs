@@ -168,6 +168,44 @@ impl BlocksGraph {
         Some(hashes)
     }
 
+    /// Checks whether a block is on a fully connected canonical path.
+    /// Added so finalized observations can only compact the branch currently selected by the kernel.
+    fn connected_path_contains(
+        &self,
+        tip_hash: BlockHash,
+        target_hash: BlockHash,
+        finalized_hash: BlockHash,
+    ) -> bool {
+        target_hash == finalized_hash
+            || self
+                .connected_path_hashes_oldest_to_newest(tip_hash, finalized_hash)
+                .is_some_and(|hashes| hashes.contains(&target_hash))
+    }
+
+    /// Retains only recent blocks that descend from the new finalized boundary.
+    /// Added so finalized snapshot compaction can drop old canonical blocks and side branches together.
+    fn retaining_descendants_of(self, finalized_hash: BlockHash) -> BlocksGraph {
+        let BlocksGraph(blocks) = self;
+        let retained_hashes = blocks
+            .keys()
+            .copied()
+            .filter(|hash| block_descends_from(&blocks, *hash, finalized_hash))
+            .collect::<HashSet<_>>();
+
+        BlocksGraph(
+            blocks
+                .into_iter()
+                .filter(|(hash, _)| retained_hashes.contains(hash))
+                .collect(),
+        )
+    }
+
+    /// Returns the hashes still present in recent block storage.
+    /// Added so pending block-scoped requests can be pruned after block compaction.
+    fn hashes(&self) -> HashSet<BlockHash> {
+        self.0.keys().copied().collect()
+    }
+
     /// Applies requested pool-state results to a target block snapshot.
     /// Added to ensure stale, missing-block, or overbroad RPC responses cannot write unrequested pool state.
     fn with_pool_data(
@@ -550,12 +588,75 @@ impl State {
             }
         }
     }
+
+    /// Attempts to compact recent block data into the finalized snapshot.
+    /// Added to bound block graph growth without remembering failed finalized observations.
+    fn with_finalized_block_observed(self, block_hash: BlockHash) -> State {
+        if block_hash == self.finalized_state.block_hash {
+            return self;
+        }
+
+        if !self.blocks.connected_path_contains(
+            self.canonical_tip,
+            block_hash,
+            self.finalized_state.block_hash,
+        ) {
+            return self;
+        }
+
+        let Some(update) = self.latest_complete_pool_state_update_from(block_hash) else {
+            return self;
+        };
+
+        if update.block_hash == self.finalized_state.block_hash {
+            return self;
+        }
+
+        let State {
+            blocks,
+            canonical_tip,
+            pending_requests,
+            finalized_state,
+            pool_registry,
+            token_registry,
+            tick,
+        } = self;
+
+        let mut pool_snapshots = finalized_state.pool_snapshots;
+        pool_snapshots.extend(update.pool_states);
+
+        let finalized_state = FinalizedState {
+            block_hash: update.block_hash,
+            pool_snapshots,
+        };
+        let blocks = blocks.retaining_descendants_of(finalized_state.block_hash);
+        let retained_blocks = blocks.hashes();
+        let canonical_tip = if retained_blocks.contains(&canonical_tip) {
+            canonical_tip
+        } else {
+            finalized_state.block_hash
+        };
+        let pending_requests = pending_requests.retaining_block_targets(&retained_blocks);
+
+        State {
+            blocks,
+            canonical_tip,
+            pending_requests,
+            finalized_state,
+            pool_registry,
+            token_registry,
+            tick,
+        }
+    }
 }
 
 pub enum Event {
     HeadObserved {
         hash: BlockHash,
         parent_hash: BlockHash,
+    },
+    FinalizedBlockObserved {
+        block_hash: BlockHash,
     },
     BlockHeaderReceived {
         request_id: RequestId<GetBlockHeader>,
@@ -592,6 +693,35 @@ pub enum Effect {
 }
 
 struct BlocksGraphCycleError;
+
+/// Checks whether a recent block's parent walk reaches a finalized boundary.
+/// Added so compaction can retain descendants while removing the finalized block itself.
+fn block_descends_from(
+    blocks: &HashMap<BlockHash, BlockNode>,
+    block_hash: BlockHash,
+    finalized_hash: BlockHash,
+) -> bool {
+    if block_hash == finalized_hash {
+        return false;
+    }
+
+    let mut visited = HashSet::new();
+    let mut current_hash = block_hash;
+
+    while current_hash != finalized_hash {
+        if !visited.insert(current_hash) {
+            return false;
+        }
+
+        let Some(block) = blocks.get(&current_hash) else {
+            return false;
+        };
+
+        current_hash = block.parent_hash;
+    }
+
+    true
+}
 
 /// Emits log-fetch requests for present canonical blocks whose logs are unknown.
 /// Added so header connectivity automatically drives pool-affecting log discovery.
@@ -912,6 +1042,9 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     vec![],
                 ),
             }
+        }
+        Event::FinalizedBlockObserved { block_hash } => {
+            (state.with_finalized_block_observed(block_hash), vec![])
         }
         Event::BlockHeaderReceived {
             request_id,
@@ -4629,6 +4762,336 @@ mod tests {
         );
     }
 
+    // Compacts a complete finalized target into the finalized snapshot.
+    // This keeps recent block storage bounded while preserving pool states needed after old blocks are removed.
+    #[test]
+    fn finalized_block_observed_compacts_complete_target_and_merges_pool_snapshots() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let target_hash = BlockHash::with_last_byte(2);
+        let tip_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let affected_pool = PoolAddress(candidate.0);
+        let unaffected_pool = pool_address(5);
+        let old_affected_snapshot = pool_state(6);
+        let new_affected_snapshot = pool_state(7);
+        let unaffected_snapshot = pool_state(8);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = tip_hash;
+        state.finalized_state.pool_snapshots = HashMap::from([
+            (affected_pool, old_affected_snapshot),
+            (unaffected_pool, unaffected_snapshot.clone()),
+        ]);
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            target_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(affected_pool, new_affected_snapshot.clone())]),
+            ),
+        );
+        state.blocks.0.insert(
+            tip_hash,
+            resolved_block_with_snapshots(target_hash, HashSet::new(), HashMap::new()),
+        );
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, target_hash);
+        assert_eq!(
+            &state.finalized_state.pool_snapshots,
+            &HashMap::from([
+                (affected_pool, new_affected_snapshot),
+                (unaffected_pool, unaffected_snapshot),
+            ])
+        );
+        assert!(!state.blocks.0.contains_key(&target_hash));
+        assert!(state.blocks.0.contains_key(&tip_hash));
+        assert_eq!(state.canonical_tip, tip_hash);
+        assert_state_invariants(&state);
+    }
+
+    // Compacts to the newest complete prefix when the observed finalized target is still incomplete.
+    // This lets finality make progress without waiting for later affected-pool snapshots.
+    #[test]
+    fn finalized_block_observed_compacts_to_latest_earlier_complete_block() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let complete_hash = BlockHash::with_last_byte(2);
+        let incomplete_hash = BlockHash::with_last_byte(3);
+        let target_hash = BlockHash::with_last_byte(4);
+        let candidate = pool_candidate_address(5);
+        let pool = PoolAddress(candidate.0);
+        let snapshot = pool_state(6);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = target_hash;
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            complete_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, snapshot.clone())]),
+            ),
+        );
+        state.blocks.0.insert(
+            incomplete_hash,
+            resolved_block_with_snapshots(
+                complete_hash,
+                HashSet::from([candidate]),
+                HashMap::new(),
+            ),
+        );
+        state.blocks.0.insert(
+            target_hash,
+            resolved_block_with_snapshots(incomplete_hash, HashSet::new(), HashMap::new()),
+        );
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, complete_hash);
+        assert_eq!(
+            &state.finalized_state.pool_snapshots,
+            &HashMap::from([(pool, snapshot)])
+        );
+        assert!(!state.blocks.0.contains_key(&complete_hash));
+        assert!(state.blocks.0.contains_key(&incomplete_hash));
+        assert!(state.blocks.0.contains_key(&target_hash));
+        assert_state_invariants(&state);
+    }
+
+    // Leaves state unchanged when no block past the current finalized anchor is complete.
+    // This avoids treating failed compaction attempts as pending work.
+    #[test]
+    fn finalized_block_observed_with_only_finalized_complete_is_noop() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let target_hash = BlockHash::with_last_byte(2);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = target_hash;
+        state
+            .blocks
+            .0
+            .insert(target_hash, block_with_parent(finalized_hash));
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, finalized_hash);
+        assert!(state.blocks.0.contains_key(&target_hash));
+        assert_eq!(state.canonical_tip, target_hash);
+        assert_state_invariants(&state);
+    }
+
+    // Leaves state unchanged when the observed finalized hash is not connected to the finalized anchor.
+    // This prevents partial or malformed ancestry from changing the immutable snapshot boundary.
+    #[test]
+    fn finalized_block_observed_with_disconnected_target_is_noop() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_parent_hash = BlockHash::with_last_byte(2);
+        let target_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = target_hash;
+        state
+            .blocks
+            .0
+            .insert(target_hash, block_with_parent(missing_parent_hash));
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, finalized_hash);
+        assert!(state.blocks.0.contains_key(&target_hash));
+        assert_state_invariants(&state);
+    }
+
+    // Leaves state unchanged when the observed finalized hash is on a non-canonical branch.
+    // This keeps compaction aligned with the kernel's current canonical tip.
+    #[test]
+    fn finalized_block_observed_for_non_canonical_target_is_noop() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let canonical_hash = BlockHash::with_last_byte(2);
+        let side_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = canonical_hash;
+        state.blocks.0.insert(
+            canonical_hash,
+            resolved_block_with_snapshots(finalized_hash, HashSet::new(), HashMap::new()),
+        );
+        state.blocks.0.insert(
+            side_hash,
+            resolved_block_with_snapshots(finalized_hash, HashSet::new(), HashMap::new()),
+        );
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: side_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, finalized_hash);
+        assert!(state.blocks.0.contains_key(&canonical_hash));
+        assert!(state.blocks.0.contains_key(&side_hash));
+        assert_state_invariants(&state);
+    }
+
+    // Prunes old blocks and their pending work after successful compaction.
+    // This ensures stale responses for compacted-away blocks cannot mutate new finalized state.
+    #[test]
+    fn finalized_block_observed_prunes_removed_blocks_and_their_pending_requests() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let target_hash = BlockHash::with_last_byte(2);
+        let retained_hash = BlockHash::with_last_byte(3);
+        let side_hash = BlockHash::with_last_byte(4);
+        let retained_token = token_address(5);
+        let candidate = pool_candidate_address(6);
+        let pool = PoolAddress(candidate.0);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = retained_hash;
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
+            candidate,
+            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+        )]));
+        state.blocks.0.insert(
+            target_hash,
+            resolved_block_with_snapshots(
+                finalized_hash,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, pool_state(7))]),
+            ),
+        );
+        state
+            .blocks
+            .0
+            .insert(retained_hash, block_with_parent(target_hash));
+        state
+            .blocks
+            .0
+            .insert(side_hash, block_with_parent(finalized_hash));
+
+        let (pending_requests, removed_logs_id) = state.pending_requests.with_new_request(
+            GetBlockLogs {
+                block_hash: target_hash,
+            },
+            tick(0),
+        );
+        let (pending_requests, removed_pool_data_id) = pending_requests.with_new_request(
+            GetPoolData {
+                at: target_hash,
+                pools: HashSet::from([pool]),
+            },
+            tick(0),
+        );
+        let (pending_requests, removed_metadata_id) = pending_requests.with_new_request(
+            GetPoolMetadata {
+                at: side_hash,
+                candidates: HashSet::from([candidate]),
+            },
+            tick(0),
+        );
+        let (pending_requests, retained_logs_id) = pending_requests.with_new_request(
+            GetBlockLogs {
+                block_hash: retained_hash,
+            },
+            tick(0),
+        );
+        let (pending_requests, retained_tokens_id) = pending_requests.with_new_request(
+            GetTokenMetadata {
+                at: retained_hash,
+                tokens: HashSet::from([retained_token]),
+            },
+            tick(0),
+        );
+        state.pending_requests = pending_requests;
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(!state.blocks.0.contains_key(&target_hash));
+        assert!(!state.blocks.0.contains_key(&side_hash));
+        assert!(state.blocks.0.contains_key(&retained_hash));
+        assert!(!state.pending_requests.contains(&removed_logs_id));
+        assert!(!state.pending_requests.contains(&removed_pool_data_id));
+        assert!(!state.pending_requests.contains(&removed_metadata_id));
+        assert!(state.pending_requests.contains(&retained_logs_id));
+        assert!(state.pending_requests.contains(&retained_tokens_id));
+        assert_state_invariants(&state);
+    }
+
+    // Does not retry a failed compaction from Tick after the target later becomes complete.
+    // This documents that failed compaction attempts are intentionally forgotten.
+    #[test]
+    fn tick_does_not_retry_failed_finalized_compaction() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let target_hash = BlockHash::with_last_byte(2);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = target_hash;
+        state
+            .blocks
+            .0
+            .insert(target_hash, block_with_parent(finalized_hash));
+
+        let (mut state, effects) = transition(
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        state.blocks.0.insert(
+            target_hash,
+            resolved_block_with_snapshots(finalized_hash, HashSet::new(), HashMap::new()),
+        );
+
+        let (state, effects) = transition(state, Event::Tick);
+
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, finalized_hash);
+        assert!(state.blocks.0.contains_key(&target_hash));
+        assert_state_invariants(&state);
+    }
+
     // Delivers successful pool-data results for an active request.
     // This ensures snapshots are stored and the matching pending request is retired.
     #[test]
@@ -7011,6 +7474,128 @@ mod tests {
                 state.latest_complete_pool_state_update_from(start_hash),
                 Some(expected_update)
             );
+        }
+
+        // Generates complete/incomplete prefixes and compacts an observed finalized target on the canonical path.
+        // This checks finalized snapshot advancement against the same invalidation rules used by the readiness query.
+        #[test]
+        fn finalized_compaction_matches_latest_complete_prefix_oracle(
+            blocks in proptest::collection::vec(
+                (
+                    proptest::collection::hash_set(0u8..16, 0..6),
+                    proptest::collection::hash_set(0u8..16, 0..6),
+                ),
+                0..16,
+            ),
+            target_choice in any::<usize>(),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let baseline_pool = pool_address(250);
+            let baseline_snapshot = pool_state(251);
+            let mut state = empty_state_at(finalized_hash);
+            let pool_metadata_results = (0u8..16)
+                .map(|byte| {
+                    (
+                        pool_candidate_address(byte),
+                        Ok(pool_metadata(
+                            byte,
+                            byte.wrapping_add(64),
+                            UniswapV3Fee::Fee3000,
+                        )),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let target_index = target_choice % (blocks.len() + 1);
+            let target_hash = hash_for_node(target_index);
+            let mut parent_hash = finalized_hash;
+
+            state.finalized_state.pool_snapshots =
+                HashMap::from([(baseline_pool, baseline_snapshot.clone())]);
+            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+
+            for (block_index, (candidate_bytes, snapshot_bytes)) in blocks.iter().enumerate() {
+                let block_hash = hash_for_node(block_index + 1);
+                state.blocks.0.insert(
+                    block_hash,
+                    BlockNode {
+                        parent_hash,
+                        pool_logs: PoolLogsStatus::Resolved(
+                            candidate_bytes
+                                .iter()
+                                .copied()
+                                .map(pool_candidate_address)
+                                .collect(),
+                        ),
+                        pool_snapshots: snapshot_bytes
+                            .iter()
+                            .copied()
+                            .map(|byte| (pool_address(byte), pool_state(byte)))
+                            .collect(),
+                        pool_data_failures: HashMap::new(),
+                    },
+                );
+                parent_hash = block_hash;
+            }
+
+            state.canonical_tip = if blocks.is_empty() {
+                finalized_hash
+            } else {
+                hash_for_node(blocks.len())
+            };
+
+            let mut affected_pools = HashSet::new();
+            let mut invalid_pools = HashSet::new();
+            let mut latest_pool_states = HashMap::new();
+            let mut expected_finalized_index = 0usize;
+            let mut expected_snapshots = HashMap::from([(baseline_pool, baseline_snapshot.clone())]);
+
+            for (block_index, (candidate_bytes, snapshot_bytes)) in
+                blocks.iter().take(target_index).enumerate()
+            {
+                for byte in candidate_bytes {
+                    let pool = pool_address(*byte);
+                    affected_pools.insert(pool);
+                    invalid_pools.insert(pool);
+                }
+
+                for byte in snapshot_bytes {
+                    let pool = pool_address(*byte);
+                    if affected_pools.contains(&pool) {
+                        latest_pool_states.insert(pool, pool_state(*byte));
+                        invalid_pools.remove(&pool);
+                    }
+                }
+
+                if invalid_pools.is_empty() {
+                    expected_finalized_index = block_index + 1;
+                    expected_snapshots =
+                        HashMap::from([(baseline_pool, baseline_snapshot.clone())]);
+                    expected_snapshots.extend(latest_pool_states.clone());
+                }
+            }
+
+            let (state, effects) = transition(
+                state,
+                Event::FinalizedBlockObserved {
+                    block_hash: target_hash,
+                },
+            );
+
+            prop_assert!(effects.is_empty());
+            prop_assert_eq!(
+                state.finalized_state.block_hash,
+                hash_for_node(expected_finalized_index)
+            );
+            prop_assert_eq!(&state.finalized_state.pool_snapshots, &expected_snapshots);
+
+            for node_index in 1..=blocks.len() {
+                prop_assert_eq!(
+                    state.blocks.0.contains_key(&hash_for_node(node_index)),
+                    node_index > expected_finalized_index
+                );
+            }
+
+            assert_state_invariants(&state);
         }
 
         // Generates candidate logs with mixed registry outcomes.

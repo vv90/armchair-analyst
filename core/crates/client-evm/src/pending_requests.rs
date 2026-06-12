@@ -345,6 +345,33 @@ impl PendingRequests {
             })
     }
 
+    pub(crate) fn retaining_block_targets(self, retained_blocks: &HashSet<BlockHash>) -> Self {
+        let mut requests = self;
+
+        requests
+            .block_headers
+            .requests
+            .retain(|_, request| retained_blocks.contains(&request.payload.block_hash));
+        requests
+            .block_logs
+            .requests
+            .retain(|_, request| retained_blocks.contains(&request.payload.block_hash));
+        requests
+            .pool_data
+            .requests
+            .retain(|_, request| retained_blocks.contains(&request.payload.at));
+        requests
+            .pool_metadata
+            .requests
+            .retain(|_, request| retained_blocks.contains(&request.payload.at));
+        requests
+            .token_metadata
+            .requests
+            .retain(|_, request| retained_blocks.contains(&request.payload.at));
+
+        requests
+    }
+
     pub fn retry_expired(self, tick: Tick) -> (Self, Vec<AnyIssuedRequest>) {
         let expired_ids = self.expired_ids(tick);
 

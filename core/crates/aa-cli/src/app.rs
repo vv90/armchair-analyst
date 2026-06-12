@@ -147,6 +147,9 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
         kernel::Event::HeadObserved { hash, parent_hash } => {
             format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}")
         }
+        kernel::Event::FinalizedBlockObserved { block_hash } => {
+            format!("input chain={chain:?} finalized_block_observed hash={block_hash}")
+        }
         kernel::Event::BlockHeaderReceived {
             request_id,
             hash,

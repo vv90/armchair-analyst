@@ -95,14 +95,24 @@ fn finalized_header_received(
                 chain,
                 ChainLifecycle::Active(kernel::State::init(finalized_state)),
             );
+            (State { chains }, Vec::new())
         }
-        Some(existing_chain) => {
-            chains.insert(chain, existing_chain);
+        Some(ChainLifecycle::Active(chain_state)) => {
+            let (chain_state, effects) = kernel::transition(
+                chain_state,
+                kernel::Event::FinalizedBlockObserved { block_hash },
+            );
+            chains.insert(chain, ChainLifecycle::Active(chain_state));
+            (
+                State { chains },
+                effects
+                    .into_iter()
+                    .map(|effect| Effect::ChainEffect { chain, effect })
+                    .collect(),
+            )
         }
-        None => {}
+        None => (State { chains }, Vec::new()),
     }
-
-    (State { chains }, Vec::new())
 }
 
 fn finalized_header_unavailable(state: State, chain: ChainKey) -> (State, Vec<Effect>) {
@@ -317,6 +327,68 @@ mod tests {
         assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
     }
 
+    #[test]
+    fn finalized_header_received_for_active_chain_routes_to_inner_compaction() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(1);
+        let compacted_hash = hash(2);
+        let old_branch_hash = hash(3);
+        let (state, _) = State::init(chain);
+        let (state, _) = transition(
+            state,
+            Event::FinalizedHeaderReceived {
+                chain,
+                block_hash: finalized_hash,
+            },
+        );
+        let (state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain,
+                event: kernel::Event::HeadObserved {
+                    hash: compacted_hash,
+                    parent_hash: finalized_hash,
+                },
+            },
+        );
+        let log_request_id =
+            assert_single_log_request_chain_effect(&effects, chain, compacted_hash);
+        let (state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain,
+                event: kernel::Event::BlockLogsReceived {
+                    request_id: log_request_id,
+                    logs: Default::default(),
+                },
+            },
+        );
+        assert!(effects.is_empty());
+
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedHeaderReceived {
+                chain,
+                block_hash: compacted_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+
+        let (_state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain,
+                event: kernel::Event::HeadObserved {
+                    hash: old_branch_hash,
+                    parent_hash: finalized_hash,
+                },
+            },
+        );
+
+        assert_single_header_request_chain_effect(&effects, chain, finalized_hash);
+    }
+
     fn hash(value: u8) -> BlockHash {
         BlockHash::with_last_byte(value)
     }
@@ -358,23 +430,27 @@ mod tests {
         effects: &[Effect],
         chain: ChainKey,
         block_hash: BlockHash,
-    ) {
-        let matching_effects = effects
-            .iter()
-            .filter(|effect| {
-                matches!(
-                    effect,
+    ) -> crate::pending_requests::RequestId<crate::pending_requests::GetBlockLogs> {
+        let matching_effects =
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
                     Effect::ChainEffect {
                         chain: effect_chain,
                         effect:
                             kernel::Effect::Request(
                                 crate::pending_requests::AnyIssuedRequest::BlockLogs(request),
                             ),
-                    } if *effect_chain == chain && request.request_payload.block_hash == block_hash
-                )
-            })
-            .count();
+                    } if *effect_chain == chain
+                        && request.request_payload.block_hash == block_hash =>
+                    {
+                        Some(request.request_id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
 
-        assert_eq!(matching_effects, 1);
+        assert_eq!(matching_effects.len(), 1);
+        matching_effects[0]
     }
 }
