@@ -430,6 +430,19 @@ impl FinalizedState {
             pool_snapshots: HashMap::new(),
         }
     }
+
+    #[cfg(test)]
+    /// Creates a finalized snapshot with explicit pool snapshots for projection tests.
+    /// Added so tests can exercise read-only projections without driving unrelated header/log scheduling.
+    pub(crate) fn with_pool_snapshots_for_test(
+        block_hash: BlockHash,
+        pool_snapshots: HashMap<PoolAddress, PoolState>,
+    ) -> FinalizedState {
+        FinalizedState {
+            block_hash,
+            pool_snapshots,
+        }
+    }
 }
 
 impl CompletePoolStateScan {
@@ -510,6 +523,43 @@ impl State {
             finalized_state,
             pool_registry: TrustedPoolRegistry::new(),
             token_registry: TokenRegistry::new(),
+            tick: Tick::initial(),
+        }
+    }
+
+    /// Exposes finalized pool snapshots to pure read models.
+    /// Added so multi-chain projections can merge finalized state with a complete recent-block overlay without mutating kernel state.
+    pub(crate) fn finalized_pool_snapshots(&self) -> &HashMap<PoolAddress, PoolState> {
+        &self.finalized_state.pool_snapshots
+    }
+
+    /// Looks up verified pool metadata without exposing registry internals.
+    /// Added so projections can refuse incomplete data while keeping validation ownership inside the kernel registry.
+    pub(crate) fn verified_pool_metadata(&self, pool: PoolAddress) -> Option<&PoolMetadata> {
+        self.pool_registry.verified_metadata(pool)
+    }
+
+    /// Looks up verified token metadata without exposing registry internals.
+    /// Added so projections can scale raw on-chain amounts only after token decimals have been validated.
+    pub(crate) fn verified_token_metadata(&self, token: TokenAddress) -> Option<&TokenMetadata> {
+        self.token_registry.verified_metadata(token)
+    }
+
+    #[cfg(test)]
+    /// Builds kernel state from projection-relevant parts for tests.
+    /// Added to keep projection tests focused on pure reserve generation instead of replaying unrelated RPC scheduling events.
+    pub(crate) fn for_pool_reserve_projection_test(
+        finalized_state: FinalizedState,
+        pool_registry: TrustedPoolRegistry,
+        token_registry: TokenRegistry,
+    ) -> State {
+        State {
+            blocks: BlocksGraph::new(),
+            canonical_tip: finalized_state.block_hash,
+            pending_requests: PendingRequests::new(),
+            finalized_state,
+            pool_registry,
+            token_registry,
             tick: Tick::initial(),
         }
     }

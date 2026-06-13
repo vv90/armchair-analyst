@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::tick_math::{self, TickMathError};
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct PoolAddress(pub Address);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +165,18 @@ mod tests {
         liquidity: 50170120777514,
         tick: I24::from_limbs([69583]),
     };
+
+    #[test]
+    fn pool_address_order_matches_inner_address_order() {
+        let first = PoolAddress(Address::with_last_byte(1));
+        let second = PoolAddress(Address::with_last_byte(2));
+        let third = PoolAddress(Address::with_last_byte(3));
+        let mut pools = vec![third, first, second];
+
+        pools.sort();
+
+        assert_eq!(pools, vec![first, second, third]);
+    }
 
     #[test]
     fn test_max_swap_x() {

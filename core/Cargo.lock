@@ -1485,6 +1485,7 @@ name = "client-evm"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "optimization",
  "proptest",
  "serde",
  "serde_json",
