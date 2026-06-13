@@ -957,6 +957,50 @@ mod tests {
     }
 
     #[test]
+    fn model_layout_treats_reserves_as_directional_edges() {
+        let forward = "USDC/WETH";
+        let reverse = "WETH/USDC";
+
+        let state = ModelLayout::new().with_reserve_values(
+            tokens::USDC.address,
+            tokens::WETH.address,
+            forward,
+        );
+
+        assert_eq!(state.shape(), [1, 2]);
+        assert_eq!(
+            state
+                .get_indexes(&tokens::USDC.address, &tokens::WETH.address)
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .get_indexes(&tokens::WETH.address, &tokens::USDC.address)
+                .is_empty(),
+            "a USDC -> WETH reserve must not create a WETH -> USDC cell"
+        );
+
+        let state = state.with_reserve_values(tokens::WETH.address, tokens::USDC.address, reverse);
+
+        assert_eq!(state.shape(), [2, 2]);
+
+        let forward_cells = state
+            .get_indexes(&tokens::USDC.address, &tokens::WETH.address)
+            .into_iter()
+            .filter_map(|(row, column)| access_reserve!(state, row, column))
+            .collect::<Vec<_>>();
+        let reverse_cells = state
+            .get_indexes(&tokens::WETH.address, &tokens::USDC.address)
+            .into_iter()
+            .filter_map(|(row, column)| access_reserve!(state, row, column))
+            .collect::<Vec<_>>();
+
+        assert_eq!(forward_cells, vec![forward]);
+        assert_eq!(reverse_cells, vec![reverse]);
+    }
+
+    #[test]
     fn test_model_layout_bridges() {
         let pool_values = [
             // USDC/WBTC
