@@ -306,6 +306,9 @@ pub enum Effect {
         chain: ChainKey,
         effect: kernel::Effect,
     },
+    RunOptimization {
+        input: OptimizationPoolReserves,
+    },
 }
 
 /// Dispatches one top-level multi-chain event through the pure state machine.
@@ -643,6 +646,24 @@ mod tests {
         );
 
         assert_single_header_request_chain_effect(&effects, chain, finalized_hash);
+    }
+
+    #[test]
+    fn run_optimization_effect_carries_chain_neutral_input() {
+        let input = OptimizationPoolReserves {
+            block_hash: hash(1),
+            reserves: Vec::new(),
+        };
+
+        let effect = Effect::RunOptimization {
+            input: input.clone(),
+        };
+
+        assert!(matches!(
+            effect,
+            Effect::RunOptimization { input: effect_input }
+                if effect_input == input
+        ));
     }
 
     #[test]

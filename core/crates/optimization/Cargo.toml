@@ -9,7 +9,7 @@ publish.workspace = true
 wgpu-tests = []
 
 [dependencies]
-burn = { version = "0.16.1", features = ["wgpu", "train"] }
+burn = { version = "0.16.1", features = ["wgpu", "ndarray", "train"] }
 petgraph = "0.8.2"
 thiserror = "2.0.17"
 

@@ -5,7 +5,7 @@ use client_evm::{
     TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
     kernel,
-    multi_chain_kernel::{Effect, Event, State, transition},
+    multi_chain_kernel::{Effect, Event, OptimizationPoolReserves, State, transition},
     subscribe_new_heads,
 };
 use std::{
@@ -87,6 +87,10 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 }
             }
             Effect::ChainEffect { chain, effect } => self.execute_chain_effect(chain, effect),
+            Effect::RunOptimization { input } => {
+                eprintln!("{}", format_run_optimization_effect_log(&input));
+                Vec::new()
+            }
         }
     }
 
@@ -140,6 +144,14 @@ fn format_input_log(input: &Event) -> String {
         Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
         Event::Tick => "input tick".to_owned(),
     }
+}
+
+fn format_run_optimization_effect_log(input: &OptimizationPoolReserves) -> String {
+    format!(
+        "effect run_optimization block={} reserves={}",
+        input.block_hash,
+        input.reserves.len()
+    )
 }
 
 fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
@@ -562,6 +574,26 @@ mod tests {
             )),
             "pool_metadata#10"
         );
+    }
+
+    #[test]
+    fn optimization_effect_log_formats_block_and_reserve_count() {
+        let input = optimization_input(hash(7));
+
+        assert_eq!(
+            format_run_optimization_effect_log(&input),
+            format!("effect run_optimization block={} reserves=0", hash(7))
+        );
+    }
+
+    #[test]
+    fn run_optimization_effect_returns_no_events() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+        let events = runtime.execute_effect(Effect::RunOptimization {
+            input: optimization_input(hash(7)),
+        });
+
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1116,6 +1148,15 @@ mod tests {
 
     fn hash(value: u8) -> BlockHash {
         BlockHash::with_last_byte(value)
+    }
+
+    fn optimization_input(
+        block_hash: BlockHash,
+    ) -> client_evm::multi_chain_kernel::OptimizationPoolReserves {
+        client_evm::multi_chain_kernel::OptimizationPoolReserves {
+            block_hash,
+            reserves: Vec::new(),
+        }
     }
 
     fn zero_logs_bloom() -> String {
