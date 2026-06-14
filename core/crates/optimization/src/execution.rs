@@ -1,19 +1,9 @@
-use std::{
-    any::Any,
-    collections::HashSet,
-    hash::Hash,
-    panic::{AssertUnwindSafe, catch_unwind},
-};
+use std::{collections::HashSet, hash::Hash};
 
 use burn::tensor::{ElementConversion, backend::AutodiffBackend, cast::ToElement};
 use thiserror::Error;
 
-use crate::{OptimizationError, PoolReserves, model::Model};
-
-const OPTIMIZATION_LAYERS: usize = 1;
-
-type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
-type WgpuBackend = burn::backend::Autodiff<burn::backend::Wgpu<f32>>;
+use crate::{OptimizationError, PoolReserves, model::Model, model::ModelOptimizer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OptimizationBackendSelection {
@@ -28,387 +18,633 @@ pub enum OptimizationBackendUsed {
     Cpu,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct OptimizationExecutionConfig<TToken> {
-    pub backend: OptimizationBackendSelection,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ReserveKey<TPool: Copy, TToken: Copy> {
+    pool_id: TPool,
+    token0: TToken,
+    token1: TToken,
+}
+
+pub struct OptimizationSession<
+    B: AutodiffBackend,
+    TPool: Copy,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+    const LAYERS: usize,
+> {
+    model: Model<B, TPool, TToken, LAYERS>,
+    optimizer: ModelOptimizer<B, LAYERS>,
+    session_config: OptimizationSessionConfig<TToken>,
+    reserve_keys: HashSet<ReserveKey<TPool, TToken>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OptimizationSessionConfig<TToken> {
     pub init_asset: TToken,
+    pub bridges: HashSet<(TToken, TToken)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OptimizationStepConfig {
     pub input_amount: f32,
     pub iterations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct OptimizationExecutionResult {
-    pub backend: OptimizationBackendUsed,
+pub enum OptimizationStepUpdate<TPool: Copy, TToken: Copy> {
+    NewReserves(Vec<PoolReserves<TPool, TToken>>),
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimizationStepStatus {
+    Initialized,
+    Updated,
+    Reinitialized,
+    Continued,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OptimizationStepResult {
+    pub status: OptimizationStepStatus,
     pub input_amount: f32,
     pub output_amount: f32,
     pub profit_amount: f32,
     pub reserves_count: usize,
+    pub iterations_completed: usize,
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
-pub enum OptimizationExecutionError {
+pub enum OptimizationStepError {
     #[error("optimization reserves are empty")]
     EmptyReserves,
 
+    #[error("duplicate reserve key")]
+    DuplicateReserveKey,
+
     #[error("optimization input amount must be finite and greater than zero: {input_amount}")]
     InvalidInputAmount { input_amount: f32 },
-
-    #[error("optimization iterations must be greater than zero")]
-    ZeroIterations,
 
     #[error("init asset output not found")]
     InitAssetOutputNotFound,
 
     #[error("optimization model init failed: {source}")]
     ModelInit { source: OptimizationError },
-
-    #[error("optimization backend {backend:?} failed: {message}")]
-    BackendFailed {
-        backend: OptimizationBackendUsed,
-        message: String,
-    },
 }
 
-pub fn execute_optimization<TPool, TToken>(
+pub fn initialize_optimization_session<B, TPool, TToken, const LAYERS: usize>(
     reserves: Vec<PoolReserves<TPool, TToken>>,
-    config: &OptimizationExecutionConfig<TToken>,
-) -> Result<OptimizationExecutionResult, OptimizationExecutionError>
+    session_config: OptimizationSessionConfig<TToken>,
+    step_config: &OptimizationStepConfig,
+) -> Result<
+    (
+        OptimizationSession<B, TPool, TToken, LAYERS>,
+        OptimizationStepResult,
+    ),
+    OptimizationStepError,
+>
 where
-    TPool: Copy + PartialEq,
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
-    execute_optimization_with_backend_runners(
+    initialize_optimization_session_with_status(
         reserves,
-        config,
-        execute_wgpu::<TPool, TToken>,
-        execute_cpu::<TPool, TToken>,
+        session_config,
+        step_config,
+        OptimizationStepStatus::Initialized,
     )
 }
 
-fn execute_optimization_with_backend_runners<TPool, TToken, WgpuRunner, CpuRunner>(
-    reserves: Vec<PoolReserves<TPool, TToken>>,
-    config: &OptimizationExecutionConfig<TToken>,
-    run_wgpu: WgpuRunner,
-    run_cpu: CpuRunner,
-) -> Result<OptimizationExecutionResult, OptimizationExecutionError>
+pub fn run_optimization_step<B, TPool, TToken, const LAYERS: usize>(
+    session: OptimizationSession<B, TPool, TToken, LAYERS>,
+    update: OptimizationStepUpdate<TPool, TToken>,
+    step_config: &OptimizationStepConfig,
+) -> Result<
+    (
+        OptimizationSession<B, TPool, TToken, LAYERS>,
+        OptimizationStepResult,
+    ),
+    OptimizationStepError,
+>
 where
-    TPool: Copy + PartialEq,
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
-    WgpuRunner: FnOnce(
-        Vec<PoolReserves<TPool, TToken>>,
-        &OptimizationExecutionConfig<TToken>,
-    ) -> Result<OptimizationExecutionResult, OptimizationExecutionError>,
-    CpuRunner: FnOnce(
-        Vec<PoolReserves<TPool, TToken>>,
-        &OptimizationExecutionConfig<TToken>,
-    ) -> Result<OptimizationExecutionResult, OptimizationExecutionError>,
 {
-    validate_execution_input(&reserves, config)?;
-
-    match config.backend {
-        OptimizationBackendSelection::Auto => match run_wgpu(reserves.clone(), config) {
-            Err(OptimizationExecutionError::BackendFailed { .. }) => run_cpu(reserves, config),
-            result => result,
-        },
-        OptimizationBackendSelection::Wgpu => run_wgpu(reserves, config),
-        OptimizationBackendSelection::Cpu => run_cpu(reserves, config),
+    match update {
+        OptimizationStepUpdate::Continue => {
+            run_optimization_chunk(session, step_config, OptimizationStepStatus::Continued)
+        }
+        OptimizationStepUpdate::NewReserves(reserves) => {
+            run_optimization_step_with_reserves(session, reserves, step_config)
+        }
     }
 }
 
-fn validate_execution_input<TPool, TToken>(
-    reserves: &[PoolReserves<TPool, TToken>],
-    config: &OptimizationExecutionConfig<TToken>,
-) -> Result<(), OptimizationExecutionError>
+fn run_optimization_step_with_reserves<B, TPool, TToken, const LAYERS: usize>(
+    session: OptimizationSession<B, TPool, TToken, LAYERS>,
+    reserves: Vec<PoolReserves<TPool, TToken>>,
+    step_config: &OptimizationStepConfig,
+) -> Result<
+    (
+        OptimizationSession<B, TPool, TToken, LAYERS>,
+        OptimizationStepResult,
+    ),
+    OptimizationStepError,
+>
 where
-    TPool: Copy,
-    TToken: Copy + PartialEq,
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
+    let incoming_keys = validate_reserve_snapshot(&reserves, &session.session_config, step_config)?;
+    let OptimizationSession {
+        model,
+        optimizer,
+        session_config,
+        reserve_keys,
+        ..
+    } = session;
+
+    if incoming_keys != reserve_keys {
+        return initialize_optimization_session_with_status(
+            reserves,
+            session_config,
+            step_config,
+            OptimizationStepStatus::Reinitialized,
+        );
+    }
+
+    match model.update(reserves.clone()) {
+        Ok(model) => run_optimization_chunk(
+            OptimizationSession {
+                model,
+                optimizer,
+                session_config,
+                reserve_keys: incoming_keys,
+            },
+            step_config,
+            OptimizationStepStatus::Updated,
+        ),
+        Err(_) => initialize_optimization_session_with_status(
+            reserves,
+            session_config,
+            step_config,
+            OptimizationStepStatus::Reinitialized,
+        ),
+    }
+}
+
+fn initialize_optimization_session_with_status<B, TPool, TToken, const LAYERS: usize>(
+    reserves: Vec<PoolReserves<TPool, TToken>>,
+    session_config: OptimizationSessionConfig<TToken>,
+    step_config: &OptimizationStepConfig,
+    status: OptimizationStepStatus,
+) -> Result<
+    (
+        OptimizationSession<B, TPool, TToken, LAYERS>,
+        OptimizationStepResult,
+    ),
+    OptimizationStepError,
+>
+where
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+{
+    let reserve_keys = validate_reserve_snapshot(&reserves, &session_config, step_config)?;
+    let model = Model::<B, TPool, TToken, LAYERS>::init(
+        session_config.init_asset,
+        reserves,
+        &session_config.bridges,
+    )
+    .map_err(|source| OptimizationStepError::ModelInit { source })?;
+    let optimizer = Model::<B, TPool, TToken, LAYERS>::init_optimizer();
+
+    run_optimization_chunk(
+        OptimizationSession {
+            model,
+            optimizer,
+            session_config,
+            reserve_keys,
+        },
+        step_config,
+        status,
+    )
+}
+
+fn run_optimization_chunk<B, TPool, TToken, const LAYERS: usize>(
+    session: OptimizationSession<B, TPool, TToken, LAYERS>,
+    step_config: &OptimizationStepConfig,
+    status: OptimizationStepStatus,
+) -> Result<
+    (
+        OptimizationSession<B, TPool, TToken, LAYERS>,
+        OptimizationStepResult,
+    ),
+    OptimizationStepError,
+>
+where
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+{
+    validate_step_config(step_config)?;
+
+    let OptimizationSession {
+        model,
+        optimizer,
+        session_config,
+        reserve_keys,
+    } = session;
+    let reserves_count = reserve_keys.len();
+    let (model, optimizer) = model.optimize_with(
+        optimizer,
+        B::FloatElem::from_elem(step_config.input_amount),
+        step_config.iterations,
+    );
+    let output_amount = model
+        .evaluate(B::FloatElem::from_elem(step_config.input_amount))
+        .to_f32();
+    let result = OptimizationStepResult {
+        status,
+        input_amount: step_config.input_amount,
+        output_amount,
+        profit_amount: output_amount - step_config.input_amount,
+        reserves_count,
+        iterations_completed: step_config.iterations,
+    };
+
+    Ok((
+        OptimizationSession {
+            model,
+            optimizer,
+            session_config,
+            reserve_keys,
+        },
+        result,
+    ))
+}
+
+fn validate_reserve_snapshot<TPool, TToken>(
+    reserves: &[PoolReserves<TPool, TToken>],
+    session_config: &OptimizationSessionConfig<TToken>,
+    step_config: &OptimizationStepConfig,
+) -> Result<HashSet<ReserveKey<TPool, TToken>>, OptimizationStepError>
+where
+    TPool: Copy + Eq + Hash,
+    TToken: Copy + Eq + Hash,
+{
+    validate_step_config(step_config)?;
+
     if reserves.is_empty() {
-        return Err(OptimizationExecutionError::EmptyReserves);
+        return Err(OptimizationStepError::EmptyReserves);
     }
 
-    if !config.input_amount.is_finite() || config.input_amount <= 0.0 {
-        return Err(OptimizationExecutionError::InvalidInputAmount {
-            input_amount: config.input_amount,
-        });
-    }
-
-    if config.iterations == 0 {
-        return Err(OptimizationExecutionError::ZeroIterations);
-    }
+    let reserve_keys = reserve_keys(reserves)?;
 
     if reserves
         .iter()
-        .all(|reserve| reserve.token1 != config.init_asset)
+        .all(|reserve| reserve.token1 != session_config.init_asset)
     {
-        return Err(OptimizationExecutionError::InitAssetOutputNotFound);
+        return Err(OptimizationStepError::InitAssetOutputNotFound);
+    }
+
+    Ok(reserve_keys)
+}
+
+fn validate_step_config(step_config: &OptimizationStepConfig) -> Result<(), OptimizationStepError> {
+    if !step_config.input_amount.is_finite() || step_config.input_amount <= 0.0 {
+        return Err(OptimizationStepError::InvalidInputAmount {
+            input_amount: step_config.input_amount,
+        });
     }
 
     Ok(())
 }
 
-fn execute_cpu<TPool, TToken>(
-    reserves: Vec<PoolReserves<TPool, TToken>>,
-    config: &OptimizationExecutionConfig<TToken>,
-) -> Result<OptimizationExecutionResult, OptimizationExecutionError>
+fn reserve_keys<TPool, TToken>(
+    reserves: &[PoolReserves<TPool, TToken>],
+) -> Result<HashSet<ReserveKey<TPool, TToken>>, OptimizationStepError>
 where
-    TPool: Copy + PartialEq,
-    TToken: Clone + Copy + PartialEq + Eq + Hash,
+    TPool: Copy + Eq + Hash,
+    TToken: Copy + Eq + Hash,
 {
-    execute_backend_catching_panics(OptimizationBackendUsed::Cpu, || {
-        execute_with_backend::<CpuBackend, TPool, TToken>(
-            reserves,
-            config,
-            OptimizationBackendUsed::Cpu,
-        )
-    })
-}
-
-fn execute_wgpu<TPool, TToken>(
-    reserves: Vec<PoolReserves<TPool, TToken>>,
-    config: &OptimizationExecutionConfig<TToken>,
-) -> Result<OptimizationExecutionResult, OptimizationExecutionError>
-where
-    TPool: Copy + PartialEq,
-    TToken: Clone + Copy + PartialEq + Eq + Hash,
-{
-    execute_backend_catching_panics(OptimizationBackendUsed::Wgpu, || {
-        execute_with_backend::<WgpuBackend, TPool, TToken>(
-            reserves,
-            config,
-            OptimizationBackendUsed::Wgpu,
-        )
-    })
-}
-
-fn execute_backend_catching_panics<F>(
-    backend: OptimizationBackendUsed,
-    run: F,
-) -> Result<OptimizationExecutionResult, OptimizationExecutionError>
-where
-    F: FnOnce() -> Result<OptimizationExecutionResult, OptimizationExecutionError>,
-{
-    match catch_unwind(AssertUnwindSafe(run)) {
-        Ok(result) => result,
-        Err(payload) => Err(OptimizationExecutionError::BackendFailed {
-            backend,
-            message: panic_message(payload),
-        }),
-    }
-}
-
-fn execute_with_backend<B, TPool, TToken>(
-    reserves: Vec<PoolReserves<TPool, TToken>>,
-    config: &OptimizationExecutionConfig<TToken>,
-    backend: OptimizationBackendUsed,
-) -> Result<OptimizationExecutionResult, OptimizationExecutionError>
-where
-    B: AutodiffBackend,
-    TPool: Copy + PartialEq,
-    TToken: Clone + Copy + PartialEq + Eq + Hash,
-{
-    let reserves_count = reserves.len();
-    let model = Model::<B, TPool, TToken, OPTIMIZATION_LAYERS>::init(
-        config.init_asset,
-        reserves,
-        &HashSet::new(),
-    )
-    .map_err(model_init_error)?;
-    let input = B::FloatElem::from_elem(config.input_amount);
-    let model = model.optimize(input, config.iterations);
-    let output_amount = model
-        .evaluate(B::FloatElem::from_elem(config.input_amount))
-        .to_f32();
-
-    Ok(OptimizationExecutionResult {
-        backend,
-        input_amount: config.input_amount,
-        output_amount,
-        profit_amount: output_amount - config.input_amount,
-        reserves_count,
-    })
-}
-
-fn model_init_error(source: OptimizationError) -> OptimizationExecutionError {
-    OptimizationExecutionError::ModelInit { source }
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    match payload.downcast_ref::<&str>() {
-        Some(message) => (*message).to_owned(),
-        None => match payload.downcast_ref::<String>() {
-            Some(message) => message.clone(),
-            None => "backend panicked".to_owned(),
+    reserves.iter().try_fold(
+        HashSet::with_capacity(reserves.len()),
+        |mut keys, reserve| {
+            if keys.insert(reserve_key(reserve)) {
+                Ok(keys)
+            } else {
+                Err(OptimizationStepError::DuplicateReserveKey)
+            }
         },
+    )
+}
+
+fn reserve_key<TPool: Copy, TToken: Copy>(
+    reserve: &PoolReserves<TPool, TToken>,
+) -> ReserveKey<TPool, TToken> {
+    ReserveKey {
+        pool_id: reserve.pool_id,
+        token0: reserve.token0,
+        token1: reserve.token1,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{Invertible, OptimizationError, PoolReserves, VirtualReserveValues};
+    use std::collections::HashSet;
 
-    const TOKEN_A: u8 = 1;
-    const TOKEN_B: u8 = 2;
-    const TOKEN_C: u8 = 3;
+    use crate::{
+        Invertible, PoolReserves, VirtualReserveValues,
+        tokens::test::{self as tokens, TokenAddress},
+    };
+
+    use super::*;
+
+    type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
 
     #[test]
-    fn cpu_execution_is_returned_as_result_for_tiny_directional_reserve_set() {
-        let config = cpu_config(TOKEN_A);
+    fn initialize_session_returns_initialized_result() {
+        let (_session, result) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                base_reserves(),
+                session_config(),
+                &step_config(0),
+            )
+            .unwrap();
 
-        let result = execute_optimization(reserves(), &config);
+        assert_eq!(result.status, OptimizationStepStatus::Initialized);
+        assert_eq!(result.reserves_count, 2);
+        assert_eq!(result.iterations_completed, 0);
+        assert!(result.output_amount.is_finite());
+        assert!(result.profit_amount.is_finite());
+    }
 
-        match result {
-            Ok(result) => {
-                assert_eq!(result.backend, OptimizationBackendUsed::Cpu);
-                assert_eq!(result.input_amount, config.input_amount);
-                assert_eq!(result.reserves_count, 2);
-                assert!(result.output_amount.is_finite());
-                assert!(result.profit_amount.is_finite());
-            }
-            Err(OptimizationExecutionError::BackendFailed { backend, message }) => {
-                assert_eq!(backend, OptimizationBackendUsed::Cpu);
-                assert!(!message.is_empty());
-            }
-            Err(error) => panic!("unexpected optimization execution error: {error}"),
-        }
+    #[test]
+    fn new_reserves_with_same_key_set_updates_existing_session() {
+        let (session, _) = initialized_session();
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves(scaled_base_reserves(1.01)),
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
+        assert_eq!(result.reserves_count, 2);
+    }
+
+    #[test]
+    fn new_reserves_with_same_keys_in_different_order_updates_existing_session() {
+        let (session, _) = initialized_session();
+        let mut reserves = scaled_base_reserves(1.01);
+        reserves.reverse();
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves(reserves),
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
+        assert_eq!(result.reserves_count, 2);
+    }
+
+    #[test]
+    fn added_reserve_key_reinitializes_session() {
+        let (session, _) = initialized_session();
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves(expanded_reserves()),
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.reserves_count, 3);
+    }
+
+    #[test]
+    fn removed_reserve_key_reinitializes_session() {
+        let (session, _) = initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+            expanded_reserves(),
+            session_config(),
+            &step_config(0),
+        )
+        .unwrap();
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves(base_reserves()),
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.reserves_count, 2);
+    }
+
+    #[test]
+    fn reserve_not_found_during_update_reinitializes_session() {
+        let (mut session, _) = initialized_session();
+        let replacement_reserves = vec![reserve(
+            99,
+            tokens::WETH.address,
+            tokens::USDC.address,
+            2_000.0,
+        )];
+        session.reserve_keys = HashSet::from([ReserveKey {
+            pool_id: 99,
+            token0: tokens::WETH.address,
+            token1: tokens::USDC.address,
+        }]);
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves(replacement_reserves),
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.reserves_count, 1);
+    }
+
+    #[test]
+    fn continue_runs_existing_session_without_reserve_update() {
+        let (session, _) = initialized_session();
+
+        let (_session, result) =
+            run_optimization_step(session, OptimizationStepUpdate::Continue, &step_config(0))
+                .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Continued);
+        assert_eq!(result.reserves_count, 2);
+        assert!(result.output_amount.is_finite());
+        assert!(result.profit_amount.is_finite());
     }
 
     #[test]
     fn empty_reserves_return_typed_error() {
-        let error = execute_optimization::<u8, u8>(Vec::new(), &cpu_config(TOKEN_A)).unwrap_err();
+        let error = expect_step_error(initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(Vec::new(), session_config(), &step_config(0)));
 
-        assert_eq!(error, OptimizationExecutionError::EmptyReserves);
+        assert_eq!(error, OptimizationStepError::EmptyReserves);
     }
 
     #[test]
-    fn missing_init_asset_returns_typed_error_before_model_init() {
-        let error = execute_optimization(reserves(), &cpu_config(TOKEN_C)).unwrap_err();
+    fn duplicate_reserve_keys_return_typed_error() {
+        let reserve = reserve(1, tokens::USDC.address, tokens::WETH.address, 1_000.0);
 
-        assert_eq!(error, OptimizationExecutionError::InitAssetOutputNotFound);
+        let error = expect_step_error(initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(
+            vec![reserve, reserve], session_config(), &step_config(0)
+        ));
+
+        assert_eq!(error, OptimizationStepError::DuplicateReserveKey);
     }
 
     #[test]
     fn invalid_input_amounts_return_typed_errors() {
         for input_amount in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
-            let mut config = cpu_config(TOKEN_A);
-            config.input_amount = input_amount;
-
-            let error = execute_optimization(reserves(), &config).unwrap_err();
+            let error = expect_step_error(initialize_optimization_session::<
+                CpuBackend,
+                i32,
+                TokenAddress,
+                1,
+            >(
+                base_reserves(),
+                session_config(),
+                &OptimizationStepConfig {
+                    input_amount,
+                    iterations: 0,
+                },
+            ));
 
             assert!(matches!(
                 error,
-                OptimizationExecutionError::InvalidInputAmount { .. }
+                OptimizationStepError::InvalidInputAmount { .. }
             ));
         }
     }
 
     #[test]
-    fn zero_iterations_returns_typed_error() {
-        let mut config = cpu_config(TOKEN_A);
-        config.iterations = 0;
+    fn missing_init_asset_output_returns_typed_error() {
+        let error = expect_step_error(initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(
+            vec![reserve(
+                1,
+                tokens::USDC.address,
+                tokens::WETH.address,
+                1_000.0,
+            )],
+            session_config(),
+            &step_config(0),
+        ));
 
-        let error = execute_optimization(reserves(), &config).unwrap_err();
-
-        assert_eq!(error, OptimizationExecutionError::ZeroIterations);
+        assert_eq!(error, OptimizationStepError::InitAssetOutputNotFound);
     }
 
-    #[test]
-    fn model_init_errors_are_mapped_to_execution_errors() {
-        let error = model_init_error(OptimizationError::InitAssetNotFound);
-
-        assert_eq!(
-            error,
-            OptimizationExecutionError::ModelInit {
-                source: OptimizationError::InitAssetNotFound,
-            }
-        );
+    fn initialized_session() -> (
+        OptimizationSession<CpuBackend, i32, TokenAddress, 1>,
+        OptimizationStepResult,
+    ) {
+        initialize_optimization_session(base_reserves(), session_config(), &step_config(0)).unwrap()
     }
 
-    #[test]
-    fn auto_backend_falls_back_to_cpu_after_injected_wgpu_backend_failure() {
-        let mut config = cpu_config(TOKEN_A);
-        config.backend = OptimizationBackendSelection::Auto;
-
-        let result = execute_optimization_with_backend_runners(
-            reserves(),
-            &config,
-            |_reserves, _config| {
-                Err(OptimizationExecutionError::BackendFailed {
-                    backend: OptimizationBackendUsed::Wgpu,
-                    message: "no adapter".to_owned(),
-                })
-            },
-            |_reserves, config| Ok(fake_result(OptimizationBackendUsed::Cpu, config)),
-        )
-        .unwrap();
-
-        assert_eq!(result.backend, OptimizationBackendUsed::Cpu);
-    }
-
-    #[test]
-    fn explicit_wgpu_backend_returns_injected_backend_failure_without_cpu_fallback() {
-        let mut config = cpu_config(TOKEN_A);
-        config.backend = OptimizationBackendSelection::Wgpu;
-
-        let error = execute_optimization_with_backend_runners(
-            reserves(),
-            &config,
-            |_reserves, _config| {
-                Err(OptimizationExecutionError::BackendFailed {
-                    backend: OptimizationBackendUsed::Wgpu,
-                    message: "no adapter".to_owned(),
-                })
-            },
-            |_reserves, config| Ok(fake_result(OptimizationBackendUsed::Cpu, config)),
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            OptimizationExecutionError::BackendFailed {
-                backend: OptimizationBackendUsed::Wgpu,
-                message: "no adapter".to_owned(),
-            }
-        );
-    }
-
-    fn cpu_config(init_asset: u8) -> OptimizationExecutionConfig<u8> {
-        OptimizationExecutionConfig {
-            backend: OptimizationBackendSelection::Cpu,
-            init_asset,
-            input_amount: 10.0,
-            iterations: 1,
+    fn expect_step_error(
+        result: Result<
+            (
+                OptimizationSession<CpuBackend, i32, TokenAddress, 1>,
+                OptimizationStepResult,
+            ),
+            OptimizationStepError,
+        >,
+    ) -> OptimizationStepError {
+        match result {
+            Ok(_) => panic!("optimization step unexpectedly succeeded"),
+            Err(error) => error,
         }
     }
 
-    fn fake_result(
-        backend: OptimizationBackendUsed,
-        config: &OptimizationExecutionConfig<u8>,
-    ) -> OptimizationExecutionResult {
-        OptimizationExecutionResult {
-            backend,
-            input_amount: config.input_amount,
-            output_amount: config.input_amount,
-            profit_amount: 0.0,
-            reserves_count: 2,
+    fn session_config() -> OptimizationSessionConfig<TokenAddress> {
+        OptimizationSessionConfig {
+            init_asset: tokens::USDC.address,
+            bridges: HashSet::new(),
         }
     }
 
-    fn reserves() -> Vec<PoolReserves<u8, u8>> {
-        let reserve = PoolReserves {
-            token0: TOKEN_A,
-            token1: TOKEN_B,
-            pool_id: 1,
-            value: VirtualReserveValues {
-                token_0: 1_000.0,
-                token_1: 1_000.0,
-                fee_multiplier: 1.0,
-                max_swap_0: 500.0,
-                max_swap_1: 500.0,
-            },
-        };
+    fn step_config(iterations: usize) -> OptimizationStepConfig {
+        OptimizationStepConfig {
+            input_amount: 100.0,
+            iterations,
+        }
+    }
+
+    fn base_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let reserve = reserve(1, tokens::USDC.address, tokens::WETH.address, 1_000.0);
 
         vec![reserve, reserve.inverse()]
+    }
+
+    fn scaled_base_reserves(scale: f32) -> Vec<PoolReserves<i32, TokenAddress>> {
+        base_reserves()
+            .into_iter()
+            .map(|mut reserve| {
+                reserve.value.token_0 *= scale;
+                reserve.value.token_1 *= scale;
+                reserve.value.max_swap_0 *= scale;
+                reserve.value.max_swap_1 *= scale;
+                reserve
+            })
+            .collect()
+    }
+
+    fn expanded_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let mut reserves = base_reserves();
+        reserves.push(reserve(
+            2,
+            tokens::WETH.address,
+            tokens::WBTC.address,
+            2_000.0,
+        ));
+        reserves
+    }
+
+    fn reserve(
+        pool_id: i32,
+        token0: TokenAddress,
+        token1: TokenAddress,
+        amount: f32,
+    ) -> PoolReserves<i32, TokenAddress> {
+        PoolReserves {
+            token0,
+            token1,
+            pool_id,
+            value: VirtualReserveValues {
+                token_0: amount,
+                token_1: amount * 1.5,
+                fee_multiplier: 0.997,
+                max_swap_0: amount * 0.5,
+                max_swap_1: amount * 0.75,
+            },
+        }
     }
 }

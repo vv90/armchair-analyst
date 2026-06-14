@@ -6,6 +6,7 @@ use burn::{
     prelude::*,
     tensor::{Distribution, activation::softmax, backend::AutodiffBackend, cast::ToElement},
 };
+use thiserror::Error;
 
 use crate::OptimizationError;
 use crate::pool_reserves::{PoolReserves, VirtualReserveValues};
@@ -387,6 +388,16 @@ pub struct Model<
 
 pub struct ModelOptimizer<B: AutodiffBackend, const LAYERS: usize> {
     optimizer: OptimizerAdaptor<Adam, LayerBlock<B, LAYERS>, B>,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ModelUpdateError<TPool, TToken> {
+    #[error("reserve not found in model layout")]
+    ReserveNotFound {
+        pool_id: TPool,
+        token0: TToken,
+        token1: TToken,
+    },
 }
 
 impl<
@@ -796,22 +807,31 @@ impl<
     const LAYERS: usize,
 > Model<B, U, I, LAYERS>
 {
-    pub fn update(mut self, reserves: Vec<PoolReserves<U, I>>) -> Self {
+    pub fn update(
+        mut self,
+        reserves: Vec<PoolReserves<U, I>>,
+    ) -> Result<Self, ModelUpdateError<U, I>> {
         let [_, m] = self.layout.shape();
         // let mut max_swap_data = vec![0.0; n * m];
         // let mut mask_data = vec![false; n * m];
 
         for reserve in reserves {
-            if let Some((RowIndex(row), ColumnIndex(col))) = self.layout.find_reserve_position(
+            let Some((RowIndex(row), ColumnIndex(col))) = self.layout.find_reserve_position(
                 &reserve.token0,
                 &reserve.token1,
                 &reserve.pool_id,
-            ) {
-                let index = row * m + col;
-                self.reserves_in_data[index] = B::FloatElem::from_elem(reserve.value.token_0);
-                self.reserves_out_data[index] = B::FloatElem::from_elem(reserve.value.token_1);
-                self.max_swap_data[index] = B::FloatElem::from_elem(reserve.value.max_swap_0);
-            }
+            ) else {
+                return Err(ModelUpdateError::ReserveNotFound {
+                    pool_id: reserve.pool_id,
+                    token0: reserve.token0,
+                    token1: reserve.token1,
+                });
+            };
+
+            let index = row * m + col;
+            self.reserves_in_data[index] = B::FloatElem::from_elem(reserve.value.token_0);
+            self.reserves_out_data[index] = B::FloatElem::from_elem(reserve.value.token_1);
+            self.max_swap_data[index] = B::FloatElem::from_elem(reserve.value.max_swap_0);
         }
 
         self.block.reserves_in.inplace(|r_in| {
@@ -827,7 +847,7 @@ impl<
                 .reshape(max_swap.shape())
         });
 
-        self
+        Ok(self)
     }
 }
 
@@ -886,6 +906,48 @@ mod tests {
         let optimizer = Model::<CpuBackend, i32, TokenAddress, 1>::init_optimizer();
         let (model, optimizer) = model.optimize_with(optimizer, 100.0, 0);
         let (_model, _optimizer) = model.optimize_with(optimizer, 100.0, 0);
+    }
+
+    #[test]
+    fn model_update_returns_error_for_unknown_directional_reserve() {
+        type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+
+        let known_reserve = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 1.0,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        let unknown_reserve = PoolReserves {
+            pool_id: 2,
+            ..known_reserve
+        };
+        let model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+            tokens::USDC.address,
+            vec![known_reserve, known_reserve.inverse()],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let error = match model.update(vec![unknown_reserve]) {
+            Ok(_) => panic!("unknown reserve update unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            ModelUpdateError::ReserveNotFound {
+                pool_id: unknown_reserve.pool_id,
+                token0: unknown_reserve.token0,
+                token1: unknown_reserve.token1,
+            }
+        );
     }
 
     #[test]
@@ -1532,7 +1594,8 @@ mod tests {
             &HashSet::new(),
         )
         .expect("base model init failed")
-        .update(updated_reserves);
+        .update(updated_reserves)
+        .expect("model update failed");
 
         model_updated.block.layer_in.weights =
             Param::from_tensor(Tensor::ones_like(&model_updated.block.layer_in.weights));

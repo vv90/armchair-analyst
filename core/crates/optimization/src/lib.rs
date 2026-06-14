@@ -7,8 +7,11 @@ mod utils;
 
 pub use error::OptimizationError;
 pub use execution::{
-    OptimizationBackendSelection, OptimizationBackendUsed, OptimizationExecutionConfig,
-    OptimizationExecutionError, OptimizationExecutionResult, execute_optimization,
+    OptimizationBackendSelection, OptimizationBackendUsed, OptimizationSession,
+    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
+    OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate,
+    initialize_optimization_session, run_optimization_step,
 };
+pub use model::ModelUpdateError;
 pub use pool_reserves::{PoolReserves, VirtualReserveValues};
 pub use utils::Invertible;
