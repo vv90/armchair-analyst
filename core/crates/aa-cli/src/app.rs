@@ -5,7 +5,9 @@ use client_evm::{
     TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
     kernel,
-    multi_chain_kernel::{Effect, Event, OptimizationPoolReserves, State, transition},
+    multi_chain_kernel::{
+        Effect, Event, OptimizationPoolReserves, State, Subscription, transition,
+    },
     subscribe_new_heads,
 };
 use std::{
@@ -37,16 +39,11 @@ impl ClientEvmRuntime {
     }
 }
 
-pub(crate) enum ClientEvmSubscription {
-    NewHeadsSubscription(ChainKey),
-    TickSubscription(time::Duration),
-}
-
 impl Application for ClientEvmApp {
     type State = State;
     type Input = Event;
     type Effect = Effect;
-    type Subscription = ClientEvmSubscription;
+    type Subscription = Subscription;
 
     fn init() -> Transition<Self::State, Self::Effect> {
         let (state, effects) = State::init(client_evm::ChainKey::Ethereum);
@@ -63,8 +60,8 @@ impl Application for ClientEvmApp {
 
     fn subscriptions() -> Vec<Self::Subscription> {
         vec![
-            ClientEvmSubscription::NewHeadsSubscription(ChainKey::Ethereum),
-            ClientEvmSubscription::TickSubscription(time::Duration::from_millis(1000)),
+            Subscription::NewHeadsSubscription(ChainKey::Ethereum),
+            Subscription::TickSubscription(time::Duration::from_millis(1000)),
         ]
     }
 }
@@ -100,14 +97,14 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
         subscription: <ClientEvmApp as Application>::Subscription,
     ) {
         match subscription {
-            ClientEvmSubscription::NewHeadsSubscription(chain) => {
+            Subscription::NewHeadsSubscription(chain) => {
                 let map_client_event = |client_event: ClientEvent| {
                     map_client_chain_event(client_event)
                         .map(|event| Event::ChainEvent { chain, event })
                 };
                 let _ = subscribe_new_heads(self.get_config(chain), sender, map_client_event);
             }
-            ClientEvmSubscription::TickSubscription(interval) => {
+            Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
             }
         }

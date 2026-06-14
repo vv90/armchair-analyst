@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use alloy::primitives::{BlockHash, U256};
 use optimization::{Invertible, PoolReserves, VirtualReserveValues};
@@ -298,6 +301,11 @@ pub enum Event {
     Tick,
 }
 
+pub enum Subscription {
+    NewHeadsSubscription(ChainKey),
+    TickSubscription(Duration),
+}
+
 pub enum Effect {
     FetchFinalizedHeader {
         chain: ChainKey,
@@ -449,6 +457,18 @@ mod tests {
 
         assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
         assert_single_fetch_finalized_header_effect(&effects, chain);
+    }
+
+    #[test]
+    fn subscription_type_lives_with_multi_chain_events_and_effects() {
+        let new_heads = Subscription::NewHeadsSubscription(ChainKey::Ethereum);
+        let tick = Subscription::TickSubscription(std::time::Duration::from_secs(1));
+
+        assert!(matches!(
+            new_heads,
+            Subscription::NewHeadsSubscription(ChainKey::Ethereum)
+        ));
+        assert!(matches!(tick, Subscription::TickSubscription(_)));
     }
 
     #[test]
