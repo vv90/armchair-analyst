@@ -385,6 +385,10 @@ pub struct Model<
     block: LayerBlock<B, LAYERS>,
 }
 
+pub struct ModelOptimizer<B: AutodiffBackend, const LAYERS: usize> {
+    optimizer: OptimizerAdaptor<Adam, LayerBlock<B, LAYERS>, B>,
+}
+
 impl<
     B: AutodiffBackend,
     U: Copy,
@@ -392,15 +396,30 @@ impl<
     const LAYERS: usize,
 > Model<B, U, I, LAYERS>
 {
-    pub fn optimize(self, input_elem: B::FloatElem, num_iterations: usize) -> Self {
-        let input: Tensor<B, 1> = Tensor::from([input_elem]);
+    pub fn init_optimizer() -> ModelOptimizer<B, LAYERS> {
         let optimizer_config = AdamConfig::new()
             .with_beta_1(0.9)
             .with_beta_2(0.999)
             .with_epsilon(1e-8);
 
-        let mut optimizer: OptimizerAdaptor<Adam, LayerBlock<B, LAYERS>, B> =
-            optimizer_config.init();
+        ModelOptimizer {
+            optimizer: optimizer_config.init(),
+        }
+    }
+
+    pub fn optimize(self, input_elem: B::FloatElem, num_iterations: usize) -> Self {
+        let optimizer = Self::init_optimizer();
+        let (model, _optimizer) = self.optimize_with(optimizer, input_elem, num_iterations);
+        model
+    }
+
+    pub fn optimize_with(
+        self,
+        mut optimizer: ModelOptimizer<B, LAYERS>,
+        input_elem: B::FloatElem,
+        num_iterations: usize,
+    ) -> (Self, ModelOptimizer<B, LAYERS>) {
+        let input: Tensor<B, 1> = Tensor::from([input_elem]);
         let mut model = self;
 
         for i in 0..num_iterations {
@@ -410,7 +429,7 @@ impl<
             let raw_grads = loss.backward();
             let grads = GradientsParams::from_grads(raw_grads, &model.block);
 
-            model.block = optimizer.step(0.1, model.block, grads);
+            model.block = optimizer.optimizer.step(0.1, model.block, grads);
             if i % 10 == 0 || i == num_iterations - 1 {
                 println!(
                     "Iteration {}: input = {}, output = {}, profit = {}",
@@ -422,7 +441,7 @@ impl<
             }
         }
 
-        model
+        (model, optimizer)
     }
 }
 
@@ -839,6 +858,34 @@ mod tests {
             Tensor::zeros([3], &device).scatter(0, pool_token_indices, pool_outputs);
 
         println!("{}", output);
+    }
+
+    #[test]
+    fn optimize_with_accepts_and_returns_optimizer() {
+        type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+
+        let reserve = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 1.0,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        let model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+            tokens::USDC.address,
+            vec![reserve, reserve.inverse()],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let optimizer = Model::<CpuBackend, i32, TokenAddress, 1>::init_optimizer();
+        let (model, optimizer) = model.optimize_with(optimizer, 100.0, 0);
+        let (_model, _optimizer) = model.optimize_with(optimizer, 100.0, 0);
     }
 
     #[test]
