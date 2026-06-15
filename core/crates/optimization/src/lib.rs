@@ -1,16 +1,16 @@
 mod error;
 mod execution;
-pub mod model;
+#[allow(dead_code)]
+mod model;
 mod pool_reserves;
 mod tokens;
 mod utils;
 
 pub use error::OptimizationError;
 pub use execution::{
-    OptimizationBackendSelection, OptimizationBackendUsed, OptimizationSession,
-    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
+    OptimizationBackendSelection, OptimizationBackendUsed, OptimizationInitError,
+    OptimizationRunner, OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
     OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate,
-    initialize_optimization_session, run_optimization_step,
 };
 pub use model::ModelUpdateError;
 pub use pool_reserves::{PoolReserves, VirtualReserveValues};

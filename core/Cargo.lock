@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "aa-framework",
  "client-evm",
+ "optimization",
  "rustls",
  "serde_json",
  "ureq 3.3.0",

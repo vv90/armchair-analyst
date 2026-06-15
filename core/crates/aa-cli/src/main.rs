@@ -5,6 +5,10 @@ use std::{
 
 mod app;
 mod effects;
+#[cfg_attr(not(test), allow(dead_code))]
+mod latest_slot;
+#[cfg_attr(not(test), allow(dead_code))]
+mod optimization;
 mod utils;
 
 fn main() -> ExitCode {

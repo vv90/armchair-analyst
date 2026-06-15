@@ -18,6 +18,9 @@ pub enum OptimizationBackendUsed {
     Cpu,
 }
 
+type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+type WgpuBackend = burn::backend::Autodiff<burn::backend::Wgpu<f32>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReserveKey<TPool: Copy, TToken: Copy> {
     pool_id: TPool,
@@ -25,7 +28,34 @@ struct ReserveKey<TPool: Copy, TToken: Copy> {
     token1: TToken,
 }
 
-pub struct OptimizationSession<
+pub struct OptimizationRunner<
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+    const LAYERS: usize,
+> {
+    inner: OptimizationRunnerInner<TPool, TToken, LAYERS>,
+}
+
+enum OptimizationRunnerInner<
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+    const LAYERS: usize,
+> {
+    Wgpu(TypedOptimizationRunner<WgpuBackend, TPool, TToken, LAYERS>),
+    Cpu(TypedOptimizationRunner<CpuBackend, TPool, TToken, LAYERS>),
+}
+
+struct TypedOptimizationRunner<
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+    const LAYERS: usize,
+> {
+    session: OptimizationSession<B, TPool, TToken, LAYERS>,
+    step_config: OptimizationStepConfig,
+}
+
+struct OptimizationSession<
     B: AutodiffBackend,
     TPool: Copy,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
@@ -74,6 +104,15 @@ pub struct OptimizationStepResult {
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
+pub enum OptimizationInitError {
+    #[error("wgpu backend unavailable")]
+    WgpuUnavailable,
+
+    #[error("{0}")]
+    Step(OptimizationStepError),
+}
+
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum OptimizationStepError {
     #[error("optimization reserves are empty")]
     EmptyReserves,
@@ -91,7 +130,182 @@ pub enum OptimizationStepError {
     ModelInit { source: OptimizationError },
 }
 
-pub fn initialize_optimization_session<B, TPool, TToken, const LAYERS: usize>(
+impl<TPool, TToken, const LAYERS: usize> OptimizationRunner<TPool, TToken, LAYERS>
+where
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+{
+    pub fn init(
+        backend: OptimizationBackendSelection,
+        reserves: Vec<PoolReserves<TPool, TToken>>,
+        session_config: OptimizationSessionConfig<TToken>,
+        step_config: OptimizationStepConfig,
+    ) -> Result<
+        (
+            OptimizationRunner<TPool, TToken, LAYERS>,
+            OptimizationStepResult,
+        ),
+        OptimizationInitError,
+    > {
+        let backend = match backend {
+            OptimizationBackendSelection::Cpu => OptimizationBackendUsed::Cpu,
+            selection => select_backend(selection, wgpu_backend_available())?,
+        };
+
+        match backend {
+            OptimizationBackendUsed::Wgpu => {
+                let (runner, result) =
+                    TypedOptimizationRunner::<WgpuBackend, TPool, TToken, LAYERS>::init(
+                        reserves,
+                        session_config,
+                        step_config,
+                    )
+                    .map_err(OptimizationInitError::Step)?;
+
+                Ok((
+                    OptimizationRunner {
+                        inner: OptimizationRunnerInner::Wgpu(runner),
+                    },
+                    result,
+                ))
+            }
+            OptimizationBackendUsed::Cpu => {
+                let (runner, result) =
+                    TypedOptimizationRunner::<CpuBackend, TPool, TToken, LAYERS>::init(
+                        reserves,
+                        session_config,
+                        step_config,
+                    )
+                    .map_err(OptimizationInitError::Step)?;
+
+                Ok((
+                    OptimizationRunner {
+                        inner: OptimizationRunnerInner::Cpu(runner),
+                    },
+                    result,
+                ))
+            }
+        }
+    }
+
+    pub fn run(
+        self,
+        update: OptimizationStepUpdate<TPool, TToken>,
+    ) -> Result<
+        (
+            OptimizationRunner<TPool, TToken, LAYERS>,
+            OptimizationStepResult,
+        ),
+        OptimizationStepError,
+    > {
+        match self.inner {
+            OptimizationRunnerInner::Wgpu(runner) => {
+                let (runner, result) = runner.run(update)?;
+
+                Ok((
+                    OptimizationRunner {
+                        inner: OptimizationRunnerInner::Wgpu(runner),
+                    },
+                    result,
+                ))
+            }
+            OptimizationRunnerInner::Cpu(runner) => {
+                let (runner, result) = runner.run(update)?;
+
+                Ok((
+                    OptimizationRunner {
+                        inner: OptimizationRunnerInner::Cpu(runner),
+                    },
+                    result,
+                ))
+            }
+        }
+    }
+
+    pub fn backend_used(&self) -> OptimizationBackendUsed {
+        match self.inner {
+            OptimizationRunnerInner::Wgpu(_) => OptimizationBackendUsed::Wgpu,
+            OptimizationRunnerInner::Cpu(_) => OptimizationBackendUsed::Cpu,
+        }
+    }
+}
+
+impl<B, TPool, TToken, const LAYERS: usize> TypedOptimizationRunner<B, TPool, TToken, LAYERS>
+where
+    B: AutodiffBackend,
+    TPool: Copy + PartialEq + Eq + Hash,
+    TToken: Clone + Copy + PartialEq + Eq + Hash,
+{
+    fn init(
+        reserves: Vec<PoolReserves<TPool, TToken>>,
+        session_config: OptimizationSessionConfig<TToken>,
+        step_config: OptimizationStepConfig,
+    ) -> Result<
+        (
+            TypedOptimizationRunner<B, TPool, TToken, LAYERS>,
+            OptimizationStepResult,
+        ),
+        OptimizationStepError,
+    > {
+        let (session, result) = initialize_optimization_session::<B, TPool, TToken, LAYERS>(
+            reserves,
+            session_config,
+            &step_config,
+        )?;
+
+        Ok((
+            TypedOptimizationRunner {
+                session,
+                step_config,
+            },
+            result,
+        ))
+    }
+
+    fn run(
+        self,
+        update: OptimizationStepUpdate<TPool, TToken>,
+    ) -> Result<
+        (
+            TypedOptimizationRunner<B, TPool, TToken, LAYERS>,
+            OptimizationStepResult,
+        ),
+        OptimizationStepError,
+    > {
+        let (session, result) = run_optimization_step(self.session, update, &self.step_config)?;
+
+        Ok((
+            TypedOptimizationRunner {
+                session,
+                step_config: self.step_config,
+            },
+            result,
+        ))
+    }
+}
+
+fn select_backend(
+    selection: OptimizationBackendSelection,
+    wgpu_available: bool,
+) -> Result<OptimizationBackendUsed, OptimizationInitError> {
+    match selection {
+        OptimizationBackendSelection::Auto if wgpu_available => Ok(OptimizationBackendUsed::Wgpu),
+        OptimizationBackendSelection::Auto => Ok(OptimizationBackendUsed::Cpu),
+        OptimizationBackendSelection::Wgpu if wgpu_available => Ok(OptimizationBackendUsed::Wgpu),
+        OptimizationBackendSelection::Wgpu => Err(OptimizationInitError::WgpuUnavailable),
+        OptimizationBackendSelection::Cpu => Ok(OptimizationBackendUsed::Cpu),
+    }
+}
+
+fn wgpu_backend_available() -> bool {
+    std::panic::catch_unwind(|| {
+        let device = burn::backend::wgpu::WgpuDevice::default();
+        let _tensor = burn::tensor::Tensor::<WgpuBackend, 1>::zeros([1], &device);
+    })
+    .is_ok()
+}
+
+fn initialize_optimization_session<B, TPool, TToken, const LAYERS: usize>(
     reserves: Vec<PoolReserves<TPool, TToken>>,
     session_config: OptimizationSessionConfig<TToken>,
     step_config: &OptimizationStepConfig,
@@ -115,7 +329,7 @@ where
     )
 }
 
-pub fn run_optimization_step<B, TPool, TToken, const LAYERS: usize>(
+fn run_optimization_step<B, TPool, TToken, const LAYERS: usize>(
     session: OptimizationSession<B, TPool, TToken, LAYERS>,
     update: OptimizationStepUpdate<TPool, TToken>,
     step_config: &OptimizationStepConfig,
@@ -366,6 +580,96 @@ mod tests {
     type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
 
     #[test]
+    fn optimization_runner_cpu_init_returns_initialized_result() {
+        let (runner, result) = OptimizationRunner::<i32, TokenAddress, 1>::init(
+            OptimizationBackendSelection::Cpu,
+            base_reserves(),
+            session_config(),
+            step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(runner.backend_used(), OptimizationBackendUsed::Cpu);
+        assert_eq!(result.status, OptimizationStepStatus::Initialized);
+        assert_eq!(result.reserves_count, 2);
+    }
+
+    #[test]
+    fn optimization_runner_cpu_continue_returns_continued_result() {
+        let (runner, _) = initialized_cpu_runner();
+
+        let (_runner, result) = runner.run(OptimizationStepUpdate::Continue).unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Continued);
+        assert_eq!(result.reserves_count, 2);
+    }
+
+    #[test]
+    fn optimization_runner_cpu_same_keys_update_existing_runner() {
+        let (runner, _) = initialized_cpu_runner();
+
+        let (_runner, result) = runner
+            .run(OptimizationStepUpdate::NewReserves(scaled_base_reserves(
+                1.01,
+            )))
+            .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
+        assert_eq!(result.reserves_count, 2);
+    }
+
+    #[test]
+    fn optimization_runner_cpu_changed_keys_reinitialize_runner() {
+        let (runner, _) = initialized_cpu_runner();
+
+        let (_runner, result) = runner
+            .run(OptimizationStepUpdate::NewReserves(expanded_reserves()))
+            .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.reserves_count, 3);
+    }
+
+    #[test]
+    fn optimization_runner_empty_reserves_return_init_step_error() {
+        let error = expect_init_error(OptimizationRunner::<i32, TokenAddress, 1>::init(
+            OptimizationBackendSelection::Cpu,
+            Vec::new(),
+            session_config(),
+            step_config(0),
+        ));
+
+        assert_eq!(
+            error,
+            OptimizationInitError::Step(OptimizationStepError::EmptyReserves)
+        );
+    }
+
+    #[test]
+    fn auto_backend_choice_prefers_wgpu_when_available() {
+        assert_eq!(
+            select_backend(OptimizationBackendSelection::Auto, true),
+            Ok(OptimizationBackendUsed::Wgpu)
+        );
+    }
+
+    #[test]
+    fn auto_backend_choice_falls_back_to_cpu_when_wgpu_is_unavailable() {
+        assert_eq!(
+            select_backend(OptimizationBackendSelection::Auto, false),
+            Ok(OptimizationBackendUsed::Cpu)
+        );
+    }
+
+    #[test]
+    fn forced_wgpu_backend_choice_requires_wgpu() {
+        assert_eq!(
+            select_backend(OptimizationBackendSelection::Wgpu, false),
+            Err(OptimizationInitError::WgpuUnavailable)
+        );
+    }
+
+    #[test]
     fn initialize_session_returns_initialized_result() {
         let (_session, result) =
             initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
@@ -567,6 +871,34 @@ mod tests {
         OptimizationStepResult,
     ) {
         initialize_optimization_session(base_reserves(), session_config(), &step_config(0)).unwrap()
+    }
+
+    fn initialized_cpu_runner() -> (
+        OptimizationRunner<i32, TokenAddress, 1>,
+        OptimizationStepResult,
+    ) {
+        OptimizationRunner::init(
+            OptimizationBackendSelection::Cpu,
+            base_reserves(),
+            session_config(),
+            step_config(0),
+        )
+        .unwrap()
+    }
+
+    fn expect_init_error(
+        result: Result<
+            (
+                OptimizationRunner<i32, TokenAddress, 1>,
+                OptimizationStepResult,
+            ),
+            OptimizationInitError,
+        >,
+    ) -> OptimizationInitError {
+        match result {
+            Ok(_) => panic!("optimization runner init unexpectedly succeeded"),
+            Err(error) => error,
+        }
     }
 
     fn expect_step_error(
