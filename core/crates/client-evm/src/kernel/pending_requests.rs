@@ -1,90 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    marker::PhantomData,
 };
 
 use alloy::primitives::BlockHash;
 
-use super::{pool_registry::PoolCandidateAddress, tick::Tick, token_registry::TokenAddress};
-use crate::pool_state::PoolAddress;
-
-// #[derive(Hash, PartialEq, Eq, Clone, PartialOrd, Ord, Copy)]
-// struct RequestId<T>(u64, PhantomData<T>);
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct RawRequestId(u64);
-
-pub struct RequestId<R> {
-    raw: RawRequestId,
-    marker: PhantomData<fn() -> R>,
-}
-
-impl<R> Copy for RequestId<R> {}
-
-impl<R> Clone for RequestId<R> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<R> PartialEq for RequestId<R> {
-    fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
-    }
-}
-
-impl<R> Eq for RequestId<R> {}
-
-impl<R> std::hash::Hash for RequestId<R> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.raw.hash(state);
-    }
-}
-
-impl<R> fmt::Debug for RequestId<R> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.raw.0)
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<R> RequestId<R> {
-    pub fn from_raw_for_test(value: u64) -> Self {
-        RawRequestId(value).typed()
-    }
-
-    pub fn raw_for_test(self) -> u64 {
-        self.raw.0
-    }
-}
-
-impl RawRequestId {
-    fn next(self) -> RawRequestId {
-        RawRequestId(self.0.wrapping_add(1))
-    }
-
-    fn typed<R>(self) -> RequestId<R> {
-        RequestId {
-            raw: self,
-            marker: PhantomData,
-        }
-    }
-}
-
-pub struct PendingPayload<R> {
-    pub payload: R,
-    pub dispatched_at: Tick,
-}
-
-pub struct IssuedRequest<R> {
-    pub request_id: RequestId<R>,
-    pub request_payload: R,
-}
-
-pub struct PendingRequestsCollection<R> {
-    requests: HashMap<RequestId<R>, PendingPayload<R>>,
-}
+use super::{pool_registry::PoolCandidateAddress, token_registry::TokenAddress};
+pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
+use crate::{
+    pool_state::PoolAddress,
+    request_tracking::{RequestCollection, RequestIdSequence},
+    tick::Tick,
+};
 
 #[derive(Clone)]
 pub struct GetBlockLogs {
@@ -158,44 +85,32 @@ pub enum AnyPendingPayload {
 }
 
 pub struct PendingRequests {
-    last_request_id: RawRequestId,
-    block_logs: PendingRequestsCollection<GetBlockLogs>,
-    block_headers: PendingRequestsCollection<GetBlockHeader>,
-    pool_data: PendingRequestsCollection<GetPoolData>,
-    pool_metadata: PendingRequestsCollection<GetPoolMetadata>,
-    token_metadata: PendingRequestsCollection<GetTokenMetadata>,
+    request_ids: RequestIdSequence,
+    block_logs: RequestCollection<GetBlockLogs>,
+    block_headers: RequestCollection<GetBlockHeader>,
+    pool_data: RequestCollection<GetPoolData>,
+    pool_metadata: RequestCollection<GetPoolMetadata>,
+    token_metadata: RequestCollection<GetTokenMetadata>,
 }
 
 pub trait RequestKind: Sized {
-    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self>;
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self>;
+    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self>;
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self>;
 }
 
 impl PendingRequests {
     pub fn new() -> Self {
         PendingRequests {
-            last_request_id: RawRequestId(0),
-            block_logs: PendingRequestsCollection {
-                requests: HashMap::new(),
-            },
-            block_headers: PendingRequestsCollection {
-                requests: HashMap::new(),
-            },
-            pool_data: PendingRequestsCollection {
-                requests: HashMap::new(),
-            },
-            pool_metadata: PendingRequestsCollection {
-                requests: HashMap::new(),
-            },
-            token_metadata: PendingRequestsCollection {
-                requests: HashMap::new(),
-            },
+            request_ids: RequestIdSequence::new(),
+            block_logs: RequestCollection::new(),
+            block_headers: RequestCollection::new(),
+            pool_data: RequestCollection::new(),
+            pool_metadata: RequestCollection::new(),
+            token_metadata: RequestCollection::new(),
         }
     }
     pub fn get<R: RequestKind>(&self, request_id: &RequestId<R>) -> Option<&PendingPayload<R>> {
-        <R as RequestKind>::get_collection(self)
-            .requests
-            .get(request_id)
+        <R as RequestKind>::get_collection(self).get(request_id)
     }
 
     pub fn take<R: RequestKind>(
@@ -203,81 +118,37 @@ impl PendingRequests {
         request_id: &RequestId<R>,
     ) -> (Self, Option<PendingPayload<R>>) {
         let mut self_mut = self;
-        let pending_request = <R as RequestKind>::get_collection_mut(&mut self_mut)
-            .requests
-            .remove(request_id);
+        let pending_request =
+            <R as RequestKind>::get_collection_mut(&mut self_mut).remove(request_id);
 
         (self_mut, pending_request)
     }
 
-    // pub fn take_expired(self, tick: Tick) -> (Self, HashMap<AnyRequestId, AnyPendingPayload>) {
-    //     let mut self_mut = self;
-
-    //     let exp_header_reqs = self_mut
-    //         .block_headers
-    //         .requests
-    //         .extract_if(|_, req| tick.is_expired_since(req.dispatched_at))
-    //         .map(|(id, req)| {
-    //             (
-    //                 AnyRequestId::BlockHeader(id),
-    //                 AnyPendingPayload::BlockHeader(req),
-    //             )
-    //         });
-
-    //     let exp_logs_reqs = self_mut
-    //         .block_logs
-    //         .requests
-    //         .extract_if(|_, req| tick.is_expired_since(req.dispatched_at))
-    //         .map(|(id, req)| {
-    //             (
-    //                 AnyRequestId::BlockLogs(id),
-    //                 AnyPendingPayload::BlockLogs(req),
-    //             )
-    //         });
-
-    //     let exp_pool_reqs = self_mut
-    //         .pool_data
-    //         .requests
-    //         .extract_if(|_, req| tick.is_expired_since(req.dispatched_at))
-    //         .map(|(id, req)| (AnyRequestId::PoolData(id), AnyPendingPayload::PoolData(req)));
-
-    //     let expired = exp_header_reqs
-    //         .chain(exp_logs_reqs)
-    //         .chain(exp_pool_reqs)
-    //         .collect();
-    //     (self_mut, expired)
-    // }
-
     fn expired_ids(&self, tick: Tick) -> Vec<AnyRequestId> {
         self.block_headers
-            .requests
             .iter()
             .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
             .map(|(id, _)| AnyRequestId::BlockHeader(*id))
             .chain(
                 self.block_logs
-                    .requests
                     .iter()
                     .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
                     .map(|(id, _)| AnyRequestId::BlockLogs(*id)),
             )
             .chain(
                 self.pool_data
-                    .requests
                     .iter()
                     .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
                     .map(|(id, _)| AnyRequestId::PoolData(*id)),
             )
             .chain(
                 self.pool_metadata
-                    .requests
                     .iter()
                     .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
                     .map(|(id, _)| AnyRequestId::PoolMetadata(*id)),
             )
             .chain(
                 self.token_metadata
-                    .requests
                     .iter()
                     .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
                     .map(|(id, _)| AnyRequestId::TokenMetadata(*id)),
@@ -286,26 +157,16 @@ impl PendingRequests {
     }
 
     pub fn with_new_request<R: RequestKind>(self, payload: R, tick: Tick) -> (Self, RequestId<R>) {
-        let new_request_id = self.last_request_id.next();
         let mut self_mut = self;
+        let new_request_id = self_mut.request_ids.issue();
 
-        let requests = &mut <R as RequestKind>::get_collection_mut(&mut self_mut).requests;
+        <R as RequestKind>::get_collection_mut(&mut self_mut).insert(new_request_id, payload, tick);
 
-        requests.insert(
-            new_request_id.typed(),
-            PendingPayload {
-                payload,
-                dispatched_at: tick,
-            },
-        );
-
-        self_mut.last_request_id = new_request_id;
-        (self_mut, new_request_id.typed())
+        (self_mut, new_request_id)
     }
 
     pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
         self.block_logs
-            .requests
             .values()
             .map(|request| request.payload.block_hash)
             .collect()
@@ -313,7 +174,6 @@ impl PendingRequests {
 
     pub(crate) fn pending_pool_metadata_candidates(&self) -> HashSet<PoolCandidateAddress> {
         self.pool_metadata
-            .requests
             .values()
             .flat_map(|request| request.payload.candidates.iter().copied())
             .collect()
@@ -321,7 +181,6 @@ impl PendingRequests {
 
     pub(crate) fn pending_token_metadata_tokens(&self) -> HashSet<TokenAddress> {
         self.token_metadata
-            .requests
             .values()
             .flat_map(|request| request.payload.tokens.iter().copied())
             .collect()
@@ -331,7 +190,6 @@ impl PendingRequests {
         &self,
     ) -> HashMap<BlockHash, HashSet<PoolAddress>> {
         self.pool_data
-            .requests
             .values()
             .fold(HashMap::new(), |mut pools_by_block, request| {
                 pools_by_block
@@ -348,23 +206,18 @@ impl PendingRequests {
 
         requests
             .block_headers
-            .requests
             .retain(|_, request| retained_blocks.contains(&request.payload.block_hash));
         requests
             .block_logs
-            .requests
             .retain(|_, request| retained_blocks.contains(&request.payload.block_hash));
         requests
             .pool_data
-            .requests
             .retain(|_, request| retained_blocks.contains(&request.payload.at));
         requests
             .pool_metadata
-            .requests
             .retain(|_, request| retained_blocks.contains(&request.payload.at));
         requests
             .token_metadata
-            .requests
             .retain(|_, request| retained_blocks.contains(&request.payload.at));
 
         requests
@@ -431,11 +284,11 @@ impl PendingRequests {
 #[cfg(test)]
 impl PendingRequests {
     pub(crate) fn len_for_test(&self) -> usize {
-        self.block_headers.requests.len()
-            + self.block_logs.requests.len()
-            + self.pool_data.requests.len()
-            + self.pool_metadata.requests.len()
-            + self.token_metadata.requests.len()
+        self.block_headers.len()
+            + self.block_logs.len()
+            + self.pool_data.len()
+            + self.pool_metadata.len()
+            + self.token_metadata.len()
     }
 
     pub(crate) fn is_empty_for_test(&self) -> bool {
@@ -443,7 +296,7 @@ impl PendingRequests {
     }
 
     pub(crate) fn last_request_id_for_test(&self) -> u64 {
-        self.last_request_id.0
+        self.request_ids.raw_for_test()
     }
 
     pub(crate) fn contains<R: RequestKind>(&self, request_id: &RequestId<R>) -> bool {
@@ -462,7 +315,6 @@ impl PendingRequests {
 
     pub(crate) fn pending_header_hashes_for_test(&self) -> HashSet<BlockHash> {
         self.block_headers
-            .requests
             .values()
             .map(|request| request.payload.block_hash)
             .collect()
@@ -473,37 +325,27 @@ impl PendingRequests {
         request_id: &RequestId<GetBlockHeader>,
     ) -> Option<Tick> {
         self.block_headers
-            .requests
             .get(request_id)
             .map(|request| request.dispatched_at)
     }
 
     pub(crate) fn dispatch_ticks_for_test(&self) -> Vec<Tick> {
         self.block_headers
-            .requests
             .values()
             .map(|request| request.dispatched_at)
             .chain(
                 self.block_logs
-                    .requests
                     .values()
                     .map(|request| request.dispatched_at),
             )
-            .chain(
-                self.pool_data
-                    .requests
-                    .values()
-                    .map(|request| request.dispatched_at),
-            )
+            .chain(self.pool_data.values().map(|request| request.dispatched_at))
             .chain(
                 self.pool_metadata
-                    .requests
                     .values()
                     .map(|request| request.dispatched_at),
             )
             .chain(
                 self.token_metadata
-                    .requests
                     .values()
                     .map(|request| request.dispatched_at),
             )
@@ -512,51 +354,51 @@ impl PendingRequests {
 }
 
 impl RequestKind for GetBlockLogs {
-    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
         &requests.block_logs
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
         &mut requests.block_logs
     }
 }
 
 impl RequestKind for GetBlockHeader {
-    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
         &requests.block_headers
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
         &mut requests.block_headers
     }
 }
 
 impl RequestKind for GetPoolData {
-    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
         &requests.pool_data
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
         &mut requests.pool_data
     }
 }
 
 impl RequestKind for GetPoolMetadata {
-    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
         &requests.pool_metadata
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
         &mut requests.pool_metadata
     }
 }
 
 impl RequestKind for GetTokenMetadata {
-    fn get_collection(requests: &PendingRequests) -> &PendingRequestsCollection<Self> {
+    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
         &requests.token_metadata
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut PendingRequestsCollection<Self> {
+    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
         &mut requests.token_metadata
     }
 }

@@ -634,7 +634,7 @@ mod tests {
         );
         assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
 
-        let (state, effects) = (0..crate::kernel::tick::REQUEST_TTL_FOR_TEST)
+        let (state, effects) = (0..crate::tick::REQUEST_TTL_FOR_TEST)
             .fold((state, Vec::new()), |(state, _effects), _| {
                 transition(state, Event::Tick)
             });

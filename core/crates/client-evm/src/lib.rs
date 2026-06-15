@@ -10,6 +10,8 @@ mod error;
 pub mod kernel;
 pub mod multi_chain_kernel;
 mod pool_state;
+mod request_tracking;
+mod tick;
 mod tick_math;
 mod tokens;
 pub mod uniswap_v3;
