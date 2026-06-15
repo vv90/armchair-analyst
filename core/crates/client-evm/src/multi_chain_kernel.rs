@@ -304,6 +304,7 @@ pub enum Event {
 pub enum Subscription {
     NewHeadsSubscription(ChainKey),
     TickSubscription(Duration),
+    OptimizationSubscription,
 }
 
 pub enum Effect {
@@ -463,12 +464,17 @@ mod tests {
     fn subscription_type_lives_with_multi_chain_events_and_effects() {
         let new_heads = Subscription::NewHeadsSubscription(ChainKey::Ethereum);
         let tick = Subscription::TickSubscription(std::time::Duration::from_secs(1));
+        let optimization = Subscription::OptimizationSubscription;
 
         assert!(matches!(
             new_heads,
             Subscription::NewHeadsSubscription(ChainKey::Ethereum)
         ));
         assert!(matches!(tick, Subscription::TickSubscription(_)));
+        assert!(matches!(
+            optimization,
+            Subscription::OptimizationSubscription
+        ));
     }
 
     #[test]

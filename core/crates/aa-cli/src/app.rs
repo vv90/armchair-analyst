@@ -1,20 +1,28 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent, ClientEvmError, ClientHead,
-    PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult, RequestId, RpcConfig,
-    TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
-    kernel,
+    ETHEREUM_USDC_TOKEN_ADDRESS, PoolAddress, PoolCandidateAddress, PoolDataResult,
+    PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult,
+    fetch_block_header, fetch_block_logs, fetch_finalized_block_header, fetch_pool_data,
+    fetch_pool_metadata, fetch_token_metadata, kernel,
     multi_chain_kernel::{
         Effect, Event, OptimizationPoolReserves, State, Subscription, transition,
     },
     subscribe_new_heads,
 };
+use optimization::{
+    OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
+};
 use std::{
     collections::{HashMap, HashSet},
-    sync::mpsc::Sender,
+    sync::{OnceLock, mpsc::Sender},
     thread::{self, JoinHandle},
     time,
+};
+
+use crate::{
+    latest_slot::{LatestReceiveError, LatestReceiver, LatestSender, latest_slot},
+    optimization::{RunOptimizationError, run_optimization},
 };
 
 pub(crate) struct ClientEvmApp {}
@@ -22,6 +30,7 @@ pub(crate) struct ClientEvmApp {}
 pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     ethereum_config: RpcConfig,
+    optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
 }
 
 impl ClientEvmRuntime {
@@ -29,6 +38,7 @@ impl ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             ethereum_config,
+            optimization_sender: OnceLock::new(),
         }
     }
 
@@ -62,6 +72,7 @@ impl Application for ClientEvmApp {
         vec![
             Subscription::NewHeadsSubscription(ChainKey::Ethereum),
             Subscription::TickSubscription(time::Duration::from_millis(1000)),
+            Subscription::OptimizationSubscription,
         ]
     }
 }
@@ -86,6 +97,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
             Effect::ChainEffect { chain, effect } => self.execute_chain_effect(chain, effect),
             Effect::RunOptimization { input } => {
                 eprintln!("{}", format_run_optimization_effect_log(&input));
+                self.send_optimization_input(input);
                 Vec::new()
             }
         }
@@ -107,6 +119,15 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
             }
+            Subscription::OptimizationSubscription => {
+                let (slot_sender, slot_receiver) = latest_slot();
+
+                if self.optimization_sender.set(slot_sender).is_ok() {
+                    drop(spawn_optimization_subscription(slot_receiver));
+                } else {
+                    eprintln!("error optimization_subscription_already_started");
+                }
+            }
         }
     }
 
@@ -119,6 +140,23 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
             ApplicationError::SendError(error) => {
                 eprintln!("error send_failed input={}", format_input_log(&error.0));
             }
+        }
+    }
+}
+
+impl ClientEvmRuntime {
+    fn send_optimization_input(&self, input: OptimizationPoolReserves) {
+        if input.reserves.is_empty() {
+            return;
+        }
+
+        match self.optimization_sender.get() {
+            Some(sender) => {
+                if let Err(error) = sender.send(input) {
+                    eprintln!("error optimization_send_failed error={error:?}");
+                }
+            }
+            None => eprintln!("error optimization_sender_uninitialized"),
         }
     }
 }
@@ -250,6 +288,43 @@ fn spawn_tick_subscription(sender: Sender<Event>, interval: time::Duration) -> J
             }
         }
     })
+}
+
+fn spawn_optimization_subscription(
+    receiver: LatestReceiver<OptimizationPoolReserves>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let result = run_optimization(
+            receiver,
+            default_optimization_backend(),
+            default_optimization_session_config(),
+            default_optimization_step_config(),
+        );
+
+        match result {
+            Ok(()) => {}
+            Err(RunOptimizationError::Receive(LatestReceiveError::Closed)) => {}
+            Err(error) => eprintln!("error optimization_worker_failed error={error:?}"),
+        }
+    })
+}
+
+fn default_optimization_backend() -> OptimizationBackendSelection {
+    OptimizationBackendSelection::Auto
+}
+
+fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddress> {
+    OptimizationSessionConfig {
+        init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+        bridges: HashSet::new(),
+    }
+}
+
+fn default_optimization_step_config() -> OptimizationStepConfig {
+    OptimizationStepConfig {
+        input_amount: 1000.0,
+        iterations: 10,
+    }
 }
 
 fn execute_chain_effect_with<
@@ -412,6 +487,35 @@ mod tests {
         let runtime = ClientEvmRuntime::new(config.clone());
 
         assert_eq!(runtime.get_config(ChainKey::Ethereum), &config);
+    }
+
+    #[test]
+    fn subscriptions_include_optimization_worker() {
+        let subscriptions = ClientEvmApp::subscriptions();
+
+        assert!(subscriptions.iter().any(|subscription| {
+            matches!(
+                subscription,
+                Subscription::NewHeadsSubscription(ChainKey::Ethereum)
+            )
+        }));
+        assert!(
+            subscriptions
+                .iter()
+                .any(|subscription| matches!(subscription, Subscription::TickSubscription(_)))
+        );
+        assert!(
+            subscriptions
+                .iter()
+                .any(|subscription| matches!(subscription, Subscription::OptimizationSubscription))
+        );
+    }
+
+    #[test]
+    fn runtime_starts_with_uninitialized_optimization_sender() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+
+        assert!(runtime.optimization_sender.get().is_none());
     }
 
     #[test]
@@ -591,6 +695,88 @@ mod tests {
         });
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn empty_optimization_snapshot_is_dropped() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+        let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
+        assert!(runtime.optimization_sender.set(slot_sender).is_ok());
+
+        let events = runtime.execute_effect(Effect::RunOptimization {
+            input: optimization_input(hash(7)),
+        });
+
+        assert!(events.is_empty());
+        assert_eq!(slot_receiver.try_take(), Ok(None));
+    }
+
+    #[test]
+    fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+        let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
+        assert!(runtime.optimization_sender.set(slot_sender).is_ok());
+        let input = optimization_input_with_reserves(hash(7));
+
+        let events = runtime.execute_effect(Effect::RunOptimization {
+            input: input.clone(),
+        });
+
+        assert!(events.is_empty());
+        assert_eq!(slot_receiver.try_take(), Ok(Some(input)));
+    }
+
+    #[test]
+    fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+
+        let events = runtime.execute_effect(Effect::RunOptimization {
+            input: optimization_input_with_reserves(hash(7)),
+        });
+
+        assert!(events.is_empty());
+        assert!(runtime.optimization_sender.get().is_none());
+    }
+
+    #[test]
+    fn optimization_subscription_initializes_sender() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+        let (sender, _receiver) = mpsc::channel();
+
+        runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
+
+        assert!(runtime.optimization_sender.get().is_some());
+    }
+
+    #[test]
+    fn optimization_subscription_starts_only_once() {
+        let runtime = ClientEvmRuntime::new(rpc_config());
+        let (sender, _receiver) = mpsc::channel();
+
+        runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
+        let first_sender = runtime
+            .optimization_sender
+            .get()
+            .map(|sender| sender as *const _);
+        runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
+
+        assert_eq!(
+            runtime
+                .optimization_sender
+                .get()
+                .map(|sender| sender as *const _),
+            first_sender
+        );
+    }
+
+    #[test]
+    fn optimization_worker_exits_cleanly_when_slot_closes_before_initialization() {
+        let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
+        let handle = spawn_optimization_subscription(slot_receiver);
+
+        drop(slot_sender);
+
+        assert!(handle.join().is_ok());
     }
 
     #[test]
@@ -1154,6 +1340,38 @@ mod tests {
             block_hash,
             reserves: Vec::new(),
         }
+    }
+
+    fn optimization_input_with_reserves(
+        block_hash: BlockHash,
+    ) -> client_evm::multi_chain_kernel::OptimizationPoolReserves {
+        client_evm::multi_chain_kernel::OptimizationPoolReserves {
+            block_hash,
+            reserves: vec![optimization_pool_reserves()],
+        }
+    }
+
+    fn optimization_pool_reserves() -> optimization::PoolReserves<PoolAddress, TokenAddress> {
+        optimization::PoolReserves {
+            pool_id: pool_address(1),
+            token0: token_address(1),
+            token1: token_address(2),
+            value: optimization::VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 2_000.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 100.0,
+                max_swap_1: 200.0,
+            },
+        }
+    }
+
+    fn pool_address(last_byte: u8) -> PoolAddress {
+        let address = format!("0x{}", format!("{last_byte:040x}"))
+            .parse()
+            .expect("test address must parse");
+
+        PoolAddress(address)
     }
 
     fn zero_logs_bloom() -> String {

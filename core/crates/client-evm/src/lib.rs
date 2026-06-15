@@ -15,6 +15,7 @@ mod pool_state;
 mod tick;
 mod tick_math;
 mod token_registry;
+mod tokens;
 pub mod uniswap_v3;
 mod utils;
 
@@ -41,4 +42,5 @@ pub use token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
     TokenMetadataResult, TokenRegistry,
 };
+pub use tokens::ETHEREUM_USDC_TOKEN_ADDRESS;
 pub use utils::{TokenAmountConversionError, u256_token_amount_to_f32};
