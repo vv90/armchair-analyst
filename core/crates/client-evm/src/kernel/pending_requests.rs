@@ -6,10 +6,8 @@ use std::{
 
 use alloy::primitives::BlockHash;
 
-use crate::{
-    pool_registry::PoolCandidateAddress, pool_state::PoolAddress, tick::Tick,
-    token_registry::TokenAddress,
-};
+use super::{pool_registry::PoolCandidateAddress, tick::Tick, token_registry::TokenAddress};
+use crate::pool_state::PoolAddress;
 
 // #[derive(Hash, PartialEq, Eq, Clone, PartialOrd, Ord, Copy)]
 // struct RequestId<T>(u64, PhantomData<T>);

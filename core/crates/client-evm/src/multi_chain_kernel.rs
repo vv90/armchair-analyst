@@ -634,7 +634,7 @@ mod tests {
         );
         assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
 
-        let (state, effects) = (0..crate::tick::REQUEST_TTL_FOR_TEST)
+        let (state, effects) = (0..crate::kernel::tick::REQUEST_TTL_FOR_TEST)
             .fold((state, Vec::new()), |(state, _effects), _| {
                 transition(state, Event::Tick)
             });
@@ -1370,7 +1370,7 @@ mod tests {
                         chain: effect_chain,
                         effect:
                             kernel::Effect::Request(
-                                crate::pending_requests::AnyIssuedRequest::BlockHeader(request),
+                                crate::AnyIssuedRequest::BlockHeader(request),
                             ),
                     } if *effect_chain == chain && request.request_payload.block_hash == block_hash
                 )
@@ -1384,25 +1384,19 @@ mod tests {
         effects: &[Effect],
         chain: ChainKey,
         block_hash: BlockHash,
-    ) -> crate::pending_requests::RequestId<crate::pending_requests::GetBlockHeader> {
-        let matching_effects =
-            effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    Effect::ChainEffect {
-                        chain: effect_chain,
-                        effect:
-                            kernel::Effect::Request(
-                                crate::pending_requests::AnyIssuedRequest::BlockHeader(request),
-                            ),
-                    } if *effect_chain == chain
-                        && request.request_payload.block_hash == block_hash =>
-                    {
-                        Some(request.request_id)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+    ) -> crate::RequestId<crate::GetBlockHeader> {
+        let matching_effects = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ChainEffect {
+                    chain: effect_chain,
+                    effect: kernel::Effect::Request(crate::AnyIssuedRequest::BlockHeader(request)),
+                } if *effect_chain == chain && request.request_payload.block_hash == block_hash => {
+                    Some(request.request_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(matching_effects.len(), 1);
         matching_effects[0]
@@ -1412,25 +1406,19 @@ mod tests {
         effects: &[Effect],
         chain: ChainKey,
         block_hash: BlockHash,
-    ) -> crate::pending_requests::RequestId<crate::pending_requests::GetBlockLogs> {
-        let matching_effects =
-            effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    Effect::ChainEffect {
-                        chain: effect_chain,
-                        effect:
-                            kernel::Effect::Request(
-                                crate::pending_requests::AnyIssuedRequest::BlockLogs(request),
-                            ),
-                    } if *effect_chain == chain
-                        && request.request_payload.block_hash == block_hash =>
-                    {
-                        Some(request.request_id)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+    ) -> crate::RequestId<crate::GetBlockLogs> {
+        let matching_effects = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ChainEffect {
+                    chain: effect_chain,
+                    effect: kernel::Effect::Request(crate::AnyIssuedRequest::BlockLogs(request)),
+                } if *effect_chain == chain && request.request_payload.block_hash == block_hash => {
+                    Some(request.request_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(matching_effects.len(), 1);
         matching_effects[0]

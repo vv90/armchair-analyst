@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::Address;
 
-use crate::PoolAddress;
+use crate::pool_state::PoolAddress;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolCandidateAddress(pub Address);

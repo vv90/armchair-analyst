@@ -5,7 +5,13 @@ use std::{
 
 use alloy::primitives::BlockHash;
 
-use crate::{pending_requests::*, pool_registry::*, pool_state::*, tick::Tick, token_registry::*};
+pub(crate) mod pending_requests;
+pub(crate) mod pool_registry;
+pub(crate) mod tick;
+pub(crate) mod token_registry;
+
+use self::{pending_requests::*, pool_registry::*, tick::Tick, token_registry::*};
+use crate::pool_state::*;
 
 enum PoolLogsStatus {
     Unknown,
@@ -1502,7 +1508,7 @@ mod tests {
 
     use alloy::primitives::{Address, U160, U256, aliases::I24};
 
-    use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
+    use super::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
     use proptest::prelude::*;
 
     #[derive(Debug)]

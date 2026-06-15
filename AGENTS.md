@@ -2,10 +2,11 @@
 
 - **Do not edit code without an explicit command from the human.** Discussion, analysis, and proposals are fine — but no file edits until the human says to proceed.
 - When making changes, do them is smallest possible increments. Avoid making multiple changes at once, large sweeping changes, or changes that are not immediately necessary. Each change should be as small as possible and should be easily understandable at a glance.
-- Test-first always:
+- Test-first new logic always:
     - Write tests before implementation.
     - Confirm tests fail for the intended reason before writing production logic.
     - Prefer stubs/placeholders when introducing new modules to establish structure and compile-time contracts first.
+- When providing test coverage for refactors, write successfull tests (or make sure they exist) that cover the expected behavior before the refactor. Then check with the same tests after refactor.
 - Prefer property-based tests by default for core logic (state transitions, framing, math, ordering, validation).
 - Keep domain logic pure:
     - Pure, deterministic functions for business logic and state transitions.

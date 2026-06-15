@@ -9,12 +9,8 @@ mod erc20;
 mod error;
 pub mod kernel;
 pub mod multi_chain_kernel;
-mod pending_requests;
-mod pool_registry;
 mod pool_state;
-mod tick;
 mod tick_math;
-mod token_registry;
 mod tokens;
 pub mod uniswap_v3;
 mod utils;
@@ -26,21 +22,21 @@ pub use client::{
 };
 pub use config::RpcConfig;
 pub use error::ClientEvmError;
-pub use pending_requests::{
+pub use kernel::pending_requests::{
     AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
     GetTokenMetadata, IssuedRequest, RequestId,
 };
-pub use pool_registry::{
+pub use kernel::pool_registry::{
     PoolCandidateAddress, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
     TrustedPoolLogs, TrustedPoolRegistry, UniswapV3Fee,
+};
+pub use kernel::token_registry::{
+    TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
+    TokenMetadataResult, TokenRegistry,
 };
 pub use pool_state::{
     PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState, PoolStateError,
 };
 pub use tick_math::TickMathError;
-pub use token_registry::{
-    TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
-    TokenMetadataResult, TokenRegistry,
-};
 pub use tokens::ETHEREUM_USDC_TOKEN_ADDRESS;
 pub use utils::{TokenAmountConversionError, u256_token_amount_to_f32};
