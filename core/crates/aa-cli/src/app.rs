@@ -96,7 +96,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
             }
             Effect::ChainEffect { chain, effect } => self.execute_chain_effect(chain, effect),
             Effect::RunOptimization { input } => {
-                eprintln!("{}", format_run_optimization_effect_log(&input));
+                println!("{}", format_run_optimization_effect_log(&input));
                 self.send_optimization_input(input);
                 Vec::new()
             }

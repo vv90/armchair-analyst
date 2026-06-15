@@ -27,6 +27,16 @@ enum ChainLifecycle {
     Active(kernel::State),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FinalizedRefreshPolicy {
+    target_len: usize,
+    retry_stride: usize,
+}
+
+const ETHEREUM_APPROX_FINALIZED_BLOCK_AGE: usize = 64;
+const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
+const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptimizationPoolReserves {
     pub block_hash: BlockHash,
@@ -388,16 +398,28 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
 
     match chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
+            let before_len = chain_state.canonical_path_len_from_finalized();
             let (chain_state, effects) = kernel::transition(chain_state, event);
+            let after_len = chain_state.canonical_path_len_from_finalized();
+            let refresh_policy = finalized_refresh_policy(chain);
+            let should_fetch_finalized = kernel::should_fetch_finalized_header(
+                before_len,
+                after_len,
+                refresh_policy.target_len,
+                refresh_policy.retry_stride,
+            );
+            let mut effects = effects
+                .into_iter()
+                .map(|effect| Effect::ChainEffect { chain, effect })
+                .collect::<Vec<_>>();
+
+            if should_fetch_finalized {
+                effects.push(Effect::FetchFinalizedHeader { chain });
+            }
+
             chains.insert(chain, ChainLifecycle::Active(chain_state));
 
-            (
-                State { chains },
-                effects
-                    .into_iter()
-                    .map(|effect| Effect::ChainEffect { chain, effect })
-                    .collect(),
-            )
+            (State { chains }, effects)
         }
         Some(existing_chain) => {
             chains.insert(chain, existing_chain);
@@ -434,6 +456,15 @@ fn tick(state: State) -> (State, Vec<Effect>) {
     );
 
     (State { chains }, effects)
+}
+
+fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
+    match chain {
+        ChainKey::Ethereum => FinalizedRefreshPolicy {
+            target_len: ETHEREUM_APPROX_FINALIZED_BLOCK_AGE + ETHEREUM_FINALIZED_RETENTION_MARGIN,
+            retry_stride: ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +641,162 @@ mod tests {
 
         assert_eq!(state.status(chain), Some(ChainStatus::Active));
         assert_single_header_request_chain_effect(&effects, chain, missing_parent_hash);
+    }
+
+    #[test]
+    fn connected_path_below_refresh_target_does_not_fetch_finalized_header() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(0);
+        let policy = finalized_refresh_policy(chain);
+        let state = active_state_at(chain, finalized_hash);
+        let (_state, effects) = drive_connected_heads(state, chain, policy.target_len - 1);
+
+        assert_no_fetch_finalized_header_effect(&effects, chain);
+    }
+
+    #[test]
+    fn connected_path_crossing_refresh_target_fetches_finalized_header_once() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(0);
+        let policy = finalized_refresh_policy(chain);
+        let state = active_state_at(chain, finalized_hash);
+        let (state, effects) = drive_connected_heads(state, chain, policy.target_len);
+
+        assert_single_fetch_finalized_header_effect_for_chain(&effects, chain);
+
+        let (_state, duplicate_effects) = observe_head(
+            state,
+            chain,
+            hash_for_index(policy.target_len),
+            hash_for_index(policy.target_len - 1),
+        );
+
+        assert_no_fetch_finalized_header_effect(&duplicate_effects, chain);
+    }
+
+    #[test]
+    fn same_tip_log_event_after_refresh_target_does_not_duplicate_finalized_fetch() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(0);
+        let policy = finalized_refresh_policy(chain);
+        let state = active_state_at(chain, finalized_hash);
+        let (state, effects) = drive_connected_heads(state, chain, policy.target_len);
+        let request_id = assert_single_log_request_chain_effect(
+            &effects,
+            chain,
+            hash_for_index(policy.target_len),
+        );
+
+        let (_state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain,
+                event: kernel::Event::BlockLogsReceived {
+                    request_id,
+                    logs: HashSet::new(),
+                },
+            },
+        );
+
+        assert_no_fetch_finalized_header_effect(&effects, chain);
+    }
+
+    #[test]
+    fn connected_heads_inside_retry_bucket_do_not_duplicate_finalized_fetch() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(0);
+        let policy = finalized_refresh_policy(chain);
+        let state = active_state_at(chain, finalized_hash);
+        let (mut state, _effects) = drive_connected_heads(state, chain, policy.target_len);
+
+        for block_index in policy.target_len + 1..policy.target_len + policy.retry_stride {
+            let (next_state, effects) = observe_head(
+                state,
+                chain,
+                hash_for_index(block_index),
+                hash_for_index(block_index - 1),
+            );
+
+            assert_no_fetch_finalized_header_effect(&effects, chain);
+            state = next_state;
+        }
+    }
+
+    #[test]
+    fn connected_head_crossing_retry_bucket_fetches_finalized_header_once() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(0);
+        let policy = finalized_refresh_policy(chain);
+        let state = active_state_at(chain, finalized_hash);
+        let (state, _effects) = drive_connected_heads(state, chain, policy.target_len);
+        let mut state = state;
+        let mut refresh_count = 0usize;
+
+        for block_index in policy.target_len + 1..=policy.target_len + policy.retry_stride {
+            let (next_state, effects) = observe_head(
+                state,
+                chain,
+                hash_for_index(block_index),
+                hash_for_index(block_index - 1),
+            );
+
+            refresh_count += fetch_finalized_header_effect_count(&effects, chain);
+            state = next_state;
+        }
+
+        assert_eq!(refresh_count, 1);
+    }
+
+    #[test]
+    fn reconnecting_long_canonical_path_fetches_finalized_header_once() {
+        let chain = ChainKey::Ethereum;
+        let finalized_hash = hash(0);
+        let policy = finalized_refresh_policy(chain);
+        let state = active_state_at(chain, finalized_hash);
+        let (mut state, mut effects) = observe_head(
+            state,
+            chain,
+            hash_for_index(policy.target_len),
+            hash_for_index(policy.target_len - 1),
+        );
+        let mut refresh_count = fetch_finalized_header_effect_count(&effects, chain);
+
+        for missing_index in (1..policy.target_len).rev() {
+            let missing_hash = hash_for_index(missing_index);
+            let request_id = single_header_request_id(&effects, chain, missing_hash);
+            let parent_hash = if missing_index == 1 {
+                finalized_hash
+            } else {
+                hash_for_index(missing_index - 1)
+            };
+
+            let (next_state, next_effects) = transition(
+                state,
+                Event::ChainEvent {
+                    chain,
+                    event: kernel::Event::BlockHeaderReceived {
+                        request_id,
+                        hash: missing_hash,
+                        parent_hash,
+                    },
+                },
+            );
+
+            refresh_count += fetch_finalized_header_effect_count(&next_effects, chain);
+            state = next_state;
+            effects = next_effects;
+        }
+
+        assert_eq!(refresh_count, 1);
+
+        let (_state, duplicate_effects) = observe_head(
+            state,
+            chain,
+            hash_for_index(policy.target_len),
+            hash_for_index(policy.target_len - 1),
+        );
+
+        assert_no_fetch_finalized_header_effect(&duplicate_effects, chain);
     }
 
     #[test]
@@ -1094,6 +1281,81 @@ mod tests {
         ));
     }
 
+    fn assert_single_fetch_finalized_header_effect_for_chain(effects: &[Effect], chain: ChainKey) {
+        assert_eq!(fetch_finalized_header_effect_count(effects, chain), 1);
+    }
+
+    fn assert_no_fetch_finalized_header_effect(effects: &[Effect], chain: ChainKey) {
+        assert_eq!(fetch_finalized_header_effect_count(effects, chain), 0);
+    }
+
+    fn fetch_finalized_header_effect_count(effects: &[Effect], chain: ChainKey) -> usize {
+        effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    Effect::FetchFinalizedHeader { chain: effect_chain }
+                        if *effect_chain == chain
+                )
+            })
+            .count()
+    }
+
+    fn active_state_at(chain: ChainKey, finalized_hash: BlockHash) -> State {
+        let (state, _effects) = State::init(chain);
+        let (state, effects) = transition(
+            state,
+            Event::FinalizedHeaderReceived {
+                chain,
+                block_hash: finalized_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        state
+    }
+
+    fn drive_connected_heads(
+        mut state: State,
+        chain: ChainKey,
+        target_len: usize,
+    ) -> (State, Vec<Effect>) {
+        let mut effects = Vec::new();
+
+        for block_index in 1..=target_len {
+            let parent_hash = if block_index == 1 {
+                hash(0)
+            } else {
+                hash_for_index(block_index - 1)
+            };
+            let result = observe_head(state, chain, hash_for_index(block_index), parent_hash);
+            state = result.0;
+            effects = result.1;
+        }
+
+        (state, effects)
+    }
+
+    fn observe_head(
+        state: State,
+        chain: ChainKey,
+        hash: BlockHash,
+        parent_hash: BlockHash,
+    ) -> (State, Vec<Effect>) {
+        transition(
+            state,
+            Event::ChainEvent {
+                chain,
+                event: kernel::Event::HeadObserved { hash, parent_hash },
+            },
+        )
+    }
+
+    fn hash_for_index(index: usize) -> BlockHash {
+        hash(u8::try_from(index).expect("test block index must fit in u8"))
+    }
+
     fn assert_single_header_request_chain_effect(
         effects: &[Effect],
         chain: ChainKey,
@@ -1116,6 +1378,34 @@ mod tests {
             .count();
 
         assert_eq!(matching_effects, 1);
+    }
+
+    fn single_header_request_id(
+        effects: &[Effect],
+        chain: ChainKey,
+        block_hash: BlockHash,
+    ) -> crate::pending_requests::RequestId<crate::pending_requests::GetBlockHeader> {
+        let matching_effects =
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::ChainEffect {
+                        chain: effect_chain,
+                        effect:
+                            kernel::Effect::Request(
+                                crate::pending_requests::AnyIssuedRequest::BlockHeader(request),
+                            ),
+                    } if *effect_chain == chain
+                        && request.request_payload.block_hash == block_hash =>
+                    {
+                        Some(request.request_id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+        assert_eq!(matching_effects.len(), 1);
+        matching_effects[0]
     }
 
     fn assert_single_log_request_chain_effect(

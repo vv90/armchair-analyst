@@ -583,6 +583,17 @@ impl State {
         }
     }
 
+    /// Measures the connected canonical path length from the finalized anchor to the current tip.
+    /// Added so wrappers can trigger finalized-header refreshes from graph distance without inspecting graph internals.
+    pub(crate) fn canonical_path_len_from_finalized(&self) -> Option<usize> {
+        self.blocks
+            .connected_path_hashes_oldest_to_newest(
+                self.canonical_tip,
+                self.finalized_state.block_hash,
+            )
+            .map(|hashes| hashes.len())
+    }
+
     /// Finds the latest complete pool-state overlay on a connected path from an arbitrary block.
     /// Added so optimization and compaction can share one readiness query without triggering effects.
     pub fn latest_complete_pool_state_update_from(
@@ -698,6 +709,40 @@ impl State {
             tick,
         }
     }
+}
+
+/// Decides whether a canonical path length transition should refresh the finalized header.
+/// Added to make finalized refresh edge-triggered instead of repeatedly firing for every event above target.
+pub(crate) fn should_fetch_finalized_header(
+    before_len: Option<usize>,
+    after_len: Option<usize>,
+    target_len: usize,
+    retry_stride: usize,
+) -> bool {
+    let Some(after_len) = after_len else {
+        return false;
+    };
+
+    if after_len < target_len {
+        return false;
+    }
+
+    match before_len {
+        None => true,
+        Some(before_len) if before_len < target_len => true,
+        Some(before_len) => {
+            finalized_refresh_bucket(before_len, target_len, retry_stride)
+                < finalized_refresh_bucket(after_len, target_len, retry_stride)
+        }
+    }
+}
+
+fn finalized_refresh_bucket(len: usize, target_len: usize, retry_stride: usize) -> usize {
+    if retry_stride == 0 {
+        return 0;
+    }
+
+    len.saturating_sub(target_len) / retry_stride
 }
 
 pub enum Event {
@@ -4357,6 +4402,148 @@ mod tests {
             Some(TrustedPoolLogs::Unknown)
         );
         assert_state_invariants(&state);
+    }
+
+    // Measures an empty canonical path at the finalized anchor.
+    // This gives refresh policy callers a stable zero-length baseline.
+    #[test]
+    fn canonical_path_len_from_finalized_returns_zero_at_finalized_anchor() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let state = empty_state_at(finalized_hash);
+
+        assert_eq!(state.canonical_path_len_from_finalized(), Some(0));
+    }
+
+    // Measures a fully connected canonical path from finalized to tip.
+    // This keeps finalized-refresh scheduling tied to actual graph distance.
+    #[test]
+    fn canonical_path_len_from_finalized_returns_connected_path_length() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let third_hash = BlockHash::with_last_byte(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = third_hash;
+        state
+            .blocks
+            .0
+            .insert(first_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .insert(second_hash, block_with_parent(first_hash));
+        state
+            .blocks
+            .0
+            .insert(third_hash, block_with_parent(second_hash));
+
+        assert_eq!(state.canonical_path_len_from_finalized(), Some(3));
+    }
+
+    // Refuses to measure a canonical path with missing ancestry.
+    // This prevents refresh policy from acting on a partial suffix.
+    #[test]
+    fn canonical_path_len_from_finalized_returns_none_for_disconnected_path() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = head_hash;
+        state
+            .blocks
+            .0
+            .insert(head_hash, block_with_parent(missing_parent_hash));
+
+        assert_eq!(state.canonical_path_len_from_finalized(), None);
+    }
+
+    // Refuses to measure cyclic canonical ancestry.
+    // This keeps refresh policy from treating corrupt graph structure as mature depth.
+    #[test]
+    fn canonical_path_len_from_finalized_returns_none_for_cyclic_path() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = second_hash;
+        state
+            .blocks
+            .0
+            .insert(first_hash, block_with_parent(second_hash));
+        state
+            .blocks
+            .0
+            .insert(second_hash, block_with_parent(first_hash));
+
+        assert_eq!(state.canonical_path_len_from_finalized(), None);
+    }
+
+    // Checks finalized-refresh threshold behavior below the target.
+    // This avoids early finalized-header fetches while the graph is still short.
+    #[test]
+    fn finalized_refresh_predicate_does_not_trigger_below_target() {
+        assert!(!should_fetch_finalized_header(Some(70), Some(71), 72, 8));
+    }
+
+    // Checks the initial crossing into the refresh target.
+    // This is the first point at which the graph should ask for a newer finalized anchor.
+    #[test]
+    fn finalized_refresh_predicate_triggers_when_crossing_target() {
+        assert!(should_fetch_finalized_header(Some(71), Some(72), 72, 8));
+    }
+
+    // Checks duplicate suppression at a stable target length.
+    // This prevents same-block events from dispatching repeated finalized fetches.
+    #[test]
+    fn finalized_refresh_predicate_does_not_trigger_without_length_change_at_target() {
+        assert!(!should_fetch_finalized_header(Some(72), Some(72), 72, 8));
+    }
+
+    // Checks duplicate suppression within the first retry bucket.
+    // This allows non-boundary head growth without repeated finalized fetches.
+    #[test]
+    fn finalized_refresh_predicate_does_not_trigger_within_same_retry_bucket() {
+        assert!(!should_fetch_finalized_header(Some(72), Some(73), 72, 8));
+        assert!(!should_fetch_finalized_header(Some(79), Some(79), 72, 8));
+    }
+
+    // Checks the next retry boundary above the target.
+    // This provides bounded retries if compaction or finalized-header fetches lag.
+    #[test]
+    fn finalized_refresh_predicate_triggers_when_crossing_retry_bucket() {
+        assert!(should_fetch_finalized_header(Some(79), Some(80), 72, 8));
+        assert!(should_fetch_finalized_header(Some(87), Some(88), 72, 8));
+    }
+
+    // Checks duplicate suppression after a retry boundary.
+    // This keeps every retry bucket to a single dispatch.
+    #[test]
+    fn finalized_refresh_predicate_does_not_trigger_inside_later_retry_bucket() {
+        assert!(!should_fetch_finalized_header(Some(80), Some(87), 72, 8));
+    }
+
+    // Checks reconnecting ancestry directly into the target range.
+    // This lets a completed parent chain request a finalized refresh once.
+    #[test]
+    fn finalized_refresh_predicate_triggers_when_disconnected_path_becomes_long_enough() {
+        assert!(should_fetch_finalized_header(None, Some(72), 72, 8));
+    }
+
+    // Checks disconnected paths below the target.
+    // This avoids refresh requests for paths that are newly connected but still short.
+    #[test]
+    fn finalized_refresh_predicate_does_not_trigger_when_reconnected_path_is_short() {
+        assert!(!should_fetch_finalized_header(None, Some(71), 72, 8));
+    }
+
+    // Checks transitions from connected to disconnected ancestry.
+    // This avoids treating missing ancestry as a retry boundary.
+    #[test]
+    fn finalized_refresh_predicate_does_not_trigger_when_path_becomes_disconnected() {
+        assert!(!should_fetch_finalized_header(Some(80), None, 72, 8));
     }
 
     // Queries from the finalized anchor.
