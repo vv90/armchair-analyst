@@ -9,7 +9,10 @@ use super::{pool_registry::PoolCandidateAddress, token_registry::TokenAddress};
 pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
 use crate::{
     pool_state::PoolAddress,
-    request_tracking::{RequestCollection, RequestIdSequence},
+    request_tracking::{
+        RequestCollection, RequestIdSequence, RequestIssuer, RequestStore, expired_request_ids,
+        issue_request, retry_request, take_request,
+    },
     tick::Tick,
 };
 
@@ -76,13 +79,13 @@ pub enum AnyIssuedRequest {
     TokenMetadata(IssuedRequest<GetTokenMetadata>),
 }
 
-pub enum AnyPendingPayload {
-    BlockHeader(PendingPayload<GetBlockHeader>),
-    BlockLogs(PendingPayload<GetBlockLogs>),
-    PoolData(PendingPayload<GetPoolData>),
-    PoolMetadata(PendingPayload<GetPoolMetadata>),
-    TokenMetadata(PendingPayload<GetTokenMetadata>),
-}
+// pub enum AnyPendingPayload {
+//     BlockHeader(PendingPayload<GetBlockHeader>),
+//     BlockLogs(PendingPayload<GetBlockLogs>),
+//     PoolData(PendingPayload<GetPoolData>),
+//     PoolMetadata(PendingPayload<GetPoolMetadata>),
+//     TokenMetadata(PendingPayload<GetTokenMetadata>),
+// }
 
 pub struct PendingRequests {
     request_ids: RequestIdSequence,
@@ -91,11 +94,6 @@ pub struct PendingRequests {
     pool_data: RequestCollection<GetPoolData>,
     pool_metadata: RequestCollection<GetPoolMetadata>,
     token_metadata: RequestCollection<GetTokenMetadata>,
-}
-
-pub trait RequestKind: Sized {
-    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self>;
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self>;
 }
 
 impl PendingRequests {
@@ -109,60 +107,45 @@ impl PendingRequests {
             token_metadata: RequestCollection::new(),
         }
     }
-    pub fn get<R: RequestKind>(&self, request_id: &RequestId<R>) -> Option<&PendingPayload<R>> {
-        <R as RequestKind>::get_collection(self).get(request_id)
-    }
-
-    pub fn take<R: RequestKind>(
-        self,
-        request_id: &RequestId<R>,
-    ) -> (Self, Option<PendingPayload<R>>) {
-        let mut self_mut = self;
-        let pending_request =
-            <R as RequestKind>::get_collection_mut(&mut self_mut).remove(request_id);
-
-        (self_mut, pending_request)
+    pub fn take<R>(self, request_id: &RequestId<R>) -> (Self, Option<PendingPayload<R>>)
+    where
+        Self: RequestStore<R>,
+    {
+        take_request(self, request_id)
     }
 
     fn expired_ids(&self, tick: Tick) -> Vec<AnyRequestId> {
-        self.block_headers
-            .iter()
-            .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
-            .map(|(id, _)| AnyRequestId::BlockHeader(*id))
+        expired_request_ids::<Self, GetBlockHeader>(self, tick)
+            .into_iter()
+            .map(AnyRequestId::BlockHeader)
             .chain(
-                self.block_logs
-                    .iter()
-                    .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
-                    .map(|(id, _)| AnyRequestId::BlockLogs(*id)),
+                expired_request_ids::<Self, GetBlockLogs>(self, tick)
+                    .into_iter()
+                    .map(AnyRequestId::BlockLogs),
             )
             .chain(
-                self.pool_data
-                    .iter()
-                    .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
-                    .map(|(id, _)| AnyRequestId::PoolData(*id)),
+                expired_request_ids::<Self, GetPoolData>(self, tick)
+                    .into_iter()
+                    .map(AnyRequestId::PoolData),
             )
             .chain(
-                self.pool_metadata
-                    .iter()
-                    .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
-                    .map(|(id, _)| AnyRequestId::PoolMetadata(*id)),
+                expired_request_ids::<Self, GetPoolMetadata>(self, tick)
+                    .into_iter()
+                    .map(AnyRequestId::PoolMetadata),
             )
             .chain(
-                self.token_metadata
-                    .iter()
-                    .filter(|(_, req)| tick.is_expired_since(req.dispatched_at))
-                    .map(|(id, _)| AnyRequestId::TokenMetadata(*id)),
+                expired_request_ids::<Self, GetTokenMetadata>(self, tick)
+                    .into_iter()
+                    .map(AnyRequestId::TokenMetadata),
             )
             .collect()
     }
 
-    pub fn with_new_request<R: RequestKind>(self, payload: R, tick: Tick) -> (Self, RequestId<R>) {
-        let mut self_mut = self;
-        let new_request_id = self_mut.request_ids.issue();
-
-        <R as RequestKind>::get_collection_mut(&mut self_mut).insert(new_request_id, payload, tick);
-
-        (self_mut, new_request_id)
+    pub fn with_new_request<R>(self, payload: R, tick: Tick) -> (Self, RequestId<R>)
+    where
+        Self: RequestStore<R>,
+    {
+        issue_request(self, payload, tick)
     }
 
     pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
@@ -255,29 +238,18 @@ impl PendingRequests {
         }
     }
 
-    fn retry_typed<R: RequestKind + Clone>(
+    fn retry_typed<R: Clone>(
         self,
         request_id: RequestId<R>,
         tick: Tick,
         wrap: fn(IssuedRequest<R>) -> AnyIssuedRequest,
-    ) -> (Self, Option<AnyIssuedRequest>) {
-        let (pending_requests, pending_payload) = self.take(&request_id);
+    ) -> (Self, Option<AnyIssuedRequest>)
+    where
+        Self: RequestStore<R>,
+    {
+        let (pending_requests, issued_request) = retry_request(self, request_id, tick);
 
-        match pending_payload {
-            Some(PendingPayload { payload, .. }) => {
-                let (pending_requests, new_request_id) =
-                    pending_requests.with_new_request(payload.clone(), tick);
-
-                (
-                    pending_requests,
-                    Some(wrap(IssuedRequest {
-                        request_id: new_request_id,
-                        request_payload: payload,
-                    })),
-                )
-            }
-            None => (pending_requests, None),
-        }
+        (pending_requests, issued_request.map(wrap))
     }
 }
 
@@ -299,8 +271,18 @@ impl PendingRequests {
         self.request_ids.raw_for_test()
     }
 
-    pub(crate) fn contains<R: RequestKind>(&self, request_id: &RequestId<R>) -> bool {
+    pub(crate) fn contains<R>(&self, request_id: &RequestId<R>) -> bool
+    where
+        Self: RequestStore<R>,
+    {
         self.get(request_id).is_some()
+    }
+
+    pub(crate) fn get<R>(&self, request_id: &RequestId<R>) -> Option<&PendingPayload<R>>
+    where
+        Self: RequestStore<R>,
+    {
+        crate::request_tracking::test_support::get_request(self, request_id)
     }
 
     pub(crate) fn contains_any_for_test(&self, request_id: AnyRequestId) -> bool {
@@ -353,52 +335,58 @@ impl PendingRequests {
     }
 }
 
-impl RequestKind for GetBlockLogs {
-    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
-        &requests.block_logs
-    }
-
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
-        &mut requests.block_logs
+impl RequestIssuer for PendingRequests {
+    fn request_ids_mut(&mut self) -> &mut RequestIdSequence {
+        &mut self.request_ids
     }
 }
 
-impl RequestKind for GetBlockHeader {
-    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
-        &requests.block_headers
+impl RequestStore<GetBlockLogs> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetBlockLogs> {
+        &self.block_logs
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
-        &mut requests.block_headers
-    }
-}
-
-impl RequestKind for GetPoolData {
-    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
-        &requests.pool_data
-    }
-
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
-        &mut requests.pool_data
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetBlockLogs> {
+        &mut self.block_logs
     }
 }
 
-impl RequestKind for GetPoolMetadata {
-    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
-        &requests.pool_metadata
+impl RequestStore<GetBlockHeader> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetBlockHeader> {
+        &self.block_headers
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
-        &mut requests.pool_metadata
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetBlockHeader> {
+        &mut self.block_headers
     }
 }
 
-impl RequestKind for GetTokenMetadata {
-    fn get_collection(requests: &PendingRequests) -> &RequestCollection<Self> {
-        &requests.token_metadata
+impl RequestStore<GetPoolData> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetPoolData> {
+        &self.pool_data
     }
 
-    fn get_collection_mut(requests: &mut PendingRequests) -> &mut RequestCollection<Self> {
-        &mut requests.token_metadata
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetPoolData> {
+        &mut self.pool_data
+    }
+}
+
+impl RequestStore<GetPoolMetadata> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetPoolMetadata> {
+        &self.pool_metadata
+    }
+
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetPoolMetadata> {
+        &mut self.pool_metadata
+    }
+}
+
+impl RequestStore<GetTokenMetadata> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetTokenMetadata> {
+        &self.token_metadata
+    }
+
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetTokenMetadata> {
+        &mut self.token_metadata
     }
 }

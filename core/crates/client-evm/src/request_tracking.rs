@@ -100,6 +100,15 @@ pub(crate) struct RequestCollection<R> {
     requests: HashMap<RequestId<R>, PendingPayload<R>>,
 }
 
+pub(crate) trait RequestIssuer {
+    fn request_ids_mut(&mut self) -> &mut RequestIdSequence;
+}
+
+pub(crate) trait RequestStore<R> {
+    fn request_collection(&self) -> &RequestCollection<R>;
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<R>;
+}
+
 impl<R> RequestCollection<R> {
     pub(crate) fn new() -> Self {
         RequestCollection {
@@ -107,7 +116,7 @@ impl<R> RequestCollection<R> {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn get(&self, request_id: &RequestId<R>) -> Option<&PendingPayload<R>> {
         self.requests.get(request_id)
     }
@@ -144,5 +153,87 @@ impl<R> RequestCollection<R> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.requests.len()
+    }
+}
+
+pub(crate) fn issue_request<S, R>(store: S, payload: R, tick: Tick) -> (S, RequestId<R>)
+where
+    S: RequestIssuer + RequestStore<R>,
+{
+    let mut store = store;
+    let request_id = store.request_ids_mut().issue();
+
+    store
+        .request_collection_mut()
+        .insert(request_id, payload, tick);
+
+    (store, request_id)
+}
+
+pub(crate) fn take_request<S, R>(
+    store: S,
+    request_id: &RequestId<R>,
+) -> (S, Option<PendingPayload<R>>)
+where
+    S: RequestStore<R>,
+{
+    let mut store = store;
+    let pending_payload = store.request_collection_mut().remove(request_id);
+
+    (store, pending_payload)
+}
+
+pub(crate) fn expired_request_ids<S, R>(store: &S, tick: Tick) -> Vec<RequestId<R>>
+where
+    S: RequestStore<R>,
+{
+    store
+        .request_collection()
+        .iter()
+        .filter(|(_, request)| tick.is_expired_since(request.dispatched_at))
+        .map(|(request_id, _)| *request_id)
+        .collect()
+}
+
+pub(crate) fn retry_request<S, R>(
+    store: S,
+    request_id: RequestId<R>,
+    tick: Tick,
+) -> (S, Option<IssuedRequest<R>>)
+where
+    S: RequestIssuer + RequestStore<R>,
+    R: Clone,
+{
+    let (store, pending_payload) = take_request(store, &request_id);
+
+    match pending_payload {
+        Some(PendingPayload { payload, .. }) => {
+            let request_payload = payload.clone();
+            let (store, request_id) = issue_request(store, request_payload, tick);
+
+            (
+                store,
+                Some(IssuedRequest {
+                    request_id,
+                    request_payload: payload,
+                }),
+            )
+        }
+        None => (store, None),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn get_request<'a, S, R>(
+        store: &'a S,
+        request_id: &RequestId<R>,
+    ) -> Option<&'a PendingPayload<R>>
+    where
+        S: RequestStore<R>,
+    {
+        store.request_collection().get(request_id)
     }
 }
