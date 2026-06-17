@@ -134,6 +134,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 if self.optimization_sender.set(slot_sender).is_ok() {
                     drop(spawn_optimization_subscription(
                         slot_receiver,
+                        sender.clone(),
                         self.logger.clone(),
                     ));
                 } else {
@@ -197,6 +198,10 @@ fn format_input_log(input: &Event) -> String {
         }
         Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
         Event::BootstrapEvent { chain, event } => format_bootstrap_event_log(*chain, event),
+        Event::OptimizationStepCompleted { result } => format!(
+            "input optimization_step_completed status={:?} profit={} reserves={} iterations={}",
+            result.status, result.profit_amount, result.reserves_count, result.iterations_completed,
+        ),
         Event::Tick => "input tick".to_owned(),
     }
 }
@@ -420,6 +425,7 @@ fn spawn_tick_subscription(sender: Sender<Event>, interval: time::Duration) -> J
 
 fn spawn_optimization_subscription(
     receiver: LatestReceiver<OptimizationPoolReserves>,
+    sender: Sender<Event>,
     logger: Logger,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -428,6 +434,8 @@ fn spawn_optimization_subscription(
             default_optimization_backend(),
             default_optimization_session_config(),
             default_optimization_step_config(),
+            sender,
+            |result| Event::OptimizationStepCompleted { result },
         );
 
         match result {
@@ -668,6 +676,23 @@ mod tests {
     }
 
     #[test]
+    fn input_log_formats_optimization_step_completed() {
+        let result = optimization::OptimizationStepResult {
+            status: optimization::OptimizationStepStatus::Updated,
+            input_amount: 1_000.0,
+            output_amount: 1_012.5,
+            profit_amount: 12.5,
+            reserves_count: 4,
+            iterations_completed: 10,
+        };
+
+        assert_eq!(
+            format_input_log(&Event::OptimizationStepCompleted { result }),
+            "input optimization_step_completed status=Updated profit=12.5 reserves=4 iterations=10"
+        );
+    }
+
+    #[test]
     fn input_log_formats_chain_events() {
         let block_hash = hash(1);
         let parent_hash = hash(2);
@@ -901,7 +926,8 @@ mod tests {
     #[test]
     fn optimization_worker_exits_cleanly_when_slot_closes_before_initialization() {
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
-        let handle = spawn_optimization_subscription(slot_receiver, Logger::sink());
+        let (sender, _receiver) = mpsc::channel();
+        let handle = spawn_optimization_subscription(slot_receiver, sender, Logger::sink());
 
         drop(slot_sender);
 

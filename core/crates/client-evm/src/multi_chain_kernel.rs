@@ -4,7 +4,7 @@ use std::{
 };
 
 use alloy::primitives::{BlockHash, U256};
-use optimization::{Invertible, PoolReserves, VirtualReserveValues};
+use optimization::{Invertible, OptimizationStepResult, PoolReserves, VirtualReserveValues};
 use thiserror::Error;
 
 use crate::{
@@ -36,6 +36,7 @@ pub enum ChainObservation {
 
 pub struct State {
     chains: BTreeMap<ChainKey, ChainLifecycle>,
+    latest_optimization_result: Option<OptimizationStepResult>,
 }
 
 enum ChainLifecycle {
@@ -113,9 +114,18 @@ impl State {
         chains.insert(chain, ChainLifecycle::Bootstrapping(bootstrap_state));
 
         (
-            State { chains },
+            State {
+                chains,
+                latest_optimization_result: None,
+            },
             wrap_bootstrap_effects(chain, bootstrap_effects),
         )
+    }
+
+    /// Reports the most recent optimization step result reported by the optimization worker.
+    /// Added so read models can surface optimization progress without inspecting the worker thread.
+    pub fn latest_optimization_result(&self) -> Option<OptimizationStepResult> {
+        self.latest_optimization_result
     }
 
     /// Reports whether a configured chain is initializing (bootstrapping) or active.
@@ -354,6 +364,9 @@ pub enum Event {
         chain: ChainKey,
         event: bootstrap::Event,
     },
+    OptimizationStepCompleted {
+        result: OptimizationStepResult,
+    },
     Tick,
 }
 
@@ -390,8 +403,22 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
         Event::FinalizedHeaderUnavailable { chain } => finalized_header_unavailable(state, chain),
         Event::ChainEvent { chain, event } => chain_event(state, chain, event),
         Event::BootstrapEvent { chain, event } => bootstrap_event(state, chain, event),
+        Event::OptimizationStepCompleted { result } => optimization_step_completed(state, result),
         Event::Tick => tick(state),
     }
+}
+
+/// Records the latest optimization step result reported by the optimization worker.
+/// Added so optimization progress reaches the kernel state without disturbing chain lifecycle;
+/// it never produces effects and leaves the chain map untouched.
+fn optimization_step_completed(state: State, result: OptimizationStepResult) -> (State, Vec<Effect>) {
+    (
+        State {
+            latest_optimization_result: Some(result),
+            ..state
+        },
+        Vec::new(),
+    )
 }
 
 /// Advances an active chain's finalized boundary from a refreshed finalized header.
@@ -402,7 +429,10 @@ fn finalized_header_received(
     chain: ChainKey,
     block_hash: BlockHash,
 ) -> (State, Vec<Effect>) {
-    let mut chains = state.chains;
+    let State {
+        mut chains,
+        latest_optimization_result,
+    } = state;
 
     match chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
@@ -412,7 +442,10 @@ fn finalized_header_received(
             );
             chains.insert(chain, ChainLifecycle::Active(chain_state));
             (
-                State { chains },
+                State {
+                    chains,
+                    latest_optimization_result,
+                },
                 effects
                     .into_iter()
                     .map(|effect| Effect::ChainEffect { chain, effect })
@@ -421,9 +454,21 @@ fn finalized_header_received(
         }
         Some(other) => {
             chains.insert(chain, other);
-            (State { chains }, Vec::new())
+            (
+                State {
+                    chains,
+                    latest_optimization_result,
+                },
+                Vec::new(),
+            )
         }
-        None => (State { chains }, Vec::new()),
+        None => (
+            State {
+                chains,
+                latest_optimization_result,
+            },
+            Vec::new(),
+        ),
     }
 }
 
@@ -438,7 +483,10 @@ fn finalized_header_unavailable(state: State, _chain: ChainKey) -> (State, Vec<E
 /// Added so bootstrap responses advance the phase machine, activate the inner kernel on completion,
 /// or drop the chain when the anchor can never be obtained.
 fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (State, Vec<Effect>) {
-    let mut chains = state.chains;
+    let State {
+        mut chains,
+        latest_optimization_result,
+    } = state;
 
     match chains.remove(&chain) {
         Some(ChainLifecycle::Bootstrapping(bootstrap_state)) => {
@@ -446,13 +494,31 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
             if let Some(lifecycle) = lifecycle {
                 chains.insert(chain, lifecycle);
             }
-            (State { chains }, effects)
+            (
+                State {
+                    chains,
+                    latest_optimization_result,
+                },
+                effects,
+            )
         }
         Some(other) => {
             chains.insert(chain, other);
-            (State { chains }, Vec::new())
+            (
+                State {
+                    chains,
+                    latest_optimization_result,
+                },
+                Vec::new(),
+            )
         }
-        None => (State { chains }, Vec::new()),
+        None => (
+            State {
+                chains,
+                latest_optimization_result,
+            },
+            Vec::new(),
+        ),
     }
 }
 
@@ -524,7 +590,10 @@ fn wrap_bootstrap_effects(chain: ChainKey, effects: Vec<bootstrap::Effect>) -> V
 /// Forwards an inner kernel event to an active chain and wraps its effects with the chain key.
 /// Added to preserve chain isolation while letting callers drive per-chain kernel events through one wrapper.
 fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, Vec<Effect>) {
-    let mut chains = state.chains;
+    let State {
+        mut chains,
+        latest_optimization_result,
+    } = state;
 
     match chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
@@ -549,13 +618,31 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
 
             chains.insert(chain, ChainLifecycle::Active(chain_state));
 
-            (State { chains }, effects)
+            (
+                State {
+                    chains,
+                    latest_optimization_result,
+                },
+                effects,
+            )
         }
         Some(existing_chain) => {
             chains.insert(chain, existing_chain);
-            (State { chains }, Vec::new())
+            (
+                State {
+                    chains,
+                    latest_optimization_result,
+                },
+                Vec::new(),
+            )
         }
-        None => (State { chains }, Vec::new()),
+        None => (
+            State {
+                chains,
+                latest_optimization_result,
+            },
+            Vec::new(),
+        ),
     }
 }
 
@@ -563,7 +650,11 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
 /// Added so a single global tick can drive request TTL handling for active kernels and the bootstrap
 /// retry/deadline timers for chains still warming up.
 fn tick(state: State) -> (State, Vec<Effect>) {
-    let (chains, effects) = state.chains.into_iter().fold(
+    let State {
+        chains,
+        latest_optimization_result,
+    } = state;
+    let (chains, effects) = chains.into_iter().fold(
         (BTreeMap::new(), Vec::new()),
         |(mut chains, mut effects), (chain, chain_state)| {
             match chain_state {
@@ -591,7 +682,13 @@ fn tick(state: State) -> (State, Vec<Effect>) {
         },
     );
 
-    (State { chains }, effects)
+    (
+        State {
+            chains,
+            latest_optimization_result,
+        },
+        effects,
+    )
 }
 
 fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
@@ -618,7 +715,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use alloy::primitives::{Address, BlockHash, U160, U256, aliases::I24};
-    use optimization::{Invertible, VirtualReserveValues};
+    use optimization::{Invertible, OptimizationStepResult, OptimizationStepStatus, VirtualReserveValues};
     use proptest::prelude::*;
 
     use super::*;
@@ -640,6 +737,85 @@ mod tests {
                 crate::bootstrap::pending_requests::AnyIssuedRequest::FinalizedHeader(_)
             )
         ));
+    }
+
+    #[test]
+    fn init_has_no_optimization_result() {
+        let (state, _effects) = State::init(ChainKey::Ethereum);
+
+        assert_eq!(state.latest_optimization_result(), None);
+    }
+
+    #[test]
+    fn optimization_step_completed_stores_result_without_touching_chains() {
+        let state = active_state_at(ChainKey::Ethereum, hash(1));
+        let before = state.observe();
+        let result = OptimizationStepResult {
+            status: OptimizationStepStatus::Updated,
+            input_amount: 1_000.0,
+            output_amount: 1_012.0,
+            profit_amount: 12.0,
+            reserves_count: 3,
+            iterations_completed: 10,
+        };
+
+        let (state, effects) = transition(state, Event::OptimizationStepCompleted { result });
+
+        assert!(effects.is_empty());
+        assert_eq!(state.latest_optimization_result(), Some(result));
+        assert_eq!(state.observe(), before);
+    }
+
+    proptest! {
+        #[test]
+        fn optimization_step_completed_overwrites_previous_result(
+            first in optimization_step_result_strategy(),
+            second in optimization_step_result_strategy(),
+        ) {
+            let state = active_state_at(ChainKey::Ethereum, hash(1));
+
+            let (state, _effects) =
+                transition(state, Event::OptimizationStepCompleted { result: first });
+            prop_assert_eq!(state.latest_optimization_result(), Some(first));
+
+            let (state, effects) =
+                transition(state, Event::OptimizationStepCompleted { result: second });
+            prop_assert!(effects.is_empty());
+            prop_assert_eq!(state.latest_optimization_result(), Some(second));
+        }
+    }
+
+    fn optimization_step_result_strategy() -> impl Strategy<Value = OptimizationStepResult> {
+        (
+            prop_oneof![
+                Just(OptimizationStepStatus::Initialized),
+                Just(OptimizationStepStatus::Updated),
+                Just(OptimizationStepStatus::Reinitialized),
+                Just(OptimizationStepStatus::Continued),
+            ],
+            -1.0e6f32..1.0e6f32,
+            -1.0e6f32..1.0e6f32,
+            -1.0e6f32..1.0e6f32,
+            0usize..100,
+            0usize..100,
+        )
+            .prop_map(
+                |(
+                    status,
+                    input_amount,
+                    output_amount,
+                    profit_amount,
+                    reserves_count,
+                    iterations_completed,
+                )| OptimizationStepResult {
+                    status,
+                    input_amount,
+                    output_amount,
+                    profit_amount,
+                    reserves_count,
+                    iterations_completed,
+                },
+            )
     }
 
     #[test]
@@ -1376,6 +1552,7 @@ mod tests {
 
         State {
             chains: BTreeMap::from([(ChainKey::Ethereum, ChainLifecycle::Active(chain_state))]),
+            latest_optimization_result: None,
         }
     }
 
@@ -1547,6 +1724,7 @@ mod tests {
 
         State {
             chains: BTreeMap::from([(chain, ChainLifecycle::Active(chain_state))]),
+            latest_optimization_result: None,
         }
     }
 

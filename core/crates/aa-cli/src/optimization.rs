@@ -1,7 +1,9 @@
+use std::sync::mpsc::Sender;
+
 use client_evm::{PoolAddress, TokenAddress, multi_chain_kernel::OptimizationPoolReserves};
 use optimization::{
     OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
-    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
+    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError, OptimizationStepResult,
     OptimizationStepUpdate,
 };
 
@@ -16,16 +18,18 @@ pub enum RunOptimizationError {
     Step(OptimizationStepError),
 }
 
-pub fn run_optimization(
+pub fn run_optimization<T>(
     receiver: LatestReceiver<OptimizationPoolReserves>,
     backend: OptimizationBackendSelection,
     session_config: OptimizationSessionConfig<TokenAddress>,
     step_config: OptimizationStepConfig,
+    result_sender: Sender<T>,
+    map_result: impl Fn(OptimizationStepResult) -> T,
 ) -> Result<(), RunOptimizationError> {
     let initial_snapshot = receiver
         .wait_take()
         .map_err(RunOptimizationError::Receive)?;
-    let (mut runner, _result) =
+    let (mut runner, result) =
         OptimizationRunner::<PoolAddress, TokenAddress, OPTIMIZATION_LAYERS>::init(
             backend,
             initial_snapshot.reserves,
@@ -34,12 +38,20 @@ pub fn run_optimization(
         )
         .map_err(RunOptimizationError::Init)?;
 
+    if result_sender.send(map_result(result)).is_err() {
+        return Ok(());
+    }
+
     loop {
         let update = match receiver.try_take().map_err(RunOptimizationError::Receive)? {
             Some(snapshot) => OptimizationStepUpdate::NewReserves(snapshot.reserves),
             None => OptimizationStepUpdate::Continue,
         };
-        let (next_runner, _result) = runner.run(update).map_err(RunOptimizationError::Step)?;
+        let (next_runner, result) = runner.run(update).map_err(RunOptimizationError::Step)?;
+
+        if result_sender.send(map_result(result)).is_err() {
+            return Ok(());
+        }
 
         runner = next_runner;
     }
@@ -47,10 +59,10 @@ pub fn run_optimization(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, sync::mpsc};
 
     use client_evm::{BlockHash, PoolAddress, TokenAddress};
-    use optimization::{PoolReserves, VirtualReserveValues};
+    use optimization::{OptimizationStepStatus, PoolReserves, VirtualReserveValues};
 
     use super::*;
     use crate::latest_slot::latest_slot;
@@ -61,11 +73,14 @@ mod tests {
 
         sender.close().unwrap();
 
+        let (result_sender, _result_receiver) = mpsc::channel();
         let error = run_optimization(
             receiver,
             OptimizationBackendSelection::Cpu,
             session_config(),
             step_config(),
+            result_sender,
+            |result| result,
         )
         .unwrap_err();
 
@@ -82,11 +97,14 @@ mod tests {
         sender.send(snapshot(1)).unwrap();
         sender.close().unwrap();
 
+        let (result_sender, result_receiver) = mpsc::channel();
         let error = run_optimization(
             receiver,
             OptimizationBackendSelection::Cpu,
             session_config(),
             step_config(),
+            result_sender,
+            |result| result,
         )
         .unwrap_err();
 
@@ -94,6 +112,31 @@ mod tests {
             error,
             RunOptimizationError::Receive(LatestReceiveError::Closed)
         );
+        assert_eq!(
+            result_receiver.recv().map(|result| result.status),
+            Ok(OptimizationStepStatus::Initialized)
+        );
+    }
+
+    #[test]
+    fn exits_cleanly_when_result_receiver_is_dropped() {
+        let (sender, receiver) = latest_slot();
+
+        sender.send(snapshot(1)).unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel::<OptimizationStepResult>();
+        drop(result_receiver);
+
+        let outcome = run_optimization(
+            receiver,
+            OptimizationBackendSelection::Cpu,
+            session_config(),
+            step_config(),
+            result_sender,
+            |result| result,
+        );
+
+        assert_eq!(outcome, Ok(()));
     }
 
     fn snapshot(last_byte: u8) -> OptimizationPoolReserves {
