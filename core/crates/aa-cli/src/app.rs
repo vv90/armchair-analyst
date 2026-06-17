@@ -110,8 +110,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 self.execute_bootstrap_effect(chain, effect)
             }
             Effect::RunOptimization { input } => {
-                self.logger
-                    .log(&format_run_optimization_effect_log(&input));
+                self.logger.log(&format_run_optimization_effect_log(&input));
                 self.send_optimization_input(input);
                 Vec::new()
             }
@@ -158,8 +157,10 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     fn log_error(&self, error: ApplicationError<<ClientEvmApp as Application>::Input>) {
         match error {
             ApplicationError::SendError(error) => {
-                self.logger
-                    .log(&format!("error send_failed input={}", format_input_log(&error.0)));
+                self.logger.log(&format!(
+                    "error send_failed input={}",
+                    format_input_log(&error.0)
+                ));
             }
         }
     }
@@ -468,7 +469,7 @@ fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddre
 fn default_optimization_step_config() -> OptimizationStepConfig {
     OptimizationStepConfig {
         input_amount: 1000.0,
-        iterations: 10,
+        iterations: 100,
     }
 }
 

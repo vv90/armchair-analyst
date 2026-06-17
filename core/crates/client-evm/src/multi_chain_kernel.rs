@@ -55,11 +55,11 @@ const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
 const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
 
 /// Pool-candidate discovery window scanned below the finalized anchor during bootstrap.
-const ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 64;
+const ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 200;
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
-const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 8;
+const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 4;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
-const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 30;
+const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptimizationPoolReserves {
@@ -411,7 +411,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
 /// Records the latest optimization step result reported by the optimization worker.
 /// Added so optimization progress reaches the kernel state without disturbing chain lifecycle;
 /// it never produces effects and leaves the chain map untouched.
-fn optimization_step_completed(state: State, result: OptimizationStepResult) -> (State, Vec<Effect>) {
+fn optimization_step_completed(
+    state: State,
+    result: OptimizationStepResult,
+) -> (State, Vec<Effect>) {
     (
         State {
             latest_optimization_result: Some(result),
@@ -715,7 +718,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use alloy::primitives::{Address, BlockHash, U160, U256, aliases::I24};
-    use optimization::{Invertible, OptimizationStepResult, OptimizationStepStatus, VirtualReserveValues};
+    use optimization::{
+        Invertible, OptimizationStepResult, OptimizationStepStatus, VirtualReserveValues,
+    };
     use proptest::prelude::*;
 
     use super::*;
