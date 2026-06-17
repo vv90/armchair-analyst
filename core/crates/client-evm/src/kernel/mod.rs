@@ -623,6 +623,12 @@ impl State {
         self.pool_registry.verified_size()
     }
 
+    /// Latest complete pool-state overlay anchored at the current canonical tip.
+    /// Added so optimization dispatch can read the tip's fully-fetched pool state without exposing `canonical_tip`.
+    pub(crate) fn latest_complete_pool_state_update(&self) -> Option<CompletePoolStateUpdate> {
+        self.latest_complete_pool_state_update_from(self.canonical_tip)
+    }
+
     /// Measures how many canonical blocks newer than the latest complete pool-state overlay the tip is.
     /// Added so read models can surface fetch progress; `None` mirrors a transiently disconnected path.
     pub(crate) fn blocks_behind_tip(&self) -> Option<usize> {
@@ -5285,6 +5291,23 @@ mod tests {
 
         assert_eq!(
             update,
+            Some(complete_pool_state_update(finalized_hash, HashMap::new()))
+        );
+    }
+
+    // Anchors the tip-relative wrapper at the canonical tip.
+    // This keeps optimization dispatch reading the same overlay as an explicit tip query.
+    #[test]
+    fn latest_complete_pool_state_update_anchors_at_canonical_tip() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let state = empty_state_at(finalized_hash);
+
+        assert_eq!(
+            state.latest_complete_pool_state_update(),
+            state.latest_complete_pool_state_update_from(state.canonical_tip)
+        );
+        assert_eq!(
+            state.latest_complete_pool_state_update(),
             Some(complete_pool_state_update(finalized_hash, HashMap::new()))
         );
     }

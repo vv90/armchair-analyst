@@ -37,6 +37,9 @@ pub enum ChainObservation {
 pub struct State {
     chains: BTreeMap<ChainKey, ChainLifecycle>,
     latest_optimization_result: Option<OptimizationStepResult>,
+    /// Latest fully-fetched block per chain for which optimization reserves were dispatched.
+    /// Added so `RunOptimization` fires only when a chain's complete pool-state frontier advances.
+    last_optimized_block: BTreeMap<ChainKey, BlockHash>,
 }
 
 enum ChainLifecycle {
@@ -117,6 +120,7 @@ impl State {
             State {
                 chains,
                 latest_optimization_result: None,
+                last_optimized_block: BTreeMap::new(),
             },
             wrap_bootstrap_effects(chain, bootstrap_effects),
         )
@@ -435,6 +439,7 @@ fn finalized_header_received(
     let State {
         mut chains,
         latest_optimization_result,
+        last_optimized_block,
     } = state;
 
     match chains.remove(&chain) {
@@ -448,6 +453,7 @@ fn finalized_header_received(
                 State {
                     chains,
                     latest_optimization_result,
+                    last_optimized_block,
                 },
                 effects
                     .into_iter()
@@ -461,6 +467,7 @@ fn finalized_header_received(
                 State {
                     chains,
                     latest_optimization_result,
+                    last_optimized_block,
                 },
                 Vec::new(),
             )
@@ -469,6 +476,7 @@ fn finalized_header_received(
             State {
                 chains,
                 latest_optimization_result,
+                last_optimized_block,
             },
             Vec::new(),
         ),
@@ -489,6 +497,7 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
     let State {
         mut chains,
         latest_optimization_result,
+        last_optimized_block,
     } = state;
 
     match chains.remove(&chain) {
@@ -501,6 +510,7 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
                 State {
                     chains,
                     latest_optimization_result,
+                    last_optimized_block,
                 },
                 effects,
             )
@@ -511,6 +521,7 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
                 State {
                     chains,
                     latest_optimization_result,
+                    last_optimized_block,
                 },
                 Vec::new(),
             )
@@ -519,6 +530,7 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
             State {
                 chains,
                 latest_optimization_result,
+                last_optimized_block,
             },
             Vec::new(),
         ),
@@ -596,6 +608,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
     let State {
         mut chains,
         latest_optimization_result,
+        last_optimized_block,
     } = state;
 
     match chains.remove(&chain) {
@@ -619,15 +632,37 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
+            // INEFFICIENT (intentional, for now): this rebuilds the complete pool-state overlay by
+            // walking the whole canonical sequence from tip back to the finalized anchor on EVERY
+            // chain event. A future iteration should cache the overlay or detect block advancement
+            // cheaply instead of rescanning the chain each time.
+            let optimization_update = chain_state.latest_complete_pool_state_update();
+
             chains.insert(chain, ChainLifecycle::Active(chain_state));
 
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                },
-                effects,
-            )
+            let mut state = State {
+                chains,
+                latest_optimization_result,
+                last_optimized_block,
+            };
+
+            if let Some(update) = optimization_update {
+                let changed =
+                    state.last_optimized_block.get(&chain) != Some(&update.block_hash);
+                // Project and dispatch only when the fully-fetched block advanced. Record the hash
+                // only on a successful projection so an unready (`Ok(None)`) or failed (`Err`) chain
+                // retries this block on the next event instead of being skipped.
+                if changed {
+                    if let Ok(Some(input)) =
+                        ethereum_pool_reserves_for_optimization(&state, &update)
+                    {
+                        state.last_optimized_block.insert(chain, update.block_hash);
+                        effects.push(Effect::RunOptimization { input });
+                    }
+                }
+            }
+
+            (state, effects)
         }
         Some(existing_chain) => {
             chains.insert(chain, existing_chain);
@@ -635,6 +670,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 State {
                     chains,
                     latest_optimization_result,
+                    last_optimized_block,
                 },
                 Vec::new(),
             )
@@ -643,6 +679,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
             State {
                 chains,
                 latest_optimization_result,
+                last_optimized_block,
             },
             Vec::new(),
         ),
@@ -656,6 +693,7 @@ fn tick(state: State) -> (State, Vec<Effect>) {
     let State {
         chains,
         latest_optimization_result,
+        last_optimized_block,
     } = state;
     let (chains, effects) = chains.into_iter().fold(
         (BTreeMap::new(), Vec::new()),
@@ -689,6 +727,7 @@ fn tick(state: State) -> (State, Vec<Effect>) {
         State {
             chains,
             latest_optimization_result,
+            last_optimized_block,
         },
         effects,
     )
@@ -1180,7 +1219,11 @@ mod tests {
                 },
             },
         );
-        assert!(effects.is_empty());
+        // Resolving the block's logs advances the complete pool-state frontier to this block, which
+        // now dispatches an optimization run. The empty test registry projects empty reserves (the
+        // adapter filters those before the worker), but the kernel still emits exactly this effect
+        // and leaves no chain-routing work behind.
+        assert!(matches!(effects.as_slice(), [Effect::RunOptimization { .. }]));
 
         let (state, effects) = transition(
             state,
@@ -1222,6 +1265,75 @@ mod tests {
             Effect::RunOptimization { input: effect_input }
                 if effect_input == input
         ));
+    }
+
+    #[test]
+    fn chain_event_emits_run_optimization_when_complete_block_advances() {
+        let pool = pool(10);
+        let token0 = token(1);
+        let token1 = token(2);
+        let pool_state = balanced_pool_state(1_000_000);
+        let state = projection_state(
+            hash(1),
+            HashMap::from([(pool, pool_state.clone())]),
+            HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
+            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+        );
+
+        let (_state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::Tick,
+            },
+        );
+
+        let inputs = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::RunOptimization { input } => Some(input),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].block_hash, hash(1));
+        assert_directional_pair(&inputs[0].reserves, pool, token0, token1, &pool_state);
+    }
+
+    #[test]
+    fn chain_event_does_not_re_emit_run_optimization_for_unchanged_complete_block() {
+        let pool = pool(10);
+        let token0 = token(1);
+        let token1 = token(2);
+        let state = projection_state(
+            hash(1),
+            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
+            HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
+            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+        );
+
+        let (state, _effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::Tick,
+            },
+        );
+
+        let (_state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain: ChainKey::Ethereum,
+                event: kernel::Event::Tick,
+            },
+        );
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RunOptimization { .. }))
+        );
     }
 
     #[test]
@@ -1558,6 +1670,7 @@ mod tests {
         State {
             chains: BTreeMap::from([(ChainKey::Ethereum, ChainLifecycle::Active(chain_state))]),
             latest_optimization_result: None,
+            last_optimized_block: BTreeMap::new(),
         }
     }
 
@@ -1730,6 +1843,7 @@ mod tests {
         State {
             chains: BTreeMap::from([(chain, ChainLifecycle::Active(chain_state))]),
             latest_optimization_result: None,
+            last_optimized_block: BTreeMap::new(),
         }
     }
 
