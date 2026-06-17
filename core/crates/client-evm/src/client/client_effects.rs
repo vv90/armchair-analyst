@@ -16,8 +16,8 @@ use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 use crate::{
     ClientEvmError, PoolAddress, PoolCandidateAddress, PoolDataCall, PoolDataFailure,
     PoolDataResult, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
-    PoolState, RpcConfig, TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall,
-    TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
+    PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals, TokenMetadata,
+    TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
     config::{compose_http_endpoint, compose_ws_endpoint},
 };
 
@@ -25,8 +25,9 @@ use super::{
     ClientEvent, ClientHead,
     client_utils::{
         build_block_header_request, build_block_logs_request, build_finalized_block_header_request,
-        build_new_heads_subscribe_request, parse_block_header_response,
-        parse_block_header_response_by_id, parse_block_logs_response, parse_subscription_response,
+        build_new_heads_subscribe_request, build_pool_logs_range_request,
+        parse_block_header_response, parse_block_header_response_by_id, parse_block_logs_response,
+        parse_pool_logs_range_response, parse_subscription_response,
     },
     multicall3::{
         MulticallCall, MulticallCallResult, build_multicall3_request, parse_multicall3_response,
@@ -85,6 +86,25 @@ pub fn fetch_block_logs(
         .map_err(ClientEvmError::HttpError)?;
 
     parse_block_logs_response(&response_value, HTTP_REQUEST_ID, block_hash)
+}
+
+pub fn fetch_pool_candidates_in_range(
+    agent: &ureq::Agent,
+    config: &RpcConfig,
+    from_block: u64,
+) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
+    let endpoint = compose_http_endpoint(config)?;
+    let request = build_pool_logs_range_request(HTTP_REQUEST_ID, from_block);
+    let mut response = agent
+        .post(endpoint.as_str())
+        .send_json(&request)
+        .map_err(ClientEvmError::HttpError)?;
+    let response_value = response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(ClientEvmError::HttpError)?;
+
+    parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
 }
 
 pub fn fetch_pool_data(

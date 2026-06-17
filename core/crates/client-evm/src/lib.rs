@@ -2,6 +2,7 @@
 
 pub use alloy::primitives::BlockHash;
 
+pub mod bootstrap;
 pub mod chain;
 pub mod client;
 mod config;
@@ -19,8 +20,9 @@ mod utils;
 
 pub use chain::{ChainKey, drpc_network_path};
 pub use client::{
-    ClientEvent, ClientHead, fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
-    fetch_pool_data, fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads,
+    ClientEvent, ClientHead, RangeLogBlock, fetch_block_header, fetch_block_logs,
+    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
+    fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads,
 };
 pub use config::RpcConfig;
 pub use error::ClientEvmError;

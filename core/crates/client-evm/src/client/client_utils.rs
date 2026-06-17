@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
 use crate::{
-    ClientEvmError, ClientHead, PoolCandidateAddress, uniswap_v3::pool_event_signature_hashes,
+    ClientEvmError, ClientHead, PoolCandidateAddress, RangeLogBlock,
+    uniswap_v3::pool_event_signature_hashes,
 };
 
 fn pool_event_topic_filter() -> Vec<String> {
@@ -58,6 +59,21 @@ pub(crate) fn build_block_logs_request(request_id: u64, block_hash: BlockHash) -
         "method": "eth_getLogs",
         "params": [{
             "blockHash": block_hash,
+            "topics": [event_topics]
+        }]
+    })
+}
+
+pub(crate) fn build_pool_logs_range_request(request_id: u64, from_block: u64) -> Value {
+    let event_topics = pool_event_topic_filter();
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_getLogs",
+        "params": [{
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": "latest",
             "topics": [event_topics]
         }]
     })
@@ -236,6 +252,87 @@ pub(crate) fn parse_block_logs_response(
                 .collect())
         }
     }
+}
+
+pub(crate) fn parse_pool_logs_range_response(
+    value: &Value,
+    expected_request_id: u64,
+) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(ClientEvmError::MalformedJsonRpcResponse(
+            "pool logs range response must use json-rpc 2.0".to_owned(),
+        ));
+    }
+
+    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        ClientEvmError::MalformedJsonRpcResponse(
+            "pool logs range response must contain a numeric request id".to_owned(),
+        )
+    })?;
+
+    if response_id != expected_request_id {
+        return Err(ClientEvmError::MalformedJsonRpcResponse(
+            "pool logs range response request id does not match request".to_owned(),
+        ));
+    }
+
+    match (value.get("result"), value.get("error")) {
+        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
+            "pool logs range response must not contain both result and error".to_owned(),
+        )),
+        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
+            "pool logs range response must contain result or error".to_owned(),
+        )),
+        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
+        (Some(result), None) => {
+            if !result.is_array() {
+                return Err(ClientEvmError::MalformedJsonRpcResponse(
+                    "pool logs range response result must be an array".to_owned(),
+                ));
+            }
+
+            let logs = serde_json::from_value::<Vec<Log>>(result.clone())
+                .map_err(ClientEvmError::JsonError)?;
+
+            Ok(group_range_logs_by_block(logs))
+        }
+    }
+}
+
+/// Groups ranged-`eth_getLogs` results into per-block candidate sets, ordered by block number.
+/// Logs missing block number or hash cannot be attributed to a block and are dropped at this
+/// boundary; the result is deterministic so downstream graph inference stays reproducible.
+fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
+    let mut candidates_by_block: HashMap<(u64, BlockHash), HashSet<PoolCandidateAddress>> =
+        HashMap::new();
+
+    for log in logs {
+        let (Some(number), Some(hash)) = (log.block_number, log.block_hash) else {
+            continue;
+        };
+
+        candidates_by_block
+            .entry((number, hash))
+            .or_default()
+            .insert(PoolCandidateAddress(log.address()));
+    }
+
+    let mut blocks = candidates_by_block
+        .into_iter()
+        .map(|((number, hash), candidates)| RangeLogBlock {
+            number,
+            hash,
+            candidates,
+        })
+        .collect::<Vec<_>>();
+
+    blocks.sort_by(|left, right| {
+        left.number
+            .cmp(&right.number)
+            .then_with(|| left.hash.cmp(&right.hash))
+    });
+
+    blocks
 }
 
 #[cfg(test)]
@@ -472,6 +569,158 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn pool_logs_range_request_uses_from_block_latest_and_pool_event_topics() {
+        let request = build_pool_logs_range_request(9, 4);
+        let expected_topics = pool_event_signature_hashes()
+            .into_iter()
+            .map(|topic| topic.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            request,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "eth_getLogs",
+                "params": [{
+                    "fromBlock": "0x4",
+                    "toBlock": "latest",
+                    "topics": [expected_topics]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn pool_logs_range_request_does_not_filter_by_address() {
+        let request = build_pool_logs_range_request(9, 4);
+        let address_filter = request
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.first())
+            .and_then(|filter| filter.get("address"));
+
+        assert_eq!(address_filter, None);
+    }
+
+    #[test]
+    fn pool_logs_range_response_groups_candidates_by_block() {
+        let first_hash = B256::with_last_byte(7);
+        let second_hash = B256::with_last_byte(8);
+        let first_pool = Address::with_last_byte(1);
+        let second_pool = Address::with_last_byte(2);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [
+                range_log_result(first_pool, first_hash, 4),
+                range_log_result(second_pool, first_hash, 4),
+                range_log_result(first_pool, first_hash, 4),
+                range_log_result(first_pool, second_hash, 5)
+            ]
+        });
+
+        let blocks = parse_pool_logs_range_response(&response, 9).unwrap();
+
+        assert_eq!(
+            blocks,
+            vec![
+                RangeLogBlock {
+                    number: 4,
+                    hash: first_hash,
+                    candidates: HashSet::from([
+                        PoolCandidateAddress(first_pool),
+                        PoolCandidateAddress(second_pool),
+                    ]),
+                },
+                RangeLogBlock {
+                    number: 5,
+                    hash: second_hash,
+                    candidates: HashSet::from([PoolCandidateAddress(first_pool)]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pool_logs_range_response_skips_logs_missing_block_attribution() {
+        let block_hash = B256::with_last_byte(7);
+        let pool = Address::with_last_byte(1);
+        let mut unattributed = range_log_result(Address::with_last_byte(2), block_hash, 4);
+        unattributed["blockHash"] = Value::Null;
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [range_log_result(pool, block_hash, 4), unattributed]
+        });
+
+        let blocks = parse_pool_logs_range_response(&response, 9).unwrap();
+
+        assert_eq!(
+            blocks,
+            vec![RangeLogBlock {
+                number: 4,
+                hash: block_hash,
+                candidates: HashSet::from([PoolCandidateAddress(pool)]),
+            }]
+        );
+    }
+
+    #[test]
+    fn pool_logs_range_response_returns_empty_for_empty_result() {
+        let response = json!({ "jsonrpc": "2.0", "id": 9, "result": [] });
+
+        let blocks = parse_pool_logs_range_response(&response, 9);
+
+        assert!(matches!(blocks, Ok(ref blocks) if blocks.is_empty()));
+    }
+
+    #[test]
+    fn pool_logs_range_response_parses_json_rpc_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "error": { "code": -32000, "message": "logs unavailable" }
+        });
+
+        assert!(matches!(
+            parse_pool_logs_range_response(&response, 9),
+            Err(ClientEvmError::JsonRpcError(ref message))
+                if message == "-32000: logs unavailable"
+        ));
+    }
+
+    #[test]
+    fn pool_logs_range_response_rejects_unexpected_request_id() {
+        let response = json!({ "jsonrpc": "2.0", "id": 10, "result": [] });
+
+        assert!(matches!(
+            parse_pool_logs_range_response(&response, 9),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn pool_logs_range_response_rejects_missing_result_and_error() {
+        let response = json!({ "jsonrpc": "2.0", "id": 9 });
+
+        assert!(matches!(
+            parse_pool_logs_range_response(&response, 9),
+            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+        ));
+    }
+
+    #[test]
+    fn pool_logs_range_response_rejects_invalid_json_rpc_version() {
+        let response = json!({ "jsonrpc": "1.0", "id": 9, "result": [] });
+
+        assert!(matches!(
+            parse_pool_logs_range_response(&response, 9),
             Err(ClientEvmError::MalformedJsonRpcResponse(_))
         ));
     }
@@ -916,6 +1165,33 @@ mod tests {
         }
 
         #[test]
+        fn pool_logs_range_request_preserves_request_id_and_from_block(
+            request_id in any::<u64>(),
+            from_block in any::<u64>(),
+        ) {
+            let request = build_pool_logs_range_request(request_id, from_block);
+
+            prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
+            prop_assert_eq!(request.get("method"), Some(&json!("eth_getLogs")));
+            prop_assert_eq!(
+                request
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(|filter| filter.get("fromBlock")),
+                Some(&json!(format!("0x{from_block:x}")))
+            );
+            prop_assert_eq!(
+                request
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(|filter| filter.get("toBlock")),
+                Some(&json!("latest"))
+            );
+        }
+
+        #[test]
         fn finalized_block_header_request_preserves_request_id(request_id in any::<u64>()) {
             let request = build_finalized_block_header_request(request_id);
 
@@ -991,6 +1267,22 @@ mod tests {
             "data": "0x",
             "blockHash": block_hash,
             "blockNumber": "0x4",
+            "transactionHash": B256::with_last_byte(5),
+            "transactionIndex": "0x6",
+            "logIndex": "0x7",
+            "removed": false
+        })
+    }
+
+    fn range_log_result(address: Address, block_hash: B256, block_number: u64) -> Value {
+        json!({
+            "address": address,
+            "topics": [
+                pool_event_signature_hashes()[0]
+            ],
+            "data": "0x",
+            "blockHash": block_hash,
+            "blockNumber": format!("0x{block_number:x}"),
             "transactionHash": B256::with_last_byte(5),
             "transactionIndex": "0x6",
             "logIndex": "0x7",
