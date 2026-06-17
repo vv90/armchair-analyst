@@ -16,7 +16,11 @@ use optimization::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{OnceLock, mpsc::Sender},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::Sender,
+    },
     thread::{self, JoinHandle},
     time,
 };
@@ -34,6 +38,7 @@ pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     ethereum_config: RpcConfig,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
+    displayed_lines: AtomicUsize,
     logger: Logger,
 }
 
@@ -43,6 +48,7 @@ impl ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             ethereum_config,
             optimization_sender: OnceLock::new(),
+            displayed_lines: AtomicUsize::new(0),
             logger,
         }
     }
@@ -159,7 +165,9 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     }
 
     fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
-        view::render(state);
+        let previous = self.displayed_lines.load(Ordering::Relaxed);
+        let drawn = view::render(state, previous);
+        self.displayed_lines.store(drawn, Ordering::Relaxed);
     }
 }
 
