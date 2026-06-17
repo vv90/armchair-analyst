@@ -532,6 +532,73 @@ impl State {
         }
     }
 
+    /// Activates kernel state from a bootstrap seed: a finalized anchor with its pool snapshots,
+    /// validated pool/token registries, and recent canonical blocks whose pool logs are already resolved.
+    /// Added so a chain starts warm from the bootstrap outcome instead of warming up from an empty finalized state.
+    pub fn activate_from_seed(
+        finalized_hash: BlockHash,
+        finalized_pool_snapshots: HashMap<PoolAddress, PoolState>,
+        pool_registry: TrustedPoolRegistry,
+        token_registry: TokenRegistry,
+        seed_blocks: Vec<(BlockHash, BlockHash, HashSet<PoolCandidateAddress>)>,
+    ) -> (State, Vec<Effect>) {
+        let blocks = seed_blocks
+            .into_iter()
+            .map(|(hash, parent_hash, candidates)| {
+                (
+                    hash,
+                    BlockNode {
+                        parent_hash,
+                        pool_logs: PoolLogsStatus::Resolved(candidates),
+                        pool_snapshots: HashMap::new(),
+                        pool_data_failures: HashMap::new(),
+                    },
+                )
+            })
+            .collect();
+        let blocks = BlocksGraph(blocks);
+        let tick = Tick::initial();
+
+        // Seed blocks can reference ancestors that were not themselves seeded: a no-log block is
+        // absent from the candidate window, so the segment above it floats. Request a header for
+        // each distinct missing ancestor so ancestry reconstruction reconnects every seeded block
+        // down to the finalized anchor, the same way `HeadObserved` does for one gap at a time.
+        let (pending_requests, effects) = missing_seed_parents(&blocks, finalized_hash)
+            .into_iter()
+            .fold(
+                (PendingRequests::new(), Vec::new()),
+                |(pending_requests, mut effects), missing_hash| {
+                    let request_payload = GetBlockHeader {
+                        block_hash: missing_hash,
+                    };
+                    let (pending_requests, request_id) =
+                        pending_requests.with_new_request(request_payload.clone(), tick);
+                    effects.push(Effect::Request(AnyIssuedRequest::BlockHeader(
+                        IssuedRequest {
+                            request_id,
+                            request_payload,
+                        },
+                    )));
+                    (pending_requests, effects)
+                },
+            );
+
+        let state = State {
+            blocks,
+            canonical_tip: finalized_hash,
+            pending_requests,
+            finalized_state: FinalizedState {
+                block_hash: finalized_hash,
+                pool_snapshots: finalized_pool_snapshots,
+            },
+            pool_registry,
+            token_registry,
+            tick,
+        };
+
+        (state, effects)
+    }
+
     /// Exposes finalized pool snapshots to pure read models.
     /// Added so multi-chain projections can merge finalized state with a complete recent-block overlay without mutating kernel state.
     pub(crate) fn finalized_pool_snapshots(&self) -> &HashMap<PoolAddress, PoolState> {
@@ -1501,6 +1568,23 @@ fn find_missing_block_hash(
     Ok(None)
 }
 
+/// Collects the distinct first missing ancestors across every seeded block, sorted so request-id
+/// assignment stays deterministic. A seeded block whose parent was not itself seeded contributes
+/// that gap hash; a cycle (which a well-formed seed never produces) contributes nothing.
+fn missing_seed_parents(blocks: &BlocksGraph, finalized_hash: BlockHash) -> Vec<BlockHash> {
+    // A well-formed seed graph never cycles; treat the impossible cycle error as "no gap".
+    let mut missing = blocks
+        .0
+        .keys()
+        .filter_map(|hash| {
+            find_missing_block_hash(&blocks.0, *hash, finalized_hash).unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,6 +1592,7 @@ mod tests {
     use alloy::primitives::{Address, U160, U256, aliases::I24};
 
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
+    use crate::{RangeLogBlock, bootstrap};
     use proptest::prelude::*;
 
     #[derive(Debug)]
@@ -3066,6 +3151,557 @@ mod tests {
         );
         assert!(next_state.token_registry.is_unsupported(unsupported_token));
         assert_state_invariants(&next_state);
+    }
+
+    // Activates kernel state from a bootstrap seed and reads back the finalized snapshots and registries.
+    // This confirms the warm-start constructor carries finalized state and validated metadata into the kernel.
+    #[test]
+    fn activate_from_seed_exposes_finalized_snapshots_and_registries() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let candidate = pool_candidate_address(4);
+        let pool = pool_address(4);
+        let token0 = token_address(6);
+        let token1 = token_address(7);
+        let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
+        let snapshot = pool_state(9);
+
+        let pool_registry = TrustedPoolRegistry::new()
+            .with_metadata_results(HashMap::from([(candidate, Ok(metadata.clone()))]));
+        let token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token0, Ok(token_metadata(18))),
+            (token1, Ok(token_metadata(6))),
+        ]));
+
+        let (state, effects) = State::activate_from_seed(
+            finalized_hash,
+            HashMap::from([(pool, snapshot.clone())]),
+            pool_registry,
+            token_registry,
+            Vec::new(),
+        );
+
+        // No seed blocks, so nothing to reconnect to the anchor.
+        assert!(effects.is_empty());
+        assert_eq!(state.finalized_state.block_hash, finalized_hash);
+        assert_eq!(
+            state.finalized_pool_snapshots(),
+            &HashMap::from([(pool, snapshot)])
+        );
+        assert_eq!(state.verified_pool_metadata(pool), Some(&metadata));
+        assert_eq!(
+            state.verified_token_metadata(token0),
+            Some(&token_metadata(18))
+        );
+        assert_eq!(state.canonical_tip, finalized_hash);
+        assert_state_invariants(&state);
+    }
+
+    // Seeds a recent block with resolved pool logs, then observes a head built on top of it.
+    // This proves the seeded logs and registries are honored: only the new head needs a log fetch,
+    // and the verified pool from the seeded block is immediately scheduled for pool data.
+    #[test]
+    fn activate_from_seed_seeds_resolved_logs_so_new_head_skips_log_refetch() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let seed_hash = BlockHash::with_last_byte(2);
+        let new_head = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = pool_address(4);
+        let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
+
+        let pool_registry = TrustedPoolRegistry::new()
+            .with_metadata_results(HashMap::from([(candidate, Ok(metadata))]));
+        let token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(6), Ok(token_metadata(18))),
+            (token_address(7), Ok(token_metadata(6))),
+        ]));
+
+        let (state, activation_effects) = State::activate_from_seed(
+            finalized_hash,
+            HashMap::new(),
+            pool_registry,
+            token_registry,
+            vec![(seed_hash, finalized_hash, HashSet::from([candidate]))],
+        );
+
+        // The seed block's parent is the finalized anchor, so nothing needs reconnecting.
+        assert!(activation_effects.is_empty());
+
+        let (state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: new_head,
+                parent_hash: seed_hash,
+            },
+        );
+
+        // The seeded block already has resolved logs, so no log request targets it.
+        let seed_log_requests = effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                        request_payload: GetBlockLogs { block_hash },
+                        ..
+                    })) if *block_hash == seed_hash
+                )
+            })
+            .count();
+        assert_eq!(seed_log_requests, 0);
+
+        // Only the new head needs its logs fetched.
+        assert_single_block_log_request_effect(&effects, new_head);
+        // The verified pool from the seeded block's resolved logs is scheduled at the tip.
+        assert_single_pool_data_request_effect(&effects, new_head, &HashSet::from([pool]));
+        assert_eq!(state.canonical_tip, new_head);
+        assert_state_invariants(&state);
+    }
+
+    // ===== Bootstrap-activation invariant coverage =====
+    // These exercises feed real `bootstrap` outcomes through `activate_from_seed` (mirroring
+    // `multi_chain_kernel::activate_bootstrap_outcome`) and hold the resulting kernel state to
+    // every kernel invariant — the core shape set plus the scheduler-level guarantees — so a
+    // warm-started chain is never weaker than a cold one. The goal: any state reachable from a
+    // `bootstrap::Completion::Ready` outcome satisfies all kernel state invariants.
+
+    /// The finalized anchor every bootstrap-activation exercise shares. Its hash byte (220) stays
+    /// clear of the per-number block hashes (derived from numbers just above 100) so fixtures
+    /// never collide.
+    fn bootstrap_anchor() -> bootstrap::FinalizedAnchor {
+        bootstrap::FinalizedAnchor {
+            hash: BlockHash::with_last_byte(220),
+            number: 100,
+        }
+    }
+
+    /// Compact, collision-free block hash for a canonical block at `number`.
+    fn block_hash_for_number(number: u64) -> BlockHash {
+        BlockHash::with_last_byte(number as u8)
+    }
+
+    /// The single pool-event candidate a block at `number` contributes to its range-logs entry.
+    fn candidate_for_number(number: u64) -> PoolCandidateAddress {
+        pool_candidate_address(number as u8)
+    }
+
+    /// A one-block range-logs entry, as the bootstrap candidate scan would report it.
+    fn range_log_block(number: u64) -> RangeLogBlock {
+        RangeLogBlock {
+            number,
+            hash: block_hash_for_number(number),
+            candidates: HashSet::from([candidate_for_number(number)]),
+        }
+    }
+
+    /// Low byte of an address, used to key the deterministic success/failure fixtures.
+    fn address_last_byte(address: &Address) -> u8 {
+        address.into_array().into_iter().next_back().unwrap_or(0)
+    }
+
+    /// The single outstanding bootstrap request carried by a transition, if any.
+    fn bootstrap_outstanding(
+        effects: Vec<bootstrap::Effect>,
+    ) -> Option<bootstrap::AnyIssuedRequest> {
+        effects
+            .into_iter()
+            .map(|bootstrap::Effect::Request(issued)| issued)
+            .next()
+    }
+
+    /// A well-formed response answering whatever bootstrap request is outstanding, with metadata,
+    /// token, and pool-data results decided by the caller-supplied failing-byte sets.
+    fn bootstrap_response(
+        issued: &bootstrap::AnyIssuedRequest,
+        window: &[RangeLogBlock],
+        metadata_fails: &HashSet<u8>,
+        token_fails: &HashSet<u8>,
+        data_fails: &HashSet<u8>,
+    ) -> bootstrap::Event {
+        match issued {
+            bootstrap::AnyIssuedRequest::FinalizedHeader(request) => {
+                bootstrap::Event::FinalizedHeaderReceived {
+                    request_id: request.request_id,
+                    anchor: bootstrap_anchor(),
+                }
+            }
+            bootstrap::AnyIssuedRequest::PoolCandidates(request) => {
+                bootstrap::Event::PoolCandidatesReceived {
+                    request_id: request.request_id,
+                    blocks: window.to_vec(),
+                }
+            }
+            bootstrap::AnyIssuedRequest::PoolMetadata(request) => {
+                let metadata = request
+                    .request_payload
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        let byte = address_last_byte(&candidate.0);
+                        let result = if metadata_fails.contains(&byte) {
+                            Err(PoolMetadataFailure::FactoryReturnedZero)
+                        } else {
+                            Ok(pool_metadata(
+                                byte,
+                                byte.wrapping_add(64),
+                                UniswapV3Fee::Fee3000,
+                            ))
+                        };
+                        (*candidate, result)
+                    })
+                    .collect();
+                bootstrap::Event::PoolMetadataReceived {
+                    request_id: request.request_id,
+                    metadata,
+                }
+            }
+            bootstrap::AnyIssuedRequest::TokenMetadata(request) => {
+                let metadata = request
+                    .request_payload
+                    .tokens
+                    .iter()
+                    .map(|token| {
+                        let result = if token_fails.contains(&address_last_byte(&token.0)) {
+                            Err(TokenMetadataFailure::CallFailed(
+                                TokenMetadataCall::Decimals,
+                            ))
+                        } else {
+                            Ok(token_metadata(18))
+                        };
+                        (*token, result)
+                    })
+                    .collect();
+                bootstrap::Event::TokenMetadataReceived {
+                    request_id: request.request_id,
+                    metadata,
+                }
+            }
+            bootstrap::AnyIssuedRequest::PoolData(request) => {
+                let pools = request
+                    .request_payload
+                    .pools
+                    .iter()
+                    .map(|pool| {
+                        let byte = address_last_byte(&pool.0);
+                        let result = if data_fails.contains(&byte) {
+                            Err(PoolDataFailure::CallFailed(PoolDataCall::Slot0))
+                        } else {
+                            Ok(pool_state(byte))
+                        };
+                        (*pool, result)
+                    })
+                    .collect();
+                bootstrap::Event::PoolDataReceived {
+                    request_id: request.request_id,
+                    pools,
+                }
+            }
+        }
+    }
+
+    /// Drives a real bootstrap from `init` to its terminal completion. It answers each outstanding
+    /// request, but stops after `deliver_limit` deliveries and ticks to the deadline instead, so
+    /// partial runs surface the *degraded* best-effort outcomes the kernel must also tolerate.
+    fn drive_bootstrap_to_completion(
+        policy: bootstrap::BootstrapPolicy,
+        window: &[RangeLogBlock],
+        metadata_fails: &HashSet<u8>,
+        token_fails: &HashSet<u8>,
+        data_fails: &HashSet<u8>,
+        deliver_limit: usize,
+    ) -> bootstrap::Completion {
+        let (mut state, effects) = bootstrap::init(policy);
+        let mut outstanding = bootstrap_outstanding(effects);
+        let mut delivered = 0;
+
+        loop {
+            if let Some(completion) = bootstrap::completion(&state) {
+                return completion;
+            }
+
+            let event = match outstanding.as_ref() {
+                Some(request) if delivered < deliver_limit => {
+                    delivered += 1;
+                    bootstrap_response(request, window, metadata_fails, token_fails, data_fails)
+                }
+                _ => bootstrap::Event::Tick,
+            };
+
+            let (next_state, effects) = bootstrap::transition(state, event);
+            state = next_state;
+            if let Some(request) = bootstrap_outstanding(effects) {
+                outstanding = Some(request);
+            }
+        }
+    }
+
+    /// Activates a kernel state from a bootstrap outcome exactly as `multi_chain_kernel` does,
+    /// returning the activation effects so tests can hold them to the effect well-formedness check.
+    fn activate_bootstrap_outcome_for_test(
+        outcome: bootstrap::BootstrapOutcome,
+    ) -> (State, Vec<Effect>) {
+        let bootstrap::BootstrapOutcome {
+            anchor,
+            pool_snapshots,
+            pool_registry,
+            token_registry,
+            seed_blocks,
+        } = outcome;
+        let seed_blocks = seed_blocks
+            .into_iter()
+            .map(|block| (block.hash, block.parent_hash, block.candidates))
+            .collect();
+
+        State::activate_from_seed(
+            anchor.hash,
+            pool_snapshots,
+            pool_registry,
+            token_registry,
+            seed_blocks,
+        )
+    }
+
+    /// Asserts every continuously-held kernel invariant: the core shape set plus the
+    /// scheduler-level guarantees `assert_state_invariants` omits but a healthy state always meets.
+    fn assert_all_kernel_invariants(state: &State) {
+        assert_state_invariants(state);
+        assert_canonical_unknown_logs_are_pending(state);
+        assert_canonical_resolved_candidates_are_known_or_pending(state);
+        assert_missing_parents_for_known_blocks_are_pending(state);
+    }
+
+    /// A fresh head hash for building on top of a seeded graph, distinct from every fixture hash.
+    fn fresh_head_hash() -> BlockHash {
+        BlockHash::with_last_byte(250)
+    }
+
+    // Positive control: a clean full bootstrap (contiguous window, all calls succeed) activates
+    // into a state that satisfies every invariant, both at activation and after a head builds on
+    // the seeded tip. If this fails, the harness or the bridge mapping is wrong, not the logic.
+    #[test]
+    fn clean_full_bootstrap_activation_satisfies_all_invariants() {
+        let policy = bootstrap::BootstrapPolicy {
+            look_back_depth: 64,
+            tip_trim: 0,
+            deadline_ticks: 100,
+        };
+        let window = vec![
+            range_log_block(101),
+            range_log_block(102),
+            range_log_block(103),
+        ];
+        let outcome = match drive_bootstrap_to_completion(
+            policy,
+            &window,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            5,
+        ) {
+            bootstrap::Completion::Ready(outcome) => outcome,
+            other => panic!("expected ready outcome, got {other:?}"),
+        };
+
+        let seed_tip = outcome
+            .seed_blocks
+            .last()
+            .expect("contiguous window seeds blocks")
+            .hash;
+        let (state, activation_effects) = activate_bootstrap_outcome_for_test(outcome);
+        assert_all_kernel_invariants(&state);
+        assert_effects_are_well_formed(&state, &activation_effects);
+
+        let (next_state, effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: fresh_head_hash(),
+                parent_hash: seed_tip,
+            },
+        );
+        assert_all_kernel_invariants(&next_state);
+        assert_effects_are_well_formed(&next_state, &effects);
+    }
+
+    // A bootstrap that hits its deadline while validating pools degrades to a Ready outcome that
+    // carries seed blocks but an empty pool registry. Once such a seeded block joins the canonical
+    // path, its resolved log candidates must still be known or pending validation — otherwise the
+    // pools in that block are silently orphaned and never validated.
+    #[test]
+    fn degraded_bootstrap_before_pool_metadata_keeps_canonical_candidates_known_or_pending() {
+        let policy = bootstrap::BootstrapPolicy {
+            look_back_depth: 64,
+            tip_trim: 0,
+            deadline_ticks: 3,
+        };
+        let window = vec![range_log_block(101), range_log_block(102)];
+        // Deliver the finalized header and pool candidates, then stall to the deadline.
+        let outcome = match drive_bootstrap_to_completion(
+            policy,
+            &window,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            2,
+        ) {
+            bootstrap::Completion::Ready(outcome) => outcome,
+            other => panic!("expected degraded ready outcome, got {other:?}"),
+        };
+
+        // Precondition: this is the degraded shape — seeded blocks, but no validated pools.
+        assert!(!outcome.seed_blocks.is_empty());
+        assert_eq!(outcome.pool_registry, TrustedPoolRegistry::new());
+
+        let seed_tip = outcome
+            .seed_blocks
+            .last()
+            .expect("seed blocks present")
+            .hash;
+        let (state, _activation_effects) = activate_bootstrap_outcome_for_test(outcome);
+        let (next_state, _effects) = transition(
+            state,
+            Event::HeadObserved {
+                hash: fresh_head_hash(),
+                parent_hash: seed_tip,
+            },
+        );
+
+        assert_canonical_resolved_candidates_are_known_or_pending(&next_state);
+    }
+
+    // A no-log block leaves a gap in the range-logs window, so the segment above it floats: the
+    // bootstrap seeds the floating block with a parent it never seeds. Every known block with a
+    // missing ancestor must have a pending header request, or ancestry reconstruction stalls.
+    #[test]
+    fn bootstrap_log_gap_leaves_seed_parent_with_pending_header() {
+        let policy = bootstrap::BootstrapPolicy {
+            look_back_depth: 64,
+            tip_trim: 0,
+            deadline_ticks: 100,
+        };
+        // Block 103 has no pool logs (absent from the window). Block 104 then floats — its parent
+        // 103 is unobserved — so the seed links 105 -> 104 while never seeding 104 itself.
+        let window = vec![
+            range_log_block(101),
+            range_log_block(102),
+            range_log_block(104),
+            range_log_block(105),
+        ];
+        let outcome = match drive_bootstrap_to_completion(
+            policy,
+            &window,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            5,
+        ) {
+            bootstrap::Completion::Ready(outcome) => outcome,
+            other => panic!("expected ready outcome, got {other:?}"),
+        };
+
+        // Precondition: a seed block references a parent that is neither seeded nor the anchor.
+        let seeded = outcome
+            .seed_blocks
+            .iter()
+            .map(|block| block.hash)
+            .collect::<HashSet<_>>();
+        let has_floating_parent = outcome.seed_blocks.iter().any(|block| {
+            !seeded.contains(&block.parent_hash) && block.parent_hash != bootstrap_anchor().hash
+        });
+        assert!(
+            has_floating_parent,
+            "fixture must produce a floating seed segment"
+        );
+
+        let (state, activation_effects) = activate_bootstrap_outcome_for_test(outcome);
+        assert_missing_parents_for_known_blocks_are_pending(&state);
+        assert_effects_are_well_formed(&state, &activation_effects);
+    }
+
+    proptest! {
+        // Every kernel invariant holds on the state activated from any Ready bootstrap outcome —
+        // full or degraded, with arbitrary log gaps, tip trimming, and metadata/token/data results.
+        #[test]
+        fn bootstrap_activation_satisfies_all_kernel_invariants(
+            offsets in prop::collection::hash_set(1u64..40, 0..16),
+            metadata_fails in prop::collection::hash_set(any::<u8>(), 0..16),
+            token_fails in prop::collection::hash_set(any::<u8>(), 0..16),
+            data_fails in prop::collection::hash_set(any::<u8>(), 0..16),
+            tip_trim in 0usize..6,
+            deliver_limit in 0usize..6,
+        ) {
+            let anchor_number = bootstrap_anchor().number;
+            let window = offsets
+                .iter()
+                .map(|offset| range_log_block(anchor_number + offset))
+                .collect::<Vec<_>>();
+            let policy = bootstrap::BootstrapPolicy {
+                look_back_depth: 64,
+                tip_trim,
+                deadline_ticks: 4,
+            };
+
+            if let bootstrap::Completion::Ready(outcome) = drive_bootstrap_to_completion(
+                policy,
+                &window,
+                &metadata_fails,
+                &token_fails,
+                &data_fails,
+                deliver_limit,
+            ) {
+                let (state, activation_effects) = activate_bootstrap_outcome_for_test(outcome);
+                assert_all_kernel_invariants(&state);
+                assert_effects_are_well_formed(&state, &activation_effects);
+            }
+        }
+
+        // Every kernel invariant still holds after a new head builds on the seeded tip, bringing
+        // the seed blocks onto the canonical path where the scheduler invariants bite. Emitted
+        // effects must also be well-formed (recorded as pending work).
+        #[test]
+        fn bootstrap_activation_then_head_satisfies_all_kernel_invariants(
+            offsets in prop::collection::hash_set(1u64..40, 0..16),
+            metadata_fails in prop::collection::hash_set(any::<u8>(), 0..16),
+            token_fails in prop::collection::hash_set(any::<u8>(), 0..16),
+            data_fails in prop::collection::hash_set(any::<u8>(), 0..16),
+            tip_trim in 0usize..6,
+            deliver_limit in 0usize..6,
+        ) {
+            let anchor_number = bootstrap_anchor().number;
+            let window = offsets
+                .iter()
+                .map(|offset| range_log_block(anchor_number + offset))
+                .collect::<Vec<_>>();
+            let policy = bootstrap::BootstrapPolicy {
+                look_back_depth: 64,
+                tip_trim,
+                deadline_ticks: 4,
+            };
+
+            if let bootstrap::Completion::Ready(outcome) = drive_bootstrap_to_completion(
+                policy,
+                &window,
+                &metadata_fails,
+                &token_fails,
+                &data_fails,
+                deliver_limit,
+            ) {
+                let seed_tip = outcome.seed_blocks.last().map(|block| block.hash);
+                let (state, activation_effects) = activate_bootstrap_outcome_for_test(outcome);
+                assert_all_kernel_invariants(&state);
+                assert_effects_are_well_formed(&state, &activation_effects);
+
+                if let Some(seed_tip) = seed_tip {
+                    let (next_state, effects) = transition(
+                        state,
+                        Event::HeadObserved {
+                            hash: fresh_head_hash(),
+                            parent_hash: seed_tip,
+                        },
+                    );
+                    assert_all_kernel_invariants(&next_state);
+                    assert_effects_are_well_formed(&next_state, &effects);
+                }
+            }
+        }
     }
 
     // Reobserves an already tracked head with the same parent.

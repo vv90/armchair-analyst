@@ -2,9 +2,10 @@ use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent, ClientEvmError, ClientHead,
     ETHEREUM_USDC_TOKEN_ADDRESS, PoolAddress, PoolCandidateAddress, PoolDataResult,
-    PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult,
-    fetch_block_header, fetch_block_logs, fetch_finalized_block_header, fetch_pool_data,
-    fetch_pool_metadata, fetch_token_metadata, kernel,
+    PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult, bootstrap,
+    fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
+    fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
+    kernel,
     multi_chain_kernel::{
         Effect, Event, OptimizationPoolReserves, State, Subscription, transition,
     },
@@ -95,6 +96,9 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 }
             }
             Effect::ChainEffect { chain, effect } => self.execute_chain_effect(chain, effect),
+            Effect::BootstrapEffect { chain, effect } => {
+                self.execute_bootstrap_effect(chain, effect)
+            }
             Effect::RunOptimization { input } => {
                 println!("{}", format_run_optimization_effect_log(&input));
                 self.send_optimization_input(input);
@@ -177,6 +181,7 @@ fn format_input_log(input: &Event) -> String {
             format!("input finalized_header_unavailable chain={chain:?}")
         }
         Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
+        Event::BootstrapEvent { chain, event } => format_bootstrap_event_log(*chain, event),
         Event::Tick => "input tick".to_owned(),
     }
 }
@@ -243,6 +248,35 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
     }
 }
 
+fn format_bootstrap_event_log(chain: ChainKey, event: &bootstrap::Event) -> String {
+    match event {
+        bootstrap::Event::FinalizedHeaderReceived { anchor, .. } => format!(
+            "input chain={chain:?} bootstrap_finalized_header_received hash={} number={}",
+            anchor.hash, anchor.number,
+        ),
+        bootstrap::Event::PoolCandidatesReceived { blocks, .. } => format!(
+            "input chain={chain:?} bootstrap_pool_candidates_received blocks={}",
+            blocks.len(),
+        ),
+        bootstrap::Event::PoolMetadataReceived { metadata, .. } => format!(
+            "input chain={chain:?} bootstrap_pool_metadata_received candidates={}",
+            metadata.len(),
+        ),
+        bootstrap::Event::TokenMetadataReceived { metadata, .. } => format!(
+            "input chain={chain:?} bootstrap_token_metadata_received tokens={}",
+            metadata.len(),
+        ),
+        bootstrap::Event::PoolDataReceived { pools, .. } => format!(
+            "input chain={chain:?} bootstrap_pool_data_received pools={}",
+            pools.len(),
+        ),
+        bootstrap::Event::RequestFailed { request_id } => {
+            format!("input chain={chain:?} bootstrap_request_failed request={request_id:?}")
+        }
+        bootstrap::Event::Tick => format!("input chain={chain:?} bootstrap_tick"),
+    }
+}
+
 fn format_typed_request_id_log<R>(request_id: &RequestId<R>) -> String {
     format!("{request_id:?}")
 }
@@ -252,6 +286,85 @@ fn format_request_id_log(request_id: &AnyRequestId) -> String {
 }
 
 impl ClientEvmRuntime {
+    fn execute_bootstrap_effect(&self, chain: ChainKey, effect: bootstrap::Effect) -> Vec<Event> {
+        let config = self.get_config(chain);
+        let bootstrap::Effect::Request(request) = effect;
+
+        let event = match request {
+            bootstrap::AnyIssuedRequest::FinalizedHeader(request) => {
+                let request_id = request.request_id;
+
+                match fetch_finalized_block_header(&self.agent, config) {
+                    Ok(Some(header)) => bootstrap::Event::FinalizedHeaderReceived {
+                        request_id,
+                        anchor: bootstrap::FinalizedAnchor {
+                            hash: header.inner.hash,
+                            number: header.inner.inner.number,
+                        },
+                    },
+                    Ok(None) | Err(_) => bootstrap::Event::RequestFailed {
+                        request_id: bootstrap::AnyRequestId::FinalizedHeader(request_id),
+                    },
+                }
+            }
+            bootstrap::AnyIssuedRequest::PoolCandidates(request) => {
+                let request_id = request.request_id;
+                let from_block = request.request_payload.from_block;
+
+                match fetch_pool_candidates_in_range(&self.agent, config, from_block) {
+                    Ok(blocks) => bootstrap::Event::PoolCandidatesReceived { request_id, blocks },
+                    Err(_) => bootstrap::Event::RequestFailed {
+                        request_id: bootstrap::AnyRequestId::PoolCandidates(request_id),
+                    },
+                }
+            }
+            bootstrap::AnyIssuedRequest::PoolMetadata(request) => {
+                let request_id = request.request_id;
+                let at = request.request_payload.at;
+                let candidates = request.request_payload.candidates;
+
+                match fetch_pool_metadata(&self.agent, config, at, candidates) {
+                    Ok(metadata) => bootstrap::Event::PoolMetadataReceived {
+                        request_id,
+                        metadata,
+                    },
+                    Err(_) => bootstrap::Event::RequestFailed {
+                        request_id: bootstrap::AnyRequestId::PoolMetadata(request_id),
+                    },
+                }
+            }
+            bootstrap::AnyIssuedRequest::TokenMetadata(request) => {
+                let request_id = request.request_id;
+                let at = request.request_payload.at;
+                let tokens = request.request_payload.tokens;
+
+                match fetch_token_metadata(&self.agent, config, at, tokens) {
+                    Ok(metadata) => bootstrap::Event::TokenMetadataReceived {
+                        request_id,
+                        metadata,
+                    },
+                    Err(_) => bootstrap::Event::RequestFailed {
+                        request_id: bootstrap::AnyRequestId::TokenMetadata(request_id),
+                    },
+                }
+            }
+            bootstrap::AnyIssuedRequest::PoolData(request) => {
+                let request_id = request.request_id;
+                let at = request.request_payload.at;
+                let pools = request.request_payload.pools;
+
+                match fetch_pool_data(&self.agent, config, at, pools) {
+                    Ok(pools) => bootstrap::Event::PoolDataReceived { request_id, pools },
+                    Err(_) => bootstrap::Event::RequestFailed {
+                        request_id: bootstrap::AnyRequestId::PoolData(request_id),
+                    },
+                }
+            }
+        };
+
+        vec![Event::BootstrapEvent { chain, event }]
+    }
+
     fn execute_chain_effect(&self, chain: ChainKey, effect: kernel::Effect) -> Vec<Event> {
         execute_chain_effect_with(
             chain,

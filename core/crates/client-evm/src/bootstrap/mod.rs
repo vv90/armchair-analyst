@@ -16,9 +16,12 @@ use crate::{
     RangeLogBlock, TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry,
     tick::Tick,
 };
-use pending_requests::{
+use pending_requests::PendingRequests;
+// Re-exported so runtimes can dispatch bootstrap requests and build their response events, mirroring
+// the kernel's crate-level request re-exports.
+pub use pending_requests::{
     AnyIssuedRequest, AnyRequestId, GetFinalizedHeader, GetPoolCandidatesInRange, IssuedRequest,
-    PendingRequests, RequestId,
+    RequestId,
 };
 
 /// Per-chain tuning for the bootstrap phase.

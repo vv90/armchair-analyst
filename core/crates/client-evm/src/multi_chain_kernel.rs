@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     PoolAddress, PoolMetadata, PoolState, PoolStateError, TokenAddress, TokenAmountConversionError,
-    TokenDecimals, UniswapV3Fee, chain::ChainKey, kernel, u256_token_amount_to_f32,
+    TokenDecimals, UniswapV3Fee, bootstrap, chain::ChainKey, kernel, u256_token_amount_to_f32,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,7 +23,7 @@ pub struct State {
 }
 
 enum ChainLifecycle {
-    Initializing,
+    Bootstrapping(bootstrap::State),
     Active(kernel::State),
 }
 
@@ -36,6 +36,13 @@ struct FinalizedRefreshPolicy {
 const ETHEREUM_APPROX_FINALIZED_BLOCK_AGE: usize = 64;
 const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
 const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+
+/// Pool-candidate discovery window scanned below the finalized anchor during bootstrap.
+const ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 64;
+/// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
+const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 8;
+/// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
+const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 30;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptimizationPoolReserves {
@@ -81,30 +88,27 @@ pub enum PoolReserveProjectionError {
 }
 
 impl State {
-    /// Creates multi-chain state with one chain waiting for its finalized anchor.
-    /// Added so runtimes can bootstrap an inner kernel only after the chain's finalized block is known.
+    /// Creates multi-chain state with one chain bootstrapping its recent canonical window.
+    /// Added so runtimes seed an inner kernel from the bootstrap outcome instead of an empty finalized state.
     pub fn init(chain: ChainKey) -> (State, Vec<Effect>) {
         let mut chains = BTreeMap::new();
+        let (bootstrap_state, bootstrap_effects) = bootstrap::init(bootstrap_policy(chain));
 
-        if chains.contains_key(&chain) {
-            return (State { chains }, Vec::new());
-        }
-
-        chains.insert(chain, ChainLifecycle::Initializing);
+        chains.insert(chain, ChainLifecycle::Bootstrapping(bootstrap_state));
 
         (
             State { chains },
-            vec![Effect::FetchFinalizedHeader { chain }],
+            wrap_bootstrap_effects(chain, bootstrap_effects),
         )
     }
 
-    /// Reports whether a configured chain is initializing or active.
+    /// Reports whether a configured chain is initializing (bootstrapping) or active.
     /// Added so callers can observe wrapper readiness without exposing the inner lifecycle representation.
     pub fn status(&self, chain: ChainKey) -> Option<ChainStatus> {
         self.chains
             .get(&chain)
             .map(|chain_state| match chain_state {
-                ChainLifecycle::Initializing => ChainStatus::Initializing,
+                ChainLifecycle::Bootstrapping(_) => ChainStatus::Initializing,
                 ChainLifecycle::Active(_) => ChainStatus::Active,
             })
     }
@@ -308,6 +312,10 @@ pub enum Event {
         chain: ChainKey,
         event: kernel::Event,
     },
+    BootstrapEvent {
+        chain: ChainKey,
+        event: bootstrap::Event,
+    },
     Tick,
 }
 
@@ -325,6 +333,10 @@ pub enum Effect {
         chain: ChainKey,
         effect: kernel::Effect,
     },
+    BootstrapEffect {
+        chain: ChainKey,
+        effect: bootstrap::Effect,
+    },
     RunOptimization {
         input: OptimizationPoolReserves,
     },
@@ -339,12 +351,14 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
         }
         Event::FinalizedHeaderUnavailable { chain } => finalized_header_unavailable(state, chain),
         Event::ChainEvent { chain, event } => chain_event(state, chain, event),
+        Event::BootstrapEvent { chain, event } => bootstrap_event(state, chain, event),
         Event::Tick => tick(state),
     }
 }
 
-/// Handles finalized header observations for both bootstrap and active-chain compaction.
-/// Added so the same finalized-header feed can initialize chains and later advance each inner kernel's finalized boundary.
+/// Advances an active chain's finalized boundary from a refreshed finalized header.
+/// Added so the finalized-header refresh feed can drive each inner kernel's compaction; bootstrapping
+/// chains fetch their own anchor and ignore this feed.
 fn finalized_header_received(
     state: State,
     chain: ChainKey,
@@ -353,14 +367,6 @@ fn finalized_header_received(
     let mut chains = state.chains;
 
     match chains.remove(&chain) {
-        Some(ChainLifecycle::Initializing) => {
-            let finalized_state = kernel::FinalizedState::empty_at(block_hash);
-            chains.insert(
-                chain,
-                ChainLifecycle::Active(kernel::State::init(finalized_state)),
-            );
-            (State { chains }, Vec::new())
-        }
         Some(ChainLifecycle::Active(chain_state)) => {
             let (chain_state, effects) = kernel::transition(
                 chain_state,
@@ -375,20 +381,106 @@ fn finalized_header_received(
                     .collect(),
             )
         }
+        Some(other) => {
+            chains.insert(chain, other);
+            (State { chains }, Vec::new())
+        }
         None => (State { chains }, Vec::new()),
     }
 }
 
-/// Removes a chain that could not fetch the finalized header during bootstrap.
-/// Added so failed initialization does not leave an unusable chain in the initializing lifecycle forever.
-fn finalized_header_unavailable(state: State, chain: ChainKey) -> (State, Vec<Effect>) {
+/// Ignores an unavailable finalized-header refresh.
+/// Added so a failed active-chain finalized refresh is a no-op; the refresh is retried later and a
+/// running chain is never torn down by a transient header fetch failure.
+fn finalized_header_unavailable(state: State, _chain: ChainKey) -> (State, Vec<Effect>) {
+    (state, Vec::new())
+}
+
+/// Forwards a bootstrap event to a bootstrapping chain and reflects the resulting lifecycle.
+/// Added so bootstrap responses advance the phase machine, activate the inner kernel on completion,
+/// or drop the chain when the anchor can never be obtained.
+fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (State, Vec<Effect>) {
     let mut chains = state.chains;
 
-    if matches!(chains.get(&chain), Some(ChainLifecycle::Initializing)) {
-        chains.remove(&chain);
+    match chains.remove(&chain) {
+        Some(ChainLifecycle::Bootstrapping(bootstrap_state)) => {
+            let (lifecycle, effects) = advance_bootstrap(chain, bootstrap_state, event);
+            if let Some(lifecycle) = lifecycle {
+                chains.insert(chain, lifecycle);
+            }
+            (State { chains }, effects)
+        }
+        Some(other) => {
+            chains.insert(chain, other);
+            (State { chains }, Vec::new())
+        }
+        None => (State { chains }, Vec::new()),
     }
+}
 
-    (State { chains }, Vec::new())
+/// Runs one bootstrap transition and maps its completion onto the chain lifecycle.
+/// Added as the single place that turns a bootstrap outcome into an active seeded kernel (or drops
+/// the chain), keeping both the event and tick paths consistent.
+fn advance_bootstrap(
+    chain: ChainKey,
+    bootstrap_state: bootstrap::State,
+    event: bootstrap::Event,
+) -> (Option<ChainLifecycle>, Vec<Effect>) {
+    let (bootstrap_state, effects) = bootstrap::transition(bootstrap_state, event);
+    let mut effects = wrap_bootstrap_effects(chain, effects);
+
+    match bootstrap::completion(&bootstrap_state) {
+        Some(bootstrap::Completion::Ready(outcome)) => {
+            let (chain_state, activation_effects) = activate_bootstrap_outcome(outcome);
+            effects.extend(
+                activation_effects
+                    .into_iter()
+                    .map(|effect| Effect::ChainEffect { chain, effect }),
+            );
+            (Some(ChainLifecycle::Active(chain_state)), effects)
+        }
+        Some(bootstrap::Completion::Abandoned) => (None, effects),
+        None => (
+            Some(ChainLifecycle::Bootstrapping(bootstrap_state)),
+            effects,
+        ),
+    }
+}
+
+/// Seeds an active kernel state from a completed bootstrap outcome.
+/// Added as the pure Stage-2 bridge from the bootstrap outcome into the kernel's warm-start constructor.
+fn activate_bootstrap_outcome(
+    outcome: bootstrap::BootstrapOutcome,
+) -> (kernel::State, Vec<kernel::Effect>) {
+    let bootstrap::BootstrapOutcome {
+        anchor,
+        pool_snapshots,
+        pool_registry,
+        token_registry,
+        seed_blocks,
+    } = outcome;
+
+    let seed_blocks = seed_blocks
+        .into_iter()
+        .map(|block| (block.hash, block.parent_hash, block.candidates))
+        .collect();
+
+    kernel::State::activate_from_seed(
+        anchor.hash,
+        pool_snapshots,
+        pool_registry,
+        token_registry,
+        seed_blocks,
+    )
+}
+
+/// Wraps inner bootstrap effects with their owning chain key.
+/// Added to keep bootstrap effect routing identical across init, event, and tick paths.
+fn wrap_bootstrap_effects(chain: ChainKey, effects: Vec<bootstrap::Effect>) -> Vec<Effect> {
+    effects
+        .into_iter()
+        .map(|effect| Effect::BootstrapEffect { chain, effect })
+        .collect()
 }
 
 /// Forwards an inner kernel event to an active chain and wraps its effects with the chain key.
@@ -429,15 +521,21 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
     }
 }
 
-/// Advances active chains and forwards any retry or scheduler effects they produce.
-/// Added so a single global tick can drive request TTL handling across all configured chains.
+/// Advances active and bootstrapping chains and forwards any retry or scheduler effects they produce.
+/// Added so a single global tick can drive request TTL handling for active kernels and the bootstrap
+/// retry/deadline timers for chains still warming up.
 fn tick(state: State) -> (State, Vec<Effect>) {
     let (chains, effects) = state.chains.into_iter().fold(
         (BTreeMap::new(), Vec::new()),
         |(mut chains, mut effects), (chain, chain_state)| {
             match chain_state {
-                ChainLifecycle::Initializing => {
-                    chains.insert(chain, ChainLifecycle::Initializing);
+                ChainLifecycle::Bootstrapping(bootstrap_state) => {
+                    let (lifecycle, chain_effects) =
+                        advance_bootstrap(chain, bootstrap_state, bootstrap::Event::Tick);
+                    if let Some(lifecycle) = lifecycle {
+                        chains.insert(chain, lifecycle);
+                    }
+                    effects.extend(chain_effects);
                 }
                 ChainLifecycle::Active(chain_state) => {
                     let (chain_state, chain_effects) =
@@ -467,6 +565,16 @@ fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
     }
 }
 
+fn bootstrap_policy(chain: ChainKey) -> bootstrap::BootstrapPolicy {
+    match chain {
+        ChainKey::Ethereum => bootstrap::BootstrapPolicy {
+            look_back_depth: ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH,
+            tip_trim: ETHEREUM_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: ETHEREUM_BOOTSTRAP_DEADLINE_TICKS,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -483,12 +591,17 @@ mod tests {
     };
 
     #[test]
-    fn init_requests_finalized_header_and_marks_chain_initializing() {
+    fn init_requests_finalized_header_and_marks_chain_bootstrapping() {
         let chain = ChainKey::Ethereum;
         let (state, effects) = State::init(chain);
 
         assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
-        assert_single_fetch_finalized_header_effect(&effects, chain);
+        assert!(matches!(
+            single_bootstrap_effect(&effects, chain),
+            bootstrap::Effect::Request(
+                crate::bootstrap::pending_requests::AnyIssuedRequest::FinalizedHeader(_)
+            )
+        ));
     }
 
     #[test]
@@ -509,22 +622,13 @@ mod tests {
     }
 
     #[test]
-    fn finalized_header_received_for_initializing_chain_activates_chain() {
+    fn bootstrap_handshake_activates_chain() {
         let chain = ChainKey::Ethereum;
         let finalized_hash = hash(1);
         let child_hash = hash(2);
-        let (state, _) = State::init(chain);
-
-        let (state, effects) = transition(
-            state,
-            Event::FinalizedHeaderReceived {
-                chain,
-                block_hash: finalized_hash,
-            },
-        );
+        let state = drive_bootstrap_to_active(chain, finalized_hash);
 
         assert_eq!(state.status(chain), Some(ChainStatus::Active));
-        assert!(effects.is_empty());
 
         let (_state, effects) = transition(
             state,
@@ -540,21 +644,30 @@ mod tests {
     }
 
     #[test]
-    fn finalized_header_unavailable_for_initializing_chain_removes_chain() {
+    fn bootstrap_deadline_before_anchor_abandons_chain() {
         let chain = ChainKey::Ethereum;
-        let (state, _) = State::init(chain);
+        let (mut state, _effects) = State::init(chain);
+        let policy = bootstrap_policy(chain);
 
-        let (state, effects) = transition(state, Event::FinalizedHeaderUnavailable { chain });
+        for _ in 0..policy.deadline_ticks {
+            let (next_state, _effects) = transition(state, Event::Tick);
+            state = next_state;
+        }
 
         assert_eq!(state.status(chain), None);
-        assert!(effects.is_empty());
     }
 
     #[test]
     fn chain_event_for_inactive_chain_is_ignored() {
         let chain = ChainKey::Ethereum;
-        let (state, _) = State::init(chain);
-        let (state, _) = transition(state, Event::FinalizedHeaderUnavailable { chain });
+        let (mut state, _effects) = State::init(chain);
+        let policy = bootstrap_policy(chain);
+
+        for _ in 0..policy.deadline_ticks {
+            let (next_state, _effects) = transition(state, Event::Tick);
+            state = next_state;
+        }
+        assert_eq!(state.status(chain), None);
 
         let (state, effects) = transition(
             state,
@@ -574,14 +687,7 @@ mod tests {
         let finalized_hash = hash(1);
         let missing_parent_hash = hash(2);
         let observed_hash = hash(3);
-        let (state, _) = State::init(chain);
-        let (state, _) = transition(
-            state,
-            Event::FinalizedHeaderReceived {
-                chain,
-                block_hash: finalized_hash,
-            },
-        );
+        let state = active_state_at(chain, finalized_hash);
 
         let (_state, effects) = transition(
             state,
@@ -598,14 +704,13 @@ mod tests {
     }
 
     #[test]
-    fn tick_is_ignored_for_initializing_chains() {
+    fn tick_keeps_bootstrapping_chain_initializing_before_deadline() {
         let chain = ChainKey::Ethereum;
         let (state, _) = State::init(chain);
 
-        let (state, effects) = transition(state, Event::Tick);
+        let (state, _effects) = transition(state, Event::Tick);
 
         assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
-        assert!(effects.is_empty());
     }
 
     #[test]
@@ -614,14 +719,7 @@ mod tests {
         let finalized_hash = hash(1);
         let missing_parent_hash = hash(2);
         let observed_hash = hash(3);
-        let (state, _) = State::init(chain);
-        let (state, _) = transition(
-            state,
-            Event::FinalizedHeaderReceived {
-                chain,
-                block_hash: finalized_hash,
-            },
-        );
+        let state = active_state_at(chain, finalized_hash);
         let (state, effects) = transition(
             state,
             Event::ChainEvent {
@@ -805,14 +903,7 @@ mod tests {
         let finalized_hash = hash(1);
         let compacted_hash = hash(2);
         let old_branch_hash = hash(3);
-        let (state, _) = State::init(chain);
-        let (state, _) = transition(
-            state,
-            Event::FinalizedHeaderReceived {
-                chain,
-                block_hash: finalized_hash,
-            },
-        );
+        let state = active_state_at(chain, finalized_hash);
         let (state, effects) = transition(
             state,
             Event::ChainEvent {
@@ -1272,13 +1363,82 @@ mod tests {
         }
     }
 
-    fn assert_single_fetch_finalized_header_effect(effects: &[Effect], chain: ChainKey) {
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            &effects[0],
-            Effect::FetchFinalizedHeader { chain: effect_chain }
-                if *effect_chain == chain
-        ));
+    /// Returns the single bootstrap effect emitted for a chain, failing on zero or many.
+    /// Bootstrap is sequential, so a non-terminal step always carries exactly one request.
+    fn single_bootstrap_effect(effects: &[Effect], chain: ChainKey) -> &bootstrap::Effect {
+        let matching = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::BootstrapEffect {
+                    chain: effect_chain,
+                    effect,
+                } if *effect_chain == chain => Some(effect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching.len(), 1);
+        matching[0]
+    }
+
+    /// Builds an empty-but-well-formed success response for the outstanding bootstrap request.
+    /// Empty windows/metadata drive the handshake to a `Ready` outcome anchored at `finalized_hash`.
+    fn bootstrap_success_event(
+        chain: ChainKey,
+        finalized_hash: BlockHash,
+        effect: &bootstrap::Effect,
+    ) -> Event {
+        use crate::bootstrap::pending_requests::AnyIssuedRequest;
+
+        let bootstrap::Effect::Request(request) = effect;
+        let event = match request {
+            AnyIssuedRequest::FinalizedHeader(issued) => {
+                bootstrap::Event::FinalizedHeaderReceived {
+                    request_id: issued.request_id,
+                    anchor: bootstrap::FinalizedAnchor {
+                        hash: finalized_hash,
+                        number: 0,
+                    },
+                }
+            }
+            AnyIssuedRequest::PoolCandidates(issued) => bootstrap::Event::PoolCandidatesReceived {
+                request_id: issued.request_id,
+                blocks: Vec::new(),
+            },
+            AnyIssuedRequest::PoolMetadata(issued) => bootstrap::Event::PoolMetadataReceived {
+                request_id: issued.request_id,
+                metadata: HashMap::new(),
+            },
+            AnyIssuedRequest::TokenMetadata(issued) => bootstrap::Event::TokenMetadataReceived {
+                request_id: issued.request_id,
+                metadata: HashMap::new(),
+            },
+            AnyIssuedRequest::PoolData(issued) => bootstrap::Event::PoolDataReceived {
+                request_id: issued.request_id,
+                pools: HashMap::new(),
+            },
+        };
+
+        Event::BootstrapEvent { chain, event }
+    }
+
+    /// Drives a freshly initialized chain through the full bootstrap handshake to an active kernel.
+    /// Feeds empty responses, so the activated kernel is anchored at `finalized_hash` with no seed.
+    fn drive_bootstrap_to_active(chain: ChainKey, finalized_hash: BlockHash) -> State {
+        let (mut state, mut effects) = State::init(chain);
+
+        while state.status(chain) == Some(ChainStatus::Initializing) {
+            let event = bootstrap_success_event(
+                chain,
+                finalized_hash,
+                single_bootstrap_effect(&effects, chain),
+            );
+            let result = transition(state, event);
+            state = result.0;
+            effects = result.1;
+        }
+
+        state
     }
 
     fn assert_single_fetch_finalized_header_effect_for_chain(effects: &[Effect], chain: ChainKey) {
@@ -1303,17 +1463,18 @@ mod tests {
     }
 
     fn active_state_at(chain: ChainKey, finalized_hash: BlockHash) -> State {
-        let (state, _effects) = State::init(chain);
-        let (state, effects) = transition(
-            state,
-            Event::FinalizedHeaderReceived {
-                chain,
-                block_hash: finalized_hash,
-            },
+        // No seed blocks, so activation issues no reconnection effects.
+        let (chain_state, _effects) = kernel::State::activate_from_seed(
+            finalized_hash,
+            HashMap::new(),
+            TrustedPoolRegistry::new(),
+            crate::TokenRegistry::new(),
+            Vec::new(),
         );
 
-        assert!(effects.is_empty());
-        state
+        State {
+            chains: BTreeMap::from([(chain, ChainLifecycle::Active(chain_state))]),
+        }
     }
 
     fn drive_connected_heads(
