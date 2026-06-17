@@ -22,6 +22,9 @@ pub(crate) enum CliError {
     RuntimeFailed {
         message: String,
     },
+    LogInitFailed {
+        message: String,
+    },
 }
 
 impl fmt::Display for CliError {
@@ -35,6 +38,9 @@ impl fmt::Display for CliError {
             }
             Self::RuntimeFailed { message } => {
                 write!(formatter, "runtime failed: {message}")
+            }
+            Self::LogInitFailed { message } => {
+                write!(formatter, "failed to initialize log file: {message}")
             }
         }
     }
@@ -256,6 +262,17 @@ mod tests {
             }
             .to_string(),
             "runtime failed: runtime thread panicked"
+        );
+    }
+
+    #[test]
+    fn log_init_failed_display_is_stable() {
+        assert_eq!(
+            CliError::LogInitFailed {
+                message: "permission denied".to_owned(),
+            }
+            .to_string(),
+            "failed to initialize log file: permission denied"
         );
     }
 

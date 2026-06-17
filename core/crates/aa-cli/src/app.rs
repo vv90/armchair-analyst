@@ -23,7 +23,9 @@ use std::{
 
 use crate::{
     latest_slot::{LatestReceiveError, LatestReceiver, LatestSender, latest_slot},
+    logger::Logger,
     optimization::{RunOptimizationError, run_optimization},
+    view,
 };
 
 pub(crate) struct ClientEvmApp {}
@@ -32,14 +34,16 @@ pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     ethereum_config: RpcConfig,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
+    logger: Logger,
 }
 
 impl ClientEvmRuntime {
-    pub(crate) fn new(ethereum_config: RpcConfig) -> ClientEvmRuntime {
+    pub(crate) fn new(ethereum_config: RpcConfig, logger: Logger) -> ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             ethereum_config,
             optimization_sender: OnceLock::new(),
+            logger,
         }
     }
 
@@ -100,7 +104,8 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 self.execute_bootstrap_effect(chain, effect)
             }
             Effect::RunOptimization { input } => {
-                println!("{}", format_run_optimization_effect_log(&input));
+                self.logger
+                    .log(&format_run_optimization_effect_log(&input));
                 self.send_optimization_input(input);
                 Vec::new()
             }
@@ -127,24 +132,33 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 let (slot_sender, slot_receiver) = latest_slot();
 
                 if self.optimization_sender.set(slot_sender).is_ok() {
-                    drop(spawn_optimization_subscription(slot_receiver));
+                    drop(spawn_optimization_subscription(
+                        slot_receiver,
+                        self.logger.clone(),
+                    ));
                 } else {
-                    eprintln!("error optimization_subscription_already_started");
+                    self.logger
+                        .log("error optimization_subscription_already_started");
                 }
             }
         }
     }
 
     fn log_input(&self, input: &<ClientEvmApp as Application>::Input) {
-        eprintln!("{}", format_input_log(input));
+        self.logger.log(&format_input_log(input));
     }
 
     fn log_error(&self, error: ApplicationError<<ClientEvmApp as Application>::Input>) {
         match error {
             ApplicationError::SendError(error) => {
-                eprintln!("error send_failed input={}", format_input_log(&error.0));
+                self.logger
+                    .log(&format!("error send_failed input={}", format_input_log(&error.0)));
             }
         }
+    }
+
+    fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
+        view::render(state);
     }
 }
 
@@ -157,17 +171,18 @@ impl ClientEvmRuntime {
         match self.optimization_sender.get() {
             Some(sender) => {
                 if let Err(error) = sender.send(input) {
-                    eprintln!("error optimization_send_failed error={error:?}");
+                    self.logger
+                        .log(&format!("error optimization_send_failed error={error:?}"));
                 }
             }
-            None => eprintln!("error optimization_sender_uninitialized"),
+            None => self.logger.log("error optimization_sender_uninitialized"),
         }
     }
 }
 
-pub(crate) fn start_runtime(config: RpcConfig) -> JoinHandle<()> {
+pub(crate) fn start_runtime(config: RpcConfig, logger: Logger) -> JoinHandle<()> {
     let (_sender, handle) =
-        <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(ClientEvmRuntime::new(config));
+        <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(ClientEvmRuntime::new(config, logger));
 
     handle
 }
@@ -405,6 +420,7 @@ fn spawn_tick_subscription(sender: Sender<Event>, interval: time::Duration) -> J
 
 fn spawn_optimization_subscription(
     receiver: LatestReceiver<OptimizationPoolReserves>,
+    logger: Logger,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = run_optimization(
@@ -417,7 +433,7 @@ fn spawn_optimization_subscription(
         match result {
             Ok(()) => {}
             Err(RunOptimizationError::Receive(LatestReceiveError::Closed)) => {}
-            Err(error) => eprintln!("error optimization_worker_failed error={error:?}"),
+            Err(error) => logger.log(&format!("error optimization_worker_failed error={error:?}")),
         }
     })
 }
@@ -597,7 +613,7 @@ mod tests {
     #[test]
     fn runtime_constructor_stores_ethereum_config() {
         let config = rpc_config();
-        let runtime = ClientEvmRuntime::new(config.clone());
+        let runtime = ClientEvmRuntime::new(config.clone(), Logger::sink());
 
         assert_eq!(runtime.get_config(ChainKey::Ethereum), &config);
     }
@@ -626,7 +642,7 @@ mod tests {
 
     #[test]
     fn runtime_starts_with_uninitialized_optimization_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
 
         assert!(runtime.optimization_sender.get().is_none());
     }
@@ -802,7 +818,7 @@ mod tests {
 
     #[test]
     fn run_optimization_effect_returns_no_events() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input(hash(7)),
         });
@@ -812,7 +828,7 @@ mod tests {
 
     #[test]
     fn empty_optimization_snapshot_is_dropped() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
 
@@ -826,7 +842,7 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
         let input = optimization_input_with_reserves(hash(7));
@@ -841,7 +857,7 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
 
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input_with_reserves(hash(7)),
@@ -853,7 +869,7 @@ mod tests {
 
     #[test]
     fn optimization_subscription_initializes_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -863,7 +879,7 @@ mod tests {
 
     #[test]
     fn optimization_subscription_starts_only_once() {
-        let runtime = ClientEvmRuntime::new(rpc_config());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -885,7 +901,7 @@ mod tests {
     #[test]
     fn optimization_worker_exits_cleanly_when_slot_closes_before_initialization() {
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
-        let handle = spawn_optimization_subscription(slot_receiver);
+        let handle = spawn_optimization_subscription(slot_receiver, Logger::sink());
 
         drop(slot_sender);
 

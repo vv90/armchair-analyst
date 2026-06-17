@@ -617,6 +617,21 @@ impl State {
         self.token_registry.verified_metadata(token)
     }
 
+    /// Counts pools the registry has verified.
+    /// Added so read models can surface tracked-pool progress without reaching into the registry.
+    pub(crate) fn verified_pool_count(&self) -> usize {
+        self.pool_registry.verified_size()
+    }
+
+    /// Measures how many canonical blocks newer than the latest complete pool-state overlay the tip is.
+    /// Added so read models can surface fetch progress; `None` mirrors a transiently disconnected path.
+    pub(crate) fn blocks_behind_tip(&self) -> Option<usize> {
+        let update = self.latest_complete_pool_state_update_from(self.canonical_tip)?;
+        self.blocks
+            .connected_path_hashes_oldest_to_newest(self.canonical_tip, update.block_hash)
+            .map(|hashes| hashes.len())
+    }
+
     #[cfg(test)]
     /// Builds kernel state from projection-relevant parts for tests.
     /// Added to keep projection tests focused on pure reserve generation instead of replaying unrelated RPC scheduling events.
@@ -5120,6 +5135,78 @@ mod tests {
             .insert(second_hash, block_with_parent(first_hash));
 
         assert_eq!(state.canonical_path_len_from_finalized(), None);
+    }
+
+    // The finalized anchor is itself fully fetched, so the tip is zero blocks ahead.
+    #[test]
+    fn blocks_behind_tip_returns_zero_at_finalized_anchor() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let state = empty_state_at(finalized_hash);
+
+        assert_eq!(state.blocks_behind_tip(), Some(0));
+    }
+
+    // With no block's logs resolved, no overlay beyond finalized is complete,
+    // so the tip is the full connected path ahead of the latest complete block.
+    #[test]
+    fn blocks_behind_tip_returns_full_path_when_no_block_is_complete() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let third_hash = BlockHash::with_last_byte(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = third_hash;
+        state
+            .blocks
+            .0
+            .insert(first_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .insert(second_hash, block_with_parent(first_hash));
+        state
+            .blocks
+            .0
+            .insert(third_hash, block_with_parent(second_hash));
+
+        assert_eq!(state.blocks_behind_tip(), Some(3));
+    }
+
+    // A disconnected path has no measurable latest-complete overlay.
+    #[test]
+    fn blocks_behind_tip_returns_none_for_disconnected_path() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let missing_parent_hash = BlockHash::with_last_byte(2);
+        let head_hash = BlockHash::with_last_byte(3);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = head_hash;
+        state
+            .blocks
+            .0
+            .insert(head_hash, block_with_parent(missing_parent_hash));
+
+        assert_eq!(state.blocks_behind_tip(), None);
+    }
+
+    // Surfaces the count of pools the registry has verified for read models.
+    #[test]
+    fn verified_pool_count_reflects_registry() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (
+                pool_candidate_address(2),
+                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
+            ),
+            (
+                pool_candidate_address(3),
+                Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000)),
+            ),
+        ]));
+
+        assert_eq!(state.verified_pool_count(), 2);
     }
 
     // Checks finalized-refresh threshold behavior below the target.

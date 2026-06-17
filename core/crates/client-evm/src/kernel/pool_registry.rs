@@ -121,6 +121,12 @@ impl TrustedPoolRegistry {
         self.verified.get(&pool)
     }
 
+    /// Counts the pools the registry has verified.
+    /// Added so read models can surface tracked-pool progress without exposing the backing map.
+    pub fn verified_size(&self) -> usize {
+        self.verified.len()
+    }
+
     pub fn verified_pool(&self, candidate: PoolCandidateAddress) -> Option<PoolAddress> {
         let pool = PoolAddress(candidate.0);
         self.verified.contains_key(&pool).then_some(pool)
@@ -239,6 +245,17 @@ mod tests {
             Some(PoolAddress(candidate.0))
         );
         assert!(!registry.is_rejected(candidate));
+    }
+
+    #[test]
+    fn verified_size_counts_verified_pools_only() {
+        let registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
+            (candidate(1), Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500))),
+            (candidate(2), Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000))),
+            (candidate(3), Err(PoolMetadataFailure::FactoryReturnedZero)),
+        ]));
+
+        assert_eq!(registry.verified_size(), 2);
     }
 
     #[test]

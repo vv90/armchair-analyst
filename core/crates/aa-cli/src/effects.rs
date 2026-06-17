@@ -4,7 +4,9 @@ use client_evm::RpcConfig;
 
 use crate::{
     app::start_runtime,
+    logger::Logger,
     utils::{CliError, load_rpc_config_with},
+    view,
 };
 
 pub(crate) fn main_exit_code() -> ExitCode {
@@ -19,9 +21,15 @@ pub(crate) fn main_exit_code() -> ExitCode {
 
 fn run() -> Result<(), CliError> {
     let config = load_rpc_config()?;
-    let handle = start_runtime(config);
+    let logger = Logger::create_for_run().map_err(|error| CliError::LogInitFailed {
+        message: error.to_string(),
+    })?;
+    let handle = start_runtime(config, logger);
 
-    finish_runtime(handle.join())
+    let result = finish_runtime(handle.join());
+    view::finish();
+
+    result
 }
 
 fn load_rpc_config() -> Result<RpcConfig, CliError> {

@@ -7,9 +7,11 @@ mod app;
 mod effects;
 #[cfg_attr(not(test), allow(dead_code))]
 mod latest_slot;
+mod logger;
 #[cfg_attr(not(test), allow(dead_code))]
 mod optimization;
 mod utils;
+mod view;
 
 fn main() -> ExitCode {
     warn_if_rustls_provider_already_installed(install_rustls_provider(), &mut io::stderr());

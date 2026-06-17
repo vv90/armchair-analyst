@@ -46,6 +46,7 @@ pub trait Runtime<App: Application>: Sized + Send + Sync + 'static {
     fn spawn_subscription(&self, sender: &Sender<App::Input>, subscription: App::Subscription);
     fn log_input(&self, _input: &App::Input) {}
     fn log_error(&self, _error: ApplicationError<App::Input>) {}
+    fn observe_state(&self, _state: &App::State) {}
 
     fn run(self) -> (Sender<App::Input>, JoinHandle<()>)
     where
@@ -92,6 +93,8 @@ fn run<App: Application, R: Runtime<App>>(
             state: next_state,
             effects,
         } = App::transition(s, i);
+
+        runtime.observe_state(&next_state);
 
         // spawn a thread to execute effects in parallel
         drop(spawn_effects::<App, R>(
@@ -178,6 +181,10 @@ mod tests {
 
     struct SendErrorLoggingRuntime {
         failed_inputs: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+    }
+
+    struct StateRecordingRuntime {
+        observed: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
     }
 
     impl Application for AccumulatorApp {
@@ -268,6 +275,18 @@ mod tests {
         fn spawn_subscription(&self, _sender: &Sender<u16>, _subscription: ()) {}
     }
 
+    impl Runtime<AccumulatorApp> for StateRecordingRuntime {
+        fn execute_effect(&self, _effect: AccumulatorEffect) -> Vec<AccumulatorInput> {
+            Vec::new()
+        }
+
+        fn spawn_subscription(&self, _sender: &Sender<AccumulatorInput>, _subscription: ()) {}
+
+        fn observe_state(&self, state: &AccumulatorState) {
+            self.observed.lock().unwrap().push(state.value);
+        }
+    }
+
     impl Runtime<EffectDeliveryApp> for SendErrorLoggingRuntime {
         fn execute_effect(&self, effect: DeliveryEffect) -> Vec<u16> {
             effect.0
@@ -317,6 +336,32 @@ mod tests {
 
             prop_assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn observe_state_is_called_with_each_post_transition_state_in_order() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = StateRecordingRuntime {
+            observed: observed.clone(),
+        };
+        // `run` loops forever (it holds its own sender clone for spawning effects),
+        // so we never join it — we send inputs and wait for the observations.
+        let (sender, _handle) = <StateRecordingRuntime as Runtime<AccumulatorApp>>::run(runtime);
+
+        sender.send(AccumulatorInput::Add(5)).unwrap();
+        sender.send(AccumulatorInput::Add(3)).unwrap();
+        sender.send(AccumulatorInput::Reset).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while observed.lock().unwrap().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for observations"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(observed.lock().unwrap().as_slice(), &[5, 8, 0]);
     }
 
     #[test]

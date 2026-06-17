@@ -18,6 +18,22 @@ pub enum ChainStatus {
     Active,
 }
 
+/// Active-chain progress metrics surfaced to read models such as the CLI view.
+/// Added so observers can show tracked-pool and fetch progress without inspecting kernel internals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainProgress {
+    pub verified_pools: usize,
+    pub blocks_behind_tip: Option<usize>,
+}
+
+/// A render snapshot of one chain: lifecycle phase plus metrics that exist only while active.
+/// Added as the single read model `observe` returns, keeping `ChainStatus` a pure lifecycle indicator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChainObservation {
+    Initializing,
+    Active(ChainProgress),
+}
+
 pub struct State {
     chains: BTreeMap<ChainKey, ChainLifecycle>,
 }
@@ -111,6 +127,28 @@ impl State {
                 ChainLifecycle::Bootstrapping(_) => ChainStatus::Initializing,
                 ChainLifecycle::Active(_) => ChainStatus::Active,
             })
+    }
+
+    /// Builds a pure render snapshot for every configured chain, in chain order.
+    /// Added as the single observation call read models make, so the view never chains accessors
+    /// or derives progress for a non-active chain.
+    pub fn observe(&self) -> Vec<(ChainKey, ChainObservation)> {
+        self.chains
+            .iter()
+            .map(|(chain, chain_state)| (*chain, observe_chain(chain_state)))
+            .collect()
+    }
+}
+
+/// Projects one chain lifecycle into its render observation.
+/// Added so active-chain metrics are gathered in one place and stay unreachable while bootstrapping.
+fn observe_chain(chain_state: &ChainLifecycle) -> ChainObservation {
+    match chain_state {
+        ChainLifecycle::Bootstrapping(_) => ChainObservation::Initializing,
+        ChainLifecycle::Active(chain_state) => ChainObservation::Active(ChainProgress {
+            verified_pools: chain_state.verified_pool_count(),
+            blocks_behind_tip: chain_state.blocks_behind_tip(),
+        }),
     }
 }
 
@@ -602,6 +640,41 @@ mod tests {
                 crate::bootstrap::pending_requests::AnyIssuedRequest::FinalizedHeader(_)
             )
         ));
+    }
+
+    #[test]
+    fn observe_reports_initializing_while_bootstrapping() {
+        let chain = ChainKey::Ethereum;
+        let (state, _effects) = State::init(chain);
+
+        assert_eq!(
+            state.observe(),
+            vec![(chain, ChainObservation::Initializing)]
+        );
+    }
+
+    #[test]
+    fn observe_reports_active_progress_with_verified_pools() {
+        let pool = pool(10);
+        let token0 = token(1);
+        let token1 = token(2);
+        let state = projection_state(
+            hash(1),
+            HashMap::new(),
+            HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
+            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+        );
+
+        assert_eq!(
+            state.observe(),
+            vec![(
+                ChainKey::Ethereum,
+                ChainObservation::Active(ChainProgress {
+                    verified_pools: 1,
+                    blocks_behind_tip: Some(0),
+                })
+            )]
+        );
     }
 
     #[test]
