@@ -1663,7 +1663,12 @@ mod tests {
         model_updated.block.layer_out.weights =
             Param::from_tensor(Tensor::ones_like(&model_updated.block.layer_out.weights));
 
-        let tolerance = 1e-6;
+        // Relative, not absolute: the fresh-`init` and `init().update()` paths build their
+        // tensors in different orders, so f32 reductions land a few ULP apart. At this output
+        // magnitude (~1e3) a single ULP is already ~1e-4 absolute, so an absolute 1e-6 bound is
+        // unsatisfiable for any f32 result here. A 1e-4 relative bound absorbs the rounding noise
+        // while still catching a genuinely divergent update.
+        let relative_tolerance = 1e-4;
 
         let input_amount = 1000.0;
 
@@ -1676,7 +1681,7 @@ mod tests {
         println!("output updated: {}", output_amount_updated);
 
         assert!(
-            diff.abs() < tolerance,
+            diff.abs() <= output_amount_expected.abs() * relative_tolerance,
             "Output amount difference is too large. Expected: {}, Actual: {}",
             output_amount_expected,
             output_amount_updated
