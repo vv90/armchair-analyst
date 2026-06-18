@@ -189,11 +189,17 @@ pub fn ethereum_pool_reserves_for_optimization(
         return Ok(None);
     };
 
+    // Resolve the overlay descriptor against the current block graph. `None` means a snapshot
+    // location is missing — a broken invariant — so we emit no reserves rather than untrustworthy ones.
+    let Some(overlay) = chain_state.resolve_complete_pool_states(update) else {
+        return Ok(None);
+    };
+
     let mut reserves = Vec::new();
 
     for (pool, pool_state) in sorted_pool_states_for_projection(
         chain_state.finalized_pool_snapshots(),
-        &update.pool_states,
+        overlay,
     ) {
         let Some((token0, token1, fee, token0_decimals, token1_decimals)) =
             projection_metadata(chain_state, pool)
@@ -231,18 +237,14 @@ pub fn ethereum_pool_reserves_for_optimization(
 /// Added so projections include the latest known state per pool while keeping output stable for model layout and tests.
 fn sorted_pool_states_for_projection<'a>(
     finalized_pool_states: &'a HashMap<PoolAddress, PoolState>,
-    update_pool_states: &'a HashMap<PoolAddress, PoolState>,
+    update_pool_states: HashMap<PoolAddress, &'a PoolState>,
 ) -> Vec<(PoolAddress, &'a PoolState)> {
     let mut pool_states = finalized_pool_states
         .iter()
         .map(|(pool, pool_state)| (*pool, pool_state))
         .collect::<HashMap<_, _>>();
 
-    pool_states.extend(
-        update_pool_states
-            .iter()
-            .map(|(pool, pool_state)| (*pool, pool_state)),
-    );
+    pool_states.extend(update_pool_states);
 
     let mut pool_states = pool_states.into_iter().collect::<Vec<_>>();
     pool_states.sort_by_key(|(pool, _)| *pool);
@@ -1383,10 +1385,7 @@ mod tests {
     #[test]
     fn pool_reserves_projection_returns_none_when_ethereum_chain_is_inactive() {
         let (state, _) = State::init(ChainKey::Ethereum);
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(1),
-            pool_states: HashMap::new(),
-        };
+        let (state, update) = projection_update(state, hash(1), HashMap::new());
 
         let reserves = ethereum_pool_reserves_for_optimization(&state, &update).unwrap();
 
@@ -1396,10 +1395,7 @@ mod tests {
     #[test]
     fn pool_reserves_projection_returns_empty_reserves_for_complete_empty_update() {
         let state = projection_state(hash(1), HashMap::new(), HashMap::new(), HashMap::new());
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::new(),
-        };
+        let (state, update) = projection_update(state, hash(2), HashMap::new());
 
         let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
             .unwrap()
@@ -1421,10 +1417,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::new(),
-        };
+        let (state, update) = projection_update(state, hash(2), HashMap::new());
 
         let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
             .unwrap()
@@ -1447,10 +1440,11 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::from([(pool, updated_pool_state.clone())]),
-        };
+        let (state, update) = projection_update(
+            state,
+            hash(2),
+            HashMap::from([(pool, updated_pool_state.clone())]),
+        );
 
         let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
             .unwrap()
@@ -1469,10 +1463,11 @@ mod tests {
     fn pool_reserves_projection_returns_none_when_pool_metadata_is_missing() {
         let pool = pool(10);
         let state = projection_state(hash(1), HashMap::new(), HashMap::new(), HashMap::new());
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::from([(pool, balanced_pool_state(1_000_000))]),
-        };
+        let (state, update) = projection_update(
+            state,
+            hash(2),
+            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
+        );
 
         let reserves = ethereum_pool_reserves_for_optimization(&state, &update).unwrap();
 
@@ -1490,10 +1485,11 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18))]),
         );
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::from([(pool, balanced_pool_state(1_000_000))]),
-        };
+        let (state, update) = projection_update(
+            state,
+            hash(2),
+            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
+        );
 
         let reserves = ethereum_pool_reserves_for_optimization(&state, &update).unwrap();
 
@@ -1516,10 +1512,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(0)), (token1, token_metadata(0))]),
         );
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::from([(pool, pool_state)]),
-        };
+        let (state, update) = projection_update(state, hash(2), HashMap::from([(pool, pool_state)]));
 
         let error = ethereum_pool_reserves_for_optimization(&state, &update).unwrap_err();
 
@@ -1550,10 +1543,8 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let update = kernel::CompletePoolStateUpdate {
-            block_hash: hash(2),
-            pool_states: HashMap::from([(pool, inconsistent_pool_state)]),
-        };
+        let (state, update) =
+            projection_update(state, hash(2), HashMap::from([(pool, inconsistent_pool_state)]));
 
         let error = ethereum_pool_reserves_for_optimization(&state, &update).unwrap_err();
 
@@ -1594,18 +1585,19 @@ mod tests {
                     [(*token0, token_metadata(18)), (*token1, token_metadata(6))]
                 })
                 .collect::<HashMap<_, _>>();
-            let update = kernel::CompletePoolStateUpdate {
-                block_hash: update_hash,
-                pool_states: pools
-                    .iter()
-                    .map(|(pool, _, _, pool_state)| (*pool, pool_state.clone()))
-                    .collect(),
-            };
             let state = projection_state(
                 finalized_hash,
                 HashMap::new(),
                 pool_metadata,
                 token_metadata,
+            );
+            let (state, update) = projection_update(
+                state,
+                update_hash,
+                pools
+                    .iter()
+                    .map(|(pool, _, _, pool_state)| (*pool, pool_state.clone()))
+                    .collect(),
             );
 
             let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
@@ -1716,6 +1708,51 @@ mod tests {
             latest_optimization_result: None,
             last_optimized_block: BTreeMap::new(),
         }
+    }
+
+    /// Seeds the overlay snapshots into a block on the Ethereum chain and returns the matching
+    /// locations descriptor, mirroring how the kernel produces overlays the projection resolves.
+    fn projection_update(
+        state: State,
+        block_hash: BlockHash,
+        overlay_pool_states: HashMap<PoolAddress, PoolState>,
+    ) -> (State, kernel::CompletePoolStateUpdate) {
+        let pool_snapshot_blocks = overlay_pool_states
+            .keys()
+            .map(|pool| (*pool, block_hash))
+            .collect();
+
+        let State {
+            mut chains,
+            latest_optimization_result,
+            last_optimized_block,
+        } = state;
+        match chains.remove(&ChainKey::Ethereum) {
+            Some(ChainLifecycle::Active(chain_state)) => {
+                chains.insert(
+                    ChainKey::Ethereum,
+                    ChainLifecycle::Active(
+                        chain_state.with_overlay_block_for_test(block_hash, overlay_pool_states),
+                    ),
+                );
+            }
+            Some(other) => {
+                chains.insert(ChainKey::Ethereum, other);
+            }
+            None => {}
+        }
+
+        (
+            State {
+                chains,
+                latest_optimization_result,
+                last_optimized_block,
+            },
+            kernel::CompletePoolStateUpdate {
+                block_hash,
+                pool_snapshot_blocks,
+            },
+        )
     }
 
     fn assert_directional_pair(

@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    ops::ControlFlow,
-};
+use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::BlockHash;
 
@@ -44,6 +41,12 @@ impl BlocksGraph {
     /// Keeps graph access centralized so future refactors can preserve graph invariants behind this type.
     fn get(&self, hash: &BlockHash) -> Option<&BlockNode> {
         self.0.get(hash)
+    }
+
+    /// Removes and returns one pool's snapshot from a block, taking ownership without cloning.
+    /// Added so finalized compaction can move snapshots out of soon-pruned blocks into the snapshot.
+    fn take_pool_snapshot(&mut self, block_hash: BlockHash, pool: PoolAddress) -> Option<PoolState> {
+        self.0.get_mut(&block_hash)?.pool_snapshots.remove(&pool)
     }
 
     /// Inserts a block header and returns the first missing parent, if the ancestry is incomplete.
@@ -416,14 +419,10 @@ pub struct FinalizedState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletePoolStateUpdate {
     pub block_hash: BlockHash,
-    pub pool_states: HashMap<PoolAddress, PoolState>,
-}
-
-struct CompletePoolStateScan {
-    affected_pools: HashSet<PoolAddress>,
-    invalid_pools: HashSet<PoolAddress>,
-    latest_pool_states: HashMap<PoolAddress, PoolState>,
-    latest_complete: CompletePoolStateUpdate,
+    /// For each affected pool, the canonical block holding its latest snapshot at-or-before
+    /// `block_hash`. Resolve into pool states via `State::resolve_complete_pool_states`; valid only
+    /// against the block graph it was computed from (consume before any block mutation).
+    pub pool_snapshot_blocks: HashMap<PoolAddress, BlockHash>,
 }
 
 impl FinalizedState {
@@ -447,63 +446,6 @@ impl FinalizedState {
             block_hash,
             pool_snapshots,
         }
-    }
-}
-
-impl CompletePoolStateScan {
-    /// Starts a readiness scan from the finalized anchor.
-    /// Added so path scanning can keep the finalized empty overlay as the fallback complete result.
-    fn initial(finalized_hash: BlockHash) -> CompletePoolStateScan {
-        CompletePoolStateScan {
-            affected_pools: HashSet::new(),
-            invalid_pools: HashSet::new(),
-            latest_pool_states: HashMap::new(),
-            latest_complete: CompletePoolStateUpdate {
-                block_hash: finalized_hash,
-                pool_states: HashMap::new(),
-            },
-        }
-    }
-
-    /// Applies one resolved block to the readiness scan.
-    /// Added to isolate affected-pool invalidation, same-block snapshot application, and complete-block promotion.
-    fn with_resolved_block(
-        mut self,
-        block_hash: BlockHash,
-        trusted_pools: HashSet<PoolAddress>,
-        pool_snapshots: &HashMap<PoolAddress, PoolState>,
-    ) -> CompletePoolStateScan {
-        self.affected_pools.extend(trusted_pools.iter().copied());
-        self.invalid_pools.extend(trusted_pools);
-
-        let affected_snapshots = pool_snapshots
-            .iter()
-            .filter(|(pool, _)| self.affected_pools.contains(pool))
-            .map(|(pool, pool_state)| (*pool, pool_state.clone()))
-            .collect::<Vec<_>>();
-        let snapshotted_pools = affected_snapshots
-            .iter()
-            .map(|(pool, _)| *pool)
-            .collect::<HashSet<_>>();
-
-        self.latest_pool_states.extend(affected_snapshots);
-        self.invalid_pools
-            .retain(|pool| !snapshotted_pools.contains(pool));
-
-        if self.invalid_pools.is_empty() {
-            self.latest_complete = CompletePoolStateUpdate {
-                block_hash,
-                pool_states: self.latest_pool_states.clone(),
-            };
-        }
-
-        self
-    }
-
-    /// Finishes the readiness scan.
-    /// Added to make early-stop and full-path scans return through the same finalization path.
-    fn into_latest_complete(self) -> CompletePoolStateUpdate {
-        self.latest_complete
     }
 }
 
@@ -658,6 +600,26 @@ impl State {
         }
     }
 
+    #[cfg(test)]
+    /// Seeds a block carrying the given pool snapshots so projection tests can resolve overlay
+    /// descriptors (`pool_snapshot_blocks`) that point at it.
+    pub(crate) fn with_overlay_block_for_test(
+        mut self,
+        block_hash: BlockHash,
+        pool_snapshots: HashMap<PoolAddress, PoolState>,
+    ) -> State {
+        self.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: self.finalized_state.block_hash,
+                pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
+                pool_snapshots,
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        self
+    }
+
     /// Rebuilds volatile chain state around a finalized anchor while preserving registries and tick.
     /// Added for reorg/inconsistency recovery where recent blocks are unsafe but immutable pool/token facts remain valid.
     fn reset(
@@ -699,32 +661,68 @@ impl State {
             self.finalized_state.block_hash,
         )?;
 
-        let scan_result = hashes.into_iter().try_fold(
-            CompletePoolStateScan::initial(self.finalized_state.block_hash),
-            |scan, block_hash| {
-                let Some(block) = self.blocks.get(&block_hash) else {
-                    return ControlFlow::Break(None);
-                };
+        // Single forward pass: accumulate snapshot *locations* (cheap `BlockHash`es) and promote a
+        // block to "complete" by flushing the pending buffer into `committed` only when every
+        // affected pool has a snapshot. The committed map is returned as the overlay descriptor;
+        // callers resolve it into pool states lazily, so no `PoolState` is cloned here.
+        let mut affected_pools: HashSet<PoolAddress> = HashSet::new();
+        let mut invalid_pools: HashSet<PoolAddress> = HashSet::new();
+        let mut committed: HashMap<PoolAddress, BlockHash> = HashMap::new();
+        let mut pending: HashMap<PoolAddress, BlockHash> = HashMap::new();
+        let mut latest_complete_hash = self.finalized_state.block_hash;
 
-                let Some(trusted_pools) = self.trusted_pools_for_complete_pool_state_scan(block)
-                else {
-                    return ControlFlow::Break(Some(scan));
-                };
+        for block_hash in hashes {
+            // A path hash with no backing block means the ancestry broke under us, so the overlay
+            // is unknown rather than "complete so far": fail the whole query.
+            let block = self.blocks.get(&block_hash)?;
 
-                ControlFlow::Continue(scan.with_resolved_block(
-                    block_hash,
-                    trusted_pools,
-                    &block.pool_snapshots,
-                ))
-            },
-        );
+            // Unresolved logs or pending candidate validation stop the scan; keep the latest
+            // complete overlay found before this block.
+            let Some(trusted_pools) = self.trusted_pools_for_complete_pool_state_scan(block) else {
+                break;
+            };
 
-        match scan_result {
-            ControlFlow::Continue(scan) | ControlFlow::Break(Some(scan)) => {
-                Some(scan.into_latest_complete())
+            affected_pools.extend(trusted_pools.iter().copied());
+            invalid_pools.extend(trusted_pools);
+
+            for pool in block.pool_snapshots.keys() {
+                if affected_pools.contains(pool) {
+                    invalid_pools.remove(pool);
+                    pending.insert(*pool, block_hash);
+                }
             }
-            ControlFlow::Break(None) => None,
+
+            if invalid_pools.is_empty() {
+                // Flush is O(pending), not O(committed): each snapshot update flushes at most once.
+                committed.extend(pending.drain());
+                latest_complete_hash = block_hash;
+            }
         }
+
+        // Pending entries left past the latest complete block are the incomplete tail and are
+        // dropped. `committed` is the overlay descriptor (pool -> snapshot location at or before
+        // the frontier); resolution is deferred to the caller.
+        Some(CompletePoolStateUpdate {
+            block_hash: latest_complete_hash,
+            pool_snapshot_blocks: committed,
+        })
+    }
+
+    /// Resolves an overlay descriptor into borrowed pool states against the current block graph.
+    /// Returns `None` if any location is missing: that is a broken invariant, so the whole overlay
+    /// is untrustworthy and callers must not act on a partial result.
+    pub(crate) fn resolve_complete_pool_states<'a>(
+        &'a self,
+        update: &CompletePoolStateUpdate,
+    ) -> Option<HashMap<PoolAddress, &'a PoolState>> {
+        update
+            .pool_snapshot_blocks
+            .iter()
+            .map(|(pool, block_hash)| {
+                let pool_state = self.blocks.get(block_hash)?.pool_snapshots.get(pool)?;
+                Some((*pool, pool_state))
+            })
+            .collect()
     }
 
     /// Resolves a block's pool logs into trusted pools for readiness scanning.
@@ -767,8 +765,15 @@ impl State {
             return self;
         }
 
+        // Validate every overlay location resolves before mutating: a missing snapshot is a broken
+        // invariant, so abort compaction (return self unchanged) rather than persist a partial,
+        // untrustworthy finalized snapshot.
+        if self.resolve_complete_pool_states(&update).is_none() {
+            return self;
+        }
+
         let State {
-            blocks,
+            mut blocks,
             canonical_tip,
             pending_requests,
             finalized_state,
@@ -777,8 +782,15 @@ impl State {
             tick,
         } = self;
 
+        // Move each pool's latest snapshot out of its block instead of cloning. Every referenced
+        // block is at or before the frontier, so `retaining_descendants_of` below prunes them all
+        // and no retained block is mutated; presence is guaranteed by the validation above.
         let mut pool_snapshots = finalized_state.pool_snapshots;
-        pool_snapshots.extend(update.pool_states);
+        for (pool, snapshot_hash) in &update.pool_snapshot_blocks {
+            if let Some(pool_state) = blocks.take_pool_snapshot(*snapshot_hash, *pool) {
+                pool_snapshots.insert(*pool, pool_state);
+            }
+        }
 
         let finalized_state = FinalizedState {
             block_hash: update.block_hash,
@@ -2742,16 +2754,35 @@ mod tests {
         }
     }
 
-    /// Builds the expected complete-pool-state overlay.
-    /// This keeps query tests focused on block and pool-state semantics.
+    /// Builds the expected (block, resolved pool states) overlay for query tests.
+    /// The query now returns snapshot *locations*, so tests compare against resolved states.
     fn complete_pool_state_update(
         block_hash: BlockHash,
         pool_states: HashMap<PoolAddress, PoolState>,
-    ) -> CompletePoolStateUpdate {
-        CompletePoolStateUpdate {
-            block_hash,
-            pool_states,
-        }
+    ) -> (BlockHash, HashMap<PoolAddress, PoolState>) {
+        (block_hash, pool_states)
+    }
+
+    /// Runs the overlay query and resolves its locations into owned pool states for comparison.
+    /// `None` propagates both a missing overlay and an unresolvable location (a broken invariant).
+    fn resolved_complete_pool_state_update_from(
+        state: &State,
+        start: BlockHash,
+    ) -> Option<(BlockHash, HashMap<PoolAddress, PoolState>)> {
+        let update = state.latest_complete_pool_state_update_from(start)?;
+        let pool_states = state
+            .resolve_complete_pool_states(&update)?
+            .into_iter()
+            .map(|(pool, pool_state)| (pool, pool_state.clone()))
+            .collect();
+        Some((update.block_hash, pool_states))
+    }
+
+    /// Resolves the latest complete overlay anchored at the canonical tip.
+    fn resolved_complete_pool_state_update(
+        state: &State,
+    ) -> Option<(BlockHash, HashMap<PoolAddress, PoolState>)> {
+        resolved_complete_pool_state_update_from(state, state.canonical_tip)
     }
 
     /// Asserts a pool snapshot equals the expected state on a block.
@@ -5313,7 +5344,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let state = empty_state_at(finalized_hash);
 
-        let update = state.latest_complete_pool_state_update_from(finalized_hash);
+        let update = resolved_complete_pool_state_update_from(&state,finalized_hash);
 
         assert_eq!(
             update,
@@ -5329,11 +5360,11 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         assert_eq!(
-            state.latest_complete_pool_state_update(),
-            state.latest_complete_pool_state_update_from(state.canonical_tip)
+            resolved_complete_pool_state_update(&state),
+            resolved_complete_pool_state_update_from(&state,state.canonical_tip)
         );
         assert_eq!(
-            state.latest_complete_pool_state_update(),
+            resolved_complete_pool_state_update(&state),
             Some(complete_pool_state_update(finalized_hash, HashMap::new()))
         );
     }
@@ -5346,7 +5377,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(BlockHash::with_last_byte(2)),
+            resolved_complete_pool_state_update_from(&state,BlockHash::with_last_byte(2)),
             None
         );
     }
@@ -5366,7 +5397,7 @@ mod tests {
             .insert(block_hash, block_with_parent(missing_parent_hash));
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(block_hash),
+            resolved_complete_pool_state_update_from(&state,block_hash),
             None
         );
     }
@@ -5390,7 +5421,7 @@ mod tests {
             .insert(second_hash, block_with_parent(first_hash));
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(first_hash),
+            resolved_complete_pool_state_update_from(&state,first_hash),
             None
         );
     }
@@ -5425,7 +5456,7 @@ mod tests {
             .insert(unknown_hash, block_with_parent(complete_hash));
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(unknown_hash),
+            resolved_complete_pool_state_update_from(&state,unknown_hash),
             Some(complete_pool_state_update(
                 complete_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5464,7 +5495,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(pending_hash),
+            resolved_complete_pool_state_update_from(&state,pending_hash),
             Some(complete_pool_state_update(
                 complete_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5495,7 +5526,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(block_hash),
+            resolved_complete_pool_state_update_from(&state,block_hash),
             Some(complete_pool_state_update(block_hash, HashMap::new()))
         );
     }
@@ -5525,7 +5556,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(block_hash),
+            resolved_complete_pool_state_update_from(&state,block_hash),
             Some(complete_pool_state_update(
                 block_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5563,7 +5594,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(later_hash),
+            resolved_complete_pool_state_update_from(&state,later_hash),
             Some(complete_pool_state_update(
                 later_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5606,7 +5637,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(third_hash),
+            resolved_complete_pool_state_update_from(&state,third_hash),
             Some(complete_pool_state_update(
                 first_hash,
                 HashMap::from([(pool, first_snapshot)])
@@ -5654,7 +5685,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(third_hash),
+            resolved_complete_pool_state_update_from(&state,third_hash),
             Some(complete_pool_state_update(
                 third_hash,
                 HashMap::from([(pool, third_snapshot)])
@@ -5690,7 +5721,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(block_hash),
+            resolved_complete_pool_state_update_from(&state,block_hash),
             Some(complete_pool_state_update(finalized_hash, HashMap::new()))
         );
     }
@@ -5725,7 +5756,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(block_hash),
+            resolved_complete_pool_state_update_from(&state,block_hash),
             Some(complete_pool_state_update(
                 block_hash,
                 HashMap::from([(affected_pool, affected_snapshot)])
@@ -5768,7 +5799,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.latest_complete_pool_state_update_from(first_hash),
+            resolved_complete_pool_state_update_from(&state,first_hash),
             Some(complete_pool_state_update(
                 first_hash,
                 HashMap::from([(pool, first_snapshot)])
@@ -8485,7 +8516,7 @@ mod tests {
             }
 
             prop_assert_eq!(
-                state.latest_complete_pool_state_update_from(start_hash),
+                resolved_complete_pool_state_update_from(&state,start_hash),
                 Some(expected_update)
             );
         }
@@ -8610,6 +8641,60 @@ mod tests {
             }
 
             assert_state_invariants(&state);
+        }
+
+        // Compaction must never drop a block at-or-after the observed block, on any branching graph.
+        // This guards retention of newer blocks regardless of where the complete frontier lands.
+        #[test]
+        fn finalized_block_observed_never_drops_descendants_of_observed_block(
+            chain in generated_chain_strategy(),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let node_count = chain.parents.len();
+
+            // Empty resolved logs make every block "complete" so compaction actually advances and
+            // prunes (rather than no-opping), exercising the retention path on a branching graph.
+            let build_state = || {
+                let mut state = empty_state_at(finalized_hash);
+                for node_index in 1..node_count {
+                    state.blocks.0.insert(
+                        hash_for_node(node_index),
+                        BlockNode {
+                            parent_hash: hash_for_node(parent_index(&chain, node_index)),
+                            pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
+                            pool_snapshots: HashMap::new(),
+                            pool_data_failures: HashMap::new(),
+                        },
+                    );
+                }
+                state.canonical_tip = hash_for_node(node_count - 1);
+                state
+            };
+
+            // Hold the invariant for every node hash, the finalized anchor, and an absent hash.
+            let mut observed_candidates: Vec<BlockHash> =
+                (0..node_count).map(hash_for_node).collect();
+            observed_candidates.push(hash_for_node(node_count + 7));
+
+            for observed in observed_candidates {
+                let state = build_state();
+                let descendants: HashSet<BlockHash> = state
+                    .blocks
+                    .0
+                    .keys()
+                    .copied()
+                    .filter(|hash| block_descends_from(&state.blocks.0, *hash, observed))
+                    .collect();
+
+                let result = state.with_finalized_block_observed(observed);
+
+                for descendant in &descendants {
+                    prop_assert!(
+                        result.blocks.0.contains_key(descendant),
+                        "compaction dropped a block at-or-after the observed block"
+                    );
+                }
+            }
         }
 
         // Generates candidate logs with mixed registry outcomes.
