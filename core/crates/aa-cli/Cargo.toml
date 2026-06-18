@@ -9,6 +9,7 @@ publish.workspace = true
 client-evm = { path = "../client-evm" }
 aa-framework = { path = "../aa-framework" }
 optimization = { path = "../optimization" }
+ratatui = "0.29"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 

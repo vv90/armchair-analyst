@@ -6,7 +6,7 @@ use crate::{
     app::start_runtime,
     logger::Logger,
     utils::{CliError, load_rpc_config_with},
-    view,
+    view::View,
 };
 
 pub(crate) fn main_exit_code() -> ExitCode {
@@ -24,10 +24,11 @@ fn run() -> Result<(), CliError> {
     let logger = Logger::create_for_run().map_err(|error| CliError::LogInitFailed {
         message: error.to_string(),
     })?;
-    let handle = start_runtime(config, logger);
+    let view = View::for_run();
+    let handle = start_runtime(config, logger, view.clone());
 
     let result = finish_runtime(handle.join());
-    view::finish();
+    view.finish();
 
     result
 }

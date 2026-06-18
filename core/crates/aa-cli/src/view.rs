@@ -1,33 +1,115 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Stdout, Write},
+    sync::{Arc, Mutex},
+};
 
 use client_evm::{
     ChainKey,
     multi_chain_kernel::{ChainObservation, ChainProgress, State},
 };
 use optimization::OptimizationStepResult;
+use ratatui::{
+    Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Position, text::Line,
+    widgets::Paragraph,
+};
 
-/// Renders the current state as an in-place multi-line block on stdout.
+type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+/// Thin terminal adapter for the live status block.
 ///
-/// `previously_drawn` is the line count of the prior frame; the block is erased and
-/// redrawn in place. Returns the number of lines drawn so the caller can pass it back on
-/// the next frame. `State::observe`/`latest_optimization_result` are the pure calls the
-/// view makes; the rest is a thin write.
-pub(crate) fn render(state: &State, previously_drawn: usize) -> usize {
-    let lines = format_lines(&state.observe(), state.latest_optimization_result());
-
-    let mut stdout = io::stdout();
-    if previously_drawn > 0 {
-        let _ = write!(stdout, "\x1b[{previously_drawn}A");
-    }
-    let _ = write!(stdout, "\r\x1b[J{}\n", lines.join("\n"));
-    let _ = stdout.flush();
-
-    lines.len()
+/// Mirrors [`Logger`](crate::logger::Logger): a cheap, cloneable handle whose side effects
+/// are isolated here. [`View::sink`] is the no-op used by tests; [`View::for_run`] drives a
+/// real `ratatui` inline viewport. The pure [`format_lines`] call decides *what* to show; the
+/// adapter only decides *how* to put it on screen, and `ratatui` owns the cursor arithmetic.
+#[derive(Clone)]
+pub(crate) struct View {
+    inner: Arc<Mutex<ViewInner>>,
 }
 
-/// Terminates the live block so the shell prompt lands on a fresh line.
-pub(crate) fn finish() {
-    println!();
+enum ViewInner {
+    Sink,
+    /// The terminal is created lazily on the first render, once the chain count (and thus the
+    /// viewport height) is known.
+    Live(Option<LiveTerminal>),
+}
+
+impl View {
+    /// A view that drives a real inline viewport on stdout.
+    pub(crate) fn for_run() -> View {
+        View {
+            inner: Arc::new(Mutex::new(ViewInner::Live(None))),
+        }
+    }
+
+    /// A view that discards everything it is given. Used by tests.
+    pub(crate) fn sink() -> View {
+        View {
+            inner: Arc::new(Mutex::new(ViewInner::Sink)),
+        }
+    }
+
+    /// Redraws the live block in place from the current state. Never blocks on a poisoned lock
+    /// and never panics; a terminal that cannot be initialized degrades to no display.
+    pub(crate) fn render(&self, state: &State) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        let ViewInner::Live(slot) = &mut *guard else {
+            return;
+        };
+
+        let observations = state.observe();
+        let lines = format_lines(&observations, state.latest_optimization_result());
+
+        let terminal = match slot {
+            Some(terminal) => terminal,
+            None => match new_inline_terminal(reserved_rows(observations.len())) {
+                Ok(terminal) => slot.insert(terminal),
+                Err(_) => return,
+            },
+        };
+
+        let _ = terminal.draw(|frame| {
+            frame.render_widget(paragraph(lines), frame.area());
+        });
+    }
+
+    /// Terminates the live block so the shell prompt lands on a fresh line below it.
+    pub(crate) fn finish(&self) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if let ViewInner::Live(slot) = &mut *guard {
+            if let Some(terminal) = slot.as_mut() {
+                let bottom = terminal.get_frame().area().bottom().saturating_sub(1);
+                let _ = terminal.set_cursor_position(Position::new(0, bottom));
+                let _ = terminal.show_cursor();
+                let _ = terminal.backend_mut().flush();
+            }
+            *slot = None;
+            println!();
+        }
+    }
+}
+
+fn new_inline_terminal(height: u16) -> io::Result<LiveTerminal> {
+    let backend = CrosstermBackend::new(io::stdout());
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+}
+
+/// Rows the inline viewport reserves: one per chain plus a fixed row for the optimization
+/// summary, so the summary appearing or disappearing never shifts the block.
+fn reserved_rows(chain_count: usize) -> u16 {
+    u16::try_from(chain_count.saturating_add(1)).unwrap_or(u16::MAX)
+}
+
+fn paragraph(lines: Vec<String>) -> Paragraph<'static> {
+    Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
 }
 
 fn format_lines(
@@ -137,6 +219,17 @@ mod tests {
                 "Optimization  status=Initialized  profit=1.5  reserves=3".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn reserved_rows_is_one_per_chain_plus_the_optimization_summary() {
+        assert_eq!(reserved_rows(1), 2);
+        assert_eq!(reserved_rows(3), 4);
+    }
+
+    #[test]
+    fn reserved_rows_saturates_instead_of_overflowing() {
+        assert_eq!(reserved_rows(usize::MAX), u16::MAX);
     }
 
     #[test]

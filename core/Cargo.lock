@@ -9,6 +9,7 @@ dependencies = [
  "aa-framework",
  "client-evm",
  "optimization",
+ "ratatui",
  "rustls",
  "serde_json",
  "ureq 3.3.0",

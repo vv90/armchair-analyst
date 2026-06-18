@@ -16,11 +16,7 @@ use optimization::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-        mpsc::Sender,
-    },
+    sync::{OnceLock, mpsc::Sender},
     thread::{self, JoinHandle},
     time,
 };
@@ -29,7 +25,7 @@ use crate::{
     latest_slot::{LatestReceiveError, LatestReceiver, LatestSender, latest_slot},
     logger::Logger,
     optimization::{RunOptimizationError, run_optimization},
-    view,
+    view::View,
 };
 
 pub(crate) struct ClientEvmApp {}
@@ -38,17 +34,17 @@ pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     ethereum_config: RpcConfig,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
-    displayed_lines: AtomicUsize,
+    view: View,
     logger: Logger,
 }
 
 impl ClientEvmRuntime {
-    pub(crate) fn new(ethereum_config: RpcConfig, logger: Logger) -> ClientEvmRuntime {
+    pub(crate) fn new(ethereum_config: RpcConfig, logger: Logger, view: View) -> ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             ethereum_config,
             optimization_sender: OnceLock::new(),
-            displayed_lines: AtomicUsize::new(0),
+            view,
             logger,
         }
     }
@@ -166,9 +162,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     }
 
     fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
-        let previous = self.displayed_lines.load(Ordering::Relaxed);
-        let drawn = view::render(state, previous);
-        self.displayed_lines.store(drawn, Ordering::Relaxed);
+        self.view.render(state);
     }
 }
 
@@ -190,9 +184,10 @@ impl ClientEvmRuntime {
     }
 }
 
-pub(crate) fn start_runtime(config: RpcConfig, logger: Logger) -> JoinHandle<()> {
-    let (_sender, handle) =
-        <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(ClientEvmRuntime::new(config, logger));
+pub(crate) fn start_runtime(config: RpcConfig, logger: Logger, view: View) -> JoinHandle<()> {
+    let (_sender, handle) = <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(
+        ClientEvmRuntime::new(config, logger, view),
+    );
 
     handle
 }
@@ -469,7 +464,7 @@ fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddre
 fn default_optimization_step_config() -> OptimizationStepConfig {
     OptimizationStepConfig {
         input_amount: 1000.0,
-        iterations: 100,
+        iterations: 10,
     }
 }
 
@@ -630,7 +625,7 @@ mod tests {
     #[test]
     fn runtime_constructor_stores_ethereum_config() {
         let config = rpc_config();
-        let runtime = ClientEvmRuntime::new(config.clone(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(config.clone(), Logger::sink(), View::sink());
 
         assert_eq!(runtime.get_config(ChainKey::Ethereum), &config);
     }
@@ -659,7 +654,7 @@ mod tests {
 
     #[test]
     fn runtime_starts_with_uninitialized_optimization_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
 
         assert!(runtime.optimization_sender.get().is_none());
     }
@@ -852,7 +847,7 @@ mod tests {
 
     #[test]
     fn run_optimization_effect_returns_no_events() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input(hash(7)),
         });
@@ -862,7 +857,7 @@ mod tests {
 
     #[test]
     fn empty_optimization_snapshot_is_dropped() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
 
@@ -876,7 +871,7 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
         let input = optimization_input_with_reserves(hash(7));
@@ -891,7 +886,7 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
 
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input_with_reserves(hash(7)),
@@ -903,7 +898,7 @@ mod tests {
 
     #[test]
     fn optimization_subscription_initializes_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -913,7 +908,7 @@ mod tests {
 
     #[test]
     fn optimization_subscription_starts_only_once() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);

@@ -435,23 +435,13 @@ impl<
         let input: Tensor<B, 1> = Tensor::from([input_elem]);
         let mut model = self;
 
-        for i in 0..num_iterations {
+        for _ in 0..num_iterations {
             let output = model.block.forward(input.clone());
-            let loss = input.clone().sub(output.clone());
-            let profit = -loss.clone().into_scalar().to_f32();
+            let loss = input.clone().sub(output);
             let raw_grads = loss.backward();
             let grads = GradientsParams::from_grads(raw_grads, &model.block);
 
             model.block = optimizer.optimizer.step(0.1, model.block, grads);
-            if i % 10 == 0 || i == num_iterations - 1 {
-                println!(
-                    "Iteration {}: input = {}, output = {}, profit = {}",
-                    i,
-                    input.clone().into_scalar(),
-                    output.into_scalar(),
-                    profit
-                );
-            }
         }
 
         (model, optimizer)
