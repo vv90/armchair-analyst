@@ -5,11 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[features]
-wgpu-tests = []
-
 [dependencies]
-burn = { version = "0.16.1", features = ["wgpu", "ndarray", "train"] }
+burn = { version = "0.19.0", features = ["wgpu", "ndarray", "train"] }
 petgraph = "0.8.2"
 thiserror = "2.0.17"
 

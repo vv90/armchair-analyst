@@ -298,11 +298,22 @@ fn select_backend(
 }
 
 fn wgpu_backend_available() -> bool {
-    std::panic::catch_unwind(|| {
-        let device = burn::backend::wgpu::WgpuDevice::default();
-        let _tensor = burn::tensor::Tensor::<WgpuBackend, 1>::zeros([1], &device);
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        // cubecl raises a panic when no GPU adapter is present. Silence the default hook for the
+        // duration of the probe so the expected, handled "No possible adapter available" message
+        // does not pollute the log, then restore it. Memoized in a `OnceLock` so the global
+        // hook swap happens exactly once per process and cannot race other threads.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let available = std::panic::catch_unwind(|| {
+            let device = burn::backend::wgpu::WgpuDevice::default();
+            let _tensor = burn::tensor::Tensor::<WgpuBackend, 1>::zeros([1], &device);
+        })
+        .is_ok();
+        std::panic::set_hook(previous_hook);
+        available
     })
-    .is_ok()
 }
 
 fn initialize_optimization_session<B, TPool, TToken, const LAYERS: usize>(
