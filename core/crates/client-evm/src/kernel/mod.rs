@@ -629,12 +629,13 @@ impl State {
         self.latest_complete_pool_state_update_from(self.canonical_tip)
     }
 
-    /// Measures how many canonical blocks newer than the latest complete pool-state overlay the tip is.
-    /// Added so read models can surface fetch progress; `None` mirrors a transiently disconnected path.
-    pub(crate) fn blocks_behind_tip(&self) -> Option<usize> {
-        let update = self.latest_complete_pool_state_update_from(self.canonical_tip)?;
+    /// Counts canonical blocks the tip is ahead of `reference_hash` on a connected path.
+    /// Added so read models can measure fetch progress from an already-known frontier block
+    /// (such as the last dispatched optimization block) without rebuilding the complete
+    /// pool-state overlay; `None` mirrors a reference that is off the tip's connected path.
+    pub(crate) fn blocks_behind(&self, reference_hash: BlockHash) -> Option<usize> {
         self.blocks
-            .connected_path_hashes_oldest_to_newest(self.canonical_tip, update.block_hash)
+            .connected_path_hashes_oldest_to_newest(self.canonical_tip, reference_hash)
             .map(|hashes| hashes.len())
     }
 
@@ -5143,19 +5144,18 @@ mod tests {
         assert_eq!(state.canonical_path_len_from_finalized(), None);
     }
 
-    // The finalized anchor is itself fully fetched, so the tip is zero blocks ahead.
+    // Measured against the finalized anchor with the tip sitting on it, the distance is zero.
     #[test]
-    fn blocks_behind_tip_returns_zero_at_finalized_anchor() {
+    fn blocks_behind_returns_zero_when_reference_is_the_tip() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let state = empty_state_at(finalized_hash);
 
-        assert_eq!(state.blocks_behind_tip(), Some(0));
+        assert_eq!(state.blocks_behind(finalized_hash), Some(0));
     }
 
-    // With no block's logs resolved, no overlay beyond finalized is complete,
-    // so the tip is the full connected path ahead of the latest complete block.
+    // Against the finalized anchor, the distance is the full connected path up to the tip.
     #[test]
-    fn blocks_behind_tip_returns_full_path_when_no_block_is_complete() {
+    fn blocks_behind_returns_full_path_to_finalized_reference() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let first_hash = BlockHash::with_last_byte(2);
         let second_hash = BlockHash::with_last_byte(3);
@@ -5176,12 +5176,38 @@ mod tests {
             .0
             .insert(third_hash, block_with_parent(second_hash));
 
-        assert_eq!(state.blocks_behind_tip(), Some(3));
+        assert_eq!(state.blocks_behind(finalized_hash), Some(3));
     }
 
-    // A disconnected path has no measurable latest-complete overlay.
+    // A mid-path reference measures only the blocks newer than it up to the tip.
     #[test]
-    fn blocks_behind_tip_returns_none_for_disconnected_path() {
+    fn blocks_behind_measures_distance_from_mid_path_reference() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_hash = BlockHash::with_last_byte(2);
+        let second_hash = BlockHash::with_last_byte(3);
+        let third_hash = BlockHash::with_last_byte(4);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.canonical_tip = third_hash;
+        state
+            .blocks
+            .0
+            .insert(first_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .insert(second_hash, block_with_parent(first_hash));
+        state
+            .blocks
+            .0
+            .insert(third_hash, block_with_parent(second_hash));
+
+        assert_eq!(state.blocks_behind(second_hash), Some(1));
+    }
+
+    // A reference off the tip's connected path is not measurable.
+    #[test]
+    fn blocks_behind_returns_none_for_disconnected_reference() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let missing_parent_hash = BlockHash::with_last_byte(2);
         let head_hash = BlockHash::with_last_byte(3);
@@ -5193,7 +5219,7 @@ mod tests {
             .0
             .insert(head_hash, block_with_parent(missing_parent_hash));
 
-        assert_eq!(state.blocks_behind_tip(), None);
+        assert_eq!(state.blocks_behind(finalized_hash), None);
     }
 
     // Surfaces the count of pools the registry has verified for read models.

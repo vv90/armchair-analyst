@@ -23,6 +23,8 @@ pub enum ChainStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChainProgress {
     pub verified_pools: usize,
+    /// Canonical blocks the tip is ahead of the chain's last dispatched optimization block.
+    /// `None` while no optimization has been dispatched or the reference is off the current path.
     pub blocks_behind_tip: Option<usize>,
 }
 
@@ -149,19 +151,30 @@ impl State {
     pub fn observe(&self) -> Vec<(ChainKey, ChainObservation)> {
         self.chains
             .iter()
-            .map(|(chain, chain_state)| (*chain, observe_chain(chain_state)))
+            .map(|(chain, chain_state)| {
+                (
+                    *chain,
+                    observe_chain(chain_state, self.last_optimized_block.get(chain).copied()),
+                )
+            })
             .collect()
     }
 }
 
 /// Projects one chain lifecycle into its render observation.
 /// Added so active-chain metrics are gathered in one place and stay unreachable while bootstrapping.
-fn observe_chain(chain_state: &ChainLifecycle) -> ChainObservation {
+/// `last_optimized_block` is the chain's last dispatched optimization block, used as the cheap
+/// reference for fetch progress; absent (not yet dispatched, or reorg-orphaned) renders as unknown.
+fn observe_chain(
+    chain_state: &ChainLifecycle,
+    last_optimized_block: Option<BlockHash>,
+) -> ChainObservation {
     match chain_state {
         ChainLifecycle::Bootstrapping(_) => ChainObservation::Initializing,
         ChainLifecycle::Active(chain_state) => ChainObservation::Active(ChainProgress {
             verified_pools: chain_state.verified_pool_count(),
-            blocks_behind_tip: chain_state.blocks_behind_tip(),
+            blocks_behind_tip: last_optimized_block
+                .and_then(|reference| chain_state.blocks_behind(reference)),
         }),
     }
 }
@@ -647,8 +660,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
             };
 
             if let Some(update) = optimization_update {
-                let changed =
-                    state.last_optimized_block.get(&chain) != Some(&update.block_hash);
+                let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
                 // Project and dispatch only when the fully-fetched block advanced. Record the hash
                 // only on a successful projection so an unready (`Ok(None)`) or failed (`Err`) chain
                 // retries this block on the next event instead of being skipped.
@@ -874,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_reports_active_progress_with_verified_pools() {
+    fn observe_reports_unknown_distance_before_first_optimization_dispatch() {
         let pool = pool(10);
         let token0 = token(1);
         let token1 = token(2);
@@ -884,6 +896,35 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
+
+        // No optimization has been dispatched, so there is no reference block to measure against.
+        assert_eq!(
+            state.observe(),
+            vec![(
+                ChainKey::Ethereum,
+                ChainObservation::Active(ChainProgress {
+                    verified_pools: 1,
+                    blocks_behind_tip: None,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn observe_measures_distance_from_last_optimized_block() {
+        let pool = pool(10);
+        let token0 = token(1);
+        let token1 = token(2);
+        let mut state = projection_state(
+            hash(1),
+            HashMap::new(),
+            HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
+            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+        );
+        // The canonical tip equals the finalized anchor here, so optimizing at it is zero behind.
+        state
+            .last_optimized_block
+            .insert(ChainKey::Ethereum, hash(1));
 
         assert_eq!(
             state.observe(),
@@ -1223,7 +1264,10 @@ mod tests {
         // now dispatches an optimization run. The empty test registry projects empty reserves (the
         // adapter filters those before the worker), but the kernel still emits exactly this effect
         // and leaves no chain-routing work behind.
-        assert!(matches!(effects.as_slice(), [Effect::RunOptimization { .. }]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RunOptimization { .. }]
+        ));
 
         let (state, effects) = transition(
             state,
