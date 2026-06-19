@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ChainKey {
     Ethereum,
+    Arbitrum,
 }
 
 /// The chains the runtime tracks. The canonical, unique source of the active-chain set: the runtime
@@ -11,6 +12,7 @@ pub const ACTIVE_CHAINS: &[ChainKey] = &[ChainKey::Ethereum];
 pub fn drpc_network_path(chain: ChainKey) -> &'static str {
     match chain {
         ChainKey::Ethereum => "ethereum",
+        ChainKey::Arbitrum => "arbitrum",
     }
 }
 
@@ -22,6 +24,11 @@ mod tests {
     #[test]
     fn ethereum_maps_to_drpc_network_path() {
         assert_eq!(drpc_network_path(ChainKey::Ethereum), "ethereum");
+    }
+
+    #[test]
+    fn arbitrum_maps_to_drpc_network_path() {
+        assert_eq!(drpc_network_path(ChainKey::Arbitrum), "arbitrum");
     }
 
     #[test]

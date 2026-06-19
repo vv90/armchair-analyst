@@ -78,7 +78,9 @@ impl Application for ClientEvmApp {
             .iter()
             .map(|&chain| Subscription::NewHeadsSubscription(chain))
             .collect();
-        subscriptions.push(Subscription::TickSubscription(time::Duration::from_millis(1000)));
+        subscriptions.push(Subscription::TickSubscription(time::Duration::from_millis(
+            1000,
+        )));
         subscriptions.push(Subscription::OptimizationSubscription);
         subscriptions
     }

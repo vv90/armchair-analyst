@@ -66,6 +66,21 @@ const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 4;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
 const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
+// PROVISIONAL — tune before activation. Arbitrum One produces ~one block per ~0.25s and inherits L1
+// finality, so its block-denominated retention/look-back windows are larger than Ethereum's. These
+// values do not affect runtime while Arbitrum is absent from `ACTIVE_CHAINS`; they are starting points
+// for the activation chunk.
+const ARBITRUM_APPROX_FINALIZED_BLOCK_AGE: usize = 1_000;
+const ARBITRUM_FINALIZED_RETENTION_MARGIN: usize = 64;
+const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
+
+/// Pool-candidate discovery window scanned below the finalized anchor during bootstrap.
+const ARBITRUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 2_000;
+/// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
+const ARBITRUM_BOOTSTRAP_TIP_TRIM: usize = 8;
+/// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
+const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptimizationPoolReserves {
     pub block_hash: BlockHash,
@@ -204,10 +219,9 @@ pub fn pool_reserves_for_optimization(
 
     let mut reserves = Vec::new();
 
-    for (pool, pool_state) in sorted_pool_states_for_projection(
-        chain_state.finalized_pool_snapshots(),
-        overlay,
-    ) {
+    for (pool, pool_state) in
+        sorted_pool_states_for_projection(chain_state.finalized_pool_snapshots(), overlay)
+    {
         let Some((token0, token1, fee, token0_decimals, token1_decimals)) =
             projection_metadata(chain_state, pool)
         else {
@@ -677,8 +691,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 // only on a successful projection so an unready (`Ok(None)`) or failed (`Err`) chain
                 // retries this block on the next event instead of being skipped.
                 if changed {
-                    if let Ok(Some(input)) =
-                        pool_reserves_for_optimization(&state, chain, &update)
+                    if let Ok(Some(input)) = pool_reserves_for_optimization(&state, chain, &update)
                     {
                         state.last_optimized_block.insert(chain, update.block_hash);
                         effects.push(Effect::RunOptimization { input });
@@ -763,6 +776,10 @@ fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
             target_len: ETHEREUM_APPROX_FINALIZED_BLOCK_AGE + ETHEREUM_FINALIZED_RETENTION_MARGIN,
             retry_stride: ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE,
         },
+        ChainKey::Arbitrum => FinalizedRefreshPolicy {
+            target_len: ARBITRUM_APPROX_FINALIZED_BLOCK_AGE + ARBITRUM_FINALIZED_RETENTION_MARGIN,
+            retry_stride: ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
     }
 }
 
@@ -772,6 +789,11 @@ fn bootstrap_policy(chain: ChainKey) -> bootstrap::BootstrapPolicy {
             look_back_depth: ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH,
             tip_trim: ETHEREUM_BOOTSTRAP_TIP_TRIM,
             deadline_ticks: ETHEREUM_BOOTSTRAP_DEADLINE_TICKS,
+        },
+        ChainKey::Arbitrum => bootstrap::BootstrapPolicy {
+            look_back_depth: ARBITRUM_BOOTSTRAP_LOOK_BACK_DEPTH,
+            tip_trim: ARBITRUM_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: ARBITRUM_BOOTSTRAP_DEADLINE_TICKS,
         },
     }
 }
@@ -825,8 +847,7 @@ mod tests {
             assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
             assert!(
                 observations.iter().any(|(observed_chain, observation)| {
-                    *observed_chain == chain
-                        && *observation == ChainObservation::Initializing
+                    *observed_chain == chain && *observation == ChainObservation::Initializing
                 }),
                 "active chain {chain:?} should be seeded as initializing"
             );
@@ -922,6 +943,7 @@ mod tests {
         let token0 = token(1);
         let token1 = token(2);
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::new(),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
@@ -947,6 +969,7 @@ mod tests {
         let token0 = token(1);
         let token1 = token(2);
         let mut state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::new(),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
@@ -1349,6 +1372,7 @@ mod tests {
         let token1 = token(2);
         let pool_state = balanced_pool_state(1_000_000);
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::from([(pool, pool_state.clone())]),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
@@ -1382,6 +1406,7 @@ mod tests {
         let token0 = token(1);
         let token1 = token(2);
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::from([(pool, balanced_pool_state(1_000_000))]),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
@@ -1414,7 +1439,7 @@ mod tests {
     #[test]
     fn pool_reserves_projection_returns_none_when_ethereum_chain_is_inactive() {
         let (state, _) = State::init(&[ChainKey::Ethereum]);
-        let (state, update) = projection_update(state, hash(1), HashMap::new());
+        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(1), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -1423,8 +1448,14 @@ mod tests {
 
     #[test]
     fn pool_reserves_projection_returns_empty_reserves_for_complete_empty_update() {
-        let state = projection_state(hash(1), HashMap::new(), HashMap::new(), HashMap::new());
-        let (state, update) = projection_update(state, hash(2), HashMap::new());
+        let state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(2), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1441,12 +1472,13 @@ mod tests {
         let token1 = token(2);
         let pool_state = balanced_pool_state(1_000_000);
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::from([(pool, pool_state.clone())]),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(state, hash(2), HashMap::new());
+        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(2), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1457,6 +1489,78 @@ mod tests {
     }
 
     #[test]
+    fn pool_reserves_projection_selects_only_the_requested_chains_pools() {
+        let ethereum_pool = pool(10);
+        let arbitrum_pool = pool(20);
+        let token0 = token(1);
+        let token1 = token(2);
+        let ethereum_pool_state = balanced_pool_state(1_000_000);
+        let arbitrum_pool_state = balanced_pool_state(2_000_000);
+
+        let ethereum_state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::from([(ethereum_pool, ethereum_pool_state.clone())]),
+            HashMap::from([(
+                ethereum_pool,
+                pool_metadata(token0, token1, UniswapV3Fee::Fee3000),
+            )]),
+            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+        );
+        let arbitrum_state = projection_state(
+            ChainKey::Arbitrum,
+            hash(2),
+            HashMap::from([(arbitrum_pool, arbitrum_pool_state.clone())]),
+            HashMap::from([(
+                arbitrum_pool,
+                pool_metadata(token0, token1, UniswapV3Fee::Fee3000),
+            )]),
+            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+        );
+
+        // Fold both active chains into one multi-chain state to prove selection happens by argument.
+        let mut chains = ethereum_state.chains;
+        chains.extend(arbitrum_state.chains);
+        let state = State {
+            chains,
+            latest_optimization_result: None,
+            last_optimized_block: BTreeMap::new(),
+        };
+
+        let (state, ethereum_update) =
+            projection_update(ChainKey::Ethereum, state, hash(3), HashMap::new());
+        let (state, arbitrum_update) =
+            projection_update(ChainKey::Arbitrum, state, hash(4), HashMap::new());
+
+        let ethereum_reserves =
+            pool_reserves_for_optimization(&state, ChainKey::Ethereum, &ethereum_update)
+                .unwrap()
+                .unwrap();
+        let arbitrum_reserves =
+            pool_reserves_for_optimization(&state, ChainKey::Arbitrum, &arbitrum_update)
+                .unwrap()
+                .unwrap();
+
+        // Each chain projects exactly its own pool (two directional entries) — no cross-chain bleed.
+        assert_eq!(ethereum_reserves.reserves.len(), 2);
+        assert_eq!(arbitrum_reserves.reserves.len(), 2);
+        assert_directional_pair(
+            &ethereum_reserves.reserves,
+            ethereum_pool,
+            token0,
+            token1,
+            &ethereum_pool_state,
+        );
+        assert_directional_pair(
+            &arbitrum_reserves.reserves,
+            arbitrum_pool,
+            token0,
+            token1,
+            &arbitrum_pool_state,
+        );
+    }
+
+    #[test]
     fn pool_reserves_projection_update_snapshot_overwrites_finalized_snapshot() {
         let pool = pool(10);
         let token0 = token(1);
@@ -1464,12 +1568,14 @@ mod tests {
         let finalized_pool_state = balanced_pool_state(1_000_000);
         let updated_pool_state = balanced_pool_state(2_000_000);
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::from([(pool, finalized_pool_state)]),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
         let (state, update) = projection_update(
+            ChainKey::Ethereum,
             state,
             hash(2),
             HashMap::from([(pool, updated_pool_state.clone())]),
@@ -1491,8 +1597,15 @@ mod tests {
     #[test]
     fn pool_reserves_projection_returns_none_when_pool_metadata_is_missing() {
         let pool = pool(10);
-        let state = projection_state(hash(1), HashMap::new(), HashMap::new(), HashMap::new());
+        let state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
         let (state, update) = projection_update(
+            ChainKey::Ethereum,
             state,
             hash(2),
             HashMap::from([(pool, balanced_pool_state(1_000_000))]),
@@ -1509,12 +1622,14 @@ mod tests {
         let token0 = token(1);
         let token1 = token(2);
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::new(),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18))]),
         );
         let (state, update) = projection_update(
+            ChainKey::Ethereum,
             state,
             hash(2),
             HashMap::from([(pool, balanced_pool_state(1_000_000))]),
@@ -1536,14 +1651,21 @@ mod tests {
             tick: I24::from_limbs([0]),
         };
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::new(),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(0)), (token1, token_metadata(0))]),
         );
-        let (state, update) = projection_update(state, hash(2), HashMap::from([(pool, pool_state)]));
+        let (state, update) = projection_update(
+            ChainKey::Ethereum,
+            state,
+            hash(2),
+            HashMap::from([(pool, pool_state)]),
+        );
 
-        let error = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
+        let error =
+            pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1567,15 +1689,21 @@ mod tests {
             tick: I24::from_limbs([60]),
         };
         let state = projection_state(
+            ChainKey::Ethereum,
             hash(1),
             HashMap::new(),
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) =
-            projection_update(state, hash(2), HashMap::from([(pool, inconsistent_pool_state)]));
+        let (state, update) = projection_update(
+            ChainKey::Ethereum,
+            state,
+            hash(2),
+            HashMap::from([(pool, inconsistent_pool_state)]),
+        );
 
-        let error = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
+        let error =
+            pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1614,13 +1742,13 @@ mod tests {
                     [(*token0, token_metadata(18)), (*token1, token_metadata(6))]
                 })
                 .collect::<HashMap<_, _>>();
-            let state = projection_state(
+            let state = projection_state(ChainKey::Ethereum,
                 finalized_hash,
                 HashMap::new(),
                 pool_metadata,
                 token_metadata,
             );
-            let (state, update) = projection_update(
+            let (state, update) = projection_update(ChainKey::Ethereum,
                 state,
                 update_hash,
                 pools
@@ -1705,6 +1833,7 @@ mod tests {
     }
 
     fn projection_state(
+        chain: ChainKey,
         finalized_hash: BlockHash,
         finalized_snapshots: HashMap<PoolAddress, PoolState>,
         pool_metadata: HashMap<PoolAddress, PoolMetadata>,
@@ -1733,15 +1862,16 @@ mod tests {
         );
 
         State {
-            chains: BTreeMap::from([(ChainKey::Ethereum, ChainLifecycle::Active(chain_state))]),
+            chains: BTreeMap::from([(chain, ChainLifecycle::Active(chain_state))]),
             latest_optimization_result: None,
             last_optimized_block: BTreeMap::new(),
         }
     }
 
-    /// Seeds the overlay snapshots into a block on the Ethereum chain and returns the matching
+    /// Seeds the overlay snapshots into a block on the given chain and returns the matching
     /// locations descriptor, mirroring how the kernel produces overlays the projection resolves.
     fn projection_update(
+        chain: ChainKey,
         state: State,
         block_hash: BlockHash,
         overlay_pool_states: HashMap<PoolAddress, PoolState>,
@@ -1756,17 +1886,17 @@ mod tests {
             latest_optimization_result,
             last_optimized_block,
         } = state;
-        match chains.remove(&ChainKey::Ethereum) {
+        match chains.remove(&chain) {
             Some(ChainLifecycle::Active(chain_state)) => {
                 chains.insert(
-                    ChainKey::Ethereum,
+                    chain,
                     ChainLifecycle::Active(
                         chain_state.with_overlay_block_for_test(block_hash, overlay_pool_states),
                     ),
                 );
             }
             Some(other) => {
-                chains.insert(ChainKey::Ethereum, other);
+                chains.insert(chain, other);
             }
             None => {}
         }

@@ -45,7 +45,11 @@ impl BlocksGraph {
 
     /// Removes and returns one pool's snapshot from a block, taking ownership without cloning.
     /// Added so finalized compaction can move snapshots out of soon-pruned blocks into the snapshot.
-    fn take_pool_snapshot(&mut self, block_hash: BlockHash, pool: PoolAddress) -> Option<PoolState> {
+    fn take_pool_snapshot(
+        &mut self,
+        block_hash: BlockHash,
+        pool: PoolAddress,
+    ) -> Option<PoolState> {
         self.0.get_mut(&block_hash)?.pool_snapshots.remove(&pool)
     }
 
@@ -5344,7 +5348,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let state = empty_state_at(finalized_hash);
 
-        let update = resolved_complete_pool_state_update_from(&state,finalized_hash);
+        let update = resolved_complete_pool_state_update_from(&state, finalized_hash);
 
         assert_eq!(
             update,
@@ -5361,7 +5365,7 @@ mod tests {
 
         assert_eq!(
             resolved_complete_pool_state_update(&state),
-            resolved_complete_pool_state_update_from(&state,state.canonical_tip)
+            resolved_complete_pool_state_update_from(&state, state.canonical_tip)
         );
         assert_eq!(
             resolved_complete_pool_state_update(&state),
@@ -5377,7 +5381,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,BlockHash::with_last_byte(2)),
+            resolved_complete_pool_state_update_from(&state, BlockHash::with_last_byte(2)),
             None
         );
     }
@@ -5397,7 +5401,7 @@ mod tests {
             .insert(block_hash, block_with_parent(missing_parent_hash));
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,block_hash),
+            resolved_complete_pool_state_update_from(&state, block_hash),
             None
         );
     }
@@ -5421,7 +5425,7 @@ mod tests {
             .insert(second_hash, block_with_parent(first_hash));
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,first_hash),
+            resolved_complete_pool_state_update_from(&state, first_hash),
             None
         );
     }
@@ -5456,7 +5460,7 @@ mod tests {
             .insert(unknown_hash, block_with_parent(complete_hash));
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,unknown_hash),
+            resolved_complete_pool_state_update_from(&state, unknown_hash),
             Some(complete_pool_state_update(
                 complete_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5495,7 +5499,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,pending_hash),
+            resolved_complete_pool_state_update_from(&state, pending_hash),
             Some(complete_pool_state_update(
                 complete_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5526,7 +5530,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,block_hash),
+            resolved_complete_pool_state_update_from(&state, block_hash),
             Some(complete_pool_state_update(block_hash, HashMap::new()))
         );
     }
@@ -5556,7 +5560,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,block_hash),
+            resolved_complete_pool_state_update_from(&state, block_hash),
             Some(complete_pool_state_update(
                 block_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5594,7 +5598,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,later_hash),
+            resolved_complete_pool_state_update_from(&state, later_hash),
             Some(complete_pool_state_update(
                 later_hash,
                 HashMap::from([(pool, snapshot)])
@@ -5637,7 +5641,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,third_hash),
+            resolved_complete_pool_state_update_from(&state, third_hash),
             Some(complete_pool_state_update(
                 first_hash,
                 HashMap::from([(pool, first_snapshot)])
@@ -5685,7 +5689,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,third_hash),
+            resolved_complete_pool_state_update_from(&state, third_hash),
             Some(complete_pool_state_update(
                 third_hash,
                 HashMap::from([(pool, third_snapshot)])
@@ -5721,7 +5725,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,block_hash),
+            resolved_complete_pool_state_update_from(&state, block_hash),
             Some(complete_pool_state_update(finalized_hash, HashMap::new()))
         );
     }
@@ -5756,7 +5760,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,block_hash),
+            resolved_complete_pool_state_update_from(&state, block_hash),
             Some(complete_pool_state_update(
                 block_hash,
                 HashMap::from([(affected_pool, affected_snapshot)])
@@ -5799,7 +5803,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_complete_pool_state_update_from(&state,first_hash),
+            resolved_complete_pool_state_update_from(&state, first_hash),
             Some(complete_pool_state_update(
                 first_hash,
                 HashMap::from([(pool, first_snapshot)])

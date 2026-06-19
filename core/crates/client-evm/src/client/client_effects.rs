@@ -758,7 +758,8 @@ mod tests {
         let config = rpc_config(&format!("http://{address}"));
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_block_header(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
+        let result =
+            fetch_block_header(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
 
         assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
     }
@@ -833,7 +834,13 @@ mod tests {
         let config = rpc_config("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_pool_data(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1), HashSet::new());
+        let result = fetch_pool_data(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            B256::with_last_byte(1),
+            HashSet::new(),
+        );
 
         assert!(matches!(result, Ok(ref pools) if pools.is_empty()));
     }
@@ -857,7 +864,8 @@ mod tests {
 
         let result = fetch_pool_data(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([second_pool, first_pool]),
         );
@@ -935,7 +943,8 @@ mod tests {
 
         let result = fetch_pool_data(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([first_pool, second_pool]),
         );
@@ -962,7 +971,13 @@ mod tests {
         let config = rpc_config(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_pool_data(&agent, &config, ChainKey::Ethereum, at, HashSet::from([pool]));
+        let result = fetch_pool_data(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            at,
+            HashSet::from([pool]),
+        );
 
         let pools = result.expect("outer multicall must succeed");
         assert_eq!(
@@ -984,7 +999,8 @@ mod tests {
 
         let result = fetch_pool_data(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::from([PoolAddress(Address::with_last_byte(2))]),
         );
@@ -997,7 +1013,13 @@ mod tests {
         let config = rpc_config("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_pool_metadata(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1), HashSet::new());
+        let result = fetch_pool_metadata(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            B256::with_last_byte(1),
+            HashSet::new(),
+        );
 
         assert!(matches!(result, Ok(ref metadata) if metadata.is_empty()));
     }
@@ -1033,7 +1055,8 @@ mod tests {
 
         let result = fetch_pool_metadata(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([second_candidate, first_candidate]),
         )
@@ -1112,8 +1135,14 @@ mod tests {
         let config = rpc_config(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_pool_metadata(&agent, &config, ChainKey::Ethereum, at, HashSet::from([candidate]))
-            .expect("outer multicall must succeed");
+        let result = fetch_pool_metadata(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            at,
+            HashSet::from([candidate]),
+        )
+        .expect("outer multicall must succeed");
 
         assert_eq!(
             result.get(&candidate),
@@ -1143,7 +1172,8 @@ mod tests {
 
         let result = fetch_pool_metadata(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([failed_candidate, malformed_candidate]),
         )
@@ -1183,8 +1213,14 @@ mod tests {
         let config = rpc_config(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_pool_metadata(&agent, &config, ChainKey::Ethereum, at, HashSet::from([candidate]))
-            .expect("outer multicall must succeed");
+        let result = fetch_pool_metadata(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            at,
+            HashSet::from([candidate]),
+        )
+        .expect("outer multicall must succeed");
 
         assert_eq!(
             result.get(&candidate),
@@ -1221,7 +1257,8 @@ mod tests {
 
         let result = fetch_pool_metadata(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([failed_candidate, malformed_candidate]),
         )
@@ -1247,7 +1284,13 @@ mod tests {
         let config = rpc_config("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_token_metadata(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1), HashSet::new());
+        let result = fetch_token_metadata(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            B256::with_last_byte(1),
+            HashSet::new(),
+        );
 
         assert!(matches!(result, Ok(ref metadata) if metadata.is_empty()));
     }
@@ -1267,7 +1310,8 @@ mod tests {
 
         let result = fetch_token_metadata(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([second_token, first_token]),
         )
@@ -1322,7 +1366,8 @@ mod tests {
 
         let result = fetch_token_metadata(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             at,
             HashSet::from([failed_token, malformed_token, unsupported_token]),
         )
@@ -1361,7 +1406,8 @@ mod tests {
 
         let result = fetch_token_metadata(
             &agent,
-            &config, ChainKey::Ethereum,
+            &config,
+            ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::from([TokenAddress(Address::with_last_byte(2))]),
         );

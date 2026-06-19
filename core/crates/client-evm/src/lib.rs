@@ -42,5 +42,5 @@ pub use pool_state::{
     PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState, PoolStateError,
 };
 pub use tick_math::TickMathError;
-pub use tokens::ETHEREUM_USDC_TOKEN_ADDRESS;
+pub use tokens::{ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS};
 pub use utils::{TokenAmountConversionError, u256_token_amount_to_f32};

@@ -119,7 +119,11 @@ fn format_lines(
     let mut lines: Vec<String> = observations
         .iter()
         .map(|(chain, observation)| {
-            format!("{}: {}", format_chain(*chain), format_observation(*observation))
+            format!(
+                "{}: {}",
+                format_chain(*chain),
+                format_observation(*observation)
+            )
         })
         .collect();
 
@@ -140,6 +144,7 @@ fn format_optimization(result: OptimizationStepResult) -> String {
 fn format_chain(chain: ChainKey) -> &'static str {
     match chain {
         ChainKey::Ethereum => "Ethereum",
+        ChainKey::Arbitrum => "Arbitrum",
     }
 }
 
@@ -173,7 +178,20 @@ mod tests {
     fn format_lines_renders_initializing_observation() {
         let observations = [(ChainKey::Ethereum, ChainObservation::Initializing)];
 
-        assert_eq!(format_lines(&observations, None), vec!["Ethereum: Initializing"]);
+        assert_eq!(
+            format_lines(&observations, None),
+            vec!["Ethereum: Initializing"]
+        );
+    }
+
+    #[test]
+    fn format_lines_renders_arbitrum_chain_label() {
+        let observations = [(ChainKey::Arbitrum, ChainObservation::Initializing)];
+
+        assert_eq!(
+            format_lines(&observations, None),
+            vec!["Arbitrum: Initializing"]
+        );
     }
 
     #[test]

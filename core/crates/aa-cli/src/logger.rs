@@ -127,9 +127,7 @@ mod tests {
         assert!(name.starts_with("aa-cli-"), "unexpected name: {name}");
         assert!(name.ends_with(".log"), "unexpected name: {name}");
         // The header is written synchronously before the writer thread spawns.
-        assert!(
-            fs::read_to_string(entries[0].path())?.starts_with("run started_millis=")
-        );
+        assert!(fs::read_to_string(entries[0].path())?.starts_with("run started_millis="));
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

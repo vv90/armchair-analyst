@@ -63,7 +63,11 @@ impl GraphSeed {
     /// block one number below it; the run anchored at `F+1` links to `F`, other runs seed as
     /// floating segments (their bottom block, whose parent is an unobserved no-log block, is
     /// dropped). The top `tip_trim` blocks near the tip are reorg-prone and left out.
-    fn from_window(window: &[RangeLogBlock], anchor: FinalizedAnchor, tip_trim: usize) -> GraphSeed {
+    fn from_window(
+        window: &[RangeLogBlock],
+        anchor: FinalizedAnchor,
+        tip_trim: usize,
+    ) -> GraphSeed {
         // Recent canonical blocks above the anchor, keyed by number (deduped, ascending).
         let mut recent: BTreeMap<u64, &RangeLogBlock> = BTreeMap::new();
         for block in window {
@@ -277,11 +281,24 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
 
                     (
-                        rebuild(pending, Phase::Discovering { anchor }, policy, started_at, tick),
-                        vec![issued(AnyIssuedRequest::PoolCandidates, request_id, payload)],
+                        rebuild(
+                            pending,
+                            Phase::Discovering { anchor },
+                            policy,
+                            started_at,
+                            tick,
+                        ),
+                        vec![issued(
+                            AnyIssuedRequest::PoolCandidates,
+                            request_id,
+                            payload,
+                        )],
                     )
                 }
-                phase => (rebuild(pending, phase, policy, started_at, tick), Vec::new()),
+                phase => (
+                    rebuild(pending, phase, policy, started_at, tick),
+                    Vec::new(),
+                ),
             }
         }
         Event::PoolCandidatesReceived { request_id, blocks } => {
@@ -310,7 +327,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         vec![issued(AnyIssuedRequest::PoolMetadata, request_id, payload)],
                     )
                 }
-                phase => (rebuild(pending, phase, policy, started_at, tick), Vec::new()),
+                phase => (
+                    rebuild(pending, phase, policy, started_at, tick),
+                    Vec::new(),
+                ),
             }
         }
         Event::PoolMetadataReceived {
@@ -342,7 +362,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         vec![issued(AnyIssuedRequest::TokenMetadata, request_id, payload)],
                     )
                 }
-                phase => (rebuild(pending, phase, policy, started_at, tick), Vec::new()),
+                phase => (
+                    rebuild(pending, phase, policy, started_at, tick),
+                    Vec::new(),
+                ),
             }
         }
         Event::TokenMetadataReceived {
@@ -379,7 +402,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         vec![issued(AnyIssuedRequest::PoolData, request_id, payload)],
                     )
                 }
-                phase => (rebuild(pending, phase, policy, started_at, tick), Vec::new()),
+                phase => (
+                    rebuild(pending, phase, policy, started_at, tick),
+                    Vec::new(),
+                ),
             }
         }
         Event::PoolDataReceived { request_id, pools } => {
@@ -408,7 +434,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         Vec::new(),
                     )
                 }
-                phase => (rebuild(pending, phase, policy, started_at, tick), Vec::new()),
+                phase => (
+                    rebuild(pending, phase, policy, started_at, tick),
+                    Vec::new(),
+                ),
             }
         }
         Event::RequestFailed { request_id } => {
@@ -423,7 +452,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
             let tick = tick.next();
 
             if matches!(phase, Phase::Ready(_) | Phase::Abandoned) {
-                return (rebuild(pending, phase, policy, started_at, tick), Vec::new());
+                return (
+                    rebuild(pending, phase, policy, started_at, tick),
+                    Vec::new(),
+                );
             }
 
             if tick.elapsed_since(started_at) >= policy.deadline_ticks {
@@ -562,17 +594,17 @@ mod tests {
     #[test]
     fn contiguous_window_links_first_block_to_anchor_then_chains() {
         let anchor = anchor(10, 100);
-        let window = [window_block(11, 11), window_block(12, 12), window_block(13, 13)];
+        let window = [
+            window_block(11, 11),
+            window_block(12, 12),
+            window_block(13, 13),
+        ];
 
         let seed = GraphSeed::from_window(&window, anchor, 0);
 
         assert_eq!(
             seed.into_blocks(),
-            vec![
-                seed_block(11, 100),
-                seed_block(12, 11),
-                seed_block(13, 12),
-            ]
+            vec![seed_block(11, 100), seed_block(12, 11), seed_block(13, 12),]
         );
     }
 
@@ -615,11 +647,7 @@ mod tests {
 
         assert_eq!(
             seed.into_blocks(),
-            vec![
-                seed_block(11, 100),
-                seed_block(12, 11),
-                seed_block(13, 12),
-            ]
+            vec![seed_block(11, 100), seed_block(12, 11), seed_block(13, 12),]
         );
     }
 
@@ -906,7 +934,10 @@ mod tests {
             outcome.seed_blocks,
             vec![seed_block(11, 200), seed_block(12, 11)]
         );
-        assert_eq!(outcome.pool_snapshots, HashMap::from([(pool(11), balanced_pool_state())]));
+        assert_eq!(
+            outcome.pool_snapshots,
+            HashMap::from([(pool(11), balanced_pool_state())])
+        );
         assert!(outcome.pool_registry.verified_metadata(pool(11)).is_some());
         assert!(outcome.token_registry.verified_metadata(token(1)).is_some());
     }
@@ -1187,7 +1218,11 @@ mod tests {
     }
 
     fn action_strategy() -> impl Strategy<Value = Action> {
-        prop_oneof![Just(Action::Deliver), Just(Action::Fail), Just(Action::Tick)]
+        prop_oneof![
+            Just(Action::Deliver),
+            Just(Action::Fail),
+            Just(Action::Tick)
+        ]
     }
 
     proptest! {

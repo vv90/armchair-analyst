@@ -3,8 +3,8 @@ use std::sync::mpsc::Sender;
 use client_evm::{PoolAddress, TokenAddress, multi_chain_kernel::OptimizationPoolReserves};
 use optimization::{
     OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
-    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError, OptimizationStepResult,
-    OptimizationStepUpdate,
+    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
+    OptimizationStepResult, OptimizationStepUpdate,
 };
 
 use crate::latest_slot::{LatestReceiveError, LatestReceiver};
