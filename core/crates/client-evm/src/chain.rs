@@ -3,6 +3,11 @@ pub enum ChainKey {
     Ethereum,
 }
 
+/// The chains the runtime tracks. The canonical, unique source of the active-chain set: the runtime
+/// seeds one bootstrapping chain and one new-heads subscription per entry, so adding a chain here is
+/// the single switch that activates it.
+pub const ACTIVE_CHAINS: &[ChainKey] = &[ChainKey::Ethereum];
+
 pub fn drpc_network_path(chain: ChainKey) -> &'static str {
     match chain {
         ChainKey::Ethereum => "ethereum",

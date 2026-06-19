@@ -61,7 +61,7 @@ impl Application for ClientEvmApp {
     type Subscription = Subscription;
 
     fn init() -> Transition<Self::State, Self::Effect> {
-        let (state, effects) = State::init(client_evm::ChainKey::Ethereum);
+        let (state, effects) = State::init(client_evm::ACTIVE_CHAINS);
         Transition { state, effects }
     }
 
@@ -74,11 +74,13 @@ impl Application for ClientEvmApp {
     }
 
     fn subscriptions() -> Vec<Self::Subscription> {
-        vec![
-            Subscription::NewHeadsSubscription(ChainKey::Ethereum),
-            Subscription::TickSubscription(time::Duration::from_millis(1000)),
-            Subscription::OptimizationSubscription,
-        ]
+        let mut subscriptions: Vec<Subscription> = client_evm::ACTIVE_CHAINS
+            .iter()
+            .map(|&chain| Subscription::NewHeadsSubscription(chain))
+            .collect();
+        subscriptions.push(Subscription::TickSubscription(time::Duration::from_millis(1000)));
+        subscriptions.push(Subscription::OptimizationSubscription);
+        subscriptions
     }
 }
 
@@ -648,6 +650,27 @@ mod tests {
                 .iter()
                 .any(|subscription| matches!(subscription, Subscription::OptimizationSubscription))
         );
+    }
+
+    #[test]
+    fn subscriptions_open_new_heads_for_every_active_chain() {
+        let subscriptions = ClientEvmApp::subscriptions();
+
+        let new_heads_chains = subscriptions
+            .iter()
+            .filter_map(|subscription| match subscription {
+                Subscription::NewHeadsSubscription(chain) => Some(*chain),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(new_heads_chains.len(), client_evm::ACTIVE_CHAINS.len());
+        for chain in client_evm::ACTIVE_CHAINS {
+            assert!(
+                new_heads_chains.contains(chain),
+                "expected a new-heads subscription for active chain {chain:?}"
+            );
+        }
     }
 
     #[test]

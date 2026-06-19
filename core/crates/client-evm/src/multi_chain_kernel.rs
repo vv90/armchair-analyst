@@ -110,21 +110,27 @@ pub enum PoolReserveProjectionError {
 }
 
 impl State {
-    /// Creates multi-chain state with one chain bootstrapping its recent canonical window.
-    /// Added so runtimes seed an inner kernel from the bootstrap outcome instead of an empty finalized state.
-    pub fn init(chain: ChainKey) -> (State, Vec<Effect>) {
-        let mut chains = BTreeMap::new();
-        let (bootstrap_state, bootstrap_effects) = bootstrap::init(bootstrap_policy(chain));
+    /// Creates multi-chain state with every requested chain bootstrapping its recent canonical window.
+    /// Added so runtimes seed an inner kernel per active chain from each bootstrap outcome instead of
+    /// an empty finalized state. The chain set is a parameter (production passes `ACTIVE_CHAINS`,
+    /// tests pass a singleton) so the active count lives in one constant, not in this constructor.
+    pub fn init(chains: &[ChainKey]) -> (State, Vec<Effect>) {
+        let mut chain_map = BTreeMap::new();
+        let mut effects = Vec::new();
 
-        chains.insert(chain, ChainLifecycle::Bootstrapping(bootstrap_state));
+        for &chain in chains {
+            let (bootstrap_state, bootstrap_effects) = bootstrap::init(bootstrap_policy(chain));
+            chain_map.insert(chain, ChainLifecycle::Bootstrapping(bootstrap_state));
+            effects.extend(wrap_bootstrap_effects(chain, bootstrap_effects));
+        }
 
         (
             State {
-                chains,
+                chains: chain_map,
                 latest_optimization_result: None,
                 last_optimized_block: BTreeMap::new(),
             },
-            wrap_bootstrap_effects(chain, bootstrap_effects),
+            effects,
         )
     }
 
@@ -790,7 +796,7 @@ mod tests {
     #[test]
     fn init_requests_finalized_header_and_marks_chain_bootstrapping() {
         let chain = ChainKey::Ethereum;
-        let (state, effects) = State::init(chain);
+        let (state, effects) = State::init(&[chain]);
 
         assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
         assert!(matches!(
@@ -803,9 +809,28 @@ mod tests {
 
     #[test]
     fn init_has_no_optimization_result() {
-        let (state, _effects) = State::init(ChainKey::Ethereum);
+        let (state, _effects) = State::init(&[ChainKey::Ethereum]);
 
         assert_eq!(state.latest_optimization_result(), None);
+    }
+
+    #[test]
+    fn init_seeds_each_chain_in_set_as_bootstrapping() {
+        let (state, _effects) = State::init(crate::ACTIVE_CHAINS);
+
+        let observations = state.observe();
+
+        assert_eq!(observations.len(), crate::ACTIVE_CHAINS.len());
+        for &chain in crate::ACTIVE_CHAINS {
+            assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
+            assert!(
+                observations.iter().any(|(observed_chain, observation)| {
+                    *observed_chain == chain
+                        && *observation == ChainObservation::Initializing
+                }),
+                "active chain {chain:?} should be seeded as initializing"
+            );
+        }
     }
 
     #[test]
@@ -883,7 +908,7 @@ mod tests {
     #[test]
     fn observe_reports_initializing_while_bootstrapping() {
         let chain = ChainKey::Ethereum;
-        let (state, _effects) = State::init(chain);
+        let (state, _effects) = State::init(&[chain]);
 
         assert_eq!(
             state.observe(),
@@ -986,7 +1011,7 @@ mod tests {
     #[test]
     fn bootstrap_deadline_before_anchor_abandons_chain() {
         let chain = ChainKey::Ethereum;
-        let (mut state, _effects) = State::init(chain);
+        let (mut state, _effects) = State::init(&[chain]);
         let policy = bootstrap_policy(chain);
 
         for _ in 0..policy.deadline_ticks {
@@ -1000,7 +1025,7 @@ mod tests {
     #[test]
     fn chain_event_for_inactive_chain_is_ignored() {
         let chain = ChainKey::Ethereum;
-        let (mut state, _effects) = State::init(chain);
+        let (mut state, _effects) = State::init(&[chain]);
         let policy = bootstrap_policy(chain);
 
         for _ in 0..policy.deadline_ticks {
@@ -1046,7 +1071,7 @@ mod tests {
     #[test]
     fn tick_keeps_bootstrapping_chain_initializing_before_deadline() {
         let chain = ChainKey::Ethereum;
-        let (state, _) = State::init(chain);
+        let (state, _) = State::init(&[chain]);
 
         let (state, _effects) = transition(state, Event::Tick);
 
@@ -1388,7 +1413,7 @@ mod tests {
 
     #[test]
     fn pool_reserves_projection_returns_none_when_ethereum_chain_is_inactive() {
-        let (state, _) = State::init(ChainKey::Ethereum);
+        let (state, _) = State::init(&[ChainKey::Ethereum]);
         let (state, update) = projection_update(state, hash(1), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
@@ -1878,7 +1903,7 @@ mod tests {
     /// Drives a freshly initialized chain through the full bootstrap handshake to an active kernel.
     /// Feeds empty responses, so the activated kernel is anchored at `finalized_hash` with no seed.
     fn drive_bootstrap_to_active(chain: ChainKey, finalized_hash: BlockHash) -> State {
-        let (mut state, mut effects) = State::init(chain);
+        let (mut state, mut effects) = State::init(&[chain]);
 
         while state.status(chain) == Some(ChainStatus::Initializing) {
             let event = bootstrap_success_event(

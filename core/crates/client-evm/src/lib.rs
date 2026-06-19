@@ -18,7 +18,7 @@ mod tokens;
 pub mod uniswap_v3;
 mod utils;
 
-pub use chain::{ChainKey, drpc_network_path};
+pub use chain::{ACTIVE_CHAINS, ChainKey, drpc_network_path};
 pub use client::{
     ClientEvent, ClientHead, RangeLogBlock, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
