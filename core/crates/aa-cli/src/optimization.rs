@@ -26,17 +26,28 @@ pub fn run_optimization<T>(
     result_sender: Sender<T>,
     map_result: impl Fn(OptimizationStepResult) -> T,
 ) -> Result<(), RunOptimizationError> {
-    let initial_snapshot = receiver
-        .wait_take()
-        .map_err(RunOptimizationError::Receive)?;
-    let (mut runner, result) =
-        OptimizationRunner::<PoolAddress, TokenAddress, OPTIMIZATION_LAYERS>::init(
+    // Wait for the first snapshot that can actually initialize. With cross-chain merging, the first
+    // snapshot may arrive from a faster chain before the chain that owns the `init_asset` (quote
+    // token) has reported, so the init asset is absent and init fails with `InitAssetOutputNotFound`.
+    // That is a transient "not ready yet" condition, not a fatal error: drop the snapshot and wait
+    // for the next one. Every other init error stays fatal.
+    let (mut runner, result) = loop {
+        let snapshot = receiver
+            .wait_take()
+            .map_err(RunOptimizationError::Receive)?;
+        match OptimizationRunner::<PoolAddress, TokenAddress, OPTIMIZATION_LAYERS>::init(
             backend,
-            initial_snapshot.reserves,
-            session_config,
+            snapshot.reserves,
+            session_config.clone(),
             step_config,
-        )
-        .map_err(RunOptimizationError::Init)?;
+        ) {
+            Ok(initialized) => break initialized,
+            Err(OptimizationInitError::Step(OptimizationStepError::InitAssetOutputNotFound)) => {
+                continue;
+            }
+            Err(error) => return Err(RunOptimizationError::Init(error)),
+        }
+    };
 
     if result_sender.send(map_result(result)).is_err() {
         return Ok(());
@@ -59,7 +70,10 @@ pub fn run_optimization<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::mpsc};
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::mpsc,
+    };
 
     use client_evm::{BlockHash, ChainKey, PoolAddress, TokenAddress};
     use optimization::{OptimizationStepStatus, PoolReserves, VirtualReserveValues};
@@ -139,10 +153,66 @@ mod tests {
         assert_eq!(outcome, Ok(()));
     }
 
+    #[test]
+    fn first_snapshot_missing_init_asset_is_skipped_not_fatal() {
+        let (sender, receiver) = latest_slot();
+
+        // A snapshot whose reserves never output the init_asset — e.g. a faster chain reported before
+        // the chain that owns the quote token. Init must treat this as "not ready yet": skip it and
+        // keep waiting, not abort the worker with an Init error.
+        sender.send(snapshot_without_init_asset(1)).unwrap();
+        sender.close().unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let outcome = run_optimization(
+            receiver,
+            OptimizationBackendSelection::Cpu,
+            session_config(),
+            step_config(),
+            result_sender,
+            |result| result,
+        );
+
+        // The unready snapshot was skipped (no fatal Init error); the wait then ends cleanly on close.
+        // Initialization never completed, so no step result was ever produced.
+        assert_eq!(
+            outcome,
+            Err(RunOptimizationError::Receive(LatestReceiveError::Closed))
+        );
+        assert!(result_receiver.recv().is_err());
+    }
+
     fn snapshot(last_byte: u8) -> OptimizationPoolReserves {
         OptimizationPoolReserves {
-            block_hash: BlockHash::with_last_byte(last_byte),
+            block_hashes: BTreeMap::from([(
+                ChainKey::Ethereum,
+                BlockHash::with_last_byte(last_byte),
+            )]),
             reserves: base_reserves(),
+        }
+    }
+
+    fn snapshot_without_init_asset(last_byte: u8) -> OptimizationPoolReserves {
+        // The session's init_asset is `token()` (Ethereum-stamped default). An Arbitrum-stamped
+        // default token is a distinct key, so no reserve here ever outputs the init_asset.
+        let other = TokenAddress(Default::default(), ChainKey::Arbitrum);
+        OptimizationPoolReserves {
+            block_hashes: BTreeMap::from([(
+                ChainKey::Arbitrum,
+                BlockHash::with_last_byte(last_byte),
+            )]),
+            reserves: vec![PoolReserves {
+                pool_id: PoolAddress(Default::default(), ChainKey::Arbitrum),
+                token0: other,
+                token1: other,
+                value: VirtualReserveValues {
+                    token_0: 2.0,
+                    token_1: 3.0,
+                    fee_multiplier: 0.997,
+                    max_swap_0: 1.0,
+                    max_swap_1: 1.0,
+                },
+            }],
         }
     }
 

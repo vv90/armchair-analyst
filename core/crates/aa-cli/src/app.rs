@@ -1,9 +1,9 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
-    AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent, ClientEvmError, ClientHead,
-    ETHEREUM_USDC_TOKEN_ADDRESS, PoolAddress, PoolCandidateAddress, PoolDataResult,
-    PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult, bootstrap,
-    fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
+    ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent,
+    ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, PoolAddress, PoolCandidateAddress,
+    PoolDataResult, PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult,
+    bootstrap, fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
     fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
     kernel,
     multi_chain_kernel::{
@@ -213,9 +213,14 @@ fn format_input_log(input: &Event) -> String {
 }
 
 fn format_run_optimization_effect_log(input: &OptimizationPoolReserves) -> String {
+    let blocks = input
+        .block_hashes
+        .iter()
+        .map(|(chain, hash)| format!("{chain:?}:{hash}"))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "effect run_optimization block={} reserves={}",
-        input.block_hash,
+        "effect run_optimization blocks={blocks} reserves={}",
         input.reserves.len()
     )
 }
@@ -459,8 +464,19 @@ fn default_optimization_backend() -> OptimizationBackendSelection {
 fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddress> {
     OptimizationSessionConfig {
         init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
-        bridges: HashSet::new(),
+        bridges: default_optimization_bridges(),
     }
+}
+
+/// Synthetic 1:1 connection between each chain's USDC, treating them as fungible so the single
+/// `init_asset` (Ethereum USDC) can traverse Arbitrum pools and close cross-chain cycles. Bridges are
+/// directional in the optimizer, so both orderings are registered; the optimizer ignores a bridge
+/// whose endpoints aren't yet present, so an Arbitrum entry is harmless before Arbitrum has reported.
+fn default_optimization_bridges() -> HashSet<(TokenAddress, TokenAddress)> {
+    HashSet::from([
+        (ETHEREUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS),
+        (ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+    ])
 }
 
 fn default_optimization_step_config() -> OptimizationStepConfig {
@@ -864,7 +880,10 @@ mod tests {
 
         assert_eq!(
             format_run_optimization_effect_log(&input),
-            format!("effect run_optimization block={} reserves=0", hash(7))
+            format!(
+                "effect run_optimization blocks=Ethereum:{} reserves=0",
+                hash(7)
+            )
         );
     }
 
@@ -876,6 +895,25 @@ mod tests {
         });
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn default_session_config_bridges_the_chain_usdc_quote_tokens() {
+        let config = default_optimization_session_config();
+
+        // Ethereum USDC is the single global quote/init asset; the bidirectional 1:1 bridge to
+        // Arbitrum USDC lets the solver close cross-chain cycles back to it.
+        assert_eq!(config.init_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
+        assert!(
+            config
+                .bridges
+                .contains(&(ETHEREUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS))
+        );
+        assert!(
+            config
+                .bridges
+                .contains(&(ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS))
+        );
     }
 
     #[test]
@@ -1520,7 +1558,7 @@ mod tests {
         block_hash: BlockHash,
     ) -> client_evm::multi_chain_kernel::OptimizationPoolReserves {
         client_evm::multi_chain_kernel::OptimizationPoolReserves {
-            block_hash,
+            block_hashes: std::collections::BTreeMap::from([(ChainKey::Ethereum, block_hash)]),
             reserves: Vec::new(),
         }
     }
@@ -1529,7 +1567,7 @@ mod tests {
         block_hash: BlockHash,
     ) -> client_evm::multi_chain_kernel::OptimizationPoolReserves {
         client_evm::multi_chain_kernel::OptimizationPoolReserves {
-            block_hash,
+            block_hashes: std::collections::BTreeMap::from([(ChainKey::Ethereum, block_hash)]),
             reserves: vec![optimization_pool_reserves()],
         }
     }

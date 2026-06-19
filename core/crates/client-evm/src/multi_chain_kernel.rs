@@ -81,9 +81,20 @@ const ARBITRUM_BOOTSTRAP_TIP_TRIM: usize = 8;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
 const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
+/// One chain's projected reserves at the block they were derived from. The per-chain piece that
+/// `pool_reserves_for_optimization` yields; the merge concatenates these into one optimizer envelope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChainPoolReserves {
+    pub block_hash: BlockHash,
+    pub reserves: Vec<PoolReserves<PoolAddress, TokenAddress>>,
+}
+
+/// The merged optimizer input spanning every active chain. Reserves stay a flat `Vec` because chain
+/// identity already rides inside every `PoolAddress`/`TokenAddress`; `block_hashes` records the block
+/// each contributing chain was projected at (one entry per chain in the merge).
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptimizationPoolReserves {
-    pub block_hash: BlockHash,
+    pub block_hashes: BTreeMap<ChainKey, BlockHash>,
     pub reserves: Vec<PoolReserves<PoolAddress, TokenAddress>>,
 }
 
@@ -206,7 +217,7 @@ pub fn pool_reserves_for_optimization(
     state: &State,
     chain: ChainKey,
     update: &kernel::CompletePoolStateUpdate,
-) -> Result<Option<OptimizationPoolReserves>, PoolReserveProjectionError> {
+) -> Result<Option<ChainPoolReserves>, PoolReserveProjectionError> {
     let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&chain) else {
         return Ok(None);
     };
@@ -248,10 +259,37 @@ pub fn pool_reserves_for_optimization(
         reserves.extend([reserve, reserve.inverse()]);
     }
 
-    Ok(Some(OptimizationPoolReserves {
+    Ok(Some(ChainPoolReserves {
         block_hash: update.block_hash,
         reserves,
     }))
+}
+
+/// Rebuilds the merged optimizer input from every active chain's current kernel state. Pure over
+/// `&State`: each call re-projects from the authoritative per-chain states rather than reading any
+/// cached reserves, so the merge can never serve stale or drifted data. Chains that are still
+/// bootstrapping, lack a resolvable overlay, or fail projection simply contribute nothing this round.
+fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
+    let mut block_hashes = BTreeMap::new();
+    let mut reserves = Vec::new();
+
+    for (&chain, lifecycle) in &state.chains {
+        let ChainLifecycle::Active(chain_state) = lifecycle else {
+            continue;
+        };
+        let Some(update) = chain_state.latest_complete_pool_state_update(chain) else {
+            continue;
+        };
+        if let Ok(Some(chain_reserves)) = pool_reserves_for_optimization(state, chain, &update) {
+            block_hashes.insert(chain, chain_reserves.block_hash);
+            reserves.extend(chain_reserves.reserves);
+        }
+    }
+
+    OptimizationPoolReserves {
+        block_hashes,
+        reserves,
+    }
 }
 
 /// Merges finalized snapshots with update snapshots and returns pools in deterministic order.
@@ -689,13 +727,20 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
 
             if let Some(update) = optimization_update {
                 let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
-                // Project and dispatch only when the fully-fetched block advanced. Record the hash
-                // only on a successful projection so an unready (`Ok(None)`) or failed (`Err`) chain
-                // retries this block on the next event instead of being skipped.
-                if changed {
-                    if let Ok(Some(input)) = pool_reserves_for_optimization(&state, chain, &update)
-                    {
-                        state.last_optimized_block.insert(chain, update.block_hash);
+                // Dispatch only when *this* chain's fully-fetched block advanced and its own
+                // projection is ready. Record the hash only on that success so an unready
+                // (`Ok(None)`) or failed (`Err`) chain retries this block next event. The dispatched
+                // input is then re-derived across *all* active chains, so a slow chain rides along
+                // with its current state and a fast chain never stalls waiting for it.
+                if changed
+                    && matches!(
+                        pool_reserves_for_optimization(&state, chain, &update),
+                        Ok(Some(_))
+                    )
+                {
+                    state.last_optimized_block.insert(chain, update.block_hash);
+                    let input = merged_optimization_reserves(&state);
+                    if !input.reserves.is_empty() {
                         effects.push(Effect::RunOptimization { input });
                     }
                 }
@@ -802,7 +847,7 @@ fn bootstrap_policy(chain: ChainKey) -> bootstrap::BootstrapPolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use alloy::primitives::{Address, BlockHash, U160, U256, aliases::I24};
     use optimization::{
@@ -1316,14 +1361,11 @@ mod tests {
                 },
             },
         );
-        // Resolving the block's logs advances the complete pool-state frontier to this block, which
-        // now dispatches an optimization run. The empty test registry projects empty reserves (the
-        // adapter filters those before the worker), but the kernel still emits exactly this effect
-        // and leaves no chain-routing work behind.
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::RunOptimization { .. }]
-        ));
+        // Resolving the block's logs advances the complete pool-state frontier to this block. The
+        // empty test registry projects no reserves, so the merged optimizer input is empty and the
+        // kernel emits nothing — it dispatches an optimization run only once some chain has
+        // projectable reserves.
+        assert!(effects.is_empty());
 
         let (state, effects) = transition(
             state,
@@ -1352,7 +1394,7 @@ mod tests {
     #[test]
     fn run_optimization_effect_carries_chain_neutral_input() {
         let input = OptimizationPoolReserves {
-            block_hash: hash(1),
+            block_hashes: BTreeMap::from([(ChainKey::Ethereum, hash(1))]),
             reserves: Vec::new(),
         };
 
@@ -1398,7 +1440,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].block_hash, hash(1));
+        assert_eq!(
+            inputs[0].block_hashes.get(&ChainKey::Ethereum),
+            Some(&hash(1))
+        );
         assert_directional_pair(&inputs[0].reserves, pool, token0, token1, &pool_state);
     }
 
@@ -1569,6 +1614,136 @@ mod tests {
             arbitrum_token0,
             arbitrum_token1,
             &arbitrum_pool_state,
+        );
+    }
+
+    /// Builds a two-chain Active state whose pools share the same raw addresses across chains,
+    /// distinguished only by `ChainKey` — the cross-chain collision the widened identity prevents,
+    /// now exercised through the live merge instead of per-chain projection.
+    fn merged_two_chain_state() -> State {
+        let ethereum_state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::from([(
+                pool_on(ChainKey::Ethereum, 10),
+                balanced_pool_state(1_000_000),
+            )]),
+            HashMap::from([(
+                pool_on(ChainKey::Ethereum, 10),
+                pool_metadata(
+                    token_on(ChainKey::Ethereum, 1),
+                    token_on(ChainKey::Ethereum, 2),
+                    UniswapV3Fee::Fee3000,
+                ),
+            )]),
+            HashMap::from([
+                (token_on(ChainKey::Ethereum, 1), token_metadata(18)),
+                (token_on(ChainKey::Ethereum, 2), token_metadata(6)),
+            ]),
+        );
+        let arbitrum_state = projection_state(
+            ChainKey::Arbitrum,
+            hash(2),
+            HashMap::from([(
+                pool_on(ChainKey::Arbitrum, 10),
+                balanced_pool_state(2_000_000),
+            )]),
+            HashMap::from([(
+                pool_on(ChainKey::Arbitrum, 10),
+                pool_metadata(
+                    token_on(ChainKey::Arbitrum, 1),
+                    token_on(ChainKey::Arbitrum, 2),
+                    UniswapV3Fee::Fee3000,
+                ),
+            )]),
+            HashMap::from([
+                (token_on(ChainKey::Arbitrum, 1), token_metadata(18)),
+                (token_on(ChainKey::Arbitrum, 2), token_metadata(6)),
+            ]),
+        );
+
+        let mut chains = ethereum_state.chains;
+        chains.extend(arbitrum_state.chains);
+        State {
+            chains,
+            latest_optimization_result: None,
+            last_optimized_block: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn merged_optimization_reserves_concatenates_every_active_chain() {
+        let state = merged_two_chain_state();
+
+        let merged = merged_optimization_reserves(&state);
+
+        // Both chains contribute their directional pair into one flat Vec, each tagged with its own
+        // block, and the same raw addresses on different chains stay distinct keys (no collision).
+        assert_eq!(merged.reserves.len(), 4);
+        assert_eq!(
+            merged.block_hashes,
+            BTreeMap::from([(ChainKey::Ethereum, hash(1)), (ChainKey::Arbitrum, hash(2))])
+        );
+        assert_directional_pair(
+            &merged.reserves,
+            pool_on(ChainKey::Ethereum, 10),
+            token_on(ChainKey::Ethereum, 1),
+            token_on(ChainKey::Ethereum, 2),
+            &balanced_pool_state(1_000_000),
+        );
+        assert_directional_pair(
+            &merged.reserves,
+            pool_on(ChainKey::Arbitrum, 10),
+            token_on(ChainKey::Arbitrum, 1),
+            token_on(ChainKey::Arbitrum, 2),
+            &balanced_pool_state(2_000_000),
+        );
+        let keys = merged
+            .reserves
+            .iter()
+            .map(|reserve| (reserve.pool_id, reserve.token0, reserve.token1))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            keys.len(),
+            merged.reserves.len(),
+            "reserve keys must be unique"
+        );
+    }
+
+    #[test]
+    fn chain_event_emits_merge_spanning_all_chains_when_one_chain_advances() {
+        let state = merged_two_chain_state();
+
+        // Advance only Arbitrum. The dispatched input is reconstructed across *all* active chains, so
+        // it still carries Ethereum's reserves — proving the merge reads every chain, not just the
+        // one that advanced, and that no per-chain reserves cache is involved.
+        let (_state, effects) = transition(
+            state,
+            Event::ChainEvent {
+                chain: ChainKey::Arbitrum,
+                event: kernel::Event::Tick,
+            },
+        );
+
+        let input = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::RunOptimization { input } => Some(input),
+                _ => None,
+            })
+            .expect("advancing a chain dispatches a merged optimization run");
+
+        assert_eq!(input.reserves.len(), 4);
+        assert_eq!(
+            input.block_hashes,
+            BTreeMap::from([(ChainKey::Ethereum, hash(1)), (ChainKey::Arbitrum, hash(2))])
+        );
+        assert_directional_pair(
+            &input.reserves,
+            pool_on(ChainKey::Ethereum, 10),
+            token_on(ChainKey::Ethereum, 1),
+            token_on(ChainKey::Ethereum, 2),
+            &balanced_pool_state(1_000_000),
         );
     }
 
