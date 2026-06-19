@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::Address;
 
+use crate::ChainKey;
 use crate::pool_state::PoolAddress;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -95,12 +96,13 @@ impl TrustedPoolRegistry {
 
     pub fn with_metadata_results(
         self,
+        chain: ChainKey,
         results: HashMap<PoolCandidateAddress, PoolMetadataResult>,
     ) -> TrustedPoolRegistry {
         let mut registry = self;
 
         for (candidate, result) in results {
-            let pool = PoolAddress(candidate.0);
+            let pool = PoolAddress(candidate.0, chain);
 
             match result {
                 Ok(metadata) => {
@@ -127,8 +129,12 @@ impl TrustedPoolRegistry {
         self.verified.len()
     }
 
-    pub fn verified_pool(&self, candidate: PoolCandidateAddress) -> Option<PoolAddress> {
-        let pool = PoolAddress(candidate.0);
+    pub fn verified_pool(
+        &self,
+        chain: ChainKey,
+        candidate: PoolCandidateAddress,
+    ) -> Option<PoolAddress> {
+        let pool = PoolAddress(candidate.0, chain);
         self.verified.contains_key(&pool).then_some(pool)
     }
 
@@ -136,25 +142,30 @@ impl TrustedPoolRegistry {
         self.rejected.contains(&candidate)
     }
 
-    pub fn is_known(&self, candidate: PoolCandidateAddress) -> bool {
-        self.verified_pool(candidate).is_some() || self.is_rejected(candidate)
+    pub fn is_known(&self, chain: ChainKey, candidate: PoolCandidateAddress) -> bool {
+        self.verified_pool(chain, candidate).is_some() || self.is_rejected(candidate)
     }
 
     pub fn unknown_candidates(
         &self,
+        chain: ChainKey,
         candidates: &HashSet<PoolCandidateAddress>,
     ) -> HashSet<PoolCandidateAddress> {
         candidates
             .iter()
             .copied()
-            .filter(|candidate| !self.is_known(*candidate))
+            .filter(|candidate| !self.is_known(chain, *candidate))
             .collect()
     }
 
-    pub fn trusted_pool_logs(&self, candidates: &HashSet<PoolCandidateAddress>) -> TrustedPoolLogs {
+    pub fn trusted_pool_logs(
+        &self,
+        chain: ChainKey,
+        candidates: &HashSet<PoolCandidateAddress>,
+    ) -> TrustedPoolLogs {
         let mut pools = HashSet::new();
         for candidate in candidates {
-            if let Some(pool) = self.verified_pool(*candidate) {
+            if let Some(pool) = self.verified_pool(chain, *candidate) {
                 pools.insert(pool);
             } else if !self.is_rejected(*candidate) {
                 return TrustedPoolLogs::PendingValidation;
@@ -214,16 +225,18 @@ mod tests {
         let candidate = candidate(3);
         let metadata = pool_metadata(1, 2, UniswapV3Fee::Fee500);
 
-        let registry = TrustedPoolRegistry::new()
-            .with_metadata_results(HashMap::from([(candidate, Ok(metadata.clone()))]));
+        let registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(metadata.clone()))]),
+        );
 
         assert_eq!(
-            registry.verified_metadata(PoolAddress(candidate.0)),
+            registry.verified_metadata(PoolAddress(candidate.0, ChainKey::Ethereum)),
             Some(&metadata)
         );
         assert_eq!(
-            registry.verified_pool(candidate),
-            Some(PoolAddress(candidate.0))
+            registry.verified_pool(ChainKey::Ethereum, candidate),
+            Some(PoolAddress(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -234,26 +247,32 @@ mod tests {
         let metadata = pool_metadata(1, 2, UniswapV3Fee::Fee500);
 
         let registry = TrustedPoolRegistry::new()
-            .with_metadata_results(HashMap::from([(
-                candidate,
-                Err(PoolMetadataFailure::FactoryReturnedZero),
-            )]))
-            .with_metadata_results(HashMap::from([(candidate, Ok(metadata))]));
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(candidate, Err(PoolMetadataFailure::FactoryReturnedZero))]),
+            )
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(candidate, Ok(metadata))]),
+            );
 
         assert_eq!(
-            registry.verified_pool(candidate),
-            Some(PoolAddress(candidate.0))
+            registry.verified_pool(ChainKey::Ethereum, candidate),
+            Some(PoolAddress(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
     }
 
     #[test]
     fn verified_size_counts_verified_pools_only() {
-        let registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (candidate(1), Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500))),
-            (candidate(2), Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000))),
-            (candidate(3), Err(PoolMetadataFailure::FactoryReturnedZero)),
-        ]));
+        let registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (candidate(1), Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500))),
+                (candidate(2), Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000))),
+                (candidate(3), Err(PoolMetadataFailure::FactoryReturnedZero)),
+            ]),
+        );
 
         assert_eq!(registry.verified_size(), 2);
     }
@@ -264,17 +283,23 @@ mod tests {
         let metadata = pool_metadata(1, 2, UniswapV3Fee::Fee500);
 
         let registry = TrustedPoolRegistry::new()
-            .with_metadata_results(HashMap::from([(candidate, Ok(metadata))]))
-            .with_metadata_results(HashMap::from([(
-                candidate,
-                Err(PoolMetadataFailure::FactoryMismatch {
-                    returned: Address::with_last_byte(9),
-                }),
-            )]));
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(candidate, Ok(metadata))]),
+            )
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(
+                    candidate,
+                    Err(PoolMetadataFailure::FactoryMismatch {
+                        returned: Address::with_last_byte(9),
+                    }),
+                )]),
+            );
 
         assert_eq!(
-            registry.verified_pool(candidate),
-            Some(PoolAddress(candidate.0))
+            registry.verified_pool(ChainKey::Ethereum, candidate),
+            Some(PoolAddress(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -285,22 +310,25 @@ mod tests {
         let rejected = candidate(4);
         let pending = candidate(5);
         let registry = TrustedPoolRegistry::new()
-            .with_metadata_results(HashMap::from([(
-                verified,
-                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-            )]))
-            .with_metadata_results(HashMap::from([(
-                rejected,
-                Err(PoolMetadataFailure::FactoryReturnedZero),
-            )]));
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+            )
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(rejected, Err(PoolMetadataFailure::FactoryReturnedZero))]),
+            );
 
         assert_eq!(
-            registry.trusted_pool_logs(&HashSet::from([verified, rejected, pending])),
+            registry.trusted_pool_logs(
+                ChainKey::Ethereum,
+                &HashSet::from([verified, rejected, pending])
+            ),
             TrustedPoolLogs::PendingValidation
         );
         assert_eq!(
-            registry.trusted_pool_logs(&HashSet::from([verified, rejected])),
-            TrustedPoolLogs::Resolved(HashSet::from([PoolAddress(verified.0)]))
+            registry.trusted_pool_logs(ChainKey::Ethereum, &HashSet::from([verified, rejected])),
+            TrustedPoolLogs::Resolved(HashSet::from([PoolAddress(verified.0, ChainKey::Ethereum)]))
         );
     }
 
@@ -322,7 +350,7 @@ mod tests {
                 })
                 .collect::<HashMap<_, _>>();
 
-            let registry = TrustedPoolRegistry::new().with_metadata_results(results);
+            let registry = TrustedPoolRegistry::new().with_metadata_results(ChainKey::Ethereum, results);
 
             for pool in registry.verified_pools_for_test() {
                 prop_assert!(!registry.is_rejected(PoolCandidateAddress(pool.0)));
@@ -377,16 +405,16 @@ mod tests {
                     }
                 }
 
-                registry = registry.with_metadata_results(results);
+                registry = registry.with_metadata_results(ChainKey::Ethereum, results);
 
                 for candidate in &observed_candidates {
                     prop_assert_eq!(
-                        registry.verified_pool(*candidate).is_some(),
+                        registry.verified_pool(ChainKey::Ethereum, *candidate).is_some(),
                         expected_verified.contains(candidate)
                     );
                     prop_assert_eq!(registry.is_rejected(*candidate), expected_rejected.contains(candidate));
                     prop_assert_eq!(
-                        registry.is_known(*candidate),
+                        registry.is_known(ChainKey::Ethereum, *candidate),
                         expected_verified.contains(candidate) || expected_rejected.contains(candidate)
                     );
                 }
@@ -394,21 +422,21 @@ mod tests {
                 let expected_unknown = query
                     .iter()
                     .copied()
-                    .filter(|candidate| !registry.is_known(*candidate))
+                    .filter(|candidate| !registry.is_known(ChainKey::Ethereum, *candidate))
                     .collect::<HashSet<_>>();
-                prop_assert_eq!(registry.unknown_candidates(&query), expected_unknown);
+                prop_assert_eq!(registry.unknown_candidates(ChainKey::Ethereum, &query), expected_unknown);
 
-                match registry.trusted_pool_logs(&query) {
+                match registry.trusted_pool_logs(ChainKey::Ethereum, &query) {
                     TrustedPoolLogs::PendingValidation => {
-                        prop_assert!(query.iter().any(|candidate| !registry.is_known(*candidate)));
+                        prop_assert!(query.iter().any(|candidate| !registry.is_known(ChainKey::Ethereum, *candidate)));
                     }
                     TrustedPoolLogs::Resolved(pools) => {
                         let expected_pools = query
                             .iter()
-                            .filter_map(|candidate| registry.verified_pool(*candidate))
+                            .filter_map(|candidate| registry.verified_pool(ChainKey::Ethereum, *candidate))
                             .collect::<HashSet<_>>();
 
-                        prop_assert!(query.iter().all(|candidate| registry.is_known(*candidate)));
+                        prop_assert!(query.iter().all(|candidate| registry.is_known(ChainKey::Ethereum, *candidate)));
                         prop_assert_eq!(pools, expected_pools);
                     }
                     TrustedPoolLogs::Unknown => {

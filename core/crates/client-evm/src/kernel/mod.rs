@@ -7,7 +7,7 @@ pub(crate) mod pool_registry;
 pub(crate) mod token_registry;
 
 use self::{pending_requests::*, pool_registry::*, token_registry::*};
-use crate::{pool_state::*, tick::Tick};
+use crate::{ChainKey, pool_state::*, tick::Tick};
 
 enum PoolLogsStatus {
     Unknown,
@@ -117,12 +117,13 @@ impl BlocksGraph {
     /// Added so validation state stays in `TrustedPoolRegistry` and block state does not duplicate trusted/rejected facts.
     fn trusted_pool_logs(
         &self,
+        chain: ChainKey,
         block_hash: BlockHash,
         registry: &TrustedPoolRegistry,
     ) -> Option<TrustedPoolLogs> {
         self.get(&block_hash).map(|block| match &block.pool_logs {
             PoolLogsStatus::Unknown => TrustedPoolLogs::Unknown,
-            PoolLogsStatus::Resolved(candidates) => registry.trusted_pool_logs(candidates),
+            PoolLogsStatus::Resolved(candidates) => registry.trusted_pool_logs(chain, candidates),
         })
     }
 
@@ -254,6 +255,7 @@ impl BlocksGraph {
     /// Added to batch accumulated affected pools at the latest tip while skipping pools already snapshotted, failed, or pending there.
     fn unknown_present_canonical_pool_data_request(
         &self,
+        chain: ChainKey,
         tip_hash: BlockHash,
         finalized_hash: BlockHash,
         registry: &TrustedPoolRegistry,
@@ -271,7 +273,9 @@ impl BlocksGraph {
             };
 
             if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
-                if let TrustedPoolLogs::Resolved(pools) = registry.trusted_pool_logs(candidates) {
+                if let TrustedPoolLogs::Resolved(pools) =
+                    registry.trusted_pool_logs(chain, candidates)
+                {
                     dirty_pools.extend(pools);
                 }
             }
@@ -324,6 +328,7 @@ impl BlocksGraph {
     /// Added to prevent arbitrary contracts that emit matching topics from being treated as real Uniswap pools.
     fn unknown_present_canonical_pool_metadata_requests(
         &self,
+        chain: ChainKey,
         tip_hash: BlockHash,
         finalized_hash: BlockHash,
         registry: &TrustedPoolRegistry,
@@ -348,7 +353,7 @@ impl BlocksGraph {
                     .iter()
                     .copied()
                     .filter(|candidate| {
-                        !registry.is_known(*candidate)
+                        !registry.is_known(chain, *candidate)
                             && !unavailable_candidates.contains(candidate)
                     })
                     .collect::<HashSet<_>>();
@@ -369,6 +374,7 @@ impl BlocksGraph {
     /// Added so later reserve projection can scale exact on-chain amounts by trusted token decimals.
     fn unknown_present_canonical_token_metadata_requests(
         &self,
+        chain: ChainKey,
         tip_hash: BlockHash,
         finalized_hash: BlockHash,
         pool_registry: &TrustedPoolRegistry,
@@ -392,10 +398,13 @@ impl BlocksGraph {
             if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
                 let tokens = candidates
                     .iter()
-                    .filter_map(|candidate| pool_registry.verified_pool(*candidate))
+                    .filter_map(|candidate| pool_registry.verified_pool(chain, *candidate))
                     .filter_map(|pool| pool_registry.verified_metadata(pool))
                     .flat_map(|metadata| {
-                        [TokenAddress(metadata.token0), TokenAddress(metadata.token1)]
+                        [
+                            TokenAddress(metadata.token0, chain),
+                            TokenAddress(metadata.token1, chain),
+                        ]
                     })
                     .filter(|token| {
                         !token_registry.is_known(*token) && !unavailable_tokens.contains(token)
@@ -571,8 +580,11 @@ impl State {
 
     /// Latest complete pool-state overlay anchored at the current canonical tip.
     /// Added so optimization dispatch can read the tip's fully-fetched pool state without exposing `canonical_tip`.
-    pub(crate) fn latest_complete_pool_state_update(&self) -> Option<CompletePoolStateUpdate> {
-        self.latest_complete_pool_state_update_from(self.canonical_tip)
+    pub(crate) fn latest_complete_pool_state_update(
+        &self,
+        chain: ChainKey,
+    ) -> Option<CompletePoolStateUpdate> {
+        self.latest_complete_pool_state_update_from(chain, self.canonical_tip)
     }
 
     /// Counts canonical blocks the tip is ahead of `reference_hash` on a connected path.
@@ -658,6 +670,7 @@ impl State {
     /// Added so optimization and compaction can share one readiness query without triggering effects.
     pub fn latest_complete_pool_state_update_from(
         &self,
+        chain: ChainKey,
         start_block_hash: BlockHash,
     ) -> Option<CompletePoolStateUpdate> {
         let hashes = self.blocks.connected_path_hashes_oldest_to_newest(
@@ -682,7 +695,8 @@ impl State {
 
             // Unresolved logs or pending candidate validation stop the scan; keep the latest
             // complete overlay found before this block.
-            let Some(trusted_pools) = self.trusted_pools_for_complete_pool_state_scan(block) else {
+            let Some(trusted_pools) = self.trusted_pools_for_complete_pool_state_scan(chain, block)
+            else {
                 break;
             };
 
@@ -733,12 +747,13 @@ impl State {
     /// Added so unresolved logs or pending candidate validation stop the scan without losing the latest prior complete overlay.
     fn trusted_pools_for_complete_pool_state_scan(
         &self,
+        chain: ChainKey,
         block: &BlockNode,
     ) -> Option<HashSet<PoolAddress>> {
         match &block.pool_logs {
             PoolLogsStatus::Unknown => None,
             PoolLogsStatus::Resolved(candidates) => {
-                match self.pool_registry.trusted_pool_logs(candidates) {
+                match self.pool_registry.trusted_pool_logs(chain, candidates) {
                     TrustedPoolLogs::Resolved(pools) => Some(pools),
                     TrustedPoolLogs::Unknown | TrustedPoolLogs::PendingValidation => None,
                 }
@@ -748,7 +763,7 @@ impl State {
 
     /// Attempts to compact recent block data into the finalized snapshot.
     /// Added to bound block graph growth without remembering failed finalized observations.
-    fn with_finalized_block_observed(self, block_hash: BlockHash) -> State {
+    fn with_finalized_block_observed(self, chain: ChainKey, block_hash: BlockHash) -> State {
         if block_hash == self.finalized_state.block_hash {
             return self;
         }
@@ -761,7 +776,7 @@ impl State {
             return self;
         }
 
-        let Some(update) = self.latest_complete_pool_state_update_from(block_hash) else {
+        let Some(update) = self.latest_complete_pool_state_update_from(chain, block_hash) else {
             return self;
         };
 
@@ -983,6 +998,7 @@ fn schedule_unknown_canonical_log_requests(
 /// Emits pool metadata requests for unvalidated candidate addresses on the canonical path.
 /// Added to turn log emitters into verified/rejected registry entries before using them as pools.
 fn schedule_unknown_canonical_pool_metadata_requests(
+    chain: ChainKey,
     state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
@@ -998,6 +1014,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
 
     let pending_candidates = pending_requests.pending_pool_metadata_candidates();
     let requests = blocks.unknown_present_canonical_pool_metadata_requests(
+        chain,
         canonical_tip,
         finalized_state.block_hash,
         &pool_registry,
@@ -1039,6 +1056,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
 /// Emits token metadata requests for tokens referenced by verified canonical pools.
 /// Added so reserve projection can use known decimals and avoid guessing token scale.
 fn schedule_unknown_canonical_token_metadata_requests(
+    chain: ChainKey,
     state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
@@ -1054,6 +1072,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
 
     let pending_tokens = pending_requests.pending_token_metadata_tokens();
     let requests = blocks.unknown_present_canonical_token_metadata_requests(
+        chain,
         canonical_tip,
         finalized_state.block_hash,
         &pool_registry,
@@ -1096,6 +1115,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
 /// Emits a pool-state request for trusted dirty pools accumulated on the canonical path.
 /// Added so affected pools get fresh snapshots that can later feed reserve projection and optimization.
 fn schedule_unknown_canonical_pool_data_request(
+    chain: ChainKey,
     state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
@@ -1111,6 +1131,7 @@ fn schedule_unknown_canonical_pool_data_request(
 
     let pending_pool_data_by_block = pending_requests.pending_pool_data_pools_by_block();
     let request = blocks.unknown_present_canonical_pool_data_request(
+        chain,
         canonical_tip,
         finalized_state.block_hash,
         &pool_registry,
@@ -1146,16 +1167,21 @@ fn schedule_unknown_canonical_pool_data_request(
 
 /// Runs every canonical follow-up scheduler in the order needed for dependencies between requests.
 /// Added so all transitions converge through one scheduling path instead of duplicating follow-up logic per event arm.
-fn schedule_unknown_canonical_requests(state: State, effects: Vec<Effect>) -> (State, Vec<Effect>) {
+fn schedule_unknown_canonical_requests(
+    chain: ChainKey,
+    state: State,
+    effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
     let (state, effects) = schedule_unknown_canonical_log_requests(state, effects);
-    let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(state, effects);
-    let (state, effects) = schedule_unknown_canonical_token_metadata_requests(state, effects);
-    schedule_unknown_canonical_pool_data_request(state, effects)
+    let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(chain, state, effects);
+    let (state, effects) =
+        schedule_unknown_canonical_token_metadata_requests(chain, state, effects);
+    schedule_unknown_canonical_pool_data_request(chain, state, effects)
 }
 
 /// Applies one kernel event to state and returns the side effects the runtime must execute.
 /// Added as the pure deterministic boundary between EVM client state transitions and impure RPC/runtime work.
-pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
+pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Effect>) {
     match event {
         Event::HeadObserved { hash, parent_hash } => {
             match state
@@ -1163,6 +1189,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 .with_new_block(hash, parent_hash, state.finalized_state.block_hash)
             {
                 Ok((blocks, None)) => schedule_unknown_canonical_requests(
+                    chain,
                     State {
                         blocks,
                         canonical_tip: hash,
@@ -1179,6 +1206,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         .with_new_request(request_payload.clone(), state.tick);
 
                     schedule_unknown_canonical_requests(
+                        chain,
                         State {
                             blocks,
                             canonical_tip: hash,
@@ -1215,6 +1243,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     )
                 }
                 Err(NewBlockError::ExistingBlock(blocks)) => schedule_unknown_canonical_requests(
+                    chain,
                     State {
                         blocks,
                         canonical_tip: hash,
@@ -1248,9 +1277,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                 ),
             }
         }
-        Event::FinalizedBlockObserved { block_hash } => {
-            (state.with_finalized_block_observed(block_hash), vec![])
-        }
+        Event::FinalizedBlockObserved { block_hash } => (
+            state.with_finalized_block_observed(chain, block_hash),
+            vec![],
+        ),
         Event::BlockHeaderReceived {
             request_id,
             hash,
@@ -1389,7 +1419,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
             };
 
             if should_schedule_log_requests {
-                schedule_unknown_canonical_requests(new_state, effects)
+                schedule_unknown_canonical_requests(chain, new_state, effects)
             } else {
                 (new_state, effects)
             }
@@ -1429,6 +1459,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     let blocks = state.blocks.with_pool_logs(block_hash, logs);
 
                     schedule_unknown_canonical_requests(
+                        chain,
                         State {
                             blocks,
                             pending_requests,
@@ -1464,9 +1495,10 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                         .into_iter()
                         .filter(|(candidate, _)| requested_candidates.contains(candidate))
                         .collect::<HashMap<_, _>>();
-                    let pool_registry = state.pool_registry.with_metadata_results(metadata);
+                    let pool_registry = state.pool_registry.with_metadata_results(chain, metadata);
 
                     schedule_unknown_canonical_requests(
+                        chain,
                         State {
                             pending_requests,
                             pool_registry,
@@ -1505,6 +1537,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     let token_registry = state.token_registry.with_metadata_results(metadata);
 
                     schedule_unknown_canonical_requests(
+                        chain,
                         State {
                             pending_requests,
                             token_registry,
@@ -1841,7 +1874,7 @@ mod tests {
             if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
                 for candidate in candidates {
                     assert!(
-                        state.pool_registry.is_known(*candidate)
+                        state.pool_registry.is_known(ChainKey::Ethereum, *candidate)
                             || pending_candidates.contains(candidate),
                         "canonical resolved log candidate must be known or pending metadata validation"
                     );
@@ -2235,7 +2268,7 @@ mod tests {
         chain: &GeneratedChain,
         event: Event,
     ) -> State {
-        let (next_state, effects) = transition(state, event);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, event);
         state = next_state;
         assert_state_invariants(&state);
 
@@ -2253,6 +2286,7 @@ mod tests {
 
                     let parent_hash = hash_for_node(parent_index(chain, block_index));
                     let (next_state, effects) = transition(
+                        ChainKey::Ethereum,
                         state,
                         Event::BlockHeaderReceived {
                             request_id,
@@ -2269,6 +2303,7 @@ mod tests {
                     request_id, ..
                 })) => {
                     let (next_state, effects) = transition(
+                        ChainKey::Ethereum,
                         state,
                         Event::BlockLogsReceived {
                             request_id,
@@ -2297,7 +2332,7 @@ mod tests {
         event: Event,
         retry_plans: &[Vec<GeneratedRetry>],
     ) -> State {
-        let (next_state, effects) = transition(state, event);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, event);
         state = next_state;
         assert_state_invariants(&state);
 
@@ -2316,9 +2351,11 @@ mod tests {
 
                     for retry in retry_plans.get(block_index).into_iter().flatten() {
                         let (next_state, effects) = match retry {
-                            GeneratedRetry::Failure => {
-                                transition(state, request_failed_for_header(current_request_id))
-                            }
+                            GeneratedRetry::Failure => transition(
+                                ChainKey::Ethereum,
+                                state,
+                                request_failed_for_header(current_request_id),
+                            ),
                             GeneratedRetry::Expiration => advance_ticks(state, REQUEST_TTL),
                         };
 
@@ -2331,6 +2368,7 @@ mod tests {
                     }
 
                     let (next_state, effects) = transition(
+                        ChainKey::Ethereum,
                         state,
                         Event::BlockHeaderReceived {
                             request_id: current_request_id,
@@ -2348,6 +2386,7 @@ mod tests {
                     request_id, ..
                 })) => {
                     let (next_state, effects) = transition(
+                        ChainKey::Ethereum,
                         state,
                         Event::BlockLogsReceived {
                             request_id,
@@ -2496,7 +2535,7 @@ mod tests {
         assert_eq!(
             state
                 .blocks
-                .trusted_pool_logs(hash, &state.pool_registry)
+                .trusted_pool_logs(ChainKey::Ethereum, hash, &state.pool_registry)
                 .expect("block must be present"),
             TrustedPoolLogs::Resolved(expected_pools)
         );
@@ -2689,7 +2728,7 @@ mod tests {
     /// Builds a deterministic pool address fixture.
     /// This keeps unit and property tests compact while avoiding repeated Address construction.
     fn pool_address(last_byte: u8) -> PoolAddress {
-        PoolAddress(Address::with_last_byte(last_byte))
+        PoolAddress(Address::with_last_byte(last_byte), ChainKey::Ethereum)
     }
 
     /// Builds a deterministic candidate address fixture.
@@ -2711,7 +2750,7 @@ mod tests {
     /// Builds a deterministic token address fixture.
     /// Scheduler tests use it as a stable key for token registry state.
     fn token_address(last_byte: u8) -> TokenAddress {
-        TokenAddress(Address::with_last_byte(last_byte))
+        TokenAddress(Address::with_last_byte(last_byte), ChainKey::Ethereum)
     }
 
     /// Builds token metadata with supported decimals.
@@ -2773,7 +2812,7 @@ mod tests {
         state: &State,
         start: BlockHash,
     ) -> Option<(BlockHash, HashMap<PoolAddress, PoolState>)> {
-        let update = state.latest_complete_pool_state_update_from(start)?;
+        let update = state.latest_complete_pool_state_update_from(ChainKey::Ethereum, start)?;
         let pool_states = state
             .resolve_complete_pool_states(&update)?
             .into_iter()
@@ -2849,7 +2888,7 @@ mod tests {
         let mut effects = Vec::new();
 
         for _ in 0..count {
-            let (next_state, tick_effects) = transition(state, Event::Tick);
+            let (next_state, tick_effects) = transition(ChainKey::Ethereum, state, Event::Tick);
             state = next_state;
             effects.extend(tick_effects);
         }
@@ -2868,6 +2907,7 @@ mod tests {
             };
 
             let (next_state, effects) = transition(
+                ChainKey::Ethereum,
                 state,
                 Event::BlockLogsReceived {
                     request_id: *request_id,
@@ -3074,6 +3114,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3105,6 +3146,7 @@ mod tests {
             .insert(head_hash, block_with_parent(original_parent_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3131,13 +3173,16 @@ mod tests {
         let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (verified_candidate, Ok(metadata.clone())),
-            (
-                rejected_candidate,
-                Err(PoolMetadataFailure::FactoryReturnedZero),
-            ),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (verified_candidate, Ok(metadata.clone())),
+                (
+                    rejected_candidate,
+                    Err(PoolMetadataFailure::FactoryReturnedZero),
+                ),
+            ]),
+        );
         state.canonical_tip = head_hash;
         state
             .blocks
@@ -3145,6 +3190,7 @@ mod tests {
             .insert(head_hash, block_with_parent(original_parent_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3157,7 +3203,7 @@ mod tests {
         assert_eq!(
             next_state
                 .pool_registry
-                .verified_metadata(PoolAddress(verified_candidate.0)),
+                .verified_metadata(PoolAddress(verified_candidate.0, ChainKey::Ethereum)),
             Some(&metadata)
         );
         assert!(next_state.pool_registry.is_rejected(rejected_candidate));
@@ -3193,6 +3239,7 @@ mod tests {
             .insert(head_hash, block_with_parent(original_parent_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3222,8 +3269,10 @@ mod tests {
         let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
         let snapshot = pool_state(9);
 
-        let pool_registry = TrustedPoolRegistry::new()
-            .with_metadata_results(HashMap::from([(candidate, Ok(metadata.clone()))]));
+        let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(metadata.clone()))]),
+        );
         let token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token0, Ok(token_metadata(18))),
             (token1, Ok(token_metadata(6))),
@@ -3265,8 +3314,10 @@ mod tests {
         let pool = pool_address(4);
         let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
 
-        let pool_registry = TrustedPoolRegistry::new()
-            .with_metadata_results(HashMap::from([(candidate, Ok(metadata))]));
+        let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(metadata))]),
+        );
         let token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(6), Ok(token_metadata(18))),
             (token_address(7), Ok(token_metadata(6))),
@@ -3284,6 +3335,7 @@ mod tests {
         assert!(activation_effects.is_empty());
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: new_head,
@@ -3483,7 +3535,7 @@ mod tests {
                 _ => bootstrap::Event::Tick,
             };
 
-            let (next_state, effects) = bootstrap::transition(state, event);
+            let (next_state, effects) = bootstrap::transition(ChainKey::Ethereum, state, event);
             state = next_state;
             if let Some(request) = bootstrap_outstanding(effects) {
                 outstanding = Some(request);
@@ -3568,6 +3620,7 @@ mod tests {
         assert_effects_are_well_formed(&state, &activation_effects);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: fresh_head_hash(),
@@ -3614,6 +3667,7 @@ mod tests {
             .hash;
         let (state, _activation_effects) = activate_bootstrap_outcome_for_test(outcome);
         let (next_state, _effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: fresh_head_hash(),
@@ -3747,7 +3801,7 @@ mod tests {
                 assert_effects_are_well_formed(&state, &activation_effects);
 
                 if let Some(seed_tip) = seed_tip {
-                    let (next_state, effects) = transition(
+                    let (next_state, effects) = transition(ChainKey::Ethereum,
                         state,
                         Event::HeadObserved {
                             hash: fresh_head_hash(),
@@ -3776,6 +3830,7 @@ mod tests {
             .insert(head_hash, block_with_parent(finalized_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3811,6 +3866,7 @@ mod tests {
             .insert(second_hash, block_with_parent(first_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: cycle_hash,
@@ -3833,6 +3889,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: finalized_hash,
@@ -3854,6 +3911,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3876,6 +3934,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3902,6 +3961,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3912,6 +3972,7 @@ mod tests {
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: header_request_id,
@@ -3954,6 +4015,7 @@ mod tests {
             .insert(head_hash, block_with_parent(parent_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3980,6 +4042,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -3989,6 +4052,7 @@ mod tests {
         let header_request_id = assert_single_block_header_request_effect(&effects, parent_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: header_request_id,
@@ -3999,6 +4063,7 @@ mod tests {
         assert_request_hashes(&effects, HashSet::new(), HashSet::from([parent_hash]));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: header_request_id,
@@ -4032,6 +4097,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -4062,6 +4128,7 @@ mod tests {
         );
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -4095,6 +4162,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id,
@@ -4128,6 +4196,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id,
@@ -4157,6 +4226,7 @@ mod tests {
             .insert(block_hash, block_with_parent(finalized_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id: RequestId::from_raw_for_test(99),
@@ -4186,8 +4256,11 @@ mod tests {
         );
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) =
-            transition(state, Event::BlockLogsReceived { request_id, logs });
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived { request_id, logs },
+        );
 
         assert!(effects.is_empty());
         assert_empty_initial_state_at(&next_state, finalized_hash);
@@ -4217,6 +4290,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id,
@@ -4242,10 +4316,10 @@ mod tests {
         let logs = HashSet::from([candidate]);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.canonical_tip = block_hash;
         state
             .blocks
@@ -4256,8 +4330,11 @@ mod tests {
             .with_new_request(GetBlockLogs { block_hash }, state.tick);
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) =
-            transition(state, Event::BlockLogsReceived { request_id, logs });
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived { request_id, logs },
+        );
 
         let token_request_id = assert_single_token_metadata_request_effect(
             &effects,
@@ -4268,7 +4345,7 @@ mod tests {
         assert_trusted_pool_logs_resolved(
             &next_state,
             block_hash,
-            HashSet::from([PoolAddress(candidate.0)]),
+            HashSet::from([PoolAddress(candidate.0, ChainKey::Ethereum)]),
         );
         assert_state_invariants(&next_state);
     }
@@ -4283,10 +4360,10 @@ mod tests {
         let logs = HashSet::from([candidate]);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Err(PoolMetadataFailure::FactoryReturnedZero),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Err(PoolMetadataFailure::FactoryReturnedZero))]),
+        );
         state.canonical_tip = block_hash;
         state
             .blocks
@@ -4297,14 +4374,19 @@ mod tests {
             .with_new_request(GetBlockLogs { block_hash }, state.tick);
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) =
-            transition(state, Event::BlockLogsReceived { request_id, logs });
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived { request_id, logs },
+        );
 
         assert!(effects.is_empty());
         assert_eq!(
-            next_state
-                .blocks
-                .trusted_pool_logs(block_hash, &next_state.pool_registry),
+            next_state.blocks.trusted_pool_logs(
+                ChainKey::Ethereum,
+                block_hash,
+                &next_state.pool_registry
+            ),
             Some(TrustedPoolLogs::Resolved(HashSet::new()))
         );
         assert_state_invariants(&next_state);
@@ -4317,13 +4399,13 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (token_address(2), Ok(token_metadata(18))),
@@ -4339,6 +4421,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id,
@@ -4373,6 +4456,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id,
@@ -4397,13 +4481,16 @@ mod tests {
         let block_hash = BlockHash::with_last_byte(2);
         let verified = pool_candidate_address(3);
         let rejected = pool_candidate_address(4);
-        let verified_pool = PoolAddress(verified.0);
+        let verified_pool = PoolAddress(verified.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000))),
-            (rejected, Err(PoolMetadataFailure::FactoryReturnedZero)),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000))),
+                (rejected, Err(PoolMetadataFailure::FactoryReturnedZero)),
+            ]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (token_address(2), Ok(token_metadata(18))),
@@ -4419,6 +4506,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id,
@@ -4470,6 +4558,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (state, first_effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id: parent_request_id,
@@ -4477,6 +4566,7 @@ mod tests {
             },
         );
         let (next_state, second_effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id: head_request_id,
@@ -4520,6 +4610,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolMetadataReceived {
                 request_id,
@@ -4532,11 +4623,15 @@ mod tests {
 
         assert!(!next_state.pending_requests.contains(&request_id));
         assert_eq!(
-            next_state.pool_registry.verified_pool(first_candidate),
-            Some(PoolAddress(first_candidate.0))
+            next_state
+                .pool_registry
+                .verified_pool(ChainKey::Ethereum, first_candidate),
+            Some(PoolAddress(first_candidate.0, ChainKey::Ethereum))
         );
         assert_eq!(
-            next_state.pool_registry.verified_pool(second_candidate),
+            next_state
+                .pool_registry
+                .verified_pool(ChainKey::Ethereum, second_candidate),
             None
         );
         let retry_request_id = assert_single_pool_metadata_request_effect(
@@ -4578,6 +4673,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolMetadataReceived {
                 request_id,
@@ -4598,13 +4694,13 @@ mod tests {
         assert_eq!(
             next_state
                 .pool_registry
-                .verified_metadata(PoolAddress(candidate.0)),
+                .verified_metadata(PoolAddress(candidate.0, ChainKey::Ethereum)),
             Some(&pool_metadata(1, 2, UniswapV3Fee::Fee500))
         );
         assert_trusted_pool_logs_resolved(
             &next_state,
             block_hash,
-            HashSet::from([PoolAddress(candidate.0)]),
+            HashSet::from([PoolAddress(candidate.0, ChainKey::Ethereum)]),
         );
         assert_state_invariants(&next_state);
     }
@@ -4616,7 +4712,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
@@ -4643,6 +4739,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolMetadataReceived {
                 request_id,
@@ -4679,6 +4776,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolMetadataReceived {
                 request_id,
@@ -4693,10 +4791,15 @@ mod tests {
         assert_eq!(
             next_state
                 .pool_registry
-                .verified_metadata(PoolAddress(unrequested.0)),
+                .verified_metadata(PoolAddress(unrequested.0, ChainKey::Ethereum)),
             None
         );
-        assert_eq!(next_state.pool_registry.verified_pool(unrequested), None);
+        assert_eq!(
+            next_state
+                .pool_registry
+                .verified_pool(ChainKey::Ethereum, unrequested),
+            None
+        );
         assert!(!next_state.pool_registry.is_rejected(unrequested));
         assert_state_invariants(&next_state);
     }
@@ -4720,6 +4823,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::TokenMetadataReceived {
                 request_id,
@@ -4751,14 +4855,14 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let logs = HashSet::from([candidate]);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (
@@ -4778,8 +4882,11 @@ mod tests {
             .with_new_request(GetBlockLogs { block_hash }, state.tick);
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) =
-            transition(state, Event::BlockLogsReceived { request_id, logs });
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived { request_id, logs },
+        );
 
         let pool_data_request_id =
             assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([pool]));
@@ -4797,20 +4904,23 @@ mod tests {
         let head_hash = BlockHash::with_last_byte(3);
         let first_candidate = pool_candidate_address(4);
         let second_candidate = pool_candidate_address(5);
-        let first_pool = PoolAddress(first_candidate.0);
-        let second_pool = PoolAddress(second_candidate.0);
+        let first_pool = PoolAddress(first_candidate.0, ChainKey::Ethereum);
+        let second_pool = PoolAddress(second_candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (
-                first_candidate,
-                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-            ),
-            (
-                second_candidate,
-                Ok(pool_metadata(3, 4, UniswapV3Fee::Fee500)),
-            ),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (
+                    first_candidate,
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+                ),
+                (
+                    second_candidate,
+                    Ok(pool_metadata(3, 4, UniswapV3Fee::Fee500)),
+                ),
+            ]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (token_address(2), Ok(token_metadata(18))),
@@ -4837,7 +4947,8 @@ mod tests {
             },
         );
 
-        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
 
         let pool_data_request_id = assert_single_pool_data_request_effect(
             &effects,
@@ -4857,20 +4968,23 @@ mod tests {
         let block_hash = BlockHash::with_last_byte(2);
         let first_candidate = pool_candidate_address(3);
         let second_candidate = pool_candidate_address(4);
-        let first_pool = PoolAddress(first_candidate.0);
-        let second_pool = PoolAddress(second_candidate.0);
+        let first_pool = PoolAddress(first_candidate.0, ChainKey::Ethereum);
+        let second_pool = PoolAddress(second_candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (
-                first_candidate,
-                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-            ),
-            (
-                second_candidate,
-                Ok(pool_metadata(3, 4, UniswapV3Fee::Fee500)),
-            ),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (
+                    first_candidate,
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+                ),
+                (
+                    second_candidate,
+                    Ok(pool_metadata(3, 4, UniswapV3Fee::Fee500)),
+                ),
+            ]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (token_address(2), Ok(token_metadata(18))),
@@ -4899,7 +5013,8 @@ mod tests {
         );
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
 
         assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([second_pool]));
         assert_effects_are_well_formed(&next_state, &effects);
@@ -4914,13 +5029,13 @@ mod tests {
         let parent_hash = BlockHash::with_last_byte(2);
         let head_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (token_address(2), Ok(token_metadata(18))),
@@ -4953,7 +5068,8 @@ mod tests {
         );
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
 
         assert_single_pool_data_request_effect(&effects, head_hash, &HashSet::from([pool]));
         assert_effects_are_well_formed(&next_state, &effects);
@@ -4967,13 +5083,13 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
             (token_address(1), Ok(token_metadata(6))),
             (token_address(2), Ok(token_metadata(18))),
@@ -4992,7 +5108,8 @@ mod tests {
             },
         );
 
-        let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
 
         assert!(effects.is_empty());
         assert_state_invariants(&next_state);
@@ -5009,16 +5126,19 @@ mod tests {
         let logs = HashSet::from([first_candidate, second_candidate]);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (
-                first_candidate,
-                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-            ),
-            (
-                second_candidate,
-                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
-            ),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (
+                    first_candidate,
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
+                ),
+                (
+                    second_candidate,
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
+                ),
+            ]),
+        );
         state.canonical_tip = block_hash;
         state
             .blocks
@@ -5029,8 +5149,11 @@ mod tests {
             .with_new_request(GetBlockLogs { block_hash }, state.tick);
         state.pending_requests = pending_requests;
 
-        let (next_state, effects) =
-            transition(state, Event::BlockLogsReceived { request_id, logs });
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived { request_id, logs },
+        );
 
         let token_request_id = assert_single_token_metadata_request_effect(
             &effects,
@@ -5051,15 +5174,18 @@ mod tests {
         let rejected = pool_candidate_address(4);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000))),
-            (
-                rejected,
-                Err(PoolMetadataFailure::FactoryMismatch {
-                    returned: Address::with_last_byte(9),
-                }),
-            ),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000))),
+                (
+                    rejected,
+                    Err(PoolMetadataFailure::FactoryMismatch {
+                        returned: Address::with_last_byte(9),
+                    }),
+                ),
+            ]),
+        );
         state.canonical_tip = block_hash;
         state.blocks.0.insert(
             block_hash,
@@ -5074,7 +5200,7 @@ mod tests {
         assert_trusted_pool_logs_resolved(
             &state,
             block_hash,
-            HashSet::from([PoolAddress(verified.0)]),
+            HashSet::from([PoolAddress(verified.0, ChainKey::Ethereum)]),
         );
         assert_state_invariants(&state);
     }
@@ -5096,7 +5222,7 @@ mod tests {
         assert_eq!(
             state
                 .blocks
-                .trusted_pool_logs(block_hash, &state.pool_registry),
+                .trusted_pool_logs(ChainKey::Ethereum, block_hash, &state.pool_registry),
             Some(TrustedPoolLogs::Unknown)
         );
         assert_state_invariants(&state);
@@ -5262,16 +5388,19 @@ mod tests {
     fn verified_pool_count_reflects_registry() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let mut state = empty_state_at(finalized_hash);
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([
-            (
-                pool_candidate_address(2),
-                Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
-            ),
-            (
-                pool_candidate_address(3),
-                Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000)),
-            ),
-        ]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([
+                (
+                    pool_candidate_address(2),
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
+                ),
+                (
+                    pool_candidate_address(3),
+                    Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000)),
+                ),
+            ]),
+        );
 
         assert_eq!(state.verified_pool_count(), 2);
     }
@@ -5438,14 +5567,14 @@ mod tests {
         let complete_hash = BlockHash::with_last_byte(2);
         let unknown_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let snapshot = pool_state(5);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             complete_hash,
             resolved_block_with_snapshots(
@@ -5477,14 +5606,14 @@ mod tests {
         let pending_hash = BlockHash::with_last_byte(3);
         let verified = pool_candidate_address(4);
         let pending = pool_candidate_address(5);
-        let pool = PoolAddress(verified.0);
+        let pool = PoolAddress(verified.0, ChainKey::Ethereum);
         let snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            verified,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             complete_hash,
             resolved_block_with_snapshots(
@@ -5516,10 +5645,10 @@ mod tests {
         let rejected = pool_candidate_address(3);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            rejected,
-            Err(PoolMetadataFailure::FactoryReturnedZero),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(rejected, Err(PoolMetadataFailure::FactoryReturnedZero))]),
+        );
         state.blocks.0.insert(
             block_hash,
             resolved_block_with_snapshots(
@@ -5542,14 +5671,14 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let snapshot = pool_state(4);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             block_hash,
             resolved_block_with_snapshots(
@@ -5576,14 +5705,14 @@ mod tests {
         let affected_hash = BlockHash::with_last_byte(2);
         let later_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let snapshot = pool_state(5);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             affected_hash,
             resolved_block_with_snapshots(
@@ -5615,14 +5744,14 @@ mod tests {
         let second_hash = BlockHash::with_last_byte(3);
         let third_hash = BlockHash::with_last_byte(4);
         let candidate = pool_candidate_address(5);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let first_snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             first_hash,
             resolved_block_with_snapshots(
@@ -5658,15 +5787,15 @@ mod tests {
         let second_hash = BlockHash::with_last_byte(3);
         let third_hash = BlockHash::with_last_byte(4);
         let candidate = pool_candidate_address(5);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let first_snapshot = pool_state(6);
         let third_snapshot = pool_state(7);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             first_hash,
             resolved_block_with_snapshots(
@@ -5704,13 +5833,13 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             block_hash,
             BlockNode {
@@ -5737,16 +5866,16 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let affected_pool = PoolAddress(candidate.0);
+        let affected_pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let unaffected_pool = pool_address(4);
         let affected_snapshot = pool_state(5);
         let unaffected_snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             block_hash,
             resolved_block_with_snapshots(
@@ -5776,15 +5905,15 @@ mod tests {
         let first_hash = BlockHash::with_last_byte(2);
         let second_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let first_snapshot = pool_state(5);
         let second_snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             first_hash,
             resolved_block_with_snapshots(
@@ -5819,7 +5948,7 @@ mod tests {
         let target_hash = BlockHash::with_last_byte(2);
         let tip_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let affected_pool = PoolAddress(candidate.0);
+        let affected_pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let unaffected_pool = pool_address(5);
         let old_affected_snapshot = pool_state(6);
         let new_affected_snapshot = pool_state(7);
@@ -5831,10 +5960,10 @@ mod tests {
             (affected_pool, old_affected_snapshot),
             (unaffected_pool, unaffected_snapshot.clone()),
         ]);
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             target_hash,
             resolved_block_with_snapshots(
@@ -5849,6 +5978,7 @@ mod tests {
         );
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
@@ -5879,15 +6009,15 @@ mod tests {
         let incomplete_hash = BlockHash::with_last_byte(3);
         let target_hash = BlockHash::with_last_byte(4);
         let candidate = pool_candidate_address(5);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
         state.canonical_tip = target_hash;
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             complete_hash,
             resolved_block_with_snapshots(
@@ -5910,6 +6040,7 @@ mod tests {
         );
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
@@ -5943,6 +6074,7 @@ mod tests {
             .insert(target_hash, block_with_parent(finalized_hash));
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
@@ -5972,6 +6104,7 @@ mod tests {
             .insert(target_hash, block_with_parent(missing_parent_hash));
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
@@ -6004,6 +6137,7 @@ mod tests {
         );
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: side_hash,
@@ -6027,14 +6161,14 @@ mod tests {
         let side_hash = BlockHash::with_last_byte(4);
         let retained_token = token_address(5);
         let candidate = pool_candidate_address(6);
-        let pool = PoolAddress(candidate.0);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
         let mut state = empty_state_at(finalized_hash);
 
         state.canonical_tip = retained_hash;
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(HashMap::from([(
-            candidate,
-            Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)),
-        )]));
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
         state.blocks.0.insert(
             target_hash,
             resolved_block_with_snapshots(
@@ -6088,6 +6222,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
@@ -6121,6 +6256,7 @@ mod tests {
             .insert(target_hash, block_with_parent(finalized_hash));
 
         let (mut state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
@@ -6133,7 +6269,7 @@ mod tests {
             resolved_block_with_snapshots(finalized_hash, HashSet::new(), HashMap::new()),
         );
 
-        let (state, effects) = transition(state, Event::Tick);
+        let (state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         assert!(effects.is_empty());
         assert_eq!(state.finalized_state.block_hash, finalized_hash);
@@ -6169,6 +6305,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6220,6 +6357,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6260,6 +6398,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6302,6 +6441,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6348,6 +6488,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6393,6 +6534,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6425,6 +6567,7 @@ mod tests {
             .insert(block_hash, block_with_parent(finalized_hash));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id: RequestId::from_raw_for_test(99),
@@ -6457,6 +6600,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id,
@@ -6494,6 +6638,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::RequestFailed {
                 request_id: AnyRequestId::PoolData(request_id),
@@ -6531,6 +6676,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::RequestFailed {
                 request_id: AnyRequestId::PoolMetadata(request_id),
@@ -6569,6 +6715,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::RequestFailed {
                 request_id: AnyRequestId::TokenMetadata(request_id),
@@ -6675,6 +6822,7 @@ mod tests {
         state.pending_requests = pending_requests;
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::RequestFailed {
                 request_id: AnyRequestId::PoolMetadata(request_id),
@@ -6684,6 +6832,7 @@ mod tests {
             assert_single_pool_metadata_request_effect(&effects, block_hash, &candidates);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::RequestFailed {
                 request_id: AnyRequestId::PoolMetadata(request_id),
@@ -6707,6 +6856,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6716,6 +6866,7 @@ mod tests {
         let log_request_id = assert_single_block_log_request_effect(&effects, head_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6727,6 +6878,7 @@ mod tests {
         assert!(state.pending_requests.contains(&log_request_id));
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockLogsReceived {
                 request_id: log_request_id,
@@ -6750,6 +6902,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6759,6 +6912,7 @@ mod tests {
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id,
@@ -6791,6 +6945,7 @@ mod tests {
         state.tick = tick(7);
 
         let (mut state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6810,6 +6965,7 @@ mod tests {
         let last_request_id = state.pending_requests.last_request_id_for_test();
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderNotFound {
                 request_id: missing_header_request_id,
@@ -6847,6 +7003,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6861,6 +7018,7 @@ mod tests {
             active_request_dispatch_tick(&state.pending_requests, pending_request_id);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderNotFound {
                 request_id: RequestId::from_raw_for_test(99),
@@ -6891,6 +7049,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6900,6 +7059,7 @@ mod tests {
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id,
@@ -6914,7 +7074,11 @@ mod tests {
         );
         let state = drain_block_log_effects(state, &effects);
 
-        let (next_state, effects) = transition(state, Event::BlockHeaderNotFound { request_id });
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockHeaderNotFound { request_id },
+        );
 
         assert!(effects.is_empty());
         assert_eq!(next_state.canonical_tip, head_hash);
@@ -6934,6 +7098,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6943,11 +7108,16 @@ mod tests {
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
-        let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderNotFound {
                 request_id: failed_request_id,
@@ -6973,6 +7143,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -6987,6 +7158,7 @@ mod tests {
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderNotFound {
                 request_id: expired_request_id,
@@ -7012,6 +7184,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7021,11 +7194,16 @@ mod tests {
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
-        let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderNotFound {
                 request_id: retry_request_id,
@@ -7047,6 +7225,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7057,11 +7236,15 @@ mod tests {
         let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
-        let (state, effects) = transition(state, Event::BlockHeaderNotFound { request_id });
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockHeaderNotFound { request_id },
+        );
         assert!(effects.is_empty());
         assert_empty_initial_state_at(&state, finalized_hash);
 
-        let (next_state, effects) = transition(state, Event::Tick);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         assert!(effects.is_empty());
         assert!(next_state.tick == tick(REQUEST_TTL));
@@ -7080,6 +7263,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7089,6 +7273,7 @@ mod tests {
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id,
@@ -7124,6 +7309,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7133,6 +7319,7 @@ mod tests {
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: RequestId::from_raw_for_test(99),
@@ -7143,6 +7330,7 @@ mod tests {
         assert!(effects.is_empty());
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id,
@@ -7172,6 +7360,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: first_head_hash,
@@ -7182,6 +7371,7 @@ mod tests {
             assert_single_block_header_request_effect(&effects, first_missing_parent_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: first_head_hash,
@@ -7193,6 +7383,7 @@ mod tests {
         assert!(effects.is_empty());
 
         let (_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: second_head_hash,
@@ -7218,6 +7409,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7246,6 +7438,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7281,6 +7474,7 @@ mod tests {
         state.tick = dispatch_tick;
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7296,7 +7490,7 @@ mod tests {
         assert!(state.tick == tick(dispatch_tick.raw_for_test().wrapping_add(REQUEST_TTL - 1)));
         assert!(state.pending_requests.contains(&expired_request_id));
 
-        let (next_state, effects) = transition(state, Event::Tick);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -7316,6 +7510,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7334,7 +7529,7 @@ mod tests {
         assert!(effects.is_empty());
         assert!(state.pending_requests.contains(&first_retry_id));
 
-        let (next_state, effects) = transition(state, Event::Tick);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         let second_retry_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -7446,7 +7641,7 @@ mod tests {
             .0
             .insert(known_hash, block_with_parent(finalized_hash));
 
-        let (next_state, effects) = transition(state, Event::Tick);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         assert!(next_state.tick == tick(1));
         assert!(effects.is_empty());
@@ -7468,6 +7663,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7478,7 +7674,11 @@ mod tests {
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
 
-        let (next_state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
 
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -7502,6 +7702,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7514,6 +7715,7 @@ mod tests {
         let last_request_id = state.pending_requests.last_request_id_for_test();
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             request_failed_for_header(RequestId::from_raw_for_test(99)),
         );
@@ -7538,6 +7740,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7547,11 +7750,19 @@ mod tests {
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
-        let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
-        let (next_state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
 
         assert!(effects.is_empty());
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
@@ -7574,6 +7785,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7585,8 +7797,11 @@ mod tests {
         let mut state = drain_block_log_effects(state, &effects);
 
         for _ in 0..4 {
-            let (next_state, effects) =
-                transition(state, request_failed_for_header(failed_request_id));
+            let (next_state, effects) = transition(
+                ChainKey::Ethereum,
+                state,
+                request_failed_for_header(failed_request_id),
+            );
             let retry_request_id =
                 assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
@@ -7613,6 +7828,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7623,6 +7839,7 @@ mod tests {
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7632,7 +7849,11 @@ mod tests {
         assert!(effects.is_empty());
         assert_chain_reset_at(&state, finalized_hash);
 
-        let (next_state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
 
         assert_chain_reset_at(&next_state, finalized_hash);
         let retry_request_id =
@@ -7653,6 +7874,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7662,6 +7884,7 @@ mod tests {
         let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id,
@@ -7676,7 +7899,11 @@ mod tests {
         );
         let state = drain_block_log_effects(state, &effects);
 
-        let (next_state, effects) = transition(state, request_failed_for_header(request_id));
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(request_id),
+        );
 
         assert!(effects.is_empty());
         assert!(next_state.pending_requests.is_empty_for_test());
@@ -7696,6 +7923,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7705,11 +7933,16 @@ mod tests {
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
-        let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: failed_request_id,
@@ -7742,6 +7975,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7751,10 +7985,15 @@ mod tests {
         let failed_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let state = drain_block_log_effects(state, &effects);
-        let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: retry_request_id,
@@ -7769,7 +8008,11 @@ mod tests {
         );
         let state = drain_block_log_effects(state, &effects);
 
-        let (next_state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
 
         assert!(effects.is_empty());
         assert!(next_state.pending_requests.is_empty_for_test());
@@ -7789,6 +8032,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7800,6 +8044,7 @@ mod tests {
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id,
@@ -7814,7 +8059,7 @@ mod tests {
         );
         let state = drain_block_log_effects(state, &effects);
 
-        let (next_state, effects) = transition(state, Event::Tick);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         assert!(effects.is_empty());
         assert!(next_state.tick == tick(REQUEST_TTL));
@@ -7834,6 +8079,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7845,11 +8091,15 @@ mod tests {
         let state = drain_block_log_effects(state, &effects);
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
-        let (state, effects) = transition(state, request_failed_for_header(failed_request_id));
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            request_failed_for_header(failed_request_id),
+        );
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
-        let (state, effects) = transition(state, Event::Tick);
+        let (state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         assert!(effects.is_empty());
         assert!(state.tick == tick(REQUEST_TTL));
@@ -7875,6 +8125,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7889,6 +8140,7 @@ mod tests {
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
         let (next_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
                 request_id: expired_request_id,
@@ -7921,6 +8173,7 @@ mod tests {
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7933,6 +8186,7 @@ mod tests {
         let (state, effects) = advance_ticks(state, REQUEST_TTL - 1);
         assert!(effects.is_empty());
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::HeadObserved {
                 hash: head_hash,
@@ -7943,7 +8197,7 @@ mod tests {
         assert_chain_reset_at(&state, finalized_hash);
         assert!(state.pending_requests.contains(&expired_request_id));
 
-        let (next_state, effects) = transition(state, Event::Tick);
+        let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
         let retry_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
@@ -7978,6 +8232,7 @@ mod tests {
                     })
                     .collect::<HashMap<_, _>>();
                 let (next_state, effects) = transition(
+                    ChainKey::Ethereum,
                     state,
                     Event::PoolMetadataReceived {
                         request_id,
@@ -8008,6 +8263,7 @@ mod tests {
                     .map(|token| (token, Ok(token_metadata(18))))
                     .collect::<HashMap<_, _>>();
                 let (next_state, effects) = transition(
+                    ChainKey::Ethereum,
                     state,
                     Event::TokenMetadataReceived {
                         request_id,
@@ -8075,7 +8331,7 @@ mod tests {
             }
 
             let expected_request_count = original_requests.len();
-            let (next_state, effects) = transition(state, Event::Tick);
+            let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
 
             prop_assert!(next_state.tick == tick_after);
             prop_assert_eq!(next_state.pending_requests.len_for_test(), expected_request_count);
@@ -8117,7 +8373,7 @@ mod tests {
                     .insert(hash_for_node(node_index), block_with_parent(hash_for_node(node_index - 1)));
             }
 
-            let (state, effects) = transition(
+            let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
                     hash: tip_hash,
@@ -8138,7 +8394,7 @@ mod tests {
             assert_effects_are_well_formed(&state, &effects);
             assert_state_invariants(&state);
 
-            let (next_state, effects) = transition(
+            let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
                     hash: tip_hash,
@@ -8194,7 +8450,7 @@ mod tests {
 
             for (block_index, candidate_bytes) in block_candidate_bytes.iter().enumerate() {
                 let block_hash = hash_for_node(block_index + 1);
-                let (next_state, effects) = transition(
+                let (next_state, effects) = transition(ChainKey::Ethereum,
                     state,
                     Event::HeadObserved {
                         hash: block_hash,
@@ -8216,7 +8472,7 @@ mod tests {
                             .copied()
                             .map(pool_candidate_address)
                             .collect::<HashSet<_>>();
-                        let (next_state, effects) = transition(
+                        let (next_state, effects) = transition(ChainKey::Ethereum,
                             state,
                             Event::BlockLogsReceived {
                                 request_id,
@@ -8284,8 +8540,8 @@ mod tests {
                 parent_hash = block_hash;
             }
 
-            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
-            let (state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+            state.pool_registry = state.pool_registry.with_metadata_results(ChainKey::Ethereum, pool_metadata_results);
+            let (state, effects) = schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
             assert_effects_are_well_formed(&state, &effects);
             let pending_tokens = state.pending_requests.pending_token_metadata_tokens();
 
@@ -8297,11 +8553,11 @@ mod tests {
 
                 if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
                     for candidate in candidates {
-                        if let Some(pool) = state.pool_registry.verified_pool(*candidate) {
+                        if let Some(pool) = state.pool_registry.verified_pool(ChainKey::Ethereum, *candidate) {
                             if let Some(metadata) = state.pool_registry.verified_metadata(pool) {
                                 for token in [
-                                    TokenAddress(metadata.token0),
-                                    TokenAddress(metadata.token1),
+                                    TokenAddress(metadata.token0, ChainKey::Ethereum),
+                                    TokenAddress(metadata.token1, ChainKey::Ethereum),
                                 ] {
                                     prop_assert!(
                                         state.token_registry.is_known(token)
@@ -8351,7 +8607,7 @@ mod tests {
                 );
             }
 
-            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+            state.pool_registry = state.pool_registry.with_metadata_results(ChainKey::Ethereum, pool_metadata_results);
             state.token_registry = state.token_registry.with_metadata_results(token_metadata_results);
             state.canonical_tip = block_hash;
             state.blocks.0.insert(
@@ -8404,7 +8660,7 @@ mod tests {
                 .iter()
                 .copied()
                 .map(pool_candidate_address)
-                .any(|candidate| !state.pool_registry.is_known(candidate));
+                .any(|candidate| !state.pool_registry.is_known(ChainKey::Ethereum, candidate));
             let expected_pools = if has_unknown_logged_candidate {
                 HashSet::new()
             } else {
@@ -8418,7 +8674,7 @@ mod tests {
                     .collect::<HashSet<_>>()
             };
 
-            let (next_state, effects) = schedule_unknown_canonical_requests(state, vec![]);
+            let (next_state, effects) = schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
             assert_effects_are_well_formed(&next_state, &effects);
             let pool_data_payloads = pool_data_request_payloads_from_effects(&effects);
 
@@ -8460,7 +8716,7 @@ mod tests {
                 .collect::<HashMap<_, _>>();
             let mut parent_hash = finalized_hash;
 
-            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+            state.pool_registry = state.pool_registry.with_metadata_results(ChainKey::Ethereum, pool_metadata_results);
 
             for (block_index, (candidate_bytes, snapshot_bytes)) in blocks.iter().enumerate() {
                 let block_hash = hash_for_node(block_index + 1);
@@ -8560,7 +8816,7 @@ mod tests {
 
             state.finalized_state.pool_snapshots =
                 HashMap::from([(baseline_pool, baseline_snapshot.clone())]);
-            state.pool_registry = state.pool_registry.with_metadata_results(pool_metadata_results);
+            state.pool_registry = state.pool_registry.with_metadata_results(ChainKey::Ethereum, pool_metadata_results);
 
             for (block_index, (candidate_bytes, snapshot_bytes)) in blocks.iter().enumerate() {
                 let block_hash = hash_for_node(block_index + 1);
@@ -8623,7 +8879,7 @@ mod tests {
                 }
             }
 
-            let (state, effects) = transition(
+            let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::FinalizedBlockObserved {
                     block_hash: target_hash,
@@ -8690,7 +8946,7 @@ mod tests {
                     .filter(|hash| block_descends_from(&state.blocks.0, *hash, observed))
                     .collect();
 
-                let result = state.with_finalized_block_observed(observed);
+                let result = state.with_finalized_block_observed(ChainKey::Ethereum, observed);
 
                 for descendant in &descendants {
                     prop_assert!(
@@ -8716,7 +8972,7 @@ mod tests {
 
             for (block_index, candidate_bytes) in block_candidate_bytes.iter().enumerate() {
                 let block_hash = hash_for_node(block_index + 1);
-                let (next_state, effects) = transition(
+                let (next_state, effects) = transition(ChainKey::Ethereum,
                     state,
                     Event::HeadObserved {
                         hash: block_hash,
@@ -8736,7 +8992,7 @@ mod tests {
                             .copied()
                             .map(pool_candidate_address)
                             .collect::<HashSet<_>>();
-                        let (next_state, effects) = transition(
+                        let (next_state, effects) = transition(ChainKey::Ethereum,
                             state,
                             Event::BlockLogsReceived {
                                 request_id,
@@ -8752,7 +9008,7 @@ mod tests {
 
             for block_hash in state.blocks.0.keys() {
                 if let Some(TrustedPoolLogs::Resolved(pools)) =
-                    state.blocks.trusted_pool_logs(*block_hash, &state.pool_registry)
+                    state.blocks.trusted_pool_logs(ChainKey::Ethereum, *block_hash, &state.pool_registry)
                 {
                     for pool in pools {
                         prop_assert!(
@@ -8821,7 +9077,7 @@ mod tests {
                 let hash = hash_for_node(*head_index);
                 let parent_hash = hash_for_node(parent_index(&chain, *head_index));
                 let (next_state, effects) =
-                    transition(state, Event::HeadObserved { hash, parent_hash });
+                    transition(ChainKey::Ethereum, state, Event::HeadObserved { hash, parent_hash });
 
                 state = next_state;
                 pending_effects.extend(effects);
@@ -8836,7 +9092,7 @@ mod tests {
                         let block_index = node_index_for_hash(&chain, block_hash)
                             .ok_or_else(|| TestCaseError::fail("requested header must be in chain"))?;
                         let parent_hash = hash_for_node(parent_index(&chain, block_index));
-                        let (next_state, effects) = transition(
+                        let (next_state, effects) = transition(ChainKey::Ethereum,
                             state,
                             Event::BlockHeaderReceived {
                                 request_id,
@@ -8851,7 +9107,7 @@ mod tests {
                     Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
                         request_id, ..
                     })) => {
-                        let (next_state, effects) = transition(
+                        let (next_state, effects) = transition(ChainKey::Ethereum,
                             state,
                             Event::BlockLogsReceived {
                                 request_id,
@@ -8971,7 +9227,7 @@ mod tests {
             state.pending_requests = pending_requests;
             let last_request_id = state.pending_requests.last_request_id_for_test();
 
-            let (next_state, effects) = transition(
+            let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::BlockHeaderNotFound {
                     request_id: target_request_id,
@@ -9038,7 +9294,7 @@ mod tests {
             let dispatch_ticks = state.pending_requests.dispatch_ticks_for_test();
             let unknown_request_id = RequestId::from_raw_for_test(last_request_id.wrapping_add(1));
 
-            let (next_state, effects) = transition(
+            let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::BlockHeaderNotFound {
                     request_id: unknown_request_id,
@@ -9085,7 +9341,7 @@ mod tests {
             let first_head_hash = hash_for_node(first_head_index);
             let first_parent_hash = hash_for_node(parent_index(&chain, first_head_index));
             let state = empty_state_at(finalized_hash);
-            let (state, effects) = transition(
+            let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
                     hash: first_head_hash,
@@ -9096,7 +9352,7 @@ mod tests {
             let state = drain_block_log_effects(state, &effects);
 
             let (mut state, effects) =
-                transition(state, Event::BlockHeaderNotFound { request_id });
+                transition(ChainKey::Ethereum, state, Event::BlockHeaderNotFound { request_id });
 
             prop_assert!(effects.is_empty());
             prop_assert!(state.blocks.0.is_empty());
@@ -9170,7 +9426,7 @@ mod tests {
             );
             state.pending_requests = pending_requests;
 
-            let (next_state, effects) = transition(
+            let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::PoolDataReceived {
                     request_id,
@@ -9238,7 +9494,7 @@ mod tests {
                 pending_requests.with_new_request(unrelated_request_payload.clone(), state.tick);
             state.pending_requests = pending_requests;
 
-            let (next_state, effects) = transition(
+            let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::RequestFailed {
                     request_id: failed_request_id,
@@ -9299,7 +9555,7 @@ mod tests {
                 let previous_tick = state.tick;
                 let is_tick = matches!(generated_event, GeneratedEvent::Tick);
                 let (next_state, effects) =
-                    transition(state, event_from_generated(generated_event));
+                    transition(ChainKey::Ethereum, state, event_from_generated(generated_event));
 
                 if is_tick {
                     prop_assert!(next_state.tick == previous_tick.next());

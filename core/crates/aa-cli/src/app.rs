@@ -1364,6 +1364,7 @@ mod tests {
         let state = kernel::State::init(kernel::FinalizedState::empty_at(finalized_hash));
 
         let (_state, effects) = kernel::transition(
+            ChainKey::Ethereum,
             state,
             kernel::Event::HeadObserved {
                 hash: observed_hash,
@@ -1484,7 +1485,7 @@ mod tests {
             .parse()
             .expect("test address must parse");
 
-        TokenAddress(address)
+        TokenAddress(address, ChainKey::Ethereum)
     }
 
     fn block_header(
@@ -1553,7 +1554,7 @@ mod tests {
             .parse()
             .expect("test address must parse");
 
-        PoolAddress(address)
+        PoolAddress(address, ChainKey::Ethereum)
     }
 
     fn zero_logs_bloom() -> String {

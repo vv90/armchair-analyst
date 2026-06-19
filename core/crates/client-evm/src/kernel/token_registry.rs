@@ -2,8 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, U256};
 
+use crate::ChainKey;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TokenAddress(pub Address);
+pub struct TokenAddress(pub Address, pub ChainKey);
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TokenDecimals(u8);
@@ -126,6 +128,18 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn same_address_on_different_chains_is_a_distinct_token() {
+        let address = Address::with_last_byte(7);
+        let ethereum = TokenAddress(address, ChainKey::Ethereum);
+        let arbitrum = TokenAddress(address, ChainKey::Arbitrum);
+
+        // Cross-chain token identity must not collapse: the optimizer keys reserves and the model
+        // layout by token, so a shared address across chains has to remain two distinct columns.
+        assert_ne!(ethereum, arbitrum);
+        assert_eq!(HashSet::from([ethereum, arbitrum]).len(), 2);
+    }
 
     #[test]
     fn token_decimals_accepts_supported_range() {
@@ -258,7 +272,7 @@ mod tests {
     }
 
     fn token(last_byte: u8) -> TokenAddress {
-        TokenAddress(Address::with_last_byte(last_byte))
+        TokenAddress(Address::with_last_byte(last_byte), ChainKey::Ethereum)
     }
 
     fn token_metadata(decimals: u8) -> TokenMetadata {

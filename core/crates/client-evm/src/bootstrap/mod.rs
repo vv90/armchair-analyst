@@ -10,12 +10,12 @@ use alloy::primitives::BlockHash;
 
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
-pub use crate::{GetPoolData, GetPoolMetadata, GetTokenMetadata};
 use crate::{
-    PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult, PoolState,
+    ChainKey, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult, PoolState,
     RangeLogBlock, TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry,
     tick::Tick,
 };
+pub use crate::{GetPoolData, GetPoolMetadata, GetTokenMetadata};
 use pending_requests::PendingRequests;
 // Re-exported so runtimes can dispatch bootstrap requests and build their response events, mirroring
 // the kernel's crate-level request re-exports.
@@ -123,24 +123,29 @@ struct VerifiedPools {
 }
 
 impl VerifiedPools {
-    fn verified_pools(&self) -> HashSet<PoolAddress> {
+    fn verified_pools(&self, chain: ChainKey) -> HashSet<PoolAddress> {
         self.metadata
             .iter()
             .filter(|(_, result)| result.is_ok())
-            .map(|(candidate, _)| PoolAddress(candidate.0))
+            .map(|(candidate, _)| PoolAddress(candidate.0, chain))
             .collect()
     }
 
-    fn referenced_tokens(&self) -> HashSet<TokenAddress> {
+    fn referenced_tokens(&self, chain: ChainKey) -> HashSet<TokenAddress> {
         self.metadata
             .values()
             .filter_map(|result| result.as_ref().ok())
-            .flat_map(|metadata| [TokenAddress(metadata.token0), TokenAddress(metadata.token1)])
+            .flat_map(|metadata| {
+                [
+                    TokenAddress(metadata.token0, chain),
+                    TokenAddress(metadata.token1, chain),
+                ]
+            })
             .collect()
     }
 
-    fn into_registry(self) -> TrustedPoolRegistry {
-        TrustedPoolRegistry::new().with_metadata_results(self.metadata)
+    fn into_registry(self, chain: ChainKey) -> TrustedPoolRegistry {
+        TrustedPoolRegistry::new().with_metadata_results(chain, self.metadata)
     }
 }
 
@@ -261,7 +266,7 @@ pub fn completion(state: &State) -> Option<Completion> {
 }
 
 /// Applies one bootstrap event, advancing the phase and issuing the next request.
-pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
+pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Effect>) {
     let State {
         pending,
         phase,
@@ -343,7 +348,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     let verified = VerifiedPools { metadata };
                     let payload = GetTokenMetadata {
                         at: anchor.hash,
-                        tokens: verified.referenced_tokens(),
+                        tokens: verified.referenced_tokens(chain),
                     };
                     let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
 
@@ -382,7 +387,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     let tokens = TokenRegistry::new().with_metadata_results(metadata);
                     let payload = GetPoolData {
                         at: anchor.hash,
-                        pools: verified.verified_pools(),
+                        pools: verified.verified_pools(chain),
                     };
                     let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
 
@@ -424,7 +429,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
                     let outcome = BootstrapOutcome {
                         anchor,
                         pool_snapshots,
-                        pool_registry: verified.into_registry(),
+                        pool_registry: verified.into_registry(chain),
                         token_registry: tokens,
                         seed_blocks: seed.into_blocks(),
                     };
@@ -460,7 +465,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
 
             if tick.elapsed_since(started_at) >= policy.deadline_ticks {
                 return (
-                    rebuild(pending, degraded(phase), policy, started_at, tick),
+                    rebuild(pending, degraded(chain, phase), policy, started_at, tick),
                     Vec::new(),
                 );
             }
@@ -504,7 +509,7 @@ fn issued<R>(
 
 /// Builds the best-effort terminal phase when the deadline is reached, carrying exactly the
 /// facts the current phase has accumulated. The pre-anchor case cannot activate, so it abandons.
-fn degraded(phase: Phase) -> Phase {
+fn degraded(chain: ChainKey, phase: Phase) -> Phase {
     match phase {
         Phase::AnchoringChain => Phase::Abandoned,
         Phase::Discovering { anchor } => Phase::Ready(BootstrapOutcome {
@@ -528,7 +533,7 @@ fn degraded(phase: Phase) -> Phase {
         } => Phase::Ready(BootstrapOutcome {
             anchor,
             pool_snapshots: HashMap::new(),
-            pool_registry: verified.into_registry(),
+            pool_registry: verified.into_registry(chain),
             token_registry: TokenRegistry::new(),
             seed_blocks: seed.into_blocks(),
         }),
@@ -540,7 +545,7 @@ fn degraded(phase: Phase) -> Phase {
         } => Phase::Ready(BootstrapOutcome {
             anchor,
             pool_snapshots: HashMap::new(),
-            pool_registry: verified.into_registry(),
+            pool_registry: verified.into_registry(chain),
             token_registry: tokens,
             seed_blocks: seed.into_blocks(),
         }),
@@ -756,11 +761,11 @@ mod tests {
     }
 
     fn pool(byte: u8) -> PoolAddress {
-        PoolAddress(Address::with_last_byte(byte))
+        PoolAddress(Address::with_last_byte(byte), ChainKey::Ethereum)
     }
 
     fn token(byte: u8) -> TokenAddress {
-        TokenAddress(Address::with_last_byte(byte))
+        TokenAddress(Address::with_last_byte(byte), ChainKey::Ethereum)
     }
 
     fn uniswap_pool_metadata() -> PoolMetadata {
@@ -852,6 +857,7 @@ mod tests {
     fn drive_to_validating_pools() -> (State, Vec<Effect>) {
         let (state, effects) = init(test_policy());
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedHeaderReceived {
                 request_id: finalized_request_id(&effects),
@@ -861,6 +867,7 @@ mod tests {
         let candidates_id = candidates_request(&effects).request_id;
 
         transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolCandidatesReceived {
                 request_id: candidates_id,
@@ -873,6 +880,7 @@ mod tests {
     fn discovery_request_uses_the_look_back_window_below_the_anchor() {
         let (state, effects) = init(test_policy());
         let (_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedHeaderReceived {
                 request_id: finalized_request_id(&effects),
@@ -893,6 +901,7 @@ mod tests {
         let metadata_id = metadata_request.request_id;
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolMetadataReceived {
                 request_id: metadata_id,
@@ -902,6 +911,7 @@ mod tests {
         let token_metadata_id = token_metadata_request_id(&effects);
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::TokenMetadataReceived {
                 request_id: token_metadata_id,
@@ -916,6 +926,7 @@ mod tests {
         let pool_data_id = pool_data.request_id;
 
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id: pool_data_id,
@@ -946,6 +957,7 @@ mod tests {
     fn stale_response_is_ignored_and_real_request_still_advances() {
         let (state, effects) = init(test_policy());
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedHeaderReceived {
                 request_id: finalized_request_id(&effects),
@@ -956,6 +968,7 @@ mod tests {
 
         let bogus_id = RequestId::<GetPoolCandidatesInRange>::from_raw_for_test(99_999);
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolCandidatesReceived {
                 request_id: bogus_id,
@@ -966,6 +979,7 @@ mod tests {
         assert!(completion(&state).is_none());
 
         let (_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolCandidatesReceived {
                 request_id: real_candidates_id,
@@ -982,6 +996,7 @@ mod tests {
     fn request_failed_reissues_the_same_request_with_a_new_id() {
         let (state, effects) = init(test_policy());
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedHeaderReceived {
                 request_id: finalized_request_id(&effects),
@@ -993,6 +1008,7 @@ mod tests {
         let candidates_id = candidates.request_id;
 
         let (_state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::RequestFailed {
                 request_id: AnyRequestId::PoolCandidates(candidates_id),
@@ -1016,6 +1032,7 @@ mod tests {
         };
         let (state, effects) = init(policy);
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedHeaderReceived {
                 request_id: finalized_request_id(&effects),
@@ -1024,6 +1041,7 @@ mod tests {
         );
         let candidates_id = candidates_request(&effects).request_id;
         let (mut state, _effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolCandidatesReceived {
                 request_id: candidates_id,
@@ -1032,7 +1050,7 @@ mod tests {
         );
 
         for _ in 0..policy.deadline_ticks {
-            let (next, _effects) = transition(state, Event::Tick);
+            let (next, _effects) = transition(ChainKey::Ethereum, state, Event::Tick);
             state = next;
         }
 
@@ -1059,7 +1077,7 @@ mod tests {
         let (mut state, _effects) = init(policy);
 
         for _ in 0..policy.deadline_ticks {
-            let (next, _effects) = transition(state, Event::Tick);
+            let (next, _effects) = transition(ChainKey::Ethereum, state, Event::Tick);
             state = next;
         }
 
@@ -1078,6 +1096,7 @@ mod tests {
     ) -> BootstrapOutcome {
         let (state, effects) = init(test_policy());
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::FinalizedHeaderReceived {
                 request_id: finalized_request_id(&effects),
@@ -1086,6 +1105,7 @@ mod tests {
         );
         let candidates_id = candidates_request(&effects).request_id;
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolCandidatesReceived {
                 request_id: candidates_id,
@@ -1094,6 +1114,7 @@ mod tests {
         );
         let metadata_id = pool_metadata_request(&effects).request_id;
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolMetadataReceived {
                 request_id: metadata_id,
@@ -1110,6 +1131,7 @@ mod tests {
             .map(|token| (*token, token_response(token)))
             .collect();
         let (state, effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::TokenMetadataReceived {
                 request_id: token_id,
@@ -1126,6 +1148,7 @@ mod tests {
             .map(|pool| (*pool, pool_data_response(pool)))
             .collect();
         let (state, _effects) = transition(
+            ChainKey::Ethereum,
             state,
             Event::PoolDataReceived {
                 request_id: pool_data_id,
@@ -1252,7 +1275,7 @@ mod tests {
                     Action::Tick => Event::Tick,
                 };
 
-                let (next_state, effects) = transition(state, event);
+                let (next_state, effects) = transition(ChainKey::Ethereum, state, event);
                 state = next_state;
                 if let Some(issued) = first_issued(effects) {
                     current = Some(issued);
@@ -1410,7 +1433,7 @@ mod tests {
                     .pool_registry
                     .verified_metadata(pool(*byte))
                     .expect("verified pool stays verified in the outcome");
-                for token in [TokenAddress(metadata.token0), TokenAddress(metadata.token1)] {
+                for token in [TokenAddress(metadata.token0, ChainKey::Ethereum), TokenAddress(metadata.token1, ChainKey::Ethereum)] {
                     prop_assert!(outcome.token_registry.is_known(token));
                 }
             }

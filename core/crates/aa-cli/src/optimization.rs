@@ -61,7 +61,7 @@ pub fn run_optimization<T>(
 mod tests {
     use std::{collections::HashSet, sync::mpsc};
 
-    use client_evm::{BlockHash, PoolAddress, TokenAddress};
+    use client_evm::{BlockHash, ChainKey, PoolAddress, TokenAddress};
     use optimization::{OptimizationStepStatus, PoolReserves, VirtualReserveValues};
 
     use super::*;
@@ -176,10 +176,10 @@ mod tests {
     }
 
     fn pool() -> PoolAddress {
-        PoolAddress(Default::default())
+        PoolAddress(Default::default(), ChainKey::Ethereum)
     }
 
     fn token() -> TokenAddress {
-        TokenAddress(Default::default())
+        TokenAddress(Default::default(), ChainKey::Ethereum)
     }
 }

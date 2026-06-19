@@ -848,8 +848,8 @@ mod tests {
     #[test]
     fn fetch_pool_data_posts_multicall3_request_and_decodes_pool_states() {
         let at = B256::with_last_byte(1);
-        let first_pool = PoolAddress(Address::with_last_byte(2));
-        let second_pool = PoolAddress(Address::with_last_byte(3));
+        let first_pool = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
+        let second_pool = PoolAddress(Address::with_last_byte(3), ChainKey::Ethereum);
         let first_state = pool_state(11, -12, 13);
         let second_state = pool_state(21, 22, 23);
         let response = multicall3_response([
@@ -927,8 +927,8 @@ mod tests {
     #[test]
     fn fetch_pool_data_returns_per_pool_failure_for_failed_inner_call() {
         let at = B256::with_last_byte(1);
-        let first_pool = PoolAddress(Address::with_last_byte(2));
-        let second_pool = PoolAddress(Address::with_last_byte(3));
+        let first_pool = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
+        let second_pool = PoolAddress(Address::with_last_byte(3), ChainKey::Ethereum);
         let first_state = pool_state(11, -12, 13);
         let second_state = pool_state(21, 22, 23);
         let response = multicall3_response([
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn fetch_pool_data_returns_per_pool_failure_for_malformed_inner_return_data() {
         let at = B256::with_last_byte(1);
-        let pool = PoolAddress(Address::with_last_byte(2));
+        let pool = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
         let state = pool_state(11, -12, 13);
         let response = multicall3_response([
             successful_multicall_result(Bytes::from(vec![0x12])),
@@ -1002,7 +1002,7 @@ mod tests {
             &config,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
-            HashSet::from([PoolAddress(Address::with_last_byte(2))]),
+            HashSet::from([PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
         );
 
         assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
@@ -1298,8 +1298,8 @@ mod tests {
     #[test]
     fn fetch_token_metadata_posts_multicall3_request_and_decodes_decimals() {
         let at = B256::with_last_byte(1);
-        let first_token = TokenAddress(Address::with_last_byte(2));
-        let second_token = TokenAddress(Address::with_last_byte(3));
+        let first_token = TokenAddress(Address::with_last_byte(2), ChainKey::Ethereum);
+        let second_token = TokenAddress(Address::with_last_byte(3), ChainKey::Ethereum);
         let response = multicall3_response([
             successful_multicall_result(decimals_return_data(6)),
             successful_multicall_result(decimals_return_data(18)),
@@ -1352,9 +1352,9 @@ mod tests {
     #[test]
     fn fetch_token_metadata_returns_per_token_failures() {
         let at = B256::with_last_byte(1);
-        let failed_token = TokenAddress(Address::with_last_byte(2));
-        let malformed_token = TokenAddress(Address::with_last_byte(3));
-        let unsupported_token = TokenAddress(Address::with_last_byte(4));
+        let failed_token = TokenAddress(Address::with_last_byte(2), ChainKey::Ethereum);
+        let malformed_token = TokenAddress(Address::with_last_byte(3), ChainKey::Ethereum);
+        let unsupported_token = TokenAddress(Address::with_last_byte(4), ChainKey::Ethereum);
         let response = multicall3_response([
             failed_multicall_result(),
             successful_multicall_result(Bytes::from(vec![0x12])),
@@ -1409,7 +1409,7 @@ mod tests {
             &config,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
-            HashSet::from([TokenAddress(Address::with_last_byte(2))]),
+            HashSet::from([TokenAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
         );
 
         assert!(matches!(result, Err(ClientEvmError::HttpError(_))));

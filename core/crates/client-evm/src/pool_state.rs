@@ -4,10 +4,11 @@ use alloy::primitives::{
 };
 use thiserror::Error;
 
+use crate::ChainKey;
 use crate::tick_math::{self, TickMathError};
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub struct PoolAddress(pub Address);
+pub struct PoolAddress(pub Address, pub ChainKey);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolState {
@@ -168,14 +169,28 @@ mod tests {
 
     #[test]
     fn pool_address_order_matches_inner_address_order() {
-        let first = PoolAddress(Address::with_last_byte(1));
-        let second = PoolAddress(Address::with_last_byte(2));
-        let third = PoolAddress(Address::with_last_byte(3));
+        let first = PoolAddress(Address::with_last_byte(1), ChainKey::Ethereum);
+        let second = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
+        let third = PoolAddress(Address::with_last_byte(3), ChainKey::Ethereum);
         let mut pools = vec![third, first, second];
 
         pools.sort();
 
         assert_eq!(pools, vec![first, second, third]);
+    }
+
+    #[test]
+    fn same_address_on_different_chains_is_a_distinct_pool() {
+        use std::collections::HashSet;
+
+        let address = Address::with_last_byte(7);
+        let ethereum = PoolAddress(address, ChainKey::Ethereum);
+        let arbitrum = PoolAddress(address, ChainKey::Arbitrum);
+
+        // The widened identity makes a contract deployed at the same address on two chains two
+        // distinct keys, so cross-chain merges never collapse or collide them.
+        assert_ne!(ethereum, arbitrum);
+        assert_eq!(HashSet::from([ethereum, arbitrum]).len(), 2);
     }
 
     #[test]

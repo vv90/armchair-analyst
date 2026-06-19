@@ -223,7 +223,7 @@ pub fn pool_reserves_for_optimization(
         sorted_pool_states_for_projection(chain_state.finalized_pool_snapshots(), overlay)
     {
         let Some((token0, token1, fee, token0_decimals, token1_decimals)) =
-            projection_metadata(chain_state, pool)
+            projection_metadata(chain_state, chain, pool)
         else {
             return Ok(None);
         };
@@ -276,6 +276,7 @@ fn sorted_pool_states_for_projection<'a>(
 /// Added so reserve generation can pause on incomplete registry data instead of emitting partially validated reserves.
 fn projection_metadata(
     chain_state: &kernel::State,
+    chain: ChainKey,
     pool: PoolAddress,
 ) -> Option<(
     TokenAddress,
@@ -289,8 +290,8 @@ fn projection_metadata(
         token1,
         fee,
     } = chain_state.verified_pool_metadata(pool)?;
-    let token0 = TokenAddress(*token0);
-    let token1 = TokenAddress(*token1);
+    let token0 = TokenAddress(*token0, chain);
+    let token1 = TokenAddress(*token1, chain);
     let token0_decimals = chain_state.verified_token_metadata(token0)?.decimals;
     let token1_decimals = chain_state.verified_token_metadata(token1)?.decimals;
 
@@ -481,6 +482,7 @@ fn finalized_header_received(
     match chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
             let (chain_state, effects) = kernel::transition(
+                chain,
                 chain_state,
                 kernel::Event::FinalizedBlockObserved { block_hash },
             );
@@ -581,7 +583,7 @@ fn advance_bootstrap(
     bootstrap_state: bootstrap::State,
     event: bootstrap::Event,
 ) -> (Option<ChainLifecycle>, Vec<Effect>) {
-    let (bootstrap_state, effects) = bootstrap::transition(bootstrap_state, event);
+    let (bootstrap_state, effects) = bootstrap::transition(chain, bootstrap_state, event);
     let mut effects = wrap_bootstrap_effects(chain, effects);
 
     match bootstrap::completion(&bootstrap_state) {
@@ -650,7 +652,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
     match chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
             let before_len = chain_state.canonical_path_len_from_finalized();
-            let (chain_state, effects) = kernel::transition(chain_state, event);
+            let (chain_state, effects) = kernel::transition(chain, chain_state, event);
             let after_len = chain_state.canonical_path_len_from_finalized();
             let refresh_policy = finalized_refresh_policy(chain);
             let should_fetch_finalized = kernel::should_fetch_finalized_header(
@@ -675,7 +677,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
             // which at block cadence is still negligible next to the optimization backend's work.
             // Caching the overlay is intentionally avoided: keeping a cached overlay valid across
             // reorgs is complex and error-prone, and the recompute is not a bottleneck.
-            let optimization_update = chain_state.latest_complete_pool_state_update();
+            let optimization_update = chain_state.latest_complete_pool_state_update(chain);
 
             chains.insert(chain, ChainLifecycle::Active(chain_state));
 
@@ -746,7 +748,7 @@ fn tick(state: State) -> (State, Vec<Effect>) {
                 }
                 ChainLifecycle::Active(chain_state) => {
                     let (chain_state, chain_effects) =
-                        kernel::transition(chain_state, kernel::Event::Tick);
+                        kernel::transition(chain, chain_state, kernel::Event::Tick);
                     chains.insert(chain, ChainLifecycle::Active(chain_state));
                     effects.extend(
                         chain_effects
@@ -1490,10 +1492,14 @@ mod tests {
 
     #[test]
     fn pool_reserves_projection_selects_only_the_requested_chains_pools() {
-        let ethereum_pool = pool(10);
-        let arbitrum_pool = pool(20);
-        let token0 = token(1);
-        let token1 = token(2);
+        // Same raw addresses on both chains, distinguished only by their `ChainKey` — exactly the
+        // collision the widened identity prevents.
+        let ethereum_pool = pool_on(ChainKey::Ethereum, 10);
+        let arbitrum_pool = pool_on(ChainKey::Arbitrum, 10);
+        let ethereum_token0 = token_on(ChainKey::Ethereum, 1);
+        let ethereum_token1 = token_on(ChainKey::Ethereum, 2);
+        let arbitrum_token0 = token_on(ChainKey::Arbitrum, 1);
+        let arbitrum_token1 = token_on(ChainKey::Arbitrum, 2);
         let ethereum_pool_state = balanced_pool_state(1_000_000);
         let arbitrum_pool_state = balanced_pool_state(2_000_000);
 
@@ -1503,9 +1509,12 @@ mod tests {
             HashMap::from([(ethereum_pool, ethereum_pool_state.clone())]),
             HashMap::from([(
                 ethereum_pool,
-                pool_metadata(token0, token1, UniswapV3Fee::Fee3000),
+                pool_metadata(ethereum_token0, ethereum_token1, UniswapV3Fee::Fee3000),
             )]),
-            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+            HashMap::from([
+                (ethereum_token0, token_metadata(18)),
+                (ethereum_token1, token_metadata(6)),
+            ]),
         );
         let arbitrum_state = projection_state(
             ChainKey::Arbitrum,
@@ -1513,9 +1522,12 @@ mod tests {
             HashMap::from([(arbitrum_pool, arbitrum_pool_state.clone())]),
             HashMap::from([(
                 arbitrum_pool,
-                pool_metadata(token0, token1, UniswapV3Fee::Fee3000),
+                pool_metadata(arbitrum_token0, arbitrum_token1, UniswapV3Fee::Fee3000),
             )]),
-            HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
+            HashMap::from([
+                (arbitrum_token0, token_metadata(18)),
+                (arbitrum_token1, token_metadata(6)),
+            ]),
         );
 
         // Fold both active chains into one multi-chain state to prove selection happens by argument.
@@ -1547,15 +1559,15 @@ mod tests {
         assert_directional_pair(
             &ethereum_reserves.reserves,
             ethereum_pool,
-            token0,
-            token1,
+            ethereum_token0,
+            ethereum_token1,
             &ethereum_pool_state,
         );
         assert_directional_pair(
             &arbitrum_reserves.reserves,
             arbitrum_pool,
-            token0,
-            token1,
+            arbitrum_token0,
+            arbitrum_token1,
             &arbitrum_pool_state,
         );
     }
@@ -1795,11 +1807,19 @@ mod tests {
     }
 
     fn pool(value: u8) -> PoolAddress {
-        PoolAddress(Address::with_last_byte(value))
+        pool_on(ChainKey::Ethereum, value)
     }
 
     fn token(value: u8) -> TokenAddress {
-        TokenAddress(Address::with_last_byte(value))
+        token_on(ChainKey::Ethereum, value)
+    }
+
+    fn pool_on(chain: ChainKey, value: u8) -> PoolAddress {
+        PoolAddress(Address::with_last_byte(value), chain)
+    }
+
+    fn token_on(chain: ChainKey, value: u8) -> TokenAddress {
+        TokenAddress(Address::with_last_byte(value), chain)
     }
 
     fn pool_metadata(
@@ -1844,6 +1864,7 @@ mod tests {
             finalized_snapshots,
         );
         let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            chain,
             pool_metadata
                 .into_iter()
                 .map(|(pool, metadata)| (crate::PoolCandidateAddress(pool.0), Ok(metadata)))
