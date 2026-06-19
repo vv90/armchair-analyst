@@ -5,13 +5,15 @@ use crate::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RpcConfig {
-    pub chain: ChainKey,
     pub http_url: String,
     pub ws_url: String,
     pub api_key: String,
 }
 
-pub(crate) fn compose_ws_endpoint(config: &RpcConfig) -> Result<String, ClientEvmError> {
+pub(crate) fn compose_ws_endpoint(
+    config: &RpcConfig,
+    chain: ChainKey,
+) -> Result<String, ClientEvmError> {
     let ws_url = config.ws_url.trim();
     if ws_url.is_empty() {
         return Err(ClientEvmError::InvalidSubscriptionConfig(
@@ -29,12 +31,15 @@ pub(crate) fn compose_ws_endpoint(config: &RpcConfig) -> Result<String, ClientEv
     Ok(format!(
         "{}/{}/{}",
         ws_url.trim_end_matches('/'),
-        drpc_network_path(config.chain),
+        drpc_network_path(chain),
         api_key
     ))
 }
 
-pub(crate) fn compose_http_endpoint(config: &RpcConfig) -> Result<String, ClientEvmError> {
+pub(crate) fn compose_http_endpoint(
+    config: &RpcConfig,
+    chain: ChainKey,
+) -> Result<String, ClientEvmError> {
     let http_url = config.http_url.trim();
     if http_url.is_empty() {
         return Err(ClientEvmError::InvalidHttpConfig(
@@ -52,7 +57,7 @@ pub(crate) fn compose_http_endpoint(config: &RpcConfig) -> Result<String, Client
     Ok(format!(
         "{}/{}/{}",
         http_url.trim_end_matches('/'),
-        drpc_network_path(config.chain),
+        drpc_network_path(chain),
         api_key
     ))
 }
@@ -69,7 +74,7 @@ mod tests {
     fn compose_ws_endpoint_appends_network_and_key() {
         let config = rpc_config(" wss://lb.drpc.org/ ", " api-key ");
 
-        let result = compose_ws_endpoint(&config);
+        let result = compose_ws_endpoint(&config, ChainKey::Ethereum);
 
         assert!(matches!(
             result.as_deref(),
@@ -82,7 +87,7 @@ mod tests {
         let config = rpc_config(" ", "api-key");
 
         assert!(matches!(
-            compose_ws_endpoint(&config),
+            compose_ws_endpoint(&config, ChainKey::Ethereum),
             Err(ClientEvmError::InvalidSubscriptionConfig(_))
         ));
     }
@@ -92,7 +97,7 @@ mod tests {
         let config = rpc_config("wss://lb.drpc.org", "\t");
 
         assert!(matches!(
-            compose_ws_endpoint(&config),
+            compose_ws_endpoint(&config, ChainKey::Ethereum),
             Err(ClientEvmError::InvalidSubscriptionConfig(_))
         ));
     }
@@ -101,7 +106,7 @@ mod tests {
     fn compose_http_endpoint_appends_network_and_key() {
         let config = rpc_config_with_http(" https://lb.drpc.org/ ", " api-key ");
 
-        let result = compose_http_endpoint(&config);
+        let result = compose_http_endpoint(&config, ChainKey::Ethereum);
 
         assert!(matches!(
             result.as_deref(),
@@ -114,7 +119,7 @@ mod tests {
         let config = rpc_config_with_http(" ", "api-key");
 
         assert!(matches!(
-            compose_http_endpoint(&config),
+            compose_http_endpoint(&config, ChainKey::Ethereum),
             Err(ClientEvmError::InvalidHttpConfig(_))
         ));
     }
@@ -124,7 +129,7 @@ mod tests {
         let config = rpc_config_with_http("https://lb.drpc.org", "\t");
 
         assert!(matches!(
-            compose_http_endpoint(&config),
+            compose_http_endpoint(&config, ChainKey::Ethereum),
             Err(ClientEvmError::InvalidHttpConfig(_))
         ));
     }
@@ -145,7 +150,7 @@ mod tests {
                 api_key
             );
 
-            prop_assert_eq!(compose_ws_endpoint(&config)?, expected);
+            prop_assert_eq!(compose_ws_endpoint(&config, ChainKey::Ethereum)?, expected);
         }
 
         #[test]
@@ -156,7 +161,7 @@ mod tests {
             let config = rpc_config(&whitespace, &api_key);
 
             prop_assert!(matches!(
-                compose_ws_endpoint(&config),
+                compose_ws_endpoint(&config, ChainKey::Ethereum),
                 Err(ClientEvmError::InvalidSubscriptionConfig(_))
             ));
         }
@@ -169,7 +174,7 @@ mod tests {
             let config = rpc_config(&ws_url, &whitespace);
 
             prop_assert!(matches!(
-                compose_ws_endpoint(&config),
+                compose_ws_endpoint(&config, ChainKey::Ethereum),
                 Err(ClientEvmError::InvalidSubscriptionConfig(_))
             ));
         }
@@ -181,10 +186,10 @@ mod tests {
             api_key in "[A-Za-z0-9_-]{1,40}",
         ) {
             let mut config = rpc_config(&ws_url, &api_key);
-            let expected = compose_ws_endpoint(&config)?;
+            let expected = compose_ws_endpoint(&config, ChainKey::Ethereum)?;
             config.http_url = http_url;
 
-            prop_assert_eq!(compose_ws_endpoint(&config)?, expected);
+            prop_assert_eq!(compose_ws_endpoint(&config, ChainKey::Ethereum)?, expected);
         }
 
         #[test]
@@ -202,7 +207,7 @@ mod tests {
                 api_key
             );
 
-            prop_assert_eq!(compose_http_endpoint(&config)?, expected);
+            prop_assert_eq!(compose_http_endpoint(&config, ChainKey::Ethereum)?, expected);
         }
 
         #[test]
@@ -212,16 +217,15 @@ mod tests {
             api_key in "[A-Za-z0-9_-]{1,40}",
         ) {
             let mut config = rpc_config_with_http(&http_url, &api_key);
-            let expected = compose_http_endpoint(&config)?;
+            let expected = compose_http_endpoint(&config, ChainKey::Ethereum)?;
             config.ws_url = ws_url;
 
-            prop_assert_eq!(compose_http_endpoint(&config)?, expected);
+            prop_assert_eq!(compose_http_endpoint(&config, ChainKey::Ethereum)?, expected);
         }
     }
 
     fn rpc_config(ws_url: &str, api_key: &str) -> RpcConfig {
         RpcConfig {
-            chain: ChainKey::Ethereum,
             http_url: "https://lb.drpc.live/".to_owned(),
             ws_url: ws_url.to_owned(),
             api_key: api_key.to_owned(),
@@ -230,7 +234,6 @@ mod tests {
 
     fn rpc_config_with_http(http_url: &str, api_key: &str) -> RpcConfig {
         RpcConfig {
-            chain: ChainKey::Ethereum,
             http_url: http_url.to_owned(),
             ws_url: "wss://lb.drpc.live/".to_owned(),
             api_key: api_key.to_owned(),

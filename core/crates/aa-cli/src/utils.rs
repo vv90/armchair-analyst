@@ -1,6 +1,6 @@
 use std::{error, fmt};
 
-use client_evm::{ChainKey, RpcConfig};
+use client_evm::RpcConfig;
 
 pub(crate) const RPC_HTTP_URL_ENV: &str = "AA_RPC_HTTP_URL";
 pub(crate) const RPC_WS_URL_ENV: &str = "AA_RPC_WS_URL";
@@ -57,7 +57,6 @@ where
     Prompt: FnMut(&'static str) -> Result<String, CliError>,
 {
     Ok(RpcConfig {
-        chain: ChainKey::Ethereum,
         http_url: required_value(
             RPC_HTTP_URL_ENV,
             RPC_HTTP_URL_PROMPT,
@@ -129,7 +128,6 @@ mod tests {
         assert_eq!(
             result,
             Ok(RpcConfig {
-                chain: ChainKey::Ethereum,
                 http_url: "https://example.invalid/http".to_owned(),
                 ws_url: "wss://example.invalid/ws".to_owned(),
                 api_key: "key-from-env".to_owned(),
@@ -165,7 +163,6 @@ mod tests {
         assert_eq!(
             result,
             Ok(RpcConfig {
-                chain: ChainKey::Ethereum,
                 http_url: "https://env.example/http".to_owned(),
                 ws_url: "wss://prompted.example/ws".to_owned(),
                 api_key: "prompted-key".to_owned(),
@@ -192,7 +189,6 @@ mod tests {
         assert_eq!(
             result,
             Ok(RpcConfig {
-                chain: ChainKey::Ethereum,
                 http_url: "https://prompted.example/http".to_owned(),
                 ws_url: "wss://prompted.example/ws".to_owned(),
                 api_key: "prompted-key".to_owned(),

@@ -32,27 +32,25 @@ pub(crate) struct ClientEvmApp {}
 
 pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
-    ethereum_config: RpcConfig,
+    rpc_config: RpcConfig,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
     view: View,
     logger: Logger,
 }
 
 impl ClientEvmRuntime {
-    pub(crate) fn new(ethereum_config: RpcConfig, logger: Logger, view: View) -> ClientEvmRuntime {
+    pub(crate) fn new(rpc_config: RpcConfig, logger: Logger, view: View) -> ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
-            ethereum_config,
+            rpc_config,
             optimization_sender: OnceLock::new(),
             view,
             logger,
         }
     }
 
-    fn get_config(&self, chain: ChainKey) -> &RpcConfig {
-        match chain {
-            ChainKey::Ethereum => &self.ethereum_config,
-        }
+    fn rpc_config(&self) -> &RpcConfig {
+        &self.rpc_config
     }
 }
 
@@ -91,7 +89,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     ) -> Vec<<ClientEvmApp as Application>::Input> {
         match effect {
             Effect::FetchFinalizedHeader { chain } => {
-                let r = fetch_finalized_block_header(&self.agent, self.get_config(chain));
+                let r = fetch_finalized_block_header(&self.agent, self.rpc_config(), chain);
                 match r {
                     Ok(Some(header)) => vec![Event::FinalizedHeaderReceived {
                         chain,
@@ -124,7 +122,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                     map_client_chain_event(client_event)
                         .map(|event| Event::ChainEvent { chain, event })
                 };
-                let _ = subscribe_new_heads(self.get_config(chain), sender, map_client_event);
+                let _ = subscribe_new_heads(self.rpc_config(), chain, sender, map_client_event);
             }
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
@@ -311,14 +309,14 @@ fn format_request_id_log(request_id: &AnyRequestId) -> String {
 
 impl ClientEvmRuntime {
     fn execute_bootstrap_effect(&self, chain: ChainKey, effect: bootstrap::Effect) -> Vec<Event> {
-        let config = self.get_config(chain);
+        let config = self.rpc_config();
         let bootstrap::Effect::Request(request) = effect;
 
         let event = match request {
             bootstrap::AnyIssuedRequest::FinalizedHeader(request) => {
                 let request_id = request.request_id;
 
-                match fetch_finalized_block_header(&self.agent, config) {
+                match fetch_finalized_block_header(&self.agent, config, chain) {
                     Ok(Some(header)) => bootstrap::Event::FinalizedHeaderReceived {
                         request_id,
                         anchor: bootstrap::FinalizedAnchor {
@@ -335,7 +333,7 @@ impl ClientEvmRuntime {
                 let request_id = request.request_id;
                 let from_block = request.request_payload.from_block;
 
-                match fetch_pool_candidates_in_range(&self.agent, config, from_block) {
+                match fetch_pool_candidates_in_range(&self.agent, config, chain, from_block) {
                     Ok(blocks) => bootstrap::Event::PoolCandidatesReceived { request_id, blocks },
                     Err(_) => bootstrap::Event::RequestFailed {
                         request_id: bootstrap::AnyRequestId::PoolCandidates(request_id),
@@ -347,7 +345,7 @@ impl ClientEvmRuntime {
                 let at = request.request_payload.at;
                 let candidates = request.request_payload.candidates;
 
-                match fetch_pool_metadata(&self.agent, config, at, candidates) {
+                match fetch_pool_metadata(&self.agent, config, chain, at, candidates) {
                     Ok(metadata) => bootstrap::Event::PoolMetadataReceived {
                         request_id,
                         metadata,
@@ -362,7 +360,7 @@ impl ClientEvmRuntime {
                 let at = request.request_payload.at;
                 let tokens = request.request_payload.tokens;
 
-                match fetch_token_metadata(&self.agent, config, at, tokens) {
+                match fetch_token_metadata(&self.agent, config, chain, at, tokens) {
                     Ok(metadata) => bootstrap::Event::TokenMetadataReceived {
                         request_id,
                         metadata,
@@ -377,7 +375,7 @@ impl ClientEvmRuntime {
                 let at = request.request_payload.at;
                 let pools = request.request_payload.pools;
 
-                match fetch_pool_data(&self.agent, config, at, pools) {
+                match fetch_pool_data(&self.agent, config, chain, at, pools) {
                     Ok(pools) => bootstrap::Event::PoolDataReceived { request_id, pools },
                     Err(_) => bootstrap::Event::RequestFailed {
                         request_id: bootstrap::AnyRequestId::PoolData(request_id),
@@ -393,13 +391,13 @@ impl ClientEvmRuntime {
         execute_chain_effect_with(
             chain,
             effect,
-            |block_hash| fetch_block_header(&self.agent, self.get_config(chain), block_hash),
-            |block_hash| fetch_block_logs(&self.agent, self.get_config(chain), block_hash),
-            |at, pools| fetch_pool_data(&self.agent, self.get_config(chain), at, pools),
+            |block_hash| fetch_block_header(&self.agent, self.rpc_config(), chain, block_hash),
+            |block_hash| fetch_block_logs(&self.agent, self.rpc_config(), chain, block_hash),
+            |at, pools| fetch_pool_data(&self.agent, self.rpc_config(), chain, at, pools),
             |at, candidates| {
-                fetch_pool_metadata(&self.agent, self.get_config(chain), at, candidates)
+                fetch_pool_metadata(&self.agent, self.rpc_config(), chain, at, candidates)
             },
-            |at, tokens| fetch_token_metadata(&self.agent, self.get_config(chain), at, tokens),
+            |at, tokens| fetch_token_metadata(&self.agent, self.rpc_config(), chain, at, tokens),
         )
     }
 }
@@ -623,11 +621,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_constructor_stores_ethereum_config() {
+    fn runtime_constructor_stores_rpc_config() {
         let config = rpc_config();
         let runtime = ClientEvmRuntime::new(config.clone(), Logger::sink(), View::sink());
 
-        assert_eq!(runtime.get_config(ChainKey::Ethereum), &config);
+        assert_eq!(runtime.rpc_config(), &config);
     }
 
     #[test]
@@ -1539,7 +1537,6 @@ mod tests {
 
     fn rpc_config() -> RpcConfig {
         RpcConfig {
-            chain: ChainKey::Ethereum,
             http_url: "https://example.invalid/http".to_owned(),
             ws_url: "wss://example.invalid/ws".to_owned(),
             api_key: "api-key".to_owned(),
