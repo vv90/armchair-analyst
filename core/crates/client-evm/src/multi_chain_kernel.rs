@@ -179,13 +179,14 @@ fn observe_chain(
     }
 }
 
-/// Projects the active Ethereum kernel state and a complete pool-state overlay into optimization reserves.
+/// Projects the requested chain's active kernel state and a complete pool-state overlay into optimization reserves.
 /// Added as the pure bridge from validated EVM pool state into the optimization crate's directional reserve model.
-pub fn ethereum_pool_reserves_for_optimization(
+pub fn pool_reserves_for_optimization(
     state: &State,
+    chain: ChainKey,
     update: &kernel::CompletePoolStateUpdate,
 ) -> Result<Option<OptimizationPoolReserves>, PoolReserveProjectionError> {
-    let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&ChainKey::Ethereum) else {
+    let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&chain) else {
         return Ok(None);
     };
 
@@ -647,10 +648,13 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
-            // INEFFICIENT (intentional, for now): this rebuilds the complete pool-state overlay by
-            // walking the whole canonical sequence from tip back to the finalized anchor on EVERY
-            // chain event. A future iteration should cache the overlay or detect block advancement
-            // cheaply instead of rescanning the chain each time.
+            // Re-derives the complete pool-state overlay on every chain event. The walk from tip to
+            // the finalized anchor only accumulates snapshot *locations* (`pool -> block_hash`), so it
+            // clones no `PoolState` and costs O(unfinalized-path + recent activity) — cheap. The real
+            // cost is downstream in reserve projection (the O(N log N) sort over all tracked pools),
+            // which at block cadence is still negligible next to the optimization backend's work.
+            // Caching the overlay is intentionally avoided: keeping a cached overlay valid across
+            // reorgs is complex and error-prone, and the recompute is not a bottleneck.
             let optimization_update = chain_state.latest_complete_pool_state_update();
 
             chains.insert(chain, ChainLifecycle::Active(chain_state));
@@ -668,7 +672,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 // retries this block on the next event instead of being skipped.
                 if changed {
                     if let Ok(Some(input)) =
-                        ethereum_pool_reserves_for_optimization(&state, &update)
+                        pool_reserves_for_optimization(&state, chain, &update)
                     {
                         state.last_optimized_block.insert(chain, update.block_hash);
                         effects.push(Effect::RunOptimization { input });
@@ -1387,7 +1391,7 @@ mod tests {
         let (state, _) = State::init(ChainKey::Ethereum);
         let (state, update) = projection_update(state, hash(1), HashMap::new());
 
-        let reserves = ethereum_pool_reserves_for_optimization(&state, &update).unwrap();
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
         assert_eq!(reserves, None);
     }
@@ -1397,7 +1401,7 @@ mod tests {
         let state = projection_state(hash(1), HashMap::new(), HashMap::new(), HashMap::new());
         let (state, update) = projection_update(state, hash(2), HashMap::new());
 
-        let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
             .unwrap();
 
@@ -1419,7 +1423,7 @@ mod tests {
         );
         let (state, update) = projection_update(state, hash(2), HashMap::new());
 
-        let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
             .unwrap();
 
@@ -1446,7 +1450,7 @@ mod tests {
             HashMap::from([(pool, updated_pool_state.clone())]),
         );
 
-        let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
             .unwrap();
 
@@ -1469,7 +1473,7 @@ mod tests {
             HashMap::from([(pool, balanced_pool_state(1_000_000))]),
         );
 
-        let reserves = ethereum_pool_reserves_for_optimization(&state, &update).unwrap();
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
         assert_eq!(reserves, None);
     }
@@ -1491,7 +1495,7 @@ mod tests {
             HashMap::from([(pool, balanced_pool_state(1_000_000))]),
         );
 
-        let reserves = ethereum_pool_reserves_for_optimization(&state, &update).unwrap();
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
         assert_eq!(reserves, None);
     }
@@ -1514,7 +1518,7 @@ mod tests {
         );
         let (state, update) = projection_update(state, hash(2), HashMap::from([(pool, pool_state)]));
 
-        let error = ethereum_pool_reserves_for_optimization(&state, &update).unwrap_err();
+        let error = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1546,7 +1550,7 @@ mod tests {
         let (state, update) =
             projection_update(state, hash(2), HashMap::from([(pool, inconsistent_pool_state)]));
 
-        let error = ethereum_pool_reserves_for_optimization(&state, &update).unwrap_err();
+        let error = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1600,7 +1604,7 @@ mod tests {
                     .collect(),
             );
 
-            let reserves = ethereum_pool_reserves_for_optimization(&state, &update)
+            let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
                 .unwrap()
                 .unwrap();
 
