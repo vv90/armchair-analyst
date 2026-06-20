@@ -251,8 +251,23 @@ impl BlocksGraph {
         BlocksGraph(blocks)
     }
 
-    /// Builds the next pool-state request for verified dirty pools on the canonical path.
-    /// Added to batch accumulated affected pools at the latest tip while skipping pools already snapshotted, failed, or pending there.
+    /// Builds the next pool-state request (issued at the tip) for verified dirty pools on the
+    /// canonical path that are not already covered.
+    ///
+    /// Semantics: a trusted pool is "dirty" at a block when that block's resolved logs name it, and
+    /// "covered" at a block when that block holds its snapshot or failure marker, or an in-flight
+    /// `GetPoolData` request targets that block. Walking the present canonical suffix oldest→newest, a
+    /// pool needs a read iff its latest dirty block is newer than its latest covered block — i.e. its
+    /// state changed after the last time we read, attempted, or are reading it. Coverage at *any* suffix
+    /// block (not only the tip) suppresses the read, so a snapshot taken at an earlier block stops being
+    /// re-requested every head until something re-dirties the pool; re-dirtying at a newer block
+    /// re-adds it. The result is read once per change instead of once per block.
+    ///
+    /// CAVEAT (known follow-up): a `pool_data_failures` entry counts as coverage, so a *transient* fetch
+    /// error filters the pool out of `dirty_pools` until it is re-dirtied. Between the failure and the
+    /// next log that names the pool, we hold no fresh snapshot for it and could optimize over an
+    /// outdated/absent state. This is acceptable only as a stopgap; a bounded retry/backoff for transient
+    /// per-pool failures should replace this so stale state cannot persist silently.
     fn unknown_present_canonical_pool_data_request(
         &self,
         chain: ChainKey,
@@ -263,8 +278,6 @@ impl BlocksGraph {
     ) -> Option<(BlockHash, HashSet<PoolAddress>)> {
         let hashes = self.present_canonical_hashes_oldest_to_newest(tip_hash, finalized_hash);
         let target_hash = hashes.last().copied()?;
-        let target_block = self.get(&target_hash)?;
-        let pending_pools = pending_pool_data_by_block.get(&target_hash);
         let mut dirty_pools = HashSet::new();
 
         for block_hash in hashes {
@@ -279,16 +292,24 @@ impl BlocksGraph {
                     dirty_pools.extend(pools);
                 }
             }
+
+            // Oldest→newest, so the latest touch wins: coverage on this block clears the pool, a
+            // newer dirty block re-adds it. This skips reads for pools already known/failed/pending
+            // at a block at-or-after their last change, not just at the tip.
+            for pool in block.pool_snapshots.keys() {
+                dirty_pools.remove(pool);
+            }
+            for pool in block.pool_data_failures.keys() {
+                dirty_pools.remove(pool);
+            }
+            if let Some(pending_pools) = pending_pool_data_by_block.get(&block_hash) {
+                for pool in pending_pools {
+                    dirty_pools.remove(pool);
+                }
+            }
         }
 
-        let pools = dirty_pools
-            .into_iter()
-            .filter(|pool| !target_block.pool_snapshots.contains_key(pool))
-            .filter(|pool| !target_block.pool_data_failures.contains_key(pool))
-            .filter(|pool| !pending_pools.is_some_and(|pools| pools.contains(pool)))
-            .collect::<HashSet<_>>();
-
-        (!pools.is_empty()).then_some((target_hash, pools))
+        (!dirty_pools.is_empty()).then_some((target_hash, dirty_pools))
     }
 
     /// Finds present canonical blocks whose logs are still unknown and not pending.
@@ -4865,6 +4886,316 @@ mod tests {
         assert!(next_state.pending_requests.contains(&pool_data_request_id));
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
+    }
+
+    // Builds a resolved block carrying per-pool data failures.
+    // Coverage tests use it to place a failure marker on a specific block.
+    fn resolved_block_with_failures(
+        parent_hash: BlockHash,
+        candidates: HashSet<PoolCandidateAddress>,
+        pool_data_failures: HashMap<PoolAddress, PoolDataFailure>,
+    ) -> BlockNode {
+        BlockNode {
+            parent_hash,
+            pool_logs: PoolLogsStatus::Resolved(candidates),
+            pool_snapshots: HashMap::new(),
+            pool_data_failures,
+        }
+    }
+
+    // Verifies a single candidate so its resolved logs project to a trusted pool.
+    fn registry_verifying(candidate: PoolCandidateAddress) -> TrustedPoolRegistry {
+        TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)))]),
+        )
+    }
+
+    // A pool snapshotted at an earlier block must not be re-read as the tip advances without re-dirtying.
+    // This is the redundant-read regression: coverage is checked per block, not only at the tip.
+    #[test]
+    fn snapshot_at_earlier_block_is_not_re_requested_as_tip_advances() {
+        let finalized = BlockHash::with_last_byte(1);
+        let dirty_block = BlockHash::with_last_byte(2);
+        let middle = BlockHash::with_last_byte(3);
+        let tip = BlockHash::with_last_byte(4);
+        let candidate = pool_candidate_address(9);
+        let pool = pool_address(9);
+
+        let blocks = BlocksGraph(HashMap::from([
+            (
+                dirty_block,
+                resolved_block_with_snapshots(
+                    finalized,
+                    HashSet::from([candidate]),
+                    HashMap::from([(pool, pool_state(9))]),
+                ),
+            ),
+            (
+                middle,
+                resolved_block_with_snapshots(dirty_block, HashSet::new(), HashMap::new()),
+            ),
+            (
+                tip,
+                resolved_block_with_snapshots(middle, HashSet::new(), HashMap::new()),
+            ),
+        ]));
+
+        let request = blocks.unknown_present_canonical_pool_data_request(
+            ChainKey::Ethereum,
+            tip,
+            finalized,
+            &registry_verifying(candidate),
+            &HashMap::new(),
+        );
+
+        assert_eq!(request, None);
+    }
+
+    // A pool with an in-flight read recorded at an earlier block must not be re-requested at the new tip.
+    #[test]
+    fn pending_pool_data_at_earlier_block_is_not_re_requested_as_tip_advances() {
+        let finalized = BlockHash::with_last_byte(1);
+        let dirty_block = BlockHash::with_last_byte(2);
+        let tip = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(9);
+        let pool = pool_address(9);
+
+        let blocks = BlocksGraph(HashMap::from([
+            (
+                dirty_block,
+                resolved_block_with_snapshots(
+                    finalized,
+                    HashSet::from([candidate]),
+                    HashMap::new(),
+                ),
+            ),
+            (
+                tip,
+                resolved_block_with_snapshots(dirty_block, HashSet::new(), HashMap::new()),
+            ),
+        ]));
+        let pending = HashMap::from([(dirty_block, HashSet::from([pool]))]);
+
+        let request = blocks.unknown_present_canonical_pool_data_request(
+            ChainKey::Ethereum,
+            tip,
+            finalized,
+            &registry_verifying(candidate),
+            &pending,
+        );
+
+        assert_eq!(request, None);
+    }
+
+    // A pool whose read failed at an earlier block must not be retried every head; retry waits for re-dirty.
+    #[test]
+    fn pool_data_failure_at_earlier_block_is_not_re_requested_as_tip_advances() {
+        let finalized = BlockHash::with_last_byte(1);
+        let dirty_block = BlockHash::with_last_byte(2);
+        let tip = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(9);
+        let pool = pool_address(9);
+
+        let blocks = BlocksGraph(HashMap::from([
+            (
+                dirty_block,
+                resolved_block_with_failures(
+                    finalized,
+                    HashSet::from([candidate]),
+                    HashMap::from([(pool, PoolDataFailure::CallFailed(PoolDataCall::Slot0))]),
+                ),
+            ),
+            (
+                tip,
+                resolved_block_with_snapshots(dirty_block, HashSet::new(), HashMap::new()),
+            ),
+        ]));
+
+        let request = blocks.unknown_present_canonical_pool_data_request(
+            ChainKey::Ethereum,
+            tip,
+            finalized,
+            &registry_verifying(candidate),
+            &HashMap::new(),
+        );
+
+        assert_eq!(request, None);
+    }
+
+    // A pool re-dirtied by a block newer than its coverage must be requested again.
+    #[test]
+    fn pool_re_dirtied_after_coverage_is_requested_again() {
+        let finalized = BlockHash::with_last_byte(1);
+        let dirty_block = BlockHash::with_last_byte(2);
+        let tip = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(9);
+        let pool = pool_address(9);
+
+        let blocks = BlocksGraph(HashMap::from([
+            (
+                dirty_block,
+                resolved_block_with_snapshots(
+                    finalized,
+                    HashSet::from([candidate]),
+                    HashMap::from([(pool, pool_state(9))]),
+                ),
+            ),
+            (
+                tip,
+                resolved_block_with_snapshots(
+                    dirty_block,
+                    HashSet::from([candidate]),
+                    HashMap::new(),
+                ),
+            ),
+        ]));
+
+        let request = blocks.unknown_present_canonical_pool_data_request(
+            ChainKey::Ethereum,
+            tip,
+            finalized,
+            &registry_verifying(candidate),
+            &HashMap::new(),
+        );
+
+        assert_eq!(request, Some((tip, HashSet::from([pool]))));
+    }
+
+    // A snapshot on the tip block still suppresses the read (existing behavior preserved).
+    #[test]
+    fn snapshot_at_tip_is_not_requested() {
+        let finalized = BlockHash::with_last_byte(1);
+        let tip = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(9);
+        let pool = pool_address(9);
+
+        let blocks = BlocksGraph(HashMap::from([(
+            tip,
+            resolved_block_with_snapshots(
+                finalized,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, pool_state(9))]),
+            ),
+        )]));
+
+        let request = blocks.unknown_present_canonical_pool_data_request(
+            ChainKey::Ethereum,
+            tip,
+            finalized,
+            &registry_verifying(candidate),
+            &HashMap::new(),
+        );
+
+        assert_eq!(request, None);
+    }
+
+    // A dirty pool with no block-level coverage is requested (e.g. only a finalized snapshot exists).
+    #[test]
+    fn dirty_pool_without_block_coverage_is_requested() {
+        let finalized = BlockHash::with_last_byte(1);
+        let tip = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(9);
+        let pool = pool_address(9);
+
+        let blocks = BlocksGraph(HashMap::from([(
+            tip,
+            resolved_block_with_snapshots(finalized, HashSet::from([candidate]), HashMap::new()),
+        )]));
+
+        let request = blocks.unknown_present_canonical_pool_data_request(
+            ChainKey::Ethereum,
+            tip,
+            finalized,
+            &registry_verifying(candidate),
+            &HashMap::new(),
+        );
+
+        assert_eq!(request, Some((tip, HashSet::from([pool]))));
+    }
+
+    proptest! {
+        // A pool is requested iff its latest dirty block is newer than its latest coverage
+        // (snapshot, failure, or pending) across the whole canonical suffix — not just the tip.
+        #[test]
+        fn pool_requested_iff_dirtied_after_latest_coverage(
+            tags in prop::collection::vec((any::<bool>(), 0u8..4), 1..7)
+        ) {
+            let finalized = BlockHash::with_last_byte(200);
+            let candidate = pool_candidate_address(9);
+            let pool = pool_address(9);
+
+            let mut nodes = HashMap::new();
+            let mut pending: HashMap<BlockHash, HashSet<PoolAddress>> = HashMap::new();
+            let mut latest_dirty: Option<usize> = None;
+            let mut latest_cover: Option<usize> = None;
+
+            for (idx, (dirty, coverage)) in tags.iter().copied().enumerate() {
+                let block_hash = BlockHash::with_last_byte(idx as u8);
+                let parent_hash = match idx.checked_sub(1) {
+                    Some(prev) => BlockHash::with_last_byte(prev as u8),
+                    None => finalized,
+                };
+                let candidates = if dirty {
+                    HashSet::from([candidate])
+                } else {
+                    HashSet::new()
+                };
+                if dirty {
+                    latest_dirty = Some(idx);
+                }
+
+                let mut snapshots = HashMap::new();
+                let mut failures = HashMap::new();
+                match coverage {
+                    1 => {
+                        snapshots.insert(pool, pool_state(9));
+                        latest_cover = Some(idx);
+                    }
+                    2 => {
+                        failures.insert(pool, PoolDataFailure::CallFailed(PoolDataCall::Slot0));
+                        latest_cover = Some(idx);
+                    }
+                    3 => {
+                        pending.insert(block_hash, HashSet::from([pool]));
+                        latest_cover = Some(idx);
+                    }
+                    _ => {}
+                }
+
+                nodes.insert(
+                    block_hash,
+                    BlockNode {
+                        parent_hash,
+                        pool_logs: PoolLogsStatus::Resolved(candidates),
+                        pool_snapshots: snapshots,
+                        pool_data_failures: failures,
+                    },
+                );
+            }
+
+            let tip = BlockHash::with_last_byte((tags.len() - 1) as u8);
+            let blocks = BlocksGraph(nodes);
+
+            let request = blocks.unknown_present_canonical_pool_data_request(
+                ChainKey::Ethereum,
+                tip,
+                finalized,
+                &registry_verifying(candidate),
+                &pending,
+            );
+
+            let should_request = match latest_dirty {
+                Some(dirty_idx) => latest_cover.map_or(true, |cover_idx| cover_idx < dirty_idx),
+                None => false,
+            };
+
+            if should_request {
+                prop_assert_eq!(request, Some((tip, HashSet::from([pool]))));
+            } else {
+                prop_assert_eq!(request, None);
+            }
+        }
     }
 
     // Returns pool metadata for an address outside the request payload.
