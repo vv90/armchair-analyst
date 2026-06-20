@@ -155,6 +155,15 @@ impl PendingRequests {
             .collect()
     }
 
+    /// Reports whether a block-header request for `block_hash` is already in flight.
+    /// Added so ancestry-reconnection sites skip re-issuing a header already being fetched, since the
+    /// in-flight request will deliver it and continue the walk (the TTL retry path still covers a loss).
+    pub(crate) fn has_pending_header_request(&self, block_hash: BlockHash) -> bool {
+        self.block_headers
+            .values()
+            .any(|request| request.payload.block_hash == block_hash)
+    }
+
     pub(crate) fn pending_pool_metadata_candidates(&self) -> HashSet<PoolCandidateAddress> {
         self.pool_metadata
             .values()
@@ -302,6 +311,12 @@ impl PendingRequests {
             .collect()
     }
 
+    /// Counts in-flight header requests including any duplicates for the same block hash.
+    /// Compared against the distinct-hash count to assert no duplicate header request is ever live.
+    pub(crate) fn pending_header_request_count_for_test(&self) -> usize {
+        self.block_headers.len()
+    }
+
     pub(crate) fn header_dispatch_tick_for_test(
         &self,
         request_id: &RequestId<GetBlockHeader>,
@@ -388,5 +403,25 @@ impl RequestStore<GetTokenMetadata> for PendingRequests {
 
     fn request_collection_mut(&mut self) -> &mut RequestCollection<GetTokenMetadata> {
         &mut self.token_metadata
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_pending_header_request_tracks_issued_and_taken_headers() {
+        let hash = BlockHash::with_last_byte(7);
+        let other = BlockHash::with_last_byte(8);
+
+        let (pending, request_id) = PendingRequests::new()
+            .with_new_request(GetBlockHeader { block_hash: hash }, Tick::initial());
+
+        assert!(pending.has_pending_header_request(hash));
+        assert!(!pending.has_pending_header_request(other));
+
+        let (pending, _) = pending.take(&request_id);
+        assert!(!pending.has_pending_header_request(hash));
     }
 }

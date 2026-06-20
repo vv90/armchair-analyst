@@ -1179,6 +1179,36 @@ fn schedule_unknown_canonical_requests(
     schedule_unknown_canonical_pool_data_request(chain, state, effects)
 }
 
+/// Issues a block-header request for a missing ancestor, unless one for that hash is already in flight.
+/// Added so every ancestry-reconnection site (head observations and header-received walks) dedups
+/// against pending headers through one path: a converging missing parent is fetched once, not per event.
+/// When deduped, returns no effect — the existing in-flight request carries the walk forward.
+fn request_missing_header(
+    pending_requests: PendingRequests,
+    tick: Tick,
+    missing_hash: BlockHash,
+) -> (PendingRequests, Vec<Effect>) {
+    if pending_requests.has_pending_header_request(missing_hash) {
+        return (pending_requests, Vec::new());
+    }
+
+    let request_payload = GetBlockHeader {
+        block_hash: missing_hash,
+    };
+    let (pending_requests, request_id) =
+        pending_requests.with_new_request(request_payload.clone(), tick);
+
+    (
+        pending_requests,
+        vec![Effect::Request(AnyIssuedRequest::BlockHeader(
+            IssuedRequest {
+                request_id,
+                request_payload,
+            },
+        ))],
+    )
+}
+
 /// Applies one kernel event to state and returns the side effects the runtime must execute.
 /// Added as the pure deterministic boundary between EVM client state transitions and impure RPC/runtime work.
 pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Effect>) {
@@ -1198,12 +1228,8 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     vec![],
                 ),
                 Ok((blocks, Some(missing_hash))) => {
-                    let request_payload = GetBlockHeader {
-                        block_hash: missing_hash,
-                    };
-                    let (pending_requests, request_id) = state
-                        .pending_requests
-                        .with_new_request(request_payload.clone(), state.tick);
+                    let (pending_requests, effects) =
+                        request_missing_header(state.pending_requests, state.tick, missing_hash);
 
                     schedule_unknown_canonical_requests(
                         chain,
@@ -1213,33 +1239,19 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                             pending_requests,
                             ..state
                         },
-                        vec![Effect::Request(AnyIssuedRequest::BlockHeader(
-                            IssuedRequest {
-                                request_id,
-                                request_payload,
-                            },
-                        ))],
+                        effects,
                     )
                 }
                 Err(NewBlockError::SelfParentBlock(missing_hash, blocks)) => {
-                    let request_payload = GetBlockHeader {
-                        block_hash: missing_hash,
-                    };
-                    let (pending_requests, request_id) = state
-                        .pending_requests
-                        .with_new_request(request_payload.clone(), state.tick);
+                    let (pending_requests, effects) =
+                        request_missing_header(state.pending_requests, state.tick, missing_hash);
                     (
                         State {
                             blocks,
                             pending_requests,
                             ..state
                         },
-                        vec![Effect::Request(AnyIssuedRequest::BlockHeader(
-                            IssuedRequest {
-                                request_id,
-                                request_payload,
-                            },
-                        ))],
+                        effects,
                     )
                 }
                 Err(NewBlockError::ExistingBlock(blocks)) => schedule_unknown_canonical_requests(
@@ -1311,11 +1323,8 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     true,
                 ),
                 Ok((blocks, Some(missing_hash))) => {
-                    let request_payload = GetBlockHeader {
-                        block_hash: missing_hash,
-                    };
-                    let (pending_requests, request_id) =
-                        pending_requests.with_new_request(request_payload.clone(), state.tick);
+                    let (pending_requests, effects) =
+                        request_missing_header(pending_requests, state.tick, missing_hash);
 
                     (
                         State {
@@ -1323,33 +1332,20 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                             pending_requests,
                             ..state
                         },
-                        vec![Effect::Request(AnyIssuedRequest::BlockHeader(
-                            IssuedRequest {
-                                request_id,
-                                request_payload,
-                            },
-                        ))],
+                        effects,
                         true,
                     )
                 }
                 Err(NewBlockError::SelfParentBlock(missing_hash, blocks)) => {
-                    let request_payload = GetBlockHeader {
-                        block_hash: missing_hash,
-                    };
-                    let (pending_requests, request_id) =
-                        pending_requests.with_new_request(request_payload.clone(), state.tick);
+                    let (pending_requests, effects) =
+                        request_missing_header(pending_requests, state.tick, missing_hash);
                     (
                         State {
                             blocks,
                             pending_requests,
                             ..state
                         },
-                        vec![Effect::Request(AnyIssuedRequest::BlockHeader(
-                            IssuedRequest {
-                                request_id,
-                                request_payload,
-                            },
-                        ))],
+                        effects,
                         false,
                     )
                 }
@@ -1824,6 +1820,25 @@ mod tests {
         assert_canonical_tip_is_known_or_finalized(state);
         assert_parent_walks_do_not_cycle(state);
         assert_pool_snapshots_and_failures_do_not_overlap(state);
+    }
+
+    /// Asserts no two in-flight header requests target the same block hash.
+    /// This pairs with `assert_missing_parent_is_pending` ("every missing parent has a request") to
+    /// guarantee each missing ancestor is fetched exactly once. Only asserted against states reached
+    /// through production transitions (not the hand-seeded fixtures that inject duplicate requests on
+    /// purpose to exercise id-matching), since the dedup is a property production maintains, not one
+    /// preserved from an arbitrary seed.
+    fn assert_no_duplicate_pending_header_requests(state: &State) {
+        assert_eq!(
+            state
+                .pending_requests
+                .pending_header_request_count_for_test(),
+            state
+                .pending_requests
+                .pending_header_hashes_for_test()
+                .len(),
+            "no two pending header requests may target the same block hash"
+        );
     }
 
     /// Asserts every present canonical block with unknown logs has an active log request.
@@ -3948,6 +3963,101 @@ mod tests {
             HashSet::from([head_hash]),
         );
         assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Two heads that resolve to the same missing parent must fetch that parent once, not twice.
+    // This pins the dedup guard that stops redundant ancestry header requests on sparse chains.
+    #[test]
+    fn second_head_sharing_missing_parent_does_not_reissue_header_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let shared_missing_parent = BlockHash::with_last_byte(2);
+        let first_head = BlockHash::with_last_byte(3);
+        let second_head = BlockHash::with_last_byte(4);
+        let state = empty_state_at(finalized_hash);
+
+        let (state, first_effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: first_head,
+                parent_hash: shared_missing_parent,
+            },
+        );
+        // First observation fetches the missing parent.
+        assert_single_block_header_request_effect(&first_effects, shared_missing_parent);
+
+        let (next_state, second_effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: second_head,
+                parent_hash: shared_missing_parent,
+            },
+        );
+
+        // Second observation reuses the in-flight request: it schedules the head's logs but no header.
+        assert_request_hashes(
+            &second_effects,
+            HashSet::new(),
+            HashSet::from([second_head]),
+        );
+        assert_eq!(
+            pending_header_hashes(&next_state),
+            HashSet::from([shared_missing_parent])
+        );
+        assert_eq!(
+            next_state
+                .pending_requests
+                .pending_header_request_count_for_test(),
+            1
+        );
+        assert_no_duplicate_pending_header_requests(&next_state);
+        assert_effects_are_well_formed(&next_state, &second_effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A distinct missing parent is still fetched even while another header request is in flight.
+    // This proves the guard keys on the specific hash, not on "any header pending".
+    #[test]
+    fn head_with_distinct_missing_parent_still_requests_header_while_another_is_pending() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_missing_parent = BlockHash::with_last_byte(2);
+        let first_head = BlockHash::with_last_byte(3);
+        let second_missing_parent = BlockHash::with_last_byte(4);
+        let second_head = BlockHash::with_last_byte(5);
+        let state = empty_state_at(finalized_hash);
+
+        let (state, _first_effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: first_head,
+                parent_hash: first_missing_parent,
+            },
+        );
+
+        let (next_state, second_effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: second_head,
+                parent_hash: second_missing_parent,
+            },
+        );
+
+        // A different missing parent is not suppressed by the unrelated in-flight header.
+        assert_request_hashes(
+            &second_effects,
+            HashSet::from([second_missing_parent]),
+            HashSet::from([second_head]),
+        );
+        assert_eq!(
+            pending_header_hashes(&next_state),
+            HashSet::from([first_missing_parent, second_missing_parent])
+        );
+        assert_no_duplicate_pending_header_requests(&next_state);
+        assert_effects_are_well_formed(&next_state, &second_effects);
         assert_state_invariants(&next_state);
     }
 
@@ -9081,6 +9191,9 @@ mod tests {
 
                 state = next_state;
                 pending_effects.extend(effects);
+                // Concurrent heads may share a missing ancestor before its header resolves; the dedup
+                // guard must keep at most one in-flight request per hash at every production-reached step.
+                assert_no_duplicate_pending_header_requests(&state);
             }
 
             while let Some(effect) = pending_effects.pop() {
@@ -9103,6 +9216,7 @@ mod tests {
 
                         state = next_state;
                         pending_effects.extend(effects);
+                        assert_no_duplicate_pending_header_requests(&state);
                     }
                     Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
                         request_id, ..
