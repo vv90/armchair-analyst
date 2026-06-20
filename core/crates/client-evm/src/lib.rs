@@ -25,7 +25,7 @@ pub use client::{
     fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads,
 };
 pub use config::RpcConfig;
-pub use error::ClientEvmError;
+pub use error::{ClientEvmError, ConfigScope};
 pub use kernel::pending_requests::{
     AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
     GetTokenMetadata, IssuedRequest, RequestId,

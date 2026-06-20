@@ -98,16 +98,96 @@ pub(crate) fn build_unsubscribe_request(request_id: u64, subscription_id: &str) 
     })
 }
 
-pub(crate) fn json_rpc_error_message(error: &Value) -> String {
+/// Builds the structured [`ClientEvmError::JsonRpcError`] from a JSON-RPC `error` object, reading
+/// the provider's own `code`/`message`.
+fn json_rpc_error(error: &Value) -> ClientEvmError {
     let code = error
         .get("code")
         .map_or_else(|| "unknown".to_owned(), Value::to_string);
     let message = error
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("unknown error");
+        .unwrap_or("unknown error")
+        .to_owned();
 
-    format!("{code}: {message}")
+    ClientEvmError::JsonRpcError { code, message }
+}
+
+/// Truncates a value rendering for inclusion in an error message so a large response value cannot
+/// bloat the log line.
+fn truncate_for_log(text: &str) -> String {
+    const MAX_DETAIL_LEN: usize = 256;
+    if text.chars().count() > MAX_DETAIL_LEN {
+        let truncated: String = text.chars().take(MAX_DETAIL_LEN).collect();
+        format!("{truncated}…")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Renders an optional JSON field for an error message: a truncated rendering of the value, or
+/// `<missing>` when the field is absent.
+fn describe_field(field: Option<&Value>) -> String {
+    field.map_or_else(
+        || "<missing>".to_owned(),
+        |value| truncate_for_log(&value.to_string()),
+    )
+}
+
+/// Wraps a failed `serde_json` decode of a response `result` with the request context and a
+/// truncated snippet of the offending raw value.
+fn decode_failed(context: &str, error: &serde_json::Error, raw: &Value) -> ClientEvmError {
+    ClientEvmError::MalformedResponse {
+        context: context.to_owned(),
+        detail: format!(
+            "decode failed: {error}; raw={}",
+            truncate_for_log(&raw.to_string())
+        ),
+    }
+}
+
+/// Validates the shared JSON-RPC response envelope (version, id, result-xor-error) and returns the
+/// `result` value, or the appropriate typed error. `context` (e.g. "block header") is woven into
+/// every malformed-envelope message, which carry the actual offending value where available. A
+/// provider `error` object becomes [`ClientEvmError::JsonRpcError`].
+pub(crate) fn json_rpc_result<'a>(
+    value: &'a Value,
+    expected_request_id: u64,
+    context: &str,
+) -> Result<&'a Value, ClientEvmError> {
+    let malformed = |detail: String| ClientEvmError::MalformedResponse {
+        context: context.to_owned(),
+        detail,
+    };
+
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(malformed(format!(
+            "expected jsonrpc 2.0, got {}",
+            describe_field(value.get("jsonrpc"))
+        )));
+    }
+
+    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        malformed(format!(
+            "expected numeric request id, got {}",
+            describe_field(value.get("id"))
+        ))
+    })?;
+
+    if response_id != expected_request_id {
+        return Err(malformed(format!(
+            "request id mismatch (expected {expected_request_id}, got {response_id})"
+        )));
+    }
+
+    match (value.get("result"), value.get("error")) {
+        (Some(_), Some(_)) => Err(malformed(
+            "must not contain both result and error".to_owned(),
+        )),
+        (None, None) => Err(malformed("must contain result or error".to_owned())),
+        (None, Some(error)) => Err(json_rpc_error(error)),
+        (Some(result), None) => Ok(result),
+    }
 }
 
 pub(crate) fn parse_subscription_response(
@@ -123,7 +203,7 @@ pub(crate) fn parse_subscription_response(
     }
 
     if let Some(error) = value.get("error") {
-        return Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error)));
+        return Err(json_rpc_error(error));
     }
 
     value
@@ -131,10 +211,9 @@ pub(crate) fn parse_subscription_response(
         .and_then(Value::as_str)
         .filter(|subscription_id| !subscription_id.trim().is_empty())
         .map(|subscription_id| Some(subscription_id.to_owned()))
-        .ok_or_else(|| {
-            ClientEvmError::MalformedJsonRpcResponse(
-                "subscription response result must be a non-empty string".to_owned(),
-            )
+        .ok_or_else(|| ClientEvmError::MalformedResponse {
+            context: "subscription".to_owned(),
+            detail: "result must be a non-empty string".to_owned(),
         })
 }
 
@@ -147,9 +226,10 @@ pub(crate) fn parse_block_header_response(
 
     if let Some(header) = &header {
         if header.inner.hash != expected_block_hash {
-            return Err(ClientEvmError::MalformedJsonRpcResponse(
-                "returned block hash does not match requested block hash".to_owned(),
-            ));
+            return Err(ClientEvmError::MalformedResponse {
+                context: "block header".to_owned(),
+                detail: "returned block hash does not match requested block hash".to_owned(),
+            });
         }
     }
 
@@ -160,40 +240,17 @@ pub(crate) fn parse_block_header_response_by_id(
     value: &Value,
     expected_request_id: u64,
 ) -> Result<Option<ClientHead>, ClientEvmError> {
-    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block header response must use json-rpc 2.0".to_owned(),
-        ));
+    let context = "block header";
+    let result = json_rpc_result(value, expected_request_id, context)?;
+
+    if result.is_null() {
+        return Ok(None);
     }
 
-    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
-        ClientEvmError::MalformedJsonRpcResponse(
-            "block header response must contain a numeric request id".to_owned(),
-        )
-    })?;
+    let header = serde_json::from_value::<ClientHead>(result.clone())
+        .map_err(|error| decode_failed(context, &error, result))?;
 
-    if response_id != expected_request_id {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block header response request id does not match request".to_owned(),
-        ));
-    }
-
-    match (value.get("result"), value.get("error")) {
-        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block header response must not contain both result and error".to_owned(),
-        )),
-        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block header response must contain result or error".to_owned(),
-        )),
-        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
-        (Some(Value::Null), None) => Ok(None),
-        (Some(result), None) => {
-            let header = serde_json::from_value::<ClientHead>(result.clone())
-                .map_err(ClientEvmError::JsonError)?;
-
-            Ok(Some(header))
-        }
-    }
+    Ok(Some(header))
 }
 
 pub(crate) fn parse_block_logs_response(
@@ -201,102 +258,59 @@ pub(crate) fn parse_block_logs_response(
     expected_request_id: u64,
     expected_block_hash: BlockHash,
 ) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError> {
-    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block logs response must use json-rpc 2.0".to_owned(),
-        ));
+    let context = "block logs";
+    let result = json_rpc_result(value, expected_request_id, context)?;
+
+    if !result.is_array() {
+        return Err(ClientEvmError::MalformedResponse {
+            context: context.to_owned(),
+            detail: format!(
+                "result must be an array, got {}",
+                truncate_for_log(&result.to_string())
+            ),
+        });
     }
 
-    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
-        ClientEvmError::MalformedJsonRpcResponse(
-            "block logs response must contain a numeric request id".to_owned(),
-        )
-    })?;
+    let logs = serde_json::from_value::<Vec<Log>>(result.clone())
+        .map_err(|error| decode_failed(context, &error, result))?;
 
-    if response_id != expected_request_id {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block logs response request id does not match request".to_owned(),
-        ));
+    if logs
+        .iter()
+        .any(|log| log.block_hash != Some(expected_block_hash))
+    {
+        return Err(ClientEvmError::MalformedResponse {
+            context: context.to_owned(),
+            detail: "returned log block hash does not match requested block hash".to_owned(),
+        });
     }
 
-    match (value.get("result"), value.get("error")) {
-        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block logs response must not contain both result and error".to_owned(),
-        )),
-        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "block logs response must contain result or error".to_owned(),
-        )),
-        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
-        (Some(result), None) => {
-            if !result.is_array() {
-                return Err(ClientEvmError::MalformedJsonRpcResponse(
-                    "block logs response result must be an array".to_owned(),
-                ));
-            }
-
-            let logs = serde_json::from_value::<Vec<Log>>(result.clone())
-                .map_err(ClientEvmError::JsonError)?;
-
-            if logs
-                .iter()
-                .any(|log| log.block_hash != Some(expected_block_hash))
-            {
-                return Err(ClientEvmError::MalformedJsonRpcResponse(
-                    "returned log block hash does not match requested block hash".to_owned(),
-                ));
-            }
-
-            Ok(logs
-                .into_iter()
-                .map(|log| PoolCandidateAddress(log.address()))
-                .collect())
-        }
-    }
+    Ok(logs
+        .into_iter()
+        .map(|log| PoolCandidateAddress(log.address()))
+        .collect())
 }
 
 pub(crate) fn parse_pool_logs_range_response(
     value: &Value,
     expected_request_id: u64,
 ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
-    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "pool logs range response must use json-rpc 2.0".to_owned(),
-        ));
+    let context = "pool logs range";
+    let result = json_rpc_result(value, expected_request_id, context)?;
+
+    if !result.is_array() {
+        return Err(ClientEvmError::MalformedResponse {
+            context: context.to_owned(),
+            detail: format!(
+                "result must be an array, got {}",
+                truncate_for_log(&result.to_string())
+            ),
+        });
     }
 
-    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
-        ClientEvmError::MalformedJsonRpcResponse(
-            "pool logs range response must contain a numeric request id".to_owned(),
-        )
-    })?;
+    let logs = serde_json::from_value::<Vec<Log>>(result.clone())
+        .map_err(|error| decode_failed(context, &error, result))?;
 
-    if response_id != expected_request_id {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "pool logs range response request id does not match request".to_owned(),
-        ));
-    }
-
-    match (value.get("result"), value.get("error")) {
-        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "pool logs range response must not contain both result and error".to_owned(),
-        )),
-        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "pool logs range response must contain result or error".to_owned(),
-        )),
-        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
-        (Some(result), None) => {
-            if !result.is_array() {
-                return Err(ClientEvmError::MalformedJsonRpcResponse(
-                    "pool logs range response result must be an array".to_owned(),
-                ));
-            }
-
-            let logs = serde_json::from_value::<Vec<Log>>(result.clone())
-                .map_err(ClientEvmError::JsonError)?;
-
-            Ok(group_range_logs_by_block(logs))
-        }
-    }
+    Ok(group_range_logs_by_block(logs))
 }
 
 /// Groups ranged-`eth_getLogs` results into per-block candidate sets, ordered by block number.
@@ -468,8 +482,8 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
-            Err(ClientEvmError::JsonRpcError(ref message))
-                if message == "-32000: logs unavailable"
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "logs unavailable"
         ));
     }
 
@@ -484,7 +498,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -498,7 +512,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -517,7 +531,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -536,7 +550,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
-            Err(ClientEvmError::JsonError(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -554,7 +568,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, requested_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -569,7 +583,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_logs_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -690,8 +704,8 @@ mod tests {
 
         assert!(matches!(
             parse_pool_logs_range_response(&response, 9),
-            Err(ClientEvmError::JsonRpcError(ref message))
-                if message == "-32000: logs unavailable"
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "logs unavailable"
         ));
     }
 
@@ -701,7 +715,7 @@ mod tests {
 
         assert!(matches!(
             parse_pool_logs_range_response(&response, 9),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -711,7 +725,7 @@ mod tests {
 
         assert!(matches!(
             parse_pool_logs_range_response(&response, 9),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -721,7 +735,7 @@ mod tests {
 
         assert!(matches!(
             parse_pool_logs_range_response(&response, 9),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -796,8 +810,8 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response_by_id(&response, 9),
-            Err(ClientEvmError::JsonRpcError(ref message))
-                if message == "-32000: block unavailable"
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "block unavailable"
         ));
     }
 
@@ -811,7 +825,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response_by_id(&response, 9),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -824,7 +838,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response_by_id(&response, 9),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -857,8 +871,8 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, block_hash),
-            Err(ClientEvmError::JsonRpcError(ref message))
-                if message == "-32000: block unavailable"
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "block unavailable"
         ));
     }
 
@@ -873,7 +887,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -887,7 +901,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -906,7 +920,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -923,7 +937,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, block_hash),
-            Err(ClientEvmError::JsonError(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -939,7 +953,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, requested_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -954,7 +968,7 @@ mod tests {
 
         assert!(matches!(
             parse_block_header_response(&response, 9, block_hash),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -1069,8 +1083,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ClientEvmError::JsonRpcError(ref message))
-                if message == "-32000: subscription failed"
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "subscription failed"
         ));
     }
 
@@ -1083,7 +1097,7 @@ mod tests {
 
         assert!(matches!(
             parse_subscription_response(&response, 1),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -1097,7 +1111,7 @@ mod tests {
 
         assert!(matches!(
             parse_subscription_response(&response, 1),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -1112,7 +1126,7 @@ mod tests {
 
             assert!(matches!(
                 parse_subscription_response(&response, 1),
-                Err(ClientEvmError::MalformedJsonRpcResponse(_))
+                Err(ClientEvmError::MalformedResponse { .. })
             ));
         }
     }

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::ClientEvmError;
 
-use super::client_utils::json_rpc_error_message;
+use super::client_utils::json_rpc_result;
 
 pub(crate) const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 
@@ -79,58 +79,103 @@ pub(crate) fn parse_multicall3_response(
     expected_request_id: u64,
     expected_call_count: usize,
 ) -> Result<Vec<MulticallCallResult>, ClientEvmError> {
-    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "multicall3 response must use json-rpc 2.0".to_owned(),
-        ));
-    }
+    let context = "multicall3";
+    let result = json_rpc_result(value, expected_request_id, context)?;
 
-    let response_id = value.get("id").and_then(Value::as_u64).ok_or_else(|| {
-        ClientEvmError::MalformedJsonRpcResponse(
-            "multicall3 response must contain a numeric request id".to_owned(),
-        )
-    })?;
-
-    if response_id != expected_request_id {
-        return Err(ClientEvmError::MalformedJsonRpcResponse(
-            "multicall3 response request id does not match request".to_owned(),
-        ));
-    }
-
-    match (value.get("result"), value.get("error")) {
-        (Some(_), Some(_)) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "multicall3 response must not contain both result and error".to_owned(),
-        )),
-        (None, None) => Err(ClientEvmError::MalformedJsonRpcResponse(
-            "multicall3 response must contain result or error".to_owned(),
-        )),
-        (None, Some(error)) => Err(ClientEvmError::JsonRpcError(json_rpc_error_message(error))),
-        (Some(result), None) => {
-            let return_data = serde_json::from_value::<Bytes>(result.clone())
-                .map_err(ClientEvmError::JsonError)?;
-            let results = Multicall3::aggregate3Call::abi_decode_returns(return_data.as_ref())
-                .map_err(|error| {
-                    ClientEvmError::MalformedJsonRpcResponse(format!(
-                        "multicall3 response result must decode as aggregate3 return data: {error}"
-                    ))
-                })?;
-
-            if results.len() != expected_call_count {
-                return Err(ClientEvmError::MalformedJsonRpcResponse(format!(
-                    "multicall3 response returned {} call results, expected {expected_call_count}",
-                    results.len()
-                )));
-            }
-
-            Ok(results
-                .into_iter()
-                .map(|result| MulticallCallResult {
-                    success: result.success,
-                    return_data: result.returnData,
-                })
-                .collect())
+    let return_data = serde_json::from_value::<Bytes>(result.clone()).map_err(|error| {
+        ClientEvmError::MalformedResponse {
+            context: context.to_owned(),
+            detail: format!("result must decode as hex bytes: {error}"),
         }
+    })?;
+    let results =
+        Multicall3::aggregate3Call::abi_decode_returns(return_data.as_ref()).map_err(|error| {
+            ClientEvmError::MalformedResponse {
+                context: context.to_owned(),
+                detail: format!("result must decode as aggregate3 return data: {error}"),
+            }
+        })?;
+
+    if results.len() != expected_call_count {
+        return Err(ClientEvmError::MalformedResponse {
+            context: context.to_owned(),
+            detail: format!(
+                "returned {} call results, expected {expected_call_count}",
+                results.len()
+            ),
+        });
     }
+
+    Ok(results
+        .into_iter()
+        .map(|result| MulticallCallResult {
+            success: result.success,
+            return_data: result.returnData,
+        })
+        .collect())
+}
+
+/// Builds a single JSON-RPC batch request carrying one `aggregate3` `eth_call` per chunk. Each
+/// chunk is assigned a distinct id (`1..=chunks.len()`) so the response array can be matched back to
+/// its chunk even if the provider reorders entries. Splitting a large call set into bounded chunks
+/// keeps each individual `eth_call` under the node's response/gas limit; batching keeps the whole set
+/// to one HTTP round-trip.
+pub(crate) fn build_multicall3_batch_request(at: BlockHash, chunks: &[&[MulticallCall]]) -> Value {
+    Value::Array(
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| build_multicall3_request(index as u64 + 1, at, chunk))
+            .collect(),
+    )
+}
+
+/// Parses a JSON-RPC batch response into the flat, in-chunk-order concatenation of every chunk's
+/// call results. Entries are located by the deterministic per-chunk id (not array position, since
+/// batch responses may be reordered), each delegating to `parse_multicall3_response` for validation.
+/// A non-array body (whole-batch rejection), a wrong entry count, a missing id, or any entry-level
+/// JSON-RPC error fails the whole parse — matching the all-or-nothing contract of the single call.
+pub(crate) fn parse_multicall3_batch_response(
+    value: &Value,
+    expected_counts: &[usize],
+) -> Result<Vec<MulticallCallResult>, ClientEvmError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| ClientEvmError::MalformedResponse {
+            context: "multicall3 batch".to_owned(),
+            detail: "response must be a json-rpc array".to_owned(),
+        })?;
+
+    if entries.len() != expected_counts.len() {
+        return Err(ClientEvmError::MalformedResponse {
+            context: "multicall3 batch".to_owned(),
+            detail: format!(
+                "returned {} entries, expected {}",
+                entries.len(),
+                expected_counts.len()
+            ),
+        });
+    }
+
+    let mut results = Vec::new();
+    for (index, expected_count) in expected_counts.iter().enumerate() {
+        let request_id = index as u64 + 1;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_u64) == Some(request_id))
+            .ok_or_else(|| ClientEvmError::MalformedResponse {
+                context: "multicall3 batch".to_owned(),
+                detail: format!("missing request id {request_id}"),
+            })?;
+
+        results.extend(parse_multicall3_response(
+            entry,
+            request_id,
+            *expected_count,
+        )?);
+    }
+
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -269,7 +314,7 @@ mod tests {
 
         assert!(matches!(
             parse_multicall3_response(&response, 9, 1),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
@@ -286,8 +331,8 @@ mod tests {
 
         assert!(matches!(
             parse_multicall3_response(&response, 9, 1),
-            Err(ClientEvmError::JsonRpcError(ref message))
-                if message == "-32000: execution reverted"
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "execution reverted"
         ));
     }
 
@@ -301,7 +346,153 @@ mod tests {
 
         assert!(matches!(
             parse_multicall3_response(&response, 9, 1),
-            Err(ClientEvmError::MalformedJsonRpcResponse(_))
+            Err(ClientEvmError::MalformedResponse { .. })
+        ));
+    }
+
+    fn call(last_byte: u8) -> MulticallCall {
+        MulticallCall {
+            target: Address::with_last_byte(last_byte),
+            call_data: Bytes::from(vec![last_byte]),
+        }
+    }
+
+    fn result(last_byte: u8) -> MulticallCallResult {
+        MulticallCallResult {
+            success: true,
+            return_data: Bytes::from(vec![last_byte]),
+        }
+    }
+
+    fn batch_entry(id: u64, results: &[MulticallCallResult]) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": aggregate3_return_data_for_test(results)
+        })
+    }
+
+    #[test]
+    fn batch_request_packs_one_eth_call_per_chunk_with_distinct_ids() {
+        let at = B256::with_last_byte(7);
+        let first = [call(1), call(2)];
+        let second = [call(3)];
+        let request = build_multicall3_batch_request(at, &[&first, &second]);
+
+        let entries = request.as_array().expect("batch request must be an array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].get("id"), Some(&json!(1)));
+        assert_eq!(entries[1].get("id"), Some(&json!(2)));
+
+        for entry in entries {
+            assert_eq!(entry.get("method"), Some(&json!("eth_call")));
+            assert_eq!(
+                entry
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(|call| call.get("to")),
+                Some(&json!(MULTICALL3_ADDRESS))
+            );
+            assert_eq!(
+                entry
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.get(1)),
+                Some(&json!({ "blockHash": at }))
+            );
+        }
+
+        let decoded_second = decode_aggregate3_call_data_for_test(
+            &serde_json::from_value::<Bytes>(
+                entries[1]
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.first())
+                    .and_then(|call| call.get("data"))
+                    .cloned()
+                    .expect("entry must carry call data"),
+            )
+            .expect("entry data must be bytes"),
+        )
+        .expect("entry data must decode as aggregate3");
+        assert_eq!(decoded_second, second);
+    }
+
+    #[test]
+    fn batch_response_flattens_chunk_results_in_chunk_order() {
+        let response = json!([
+            batch_entry(1, &[result(0xaa)]),
+            batch_entry(2, &[result(0xbb), result(0xcc)]),
+        ]);
+
+        let results = parse_multicall3_batch_response(&response, &[1, 2])
+            .expect("batch response must decode");
+
+        assert_eq!(results, vec![result(0xaa), result(0xbb), result(0xcc)]);
+    }
+
+    #[test]
+    fn batch_response_matches_entries_by_id_when_reordered() {
+        let response = json!([
+            batch_entry(2, &[result(0xbb), result(0xcc)]),
+            batch_entry(1, &[result(0xaa)]),
+        ]);
+
+        let results = parse_multicall3_batch_response(&response, &[1, 2])
+            .expect("reordered batch response must decode");
+
+        assert_eq!(results, vec![result(0xaa), result(0xbb), result(0xcc)]);
+    }
+
+    #[test]
+    fn batch_response_surfaces_entry_level_json_rpc_error() {
+        let response = json!([
+            batch_entry(1, &[result(0xaa)]),
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": { "code": -32000, "message": "execution reverted" }
+            },
+        ]);
+
+        assert!(matches!(
+            parse_multicall3_batch_response(&response, &[1, 1]),
+            Err(ClientEvmError::JsonRpcError { ref code, ref message })
+                if code == "-32000" && message == "execution reverted"
+        ));
+    }
+
+    #[test]
+    fn batch_response_rejects_missing_request_id() {
+        let response = json!([
+            batch_entry(1, &[result(0xaa)]),
+            batch_entry(1, &[result(0xbb)]),
+        ]);
+
+        assert!(matches!(
+            parse_multicall3_batch_response(&response, &[1, 1]),
+            Err(ClientEvmError::MalformedResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_response_rejects_non_array_body() {
+        let response = batch_entry(1, &[result(0xaa)]);
+
+        assert!(matches!(
+            parse_multicall3_batch_response(&response, &[1]),
+            Err(ClientEvmError::MalformedResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_response_rejects_entry_count_mismatch() {
+        let response = json!([batch_entry(1, &[result(0xaa)])]);
+
+        assert!(matches!(
+            parse_multicall3_batch_response(&response, &[1, 1]),
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 }

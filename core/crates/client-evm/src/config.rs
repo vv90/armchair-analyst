@@ -1,6 +1,6 @@
 use crate::{
     chain::{ChainKey, drpc_network_path},
-    error::ClientEvmError,
+    error::{ClientEvmError, ConfigScope},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,16 +16,18 @@ pub(crate) fn compose_ws_endpoint(
 ) -> Result<String, ClientEvmError> {
     let ws_url = config.ws_url.trim();
     if ws_url.is_empty() {
-        return Err(ClientEvmError::InvalidSubscriptionConfig(
-            "websocket url is required".to_owned(),
-        ));
+        return Err(ClientEvmError::InvalidConfig {
+            scope: ConfigScope::Subscription,
+            reason: "websocket url is required".to_owned(),
+        });
     }
 
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
-        return Err(ClientEvmError::InvalidSubscriptionConfig(
-            "rpc api key is required".to_owned(),
-        ));
+        return Err(ClientEvmError::InvalidConfig {
+            scope: ConfigScope::Subscription,
+            reason: "rpc api key is required".to_owned(),
+        });
     }
 
     Ok(format!(
@@ -42,16 +44,18 @@ pub(crate) fn compose_http_endpoint(
 ) -> Result<String, ClientEvmError> {
     let http_url = config.http_url.trim();
     if http_url.is_empty() {
-        return Err(ClientEvmError::InvalidHttpConfig(
-            "http url is required".to_owned(),
-        ));
+        return Err(ClientEvmError::InvalidConfig {
+            scope: ConfigScope::Http,
+            reason: "http url is required".to_owned(),
+        });
     }
 
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
-        return Err(ClientEvmError::InvalidHttpConfig(
-            "rpc api key is required".to_owned(),
-        ));
+        return Err(ClientEvmError::InvalidConfig {
+            scope: ConfigScope::Http,
+            reason: "rpc api key is required".to_owned(),
+        });
     }
 
     Ok(format!(
@@ -66,7 +70,7 @@ pub(crate) fn compose_http_endpoint(
 mod tests {
     use proptest::prelude::*;
 
-    use crate::{ChainKey, ClientEvmError};
+    use crate::{ChainKey, ClientEvmError, ConfigScope};
 
     use super::*;
 
@@ -88,7 +92,10 @@ mod tests {
 
         assert!(matches!(
             compose_ws_endpoint(&config, ChainKey::Ethereum),
-            Err(ClientEvmError::InvalidSubscriptionConfig(_))
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Subscription,
+                ..
+            })
         ));
     }
 
@@ -98,7 +105,10 @@ mod tests {
 
         assert!(matches!(
             compose_ws_endpoint(&config, ChainKey::Ethereum),
-            Err(ClientEvmError::InvalidSubscriptionConfig(_))
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Subscription,
+                ..
+            })
         ));
     }
 
@@ -120,7 +130,10 @@ mod tests {
 
         assert!(matches!(
             compose_http_endpoint(&config, ChainKey::Ethereum),
-            Err(ClientEvmError::InvalidHttpConfig(_))
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Http,
+                ..
+            })
         ));
     }
 
@@ -130,7 +143,10 @@ mod tests {
 
         assert!(matches!(
             compose_http_endpoint(&config, ChainKey::Ethereum),
-            Err(ClientEvmError::InvalidHttpConfig(_))
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Http,
+                ..
+            })
         ));
     }
 
@@ -160,10 +176,14 @@ mod tests {
         ) {
             let config = rpc_config(&whitespace, &api_key);
 
-            prop_assert!(matches!(
+            let rejected = matches!(
                 compose_ws_endpoint(&config, ChainKey::Ethereum),
-                Err(ClientEvmError::InvalidSubscriptionConfig(_))
-            ));
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Subscription,
+                    ..
+                })
+            );
+            prop_assert!(rejected);
         }
 
         #[test]
@@ -173,10 +193,14 @@ mod tests {
         ) {
             let config = rpc_config(&ws_url, &whitespace);
 
-            prop_assert!(matches!(
+            let rejected = matches!(
                 compose_ws_endpoint(&config, ChainKey::Ethereum),
-                Err(ClientEvmError::InvalidSubscriptionConfig(_))
-            ));
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Subscription,
+                    ..
+                })
+            );
+            prop_assert!(rejected);
         }
 
         #[test]

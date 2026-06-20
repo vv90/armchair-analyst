@@ -333,9 +333,16 @@ impl ClientEvmRuntime {
                             number: header.inner.inner.number,
                         },
                     },
-                    Ok(None) | Err(_) => bootstrap::Event::RequestFailed {
+                    Ok(None) => bootstrap::Event::RequestFailed {
                         request_id: bootstrap::AnyRequestId::FinalizedHeader(request_id),
                     },
+                    Err(error) => {
+                        let request_id = bootstrap::AnyRequestId::FinalizedHeader(request_id);
+                        self.logger.log(&format!(
+                            "error chain={chain:?} bootstrap_request_failed request={request_id:?} error={error}"
+                        ));
+                        bootstrap::Event::RequestFailed { request_id }
+                    }
                 }
             }
             bootstrap::AnyIssuedRequest::PoolCandidates(request) => {
@@ -344,9 +351,13 @@ impl ClientEvmRuntime {
 
                 match fetch_pool_candidates_in_range(&self.agent, config, chain, from_block) {
                     Ok(blocks) => bootstrap::Event::PoolCandidatesReceived { request_id, blocks },
-                    Err(_) => bootstrap::Event::RequestFailed {
-                        request_id: bootstrap::AnyRequestId::PoolCandidates(request_id),
-                    },
+                    Err(error) => {
+                        let request_id = bootstrap::AnyRequestId::PoolCandidates(request_id);
+                        self.logger.log(&format!(
+                            "error chain={chain:?} bootstrap_request_failed request={request_id:?} error={error}"
+                        ));
+                        bootstrap::Event::RequestFailed { request_id }
+                    }
                 }
             }
             bootstrap::AnyIssuedRequest::PoolMetadata(request) => {
@@ -359,9 +370,13 @@ impl ClientEvmRuntime {
                         request_id,
                         metadata,
                     },
-                    Err(_) => bootstrap::Event::RequestFailed {
-                        request_id: bootstrap::AnyRequestId::PoolMetadata(request_id),
-                    },
+                    Err(error) => {
+                        let request_id = bootstrap::AnyRequestId::PoolMetadata(request_id);
+                        self.logger.log(&format!(
+                            "error chain={chain:?} bootstrap_request_failed request={request_id:?} error={error}"
+                        ));
+                        bootstrap::Event::RequestFailed { request_id }
+                    }
                 }
             }
             bootstrap::AnyIssuedRequest::TokenMetadata(request) => {
@@ -374,9 +389,13 @@ impl ClientEvmRuntime {
                         request_id,
                         metadata,
                     },
-                    Err(_) => bootstrap::Event::RequestFailed {
-                        request_id: bootstrap::AnyRequestId::TokenMetadata(request_id),
-                    },
+                    Err(error) => {
+                        let request_id = bootstrap::AnyRequestId::TokenMetadata(request_id);
+                        self.logger.log(&format!(
+                            "error chain={chain:?} bootstrap_request_failed request={request_id:?} error={error}"
+                        ));
+                        bootstrap::Event::RequestFailed { request_id }
+                    }
                 }
             }
             bootstrap::AnyIssuedRequest::PoolData(request) => {
@@ -386,9 +405,13 @@ impl ClientEvmRuntime {
 
                 match fetch_pool_data(&self.agent, config, chain, at, pools) {
                     Ok(pools) => bootstrap::Event::PoolDataReceived { request_id, pools },
-                    Err(_) => bootstrap::Event::RequestFailed {
-                        request_id: bootstrap::AnyRequestId::PoolData(request_id),
-                    },
+                    Err(error) => {
+                        let request_id = bootstrap::AnyRequestId::PoolData(request_id);
+                        self.logger.log(&format!(
+                            "error chain={chain:?} bootstrap_request_failed request={request_id:?} error={error}"
+                        ));
+                        bootstrap::Event::RequestFailed { request_id }
+                    }
                 }
             }
         };
@@ -400,6 +423,7 @@ impl ClientEvmRuntime {
         execute_chain_effect_with(
             chain,
             effect,
+            &self.logger,
             |block_hash| fetch_block_header(&self.agent, self.rpc_config(), chain, block_hash),
             |block_hash| fetch_block_logs(&self.agent, self.rpc_config(), chain, block_hash),
             |at, pools| fetch_pool_data(&self.agent, self.rpc_config(), chain, at, pools),
@@ -495,6 +519,7 @@ fn execute_chain_effect_with<
 >(
     chain: ChainKey,
     effect: kernel::Effect,
+    logger: &Logger,
     fetch_block_header: FetchBlockHeader,
     fetch_block_logs: FetchBlockLogs,
     fetch_pool_data: FetchPoolData,
@@ -539,12 +564,16 @@ where
                         chain,
                         event: kernel::Event::BlockHeaderNotFound { request_id },
                     }],
-                    Err(_) => vec![Event::ChainEvent {
-                        chain,
-                        event: kernel::Event::RequestFailed {
-                            request_id: AnyRequestId::BlockHeader(request_id),
-                        },
-                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::BlockHeader(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
                 }
             }
             AnyIssuedRequest::BlockLogs(request) => {
@@ -556,12 +585,16 @@ where
                         chain,
                         event: kernel::Event::BlockLogsReceived { request_id, logs },
                     }],
-                    Err(_) => vec![Event::ChainEvent {
-                        chain,
-                        event: kernel::Event::RequestFailed {
-                            request_id: AnyRequestId::BlockLogs(request_id),
-                        },
-                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::BlockLogs(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
                 }
             }
             AnyIssuedRequest::PoolData(request) => {
@@ -574,12 +607,16 @@ where
                         chain,
                         event: kernel::Event::PoolDataReceived { request_id, pools },
                     }],
-                    Err(_) => vec![Event::ChainEvent {
-                        chain,
-                        event: kernel::Event::RequestFailed {
-                            request_id: AnyRequestId::PoolData(request_id),
-                        },
-                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::PoolData(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
                 }
             }
             AnyIssuedRequest::PoolMetadata(request) => {
@@ -595,12 +632,16 @@ where
                             metadata,
                         },
                     }],
-                    Err(_) => vec![Event::ChainEvent {
-                        chain,
-                        event: kernel::Event::RequestFailed {
-                            request_id: AnyRequestId::PoolMetadata(request_id),
-                        },
-                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::PoolMetadata(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
                 }
             }
             AnyIssuedRequest::TokenMetadata(request) => {
@@ -616,12 +657,16 @@ where
                             metadata,
                         },
                     }],
-                    Err(_) => vec![Event::ChainEvent {
-                        chain,
-                        event: kernel::Event::RequestFailed {
-                            request_id: AnyRequestId::TokenMetadata(request_id),
-                        },
-                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::TokenMetadata(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
                 }
             }
         },
@@ -631,7 +676,7 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata, GetTokenMetadata,
+        ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata, GetTokenMetadata,
         IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult,
         RequestId, TokenAddress, TokenMetadataResult,
     };
@@ -1034,6 +1079,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             |block_hash| {
                 assert_eq!(block_hash, requested_hash);
                 Ok(Some(header))
@@ -1072,6 +1118,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             |block_hash| {
                 assert_eq!(block_hash, requested_hash);
                 Ok(None)
@@ -1100,9 +1147,13 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             |block_hash| {
                 assert_eq!(block_hash, requested_hash);
-                Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
             },
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
@@ -1131,6 +1182,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             |requested_hash| {
                 assert_eq!(requested_hash, block_hash);
@@ -1165,10 +1217,14 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             |requested_hash| {
                 assert_eq!(requested_hash, block_hash);
-                Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
             },
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
@@ -1196,6 +1252,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
             |requested_at, requested_pools| {
@@ -1231,12 +1288,16 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
             |requested_at, requested_pools| {
                 assert_eq!(requested_at, at);
                 assert!(requested_pools.is_empty());
-                Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
             },
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
@@ -1265,6 +1326,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
@@ -1301,13 +1363,17 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
             |requested_at, requested_candidates| {
                 assert_eq!(requested_at, at);
                 assert_eq!(requested_candidates, candidates);
-                Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
             },
             unexpected_token_metadata_fetch,
         );
@@ -1335,6 +1401,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
@@ -1371,6 +1438,7 @@ mod tests {
         let events = execute_chain_effect_with(
             chain,
             effect,
+            &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
             unexpected_pool_data_fetch,
@@ -1378,7 +1446,10 @@ mod tests {
             |requested_at, requested_tokens| {
                 assert_eq!(requested_at, at);
                 assert_eq!(requested_tokens, tokens);
-                Err(ClientEvmError::InvalidHttpConfig("bad config".to_owned()))
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
             },
         );
 

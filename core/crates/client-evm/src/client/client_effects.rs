@@ -3,6 +3,7 @@ use std::{
     net::TcpStream,
     str,
     sync::mpsc::Sender,
+    thread,
 };
 
 use alloy::{
@@ -30,12 +31,141 @@ use super::{
         parse_pool_logs_range_response, parse_subscription_response,
     },
     multicall3::{
-        MulticallCall, MulticallCallResult, build_multicall3_request, parse_multicall3_response,
+        MulticallCall, MulticallCallResult, build_multicall3_batch_request,
+        parse_multicall3_batch_response,
     },
 };
 
 const HTTP_REQUEST_ID: u64 = 1;
 const SUBSCRIBE_REQUEST_ID: u64 = 1;
+
+/// Maximum `aggregate3` sub-calls packed into one `eth_call`. Bounds each call's response/gas so a
+/// dense chain (e.g. Arbitrum) cannot produce a single multicall the node rejects.
+const MULTICALL_CHUNK_SIZE: usize = 1000;
+/// Maximum `eth_call` entries packed into one JSON-RPC batch (one HTTP round-trip). Bounds the batch
+/// payload; call sets larger than `MULTICALL_CHUNK_SIZE * MULTICALL_MAX_BATCH_ITEMS` span several
+/// batches.
+const MULTICALL_MAX_BATCH_ITEMS: usize = 3;
+/// Maximum batch requests dispatched concurrently per fetch. Bounds simultaneous HTTP round-trips
+/// (provider RPS / compute-unit limit) — distinct from [`MULTICALL_MAX_BATCH_ITEMS`], which bounds a
+/// single request's response size.
+const MULTICALL_MAX_CONCURRENT_BATCHES: usize = 4;
+
+/// Maximum bytes of an HTTP error-response body retained in a [`ClientEvmError::HttpStatus`]. Bounds
+/// the log line so a large HTML/JSON error page cannot flood it.
+const MAX_ERROR_BODY_LEN: usize = 512;
+
+/// Posts a JSON-RPC request and returns the parsed response value. Status-as-error is disabled per
+/// request so a non-2xx response is not collapsed into an opaque `ureq` status error: its body —
+/// which carries the provider's actual reason (response-size cap, execution timeout, upstream down,
+/// rate limit) — is captured into [`ClientEvmError::HttpStatus`]. Genuine transport failures
+/// (connect, TLS, timeout, DNS) surface as [`ClientEvmError::HttpTransport`].
+fn send_rpc_request(
+    agent: &ureq::Agent,
+    endpoint: &str,
+    request: &impl serde::Serialize,
+) -> Result<Value, ClientEvmError> {
+    let mut response = agent
+        .post(endpoint)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_json(request)
+        .map_err(ClientEvmError::HttpTransport)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| format!("<unreadable body: {error}>"));
+        return Err(ClientEvmError::HttpStatus {
+            status: status.as_u16(),
+            body: sanitize_error_body(&body),
+        });
+    }
+
+    response
+        .body_mut()
+        .read_json::<Value>()
+        .map_err(|error| ClientEvmError::MalformedResponse {
+            context: "http json".to_owned(),
+            detail: error.to_string(),
+        })
+}
+
+/// Collapses whitespace runs to single spaces and truncates to [`MAX_ERROR_BODY_LEN`] characters,
+/// appending an ellipsis when cut, so a captured error body stays on a single log line.
+fn sanitize_error_body(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_ERROR_BODY_LEN {
+        let truncated: String = collapsed.chars().take(MAX_ERROR_BODY_LEN).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
+    }
+}
+
+/// Dispatches one JSON-RPC batch (a group of `aggregate3` chunks) and returns its results flattened
+/// in chunk order. Self-contained: the request carries its own local ids and is validated against its
+/// own per-chunk counts, so batches share no state and can run concurrently.
+fn run_multicall_batch(
+    agent: &ureq::Agent,
+    endpoint: &str,
+    at: BlockHash,
+    batch: &[&[MulticallCall]],
+) -> Result<Vec<MulticallCallResult>, ClientEvmError> {
+    let request = build_multicall3_batch_request(at, batch);
+    let expected_counts: Vec<usize> = batch.iter().map(|chunk| chunk.len()).collect();
+    let response_value = send_rpc_request(agent, endpoint, &request)?;
+    parse_multicall3_batch_response(&response_value, &expected_counts)
+}
+
+/// Executes a Multicall3 `aggregate3` over an arbitrary number of calls by chunking them into
+/// bounded sub-multicalls and dispatching each group of chunks as a single JSON-RPC batch. Batches
+/// are dispatched concurrently in windows of [`MULTICALL_MAX_CONCURRENT_BATCHES`] to overlap their
+/// HTTP round-trips while bounding in-flight requests. Returns the call results flattened in input
+/// order, exactly as a single `aggregate3` would — callers stay oblivious to the chunking.
+fn aggregate3_batched(
+    agent: &ureq::Agent,
+    endpoint: &str,
+    at: BlockHash,
+    calls: &[MulticallCall],
+) -> Result<Vec<MulticallCallResult>, ClientEvmError> {
+    if calls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunks: Vec<&[MulticallCall]> = calls.chunks(MULTICALL_CHUNK_SIZE).collect();
+    let batches: Vec<&[&[MulticallCall]]> = chunks.chunks(MULTICALL_MAX_BATCH_ITEMS).collect();
+    let mut results = Vec::with_capacity(calls.len());
+
+    for window in batches.chunks(MULTICALL_MAX_CONCURRENT_BATCHES) {
+        let window_results = thread::scope(|scope| {
+            let handles: Vec<_> = window
+                .iter()
+                .map(|batch| scope.spawn(move || run_multicall_batch(agent, endpoint, at, batch)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(ClientEvmError::MalformedResponse {
+                            context: "multicall3 batch".to_owned(),
+                            detail: "batch worker thread panicked".to_owned(),
+                        })
+                    })
+                })
+                .collect::<Vec<Result<Vec<MulticallCallResult>, ClientEvmError>>>()
+        });
+
+        for batch_result in window_results {
+            results.extend(batch_result?);
+        }
+    }
+
+    Ok(results)
+}
 
 type BlockingWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -58,14 +188,7 @@ pub fn fetch_block_header(
 ) -> Result<Option<ClientHead>, ClientEvmError> {
     let endpoint = compose_http_endpoint(config, chain)?;
     let request = build_block_header_request(HTTP_REQUEST_ID, block_hash);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
+    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
 
     parse_block_header_response(&response_value, HTTP_REQUEST_ID, block_hash)
 }
@@ -78,14 +201,7 @@ pub fn fetch_block_logs(
 ) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError> {
     let endpoint = compose_http_endpoint(config, chain)?;
     let request = build_block_logs_request(HTTP_REQUEST_ID, block_hash);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
+    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
 
     parse_block_logs_response(&response_value, HTTP_REQUEST_ID, block_hash)
 }
@@ -98,14 +214,7 @@ pub fn fetch_pool_candidates_in_range(
 ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
     let endpoint = compose_http_endpoint(config, chain)?;
     let request = build_pool_logs_range_request(HTTP_REQUEST_ID, from_block);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
+    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
 
     parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
 }
@@ -124,16 +233,7 @@ pub fn fetch_pool_data(
     let endpoint = compose_http_endpoint(config, chain)?;
     let pools = sorted_pool_addresses(pools);
     let calls = pool_data_multicall_calls(&pools);
-    let request = build_multicall3_request(HTTP_REQUEST_ID, at, &calls);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
-    let results = parse_multicall3_response(&response_value, HTTP_REQUEST_ID, calls.len())?;
+    let results = aggregate3_batched(agent, endpoint.as_str(), at, &calls)?;
 
     Ok(decode_pool_data_results(&pools, &results))
 }
@@ -152,16 +252,7 @@ pub fn fetch_pool_metadata(
     let endpoint = compose_http_endpoint(config, chain)?;
     let candidates = sorted_pool_candidate_addresses(candidates);
     let calls = pool_metadata_candidate_multicall_calls(&candidates);
-    let request = build_multicall3_request(HTTP_REQUEST_ID, at, &calls);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
-    let results = parse_multicall3_response(&response_value, HTTP_REQUEST_ID, calls.len())?;
+    let results = aggregate3_batched(agent, endpoint.as_str(), at, &calls)?;
     let (mut metadata_results, factory_inputs) =
         decode_pool_metadata_candidate_results(&candidates, &results);
 
@@ -170,17 +261,7 @@ pub fn fetch_pool_metadata(
     }
 
     let factory_calls = pool_metadata_factory_multicall_calls(&factory_inputs);
-    let request = build_multicall3_request(HTTP_REQUEST_ID, at, &factory_calls);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
-    let factory_results =
-        parse_multicall3_response(&response_value, HTTP_REQUEST_ID, factory_calls.len())?;
+    let factory_results = aggregate3_batched(agent, endpoint.as_str(), at, &factory_calls)?;
 
     metadata_results.extend(decode_pool_metadata_factory_results(
         &factory_inputs,
@@ -204,16 +285,7 @@ pub fn fetch_token_metadata(
     let endpoint = compose_http_endpoint(config, chain)?;
     let tokens = sorted_token_addresses(tokens);
     let calls = token_metadata_multicall_calls(&tokens);
-    let request = build_multicall3_request(HTTP_REQUEST_ID, at, &calls);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
-    let results = parse_multicall3_response(&response_value, HTTP_REQUEST_ID, calls.len())?;
+    let results = aggregate3_batched(agent, endpoint.as_str(), at, &calls)?;
 
     Ok(decode_token_metadata_results(&tokens, &results))
 }
@@ -540,14 +612,7 @@ pub fn fetch_finalized_block_header(
 ) -> Result<Option<ClientHead>, ClientEvmError> {
     let endpoint = compose_http_endpoint(config, chain)?;
     let request = build_finalized_block_header_request(HTTP_REQUEST_ID);
-    let mut response = agent
-        .post(endpoint.as_str())
-        .send_json(&request)
-        .map_err(ClientEvmError::HttpError)?;
-    let response_value = response
-        .body_mut()
-        .read_json::<Value>()
-        .map_err(ClientEvmError::HttpError)?;
+    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
 
     parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)
 }
@@ -588,9 +653,10 @@ fn read_subscription_id(
 ) -> Result<String, ClientEvmError> {
     loop {
         let Some(message) = read_json_rpc_message::<Value>(socket)? else {
-            return Err(ClientEvmError::MalformedJsonRpcResponse(
-                "websocket closed before subscription response".to_owned(),
-            ));
+            return Err(ClientEvmError::MalformedResponse {
+                context: "subscription".to_owned(),
+                detail: "websocket closed before subscription response".to_owned(),
+            });
         };
 
         if let Some(subscription_id) = parse_subscription_response(&message, expected_request_id)? {
@@ -648,15 +714,27 @@ where
     loop {
         match socket.read() {
             Ok(Message::Text(text)) => {
-                let message = serde_json::from_slice::<T>(text.as_bytes())
-                    .map_err(|error| ClientEvmError::JsonError(error))?;
+                let message = serde_json::from_slice::<T>(text.as_bytes()).map_err(|error| {
+                    ClientEvmError::MalformedResponse {
+                        context: "subscription".to_owned(),
+                        detail: error.to_string(),
+                    }
+                })?;
                 return Ok(Some(message));
             }
             Ok(Message::Binary(bytes)) => {
-                let text = str::from_utf8(bytes.as_ref())
-                    .map_err(|error| ClientEvmError::MalformedJsonRpcResponse(error.to_string()))?;
-                let message = serde_json::from_str::<T>(text)
-                    .map_err(|error| ClientEvmError::JsonError(error))?;
+                let text = str::from_utf8(bytes.as_ref()).map_err(|error| {
+                    ClientEvmError::MalformedResponse {
+                        context: "subscription".to_owned(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                let message = serde_json::from_str::<T>(text).map_err(|error| {
+                    ClientEvmError::MalformedResponse {
+                        context: "subscription".to_owned(),
+                        detail: error.to_string(),
+                    }
+                })?;
                 return Ok(Some(message));
             }
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
@@ -749,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_block_header_maps_transport_failure_to_http_error() {
+    fn fetch_block_header_maps_transport_failure_to_http_transport_error() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
         let address = listener
             .local_addr()
@@ -761,7 +839,27 @@ mod tests {
         let result =
             fetch_block_header(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
 
-        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+        assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
+    }
+
+    #[test]
+    fn fetch_block_header_maps_non_2xx_status_to_http_status_with_body() {
+        let (http_url, server) = spawn_http_status_server(
+            "500 Internal Server Error",
+            "{\"error\":\"response size exceeded\"}",
+        );
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result =
+            fetch_block_header(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
+
+        assert!(matches!(
+            result,
+            Err(ClientEvmError::HttpStatus { status: 500, ref body })
+                if body.contains("response size exceeded")
+        ));
+        server.join().expect("server thread must complete");
     }
 
     #[test]
@@ -815,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_block_logs_maps_transport_failure_to_http_error() {
+    fn fetch_block_logs_maps_transport_failure_to_http_transport_error() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
         let address = listener
             .local_addr()
@@ -826,7 +924,7 @@ mod tests {
 
         let result = fetch_block_logs(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
 
-        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+        assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
 
     #[test]
@@ -878,36 +976,8 @@ mod tests {
             .recv()
             .expect("server must report received request");
         assert_eq!(request.path, "/ethereum/api-key");
-        assert_eq!(request.body.get("method"), Some(&json!("eth_call")));
-        assert_eq!(
-            request
-                .body
-                .get("params")
-                .and_then(Value::as_array)
-                .and_then(|params| params.first())
-                .and_then(|call| call.get("to")),
-            Some(&json!(MULTICALL3_ADDRESS))
-        );
-        assert_eq!(
-            request
-                .body
-                .get("params")
-                .and_then(Value::as_array)
-                .and_then(|params| params.get(1)),
-            Some(&json!({ "blockHash": at }))
-        );
-
-        let multicall_data = request
-            .body
-            .get("params")
-            .and_then(Value::as_array)
-            .and_then(|params| params.first())
-            .and_then(|call| call.get("data"))
-            .cloned()
-            .and_then(|data| serde_json::from_value::<Bytes>(data).ok())
-            .expect("pool data request must contain multicall data");
-        let calls = decode_aggregate3_call_data_for_test(&multicall_data)
-            .expect("pool data request must decode as aggregate3");
+        assert_multicall_request_at(&request.body, at);
+        let calls = multicall_calls_from_request(&request.body);
         assert_eq!(
             calls
                 .iter()
@@ -988,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_pool_data_maps_transport_failure_to_http_error() {
+    fn fetch_pool_data_maps_transport_failure_to_http_transport_error() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
         let address = listener
             .local_addr()
@@ -1005,7 +1075,7 @@ mod tests {
             HashSet::from([PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
         );
 
-        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+        assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
 
     #[test]
@@ -1395,7 +1465,143 @@ mod tests {
     }
 
     #[test]
-    fn fetch_token_metadata_maps_transport_failure_to_http_error() {
+    fn fetch_token_metadata_chunks_oversized_call_set_into_one_batch() {
+        // One more token than fits in a single chunk forces the call set to split into two
+        // `eth_call`s dispatched as one JSON-RPC batch. The chunk boundary must not disturb
+        // positional decoding: every token still resolves to its own decimals.
+        let at = B256::with_last_byte(1);
+        let token_count = MULTICALL_CHUNK_SIZE + 1;
+        let tokens: Vec<TokenAddress> = (0..token_count).map(token_address_from_index).collect();
+        let decimals_for = |index: usize| (index % 19) as u8;
+
+        let first_chunk: Vec<MulticallCallResult> = (0..MULTICALL_CHUNK_SIZE)
+            .map(|index| successful_multicall_result(decimals_return_data(decimals_for(index))))
+            .collect();
+        let second_chunk = [successful_multicall_result(decimals_return_data(
+            decimals_for(MULTICALL_CHUNK_SIZE),
+        ))];
+        let response = json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": aggregate3_return_data_for_test(&first_chunk)
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": aggregate3_return_data_for_test(&second_chunk)
+            }
+        ]);
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let config = rpc_config(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_token_metadata(
+            &agent,
+            &config,
+            ChainKey::Ethereum,
+            at,
+            tokens.iter().copied().collect(),
+        )
+        .expect("token metadata fetch must succeed");
+
+        assert_eq!(result.len(), token_count);
+        for (index, token) in tokens.iter().enumerate() {
+            assert_eq!(
+                result.get(token),
+                Some(&Ok(TokenMetadata {
+                    decimals: TokenDecimals::try_from_u256(U256::from(decimals_for(index)))
+                        .expect("test decimals must be supported"),
+                })),
+                "token at sorted index {index} must decode to its own decimals"
+            );
+        }
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        let entries = request
+            .body
+            .as_array()
+            .expect("request must be a json-rpc batch array");
+        assert_eq!(entries.len(), 2, "call set must split into two chunks");
+        let calls = multicall_batch_calls_from_request(&request.body);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| (call.target, call.call_data.clone()))
+                .collect::<Vec<_>>(),
+            tokens
+                .iter()
+                .map(|token| (token.0, decimals_call_data()))
+                .collect::<Vec<_>>()
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn aggregate3_batched_preserves_order_across_batches() {
+        // A call set large enough to span several JSON-RPC batches (more than the concurrency
+        // window), so batches complete out of order under parallel dispatch. The flattened results
+        // must still match input order exactly — each result echoes its own call's data.
+        let at = B256::with_last_byte(1);
+        let call_count = MULTICALL_CHUNK_SIZE * MULTICALL_MAX_BATCH_ITEMS * 4 + 1;
+        let calls: Vec<MulticallCall> = (0..call_count).map(multicall_call_from_index).collect();
+        let chunk_count = call_count.div_ceil(MULTICALL_CHUNK_SIZE);
+        let batch_count = chunk_count.div_ceil(MULTICALL_MAX_BATCH_ITEMS);
+        let (http_url, server) = spawn_concurrent_multicall_echo_server(batch_count);
+        let endpoint = format!("{http_url}/ethereum/api-key");
+        let agent = ureq::Agent::new_with_defaults();
+
+        let results = aggregate3_batched(&agent, &endpoint, at, &calls)
+            .expect("batched aggregate must succeed");
+
+        assert_eq!(results.len(), call_count);
+        for (index, (call, result)) in calls.iter().zip(results.iter()).enumerate() {
+            assert!(result.success, "result {index} must be successful");
+            assert_eq!(
+                result.return_data, call.call_data,
+                "result at index {index} is out of input order"
+            );
+        }
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn aggregate3_batched_surfaces_a_single_batch_error() {
+        // Span more than one batch and poison a call in the second batch. The all-or-nothing contract
+        // means the whole aggregate fails with that batch's JSON-RPC error, even though the first
+        // batch succeeds.
+        let at = B256::with_last_byte(1);
+        let call_count =
+            MULTICALL_CHUNK_SIZE * MULTICALL_MAX_BATCH_ITEMS + MULTICALL_CHUNK_SIZE + 1;
+        let mut calls: Vec<MulticallCall> =
+            (0..call_count).map(multicall_call_from_index).collect();
+        let poison_index = MULTICALL_CHUNK_SIZE * MULTICALL_MAX_BATCH_ITEMS + 1;
+        if let Some(call) = calls.get_mut(poison_index) {
+            call.target = poison_target();
+        }
+        let chunk_count = call_count.div_ceil(MULTICALL_CHUNK_SIZE);
+        let batch_count = chunk_count.div_ceil(MULTICALL_MAX_BATCH_ITEMS);
+        let (http_url, server) = spawn_concurrent_multicall_echo_server(batch_count);
+        let endpoint = format!("{http_url}/ethereum/api-key");
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = aggregate3_batched(&agent, &endpoint, at, &calls);
+
+        assert!(matches!(result, Err(ClientEvmError::JsonRpcError { .. })));
+        server.join().expect("server thread must complete");
+    }
+
+    fn token_address_from_index(index: usize) -> TokenAddress {
+        let mut bytes = [0u8; 20];
+        let suffix = (index as u32 + 1).to_be_bytes();
+        bytes[16..].copy_from_slice(&suffix);
+        TokenAddress(Address::from(bytes), ChainKey::Ethereum)
+    }
+
+    #[test]
+    fn fetch_token_metadata_maps_transport_failure_to_http_transport_error() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
         let address = listener
             .local_addr()
@@ -1412,7 +1618,7 @@ mod tests {
             HashSet::from([TokenAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
         );
 
-        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+        assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
 
     #[test]
@@ -1453,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_finalized_block_header_maps_transport_failure_to_http_error() {
+    fn fetch_finalized_block_header_maps_transport_failure_to_http_transport_error() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
         let address = listener
             .local_addr()
@@ -1464,7 +1670,7 @@ mod tests {
 
         let result = fetch_finalized_block_header(&agent, &config, ChainKey::Ethereum);
 
-        assert!(matches!(result, Err(ClientEvmError::HttpError(_))));
+        assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
 
     #[test]
@@ -1553,11 +1759,13 @@ mod tests {
     }
 
     fn multicall3_response<const N: usize>(results: [MulticallCallResult; N]) -> Value {
-        json!({
+        // Multicall fetches now dispatch a JSON-RPC batch (one `eth_call` per chunk). A call set this
+        // small fits in a single chunk, so the response is a one-entry batch array with id 1.
+        json!([{
             "jsonrpc": "2.0",
             "id": 1,
             "result": aggregate3_return_data_for_test(&results)
-        })
+        }])
     }
 
     fn successful_multicall_result(return_data: Bytes) -> MulticallCallResult {
@@ -1659,7 +1867,15 @@ mod tests {
         Bytes::from(crate::uniswap_v3::getPoolCall::abi_encode_returns(&pool))
     }
 
+    fn first_batch_entry(request: &Value) -> &Value {
+        request
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("multicall request must be a json-rpc batch array")
+    }
+
     fn assert_multicall_request_at(request: &Value, at: B256) {
+        let request = first_batch_entry(request);
         assert_eq!(request.get("method"), Some(&json!("eth_call")));
         assert_eq!(
             request
@@ -1678,7 +1894,126 @@ mod tests {
         );
     }
 
+    fn multicall_batch_calls_from_request(request: &Value) -> Vec<MulticallCall> {
+        request
+            .as_array()
+            .expect("multicall request must be a json-rpc batch array")
+            .iter()
+            .flat_map(multicall_calls_from_entry)
+            .collect()
+    }
+
+    fn multicall_calls_from_entry(entry: &Value) -> Vec<MulticallCall> {
+        let data = entry
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.first())
+            .and_then(|call| call.get("data"))
+            .cloned()
+            .and_then(|data| serde_json::from_value::<Bytes>(data).ok())
+            .expect("batch entry must contain multicall data");
+
+        decode_aggregate3_call_data_for_test(&data)
+            .expect("batch entry data must decode as aggregate3")
+    }
+
+    fn multicall_call_from_index(index: usize) -> MulticallCall {
+        let mut bytes = [0u8; 20];
+        let suffix = (index as u32 + 1).to_be_bytes();
+        bytes[16..].copy_from_slice(&suffix);
+        MulticallCall {
+            target: Address::from(bytes),
+            call_data: Bytes::from((index as u64).to_be_bytes().to_vec()),
+        }
+    }
+
+    fn poison_target() -> Address {
+        Address::from([0xeeu8; 20])
+    }
+
+    /// Builds a JSON-RPC batch response for a received multicall batch request: each entry echoes its
+    /// chunk's call data back as the per-call return data, so callers can assert results land in input
+    /// order. An entry whose chunk contains [`poison_target`] yields a JSON-RPC error instead, modelling
+    /// a single failing batch.
+    fn multicall_echo_response(request: &Value) -> Value {
+        let entries = request
+            .as_array()
+            .expect("multicall request must be a json-rpc batch array");
+        Value::Array(
+            entries
+                .iter()
+                .map(|entry| {
+                    let id = entry
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .expect("batch entry must carry a numeric id");
+                    let calls = multicall_calls_from_entry(entry);
+                    if calls.iter().any(|call| call.target == poison_target()) {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": "poison batch" }
+                        })
+                    } else {
+                        let results: Vec<MulticallCallResult> = calls
+                            .iter()
+                            .map(|call| successful_multicall_result(call.call_data.clone()))
+                            .collect();
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": aggregate3_return_data_for_test(&results)
+                        })
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn write_json_response<W: Write>(stream: &mut W, response: &Value) {
+        let response_body = serde_json::to_vec(response).expect("test response must serialize");
+        let response_headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        );
+        stream
+            .write_all(response_headers.as_bytes())
+            .expect("test server must write response headers");
+        stream
+            .write_all(&response_body)
+            .expect("test server must write response body");
+    }
+
+    /// Test server that handles each of `connection_count` connections on its own thread, replying via
+    /// [`multicall_echo_response`]. Unlike `spawn_json_rpc_server_sequence` (serial accept, response per
+    /// accept order), it pairs each response with its own request, so it stays correct when batches are
+    /// dispatched concurrently and complete out of order.
+    fn spawn_concurrent_multicall_echo_server(connection_count: usize) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server must bind");
+        let address = listener
+            .local_addr()
+            .expect("test server must have local address");
+
+        let handle = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..connection_count {
+                let (mut stream, _) = listener.accept().expect("test server must accept request");
+                handlers.push(thread::spawn(move || {
+                    let request = read_http_request(&mut stream);
+                    let response = multicall_echo_response(&request.body);
+                    write_json_response(&mut stream, &response);
+                }));
+            }
+            for handler in handlers {
+                handler.join().expect("connection handler must complete");
+            }
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
     fn multicall_calls_from_request(request: &Value) -> Vec<MulticallCall> {
+        let request = first_batch_entry(request);
         let multicall_data = request
             .get("params")
             .and_then(Value::as_array)
@@ -1765,6 +2100,35 @@ mod tests {
         });
 
         (format!("http://{address}"), receiver, handle)
+    }
+
+    fn spawn_http_status_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server must bind");
+        let address = listener
+            .local_addr()
+            .expect("test server must have local address");
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server must accept request");
+            let _ = read_http_request(&mut stream);
+
+            let response_headers = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+
+            stream
+                .write_all(response_headers.as_bytes())
+                .expect("test server must write response headers");
+            stream
+                .write_all(body.as_bytes())
+                .expect("test server must write response body");
+        });
+
+        (format!("http://{address}"), handle)
     }
 
     fn read_http_request(stream: &mut TcpStream) -> ReceivedHttpRequest {
