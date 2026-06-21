@@ -2,14 +2,14 @@ use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent,
     ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, PoolAddress, PoolCandidateAddress,
-    PoolDataResult, PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult,
-    bootstrap, fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
-    fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
-    kernel,
+    PoolDataResult, PoolLog, PoolMetadataResult, RequestId, RpcConfig, TokenAddress,
+    TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
+    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
+    fetch_pool_metadata, fetch_token_metadata, kernel,
     multi_chain_kernel::{
         Effect, Event, OptimizationPoolReserves, State, Subscription, transition,
     },
-    subscribe_new_heads,
+    subscribe_new_heads, subscribe_pool_events,
 };
 use optimization::{
     OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
@@ -76,7 +76,12 @@ impl Application for ClientEvmApp {
     fn subscriptions() -> Vec<Self::Subscription> {
         let mut subscriptions: Vec<Subscription> = client_evm::ACTIVE_CHAINS
             .iter()
-            .map(|&chain| Subscription::NewHeadsSubscription(chain))
+            .flat_map(|&chain| {
+                [
+                    Subscription::NewHeadsSubscription(chain),
+                    Subscription::PoolEventsSubscription(chain),
+                ]
+            })
             .collect();
         subscriptions.push(Subscription::TickSubscription(time::Duration::from_millis(
             1000,
@@ -127,6 +132,13 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                         .map(|event| Event::ChainEvent { chain, event })
                 };
                 let _ = subscribe_new_heads(self.rpc_config(), chain, sender, map_client_event);
+            }
+            Subscription::PoolEventsSubscription(chain) => {
+                let map_client_event = |client_event: ClientEvent| {
+                    map_client_chain_event(client_event)
+                        .map(|event| Event::ChainEvent { chain, event })
+                };
+                let _ = subscribe_pool_events(self.rpc_config(), chain, sender, map_client_event);
             }
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
@@ -248,6 +260,10 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
         kernel::Event::BlockLogsReceived { request_id, logs } => format!(
             "input chain={chain:?} block_logs_received request={} pools={}",
             format_typed_request_id_log(request_id),
+            logs.len(),
+        ),
+        kernel::Event::LogObserved { block_hash, logs } => format!(
+            "input chain={chain:?} log_observed block={block_hash} pools={}",
             logs.len(),
         ),
         kernel::Event::PoolDataReceived { request_id, pools } => format!(
@@ -441,6 +457,12 @@ fn map_client_chain_event(client_chain_event: ClientEvent) -> Option<client_evm:
             hash: header.inner.hash,
             parent_hash: header.inner.inner.parent_hash,
         }),
+        ClientEvent::PoolLogObserved {
+            block_hash, log, ..
+        } => Some(client_evm::kernel::Event::LogObserved {
+            block_hash,
+            logs: vec![log],
+        }),
         ClientEvent::Subscribed { .. } => None,
         ClientEvent::Closed { .. } => None,
     }
@@ -528,7 +550,7 @@ fn execute_chain_effect_with<
 ) -> Vec<Event>
 where
     FetchBlockHeader: FnOnce(BlockHash) -> Result<Option<ClientHead>, ClientEvmError>,
-    FetchBlockLogs: FnOnce(BlockHash) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError>,
+    FetchBlockLogs: FnOnce(BlockHash) -> Result<Vec<PoolLog>, ClientEvmError>,
     FetchPoolData: FnOnce(
         BlockHash,
         HashSet<PoolAddress>,
@@ -677,8 +699,8 @@ where
 mod tests {
     use client_evm::{
         ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata, GetTokenMetadata,
-        IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult,
-        RequestId, TokenAddress, TokenMetadataResult,
+        IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolLog,
+        PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult,
     };
     use serde_json::json;
     use std::{sync::mpsc, time::Duration};
@@ -732,6 +754,27 @@ mod tests {
             assert!(
                 new_heads_chains.contains(chain),
                 "expected a new-heads subscription for active chain {chain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscriptions_open_pool_events_for_every_active_chain() {
+        let subscriptions = ClientEvmApp::subscriptions();
+
+        let pool_event_chains = subscriptions
+            .iter()
+            .filter_map(|subscription| match subscription {
+                Subscription::PoolEventsSubscription(chain) => Some(*chain),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(pool_event_chains.len(), client_evm::ACTIVE_CHAINS.len());
+        for chain in client_evm::ACTIVE_CHAINS {
+            assert!(
+                pool_event_chains.contains(chain),
+                "expected a pool-events subscription for active chain {chain:?}"
             );
         }
     }
@@ -830,7 +873,7 @@ mod tests {
                 chain: ChainKey::Ethereum,
                 event: kernel::Event::BlockLogsReceived {
                     request_id: logs_request_id,
-                    logs: HashSet::new(),
+                    logs: Vec::new(),
                 },
             }),
             "input chain=Ethereum block_logs_received request=8 pools=0"
@@ -1186,7 +1229,7 @@ mod tests {
             unexpected_block_header_fetch,
             |requested_hash| {
                 assert_eq!(requested_hash, block_hash);
-                Ok(HashSet::new())
+                Ok(Vec::new())
             },
             unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
@@ -1554,9 +1597,7 @@ mod tests {
         panic!("block header fetch must not be called")
     }
 
-    fn unexpected_block_logs_fetch(
-        _block_hash: BlockHash,
-    ) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError> {
+    fn unexpected_block_logs_fetch(_block_hash: BlockHash) -> Result<Vec<PoolLog>, ClientEvmError> {
         panic!("block logs fetch must not be called")
     }
 

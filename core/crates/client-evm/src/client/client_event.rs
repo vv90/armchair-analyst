@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use alloy::{primitives::BlockHash, rpc::types::Header, serde::WithOtherFields};
 
-use crate::PoolCandidateAddress;
+use crate::{PoolCandidateAddress, PoolLog};
 
 pub type ClientHead = WithOtherFields<Header>;
 
@@ -24,6 +24,13 @@ pub enum ClientEvent {
     NewHead {
         subscription_id: String,
         header: ClientHead,
+    },
+    /// A single state-relevant pool log delivered by the live `logs` subscription, with the block
+    /// it belongs to.
+    PoolLogObserved {
+        subscription_id: String,
+        block_hash: BlockHash,
+        log: PoolLog,
     },
     Closed {
         subscription_id: String,

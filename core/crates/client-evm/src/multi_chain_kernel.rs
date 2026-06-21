@@ -451,6 +451,7 @@ pub enum Event {
 
 pub enum Subscription {
     NewHeadsSubscription(ChainKey),
+    PoolEventsSubscription(ChainKey),
     TickSubscription(Duration),
     OptimizationSubscription,
 }
@@ -1226,7 +1227,7 @@ mod tests {
                 chain,
                 event: kernel::Event::BlockLogsReceived {
                     request_id,
-                    logs: HashSet::new(),
+                    logs: Vec::new(),
                 },
             },
         );

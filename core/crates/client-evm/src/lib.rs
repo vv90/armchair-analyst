@@ -10,6 +10,7 @@ mod erc20;
 mod error;
 pub mod kernel;
 pub mod multi_chain_kernel;
+mod pool_log;
 mod pool_state;
 mod request_tracking;
 mod tick;
@@ -22,7 +23,7 @@ pub use chain::{ACTIVE_CHAINS, ChainKey, drpc_network_path};
 pub use client::{
     ClientEvent, ClientHead, RangeLogBlock, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
-    fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads,
+    fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads, subscribe_pool_events,
 };
 pub use config::RpcConfig;
 pub use error::{ClientEvmError, ConfigScope};
@@ -38,6 +39,7 @@ pub use kernel::token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
     TokenMetadataResult, TokenRegistry,
 };
+pub use pool_log::{PoolLog, PoolLogEvent, decode_pool_log, derive_pool_state};
 pub use pool_state::{
     PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState, PoolStateError,
 };

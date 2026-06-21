@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1b9e6da139c6298ab1b37afd08b00aebfcb7ca4e9422514d7b4c32324769eee0 # shrinks to leading = [Burn { tick_lower: 0, tick_upper: 0, amount: 0 }], anchor = Swap { sqrt_price_x96: 0, tick: 0, liquidity: 0 }, trailing = []

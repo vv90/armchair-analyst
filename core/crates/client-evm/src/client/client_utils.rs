@@ -4,7 +4,7 @@ use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
 use crate::{
-    ClientEvmError, ClientHead, PoolCandidateAddress, RangeLogBlock,
+    ClientEvmError, ClientHead, PoolCandidateAddress, PoolLog, RangeLogBlock, decode_pool_log,
     uniswap_v3::pool_event_signature_hashes,
 };
 
@@ -257,7 +257,7 @@ pub(crate) fn parse_block_logs_response(
     value: &Value,
     expected_request_id: u64,
     expected_block_hash: BlockHash,
-) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError> {
+) -> Result<Vec<PoolLog>, ClientEvmError> {
     let context = "block logs";
     let result = json_rpc_result(value, expected_request_id, context)?;
 
@@ -284,10 +284,9 @@ pub(crate) fn parse_block_logs_response(
         });
     }
 
-    Ok(logs
-        .into_iter()
-        .map(|log| PoolCandidateAddress(log.address()))
-        .collect())
+    // Decode to the state-relevant pool events; logs that do not affect pool state (and so cannot
+    // dirty a pool) are dropped here, and the candidate set is derived from what remains.
+    Ok(logs.iter().filter_map(decode_pool_log).collect())
 }
 
 pub(crate) fn parse_pool_logs_range_response(
@@ -443,15 +442,19 @@ mod tests {
             ]
         });
 
-        let result = parse_block_logs_response(&response, 9, block_hash);
+        let candidates = parse_block_logs_response(&response, 9, block_hash)
+            .expect("logs parse")
+            .iter()
+            .map(|log| PoolCandidateAddress(log.address))
+            .collect::<HashSet<_>>();
 
-        assert!(matches!(
-            result,
-            Ok(ref pools)
-                if pools.len() == 2
-                    && pools.contains(&PoolCandidateAddress(first_pool))
-                    && pools.contains(&PoolCandidateAddress(second_pool))
-        ));
+        assert_eq!(
+            candidates,
+            HashSet::from([
+                PoolCandidateAddress(first_pool),
+                PoolCandidateAddress(second_pool),
+            ])
+        );
     }
 
     #[test]
@@ -1273,19 +1276,34 @@ mod tests {
     }
 
     fn log_result(address: Address, block_hash: B256) -> Value {
-        json!({
-            "address": address,
-            "topics": [
-                pool_event_signature_hashes()[0]
-            ],
-            "data": "0x",
-            "blockHash": block_hash,
-            "blockNumber": "0x4",
-            "transactionHash": B256::with_last_byte(5),
-            "transactionIndex": "0x6",
-            "logIndex": "0x7",
-            "removed": false
-        })
+        use alloy::primitives::{I256, U160, aliases::I24};
+        use alloy::sol_types::SolEvent;
+
+        use crate::uniswap_v3::Swap;
+
+        // A real, decodable Swap log: `parse_block_logs_response` now decodes events, so fixtures
+        // must carry valid topics and data rather than an empty placeholder.
+        let event = Swap {
+            sender: Address::with_last_byte(9),
+            recipient: Address::with_last_byte(10),
+            amount0: I256::ZERO,
+            amount1: I256::ZERO,
+            sqrtPriceX96: U160::from(1u128),
+            liquidity: 1,
+            tick: I24::ZERO,
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address,
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(4),
+            log_index: Some(7),
+            ..Default::default()
+        };
+
+        serde_json::to_value(&log).expect("log serializes to json")
     }
 
     fn range_log_result(address: Address, block_hash: B256, block_number: u64) -> Value {

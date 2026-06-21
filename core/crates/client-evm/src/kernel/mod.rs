@@ -7,11 +7,29 @@ pub(crate) mod pool_registry;
 pub(crate) mod token_registry;
 
 use self::{pending_requests::*, pool_registry::*, token_registry::*};
-use crate::{ChainKey, pool_state::*, tick::Tick};
+use crate::{ChainKey, PoolLog, PoolLogEvent, derive_pool_state, pool_state::*, tick::Tick};
 
 enum PoolLogsStatus {
     Unknown,
+    /// Logs observed via the best-effort subscription: candidates are real but the set is not
+    /// guaranteed complete, so it is provisional and never gates the optimizer or finalization.
+    Partial(HashSet<PoolCandidateAddress>),
+    /// Logs from an authoritative `GetBlockLogs`: the candidate set is complete.
     Resolved(HashSet<PoolCandidateAddress>),
+}
+
+impl PoolLogsStatus {
+    /// The observed candidate set for `Partial`/`Resolved`, or `None` while `Unknown`. Lets
+    /// consumers that treat any observation alike (candidate discovery, dirty tracking, metadata
+    /// validation) avoid distinguishing provisional from authoritative.
+    fn candidates(&self) -> Option<&HashSet<PoolCandidateAddress>> {
+        match self {
+            PoolLogsStatus::Unknown => None,
+            PoolLogsStatus::Partial(candidates) | PoolLogsStatus::Resolved(candidates) => {
+                Some(candidates)
+            }
+        }
+    }
 }
 
 struct BlockNode {
@@ -96,17 +114,13 @@ impl BlocksGraph {
         }
     }
 
-    /// Stores fetched log-derived candidate pool addresses on an existing block.
-    /// Added to keep raw log observations separate from trusted pool validation in the registry.
-    fn with_pool_logs(
-        self,
-        block_hash: BlockHash,
-        logs: HashSet<PoolCandidateAddress>,
-    ) -> BlocksGraph {
+    /// Sets a block's pool-logs status (`Partial` for provisional subscription logs, `Resolved` for
+    /// authoritative `GetBlockLogs`). No-ops if the block is absent.
+    fn with_pool_logs(self, block_hash: BlockHash, status: PoolLogsStatus) -> BlocksGraph {
         let BlocksGraph(mut blocks) = self;
 
         if let Some(block) = blocks.get_mut(&block_hash) {
-            block.pool_logs = PoolLogsStatus::Resolved(logs);
+            block.pool_logs = status;
         }
 
         BlocksGraph(blocks)
@@ -121,10 +135,11 @@ impl BlocksGraph {
         block_hash: BlockHash,
         registry: &TrustedPoolRegistry,
     ) -> Option<TrustedPoolLogs> {
-        self.get(&block_hash).map(|block| match &block.pool_logs {
-            PoolLogsStatus::Unknown => TrustedPoolLogs::Unknown,
-            PoolLogsStatus::Resolved(candidates) => registry.trusted_pool_logs(chain, candidates),
-        })
+        self.get(&block_hash)
+            .map(|block| match block.pool_logs.candidates() {
+                None => TrustedPoolLogs::Unknown,
+                Some(candidates) => registry.trusted_pool_logs(chain, candidates),
+            })
     }
 
     /// Returns the present canonical suffix from oldest known block to tip.
@@ -251,6 +266,28 @@ impl BlocksGraph {
         BlocksGraph(blocks)
     }
 
+    /// Records log-derived pool snapshots onto a block.
+    ///
+    /// Unlike [`BlocksGraph::with_pool_data`] there is no failure map: derivation either produces a
+    /// snapshot (stored here) or it does not (the pool is simply left uncovered, so the existing
+    /// `GetPoolData` path picks it up). A derived snapshot is authoritative for its block; it
+    /// overwrites any prior snapshot for the same pool on that block.
+    fn with_derived_pool_state(
+        self,
+        block_hash: BlockHash,
+        derived: HashMap<PoolAddress, PoolState>,
+    ) -> BlocksGraph {
+        let BlocksGraph(mut blocks) = self;
+
+        if let Some(block) = blocks.get_mut(&block_hash) {
+            for (pool, pool_state) in derived {
+                block.pool_snapshots.insert(pool, pool_state);
+            }
+        }
+
+        BlocksGraph(blocks)
+    }
+
     /// Builds the next pool-state request (issued at the tip) for verified dirty pools on the
     /// canonical path that are not already covered.
     ///
@@ -285,7 +322,7 @@ impl BlocksGraph {
                 continue;
             };
 
-            if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+            if let Some(candidates) = block.pool_logs.candidates() {
                 if let TrustedPoolLogs::Resolved(pools) =
                     registry.trusted_pool_logs(chain, candidates)
                 {
@@ -333,7 +370,8 @@ impl BlocksGraph {
                 break;
             };
 
-            if matches!(block.pool_logs, PoolLogsStatus::Unknown)
+            // `Partial` logs are provisional, so they still need an authoritative `GetBlockLogs`.
+            if !matches!(block.pool_logs, PoolLogsStatus::Resolved(_))
                 && !pending_log_hashes.contains(&current_hash)
             {
                 hashes.push(current_hash);
@@ -369,7 +407,7 @@ impl BlocksGraph {
                 break;
             };
 
-            if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+            if let Some(candidates) = block.pool_logs.candidates() {
                 let request_candidates = candidates
                     .iter()
                     .copied()
@@ -416,7 +454,7 @@ impl BlocksGraph {
                 break;
             };
 
-            if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+            if let Some(candidates) = block.pool_logs.candidates() {
                 let tokens = candidates
                     .iter()
                     .filter_map(|candidate| pool_registry.verified_pool(chain, *candidate))
@@ -491,7 +529,15 @@ pub struct State {
     pool_registry: TrustedPoolRegistry,
     token_registry: TokenRegistry,
     tick: Tick,
+    /// Subscription-observed logs for blocks not yet in the graph, keyed by block hash. Drained
+    /// into the block when it enters via a head/header observation. Bounded by
+    /// [`MAX_STREAMED_LOG_BLOCKS`]; raw input staging only, safe to drop.
+    streamed_logs: HashMap<BlockHash, Vec<PoolLog>>,
 }
+
+/// Caps how many not-yet-known blocks can hold buffered subscription logs at once, bounding the
+/// staging map when observed logs for a block arrive but its head never does (e.g. a reorg).
+const MAX_STREAMED_LOG_BLOCKS: usize = 1024;
 
 impl State {
     /// Creates kernel state from a finalized snapshot with no pending requests or recent blocks.
@@ -505,6 +551,7 @@ impl State {
             pool_registry: TrustedPoolRegistry::new(),
             token_registry: TokenRegistry::new(),
             tick: Tick::initial(),
+            streamed_logs: HashMap::new(),
         }
     }
 
@@ -570,6 +617,7 @@ impl State {
             pool_registry,
             token_registry,
             tick,
+            streamed_logs: HashMap::new(),
         };
 
         (state, effects)
@@ -634,6 +682,7 @@ impl State {
             pool_registry,
             token_registry,
             tick: Tick::initial(),
+            streamed_logs: HashMap::new(),
         }
     }
 
@@ -673,6 +722,7 @@ impl State {
             pool_registry,
             token_registry,
             tick,
+            streamed_logs: HashMap::new(),
         }
     }
 
@@ -772,7 +822,10 @@ impl State {
         block: &BlockNode,
     ) -> Option<HashSet<PoolAddress>> {
         match &block.pool_logs {
-            PoolLogsStatus::Unknown => None,
+            // `Partial` is provisional: it must not contribute to a "complete" overlay, so it stops
+            // the scan exactly like `Unknown`. This is the single gate that keeps the optimizer and
+            // finalization acting only on authoritative `Resolved` state.
+            PoolLogsStatus::Unknown | PoolLogsStatus::Partial(_) => None,
             PoolLogsStatus::Resolved(candidates) => {
                 match self.pool_registry.trusted_pool_logs(chain, candidates) {
                     TrustedPoolLogs::Resolved(pools) => Some(pools),
@@ -780,6 +833,139 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Records an authoritative block-logs response: resolves the block's candidate set, derives a
+    /// snapshot for every trusted pool the logs can be folded forward for, and stores both.
+    ///
+    /// Derivation is best-effort: a pool whose base is uncertain or whose fold yields nothing is
+    /// left unsnapshotted, so the existing dirty/`GetPoolData` machinery covers it unchanged. No
+    /// scheduler change is needed — a derived snapshot simply keeps the pool out of the dirty set.
+    fn with_block_logs_applied(
+        self,
+        chain: ChainKey,
+        block_hash: BlockHash,
+        logs: Vec<PoolLog>,
+        complete: bool,
+    ) -> State {
+        let Some(block) = self.blocks.get(&block_hash) else {
+            // The target block was pruned/reset between request and response; drop the logs.
+            return self;
+        };
+        let parent_hash = block.parent_hash;
+
+        // A provisional (subscription) update never downgrades or re-derives an already
+        // authoritative block: the `Resolved` snapshots stand.
+        if !complete && matches!(block.pool_logs, PoolLogsStatus::Resolved(_)) {
+            return self;
+        }
+
+        let observed = logs
+            .iter()
+            .map(|log| PoolCandidateAddress(log.address))
+            .collect::<HashSet<_>>();
+        let status = if complete {
+            PoolLogsStatus::Resolved(observed)
+        } else if let PoolLogsStatus::Partial(existing) = &block.pool_logs {
+            // Subscription logs arrive in fragments; accumulate the provisional candidate set.
+            PoolLogsStatus::Partial(existing.union(&observed).copied().collect())
+        } else {
+            PoolLogsStatus::Partial(observed)
+        };
+
+        // Group this block's logs by the trusted pool that emitted them, preserving intra-block
+        // order via `log_index`.
+        let mut events_by_pool: HashMap<PoolAddress, Vec<(u64, &PoolLogEvent)>> = HashMap::new();
+        for log in &logs {
+            if let Some(pool) = self
+                .pool_registry
+                .verified_pool(chain, PoolCandidateAddress(log.address))
+            {
+                events_by_pool
+                    .entry(pool)
+                    .or_default()
+                    .push((log.log_index, &log.event));
+            }
+        }
+
+        let mut derived = HashMap::new();
+        for (pool, mut indexed_events) in events_by_pool {
+            // An uncertain base resolves to `None`: a block whose logs contain an absolute event
+            // (Swap/Initialize) still derives from that event alone, while a delta-only block with
+            // no base derives to `None` and falls back to `GetPoolData` exactly as before.
+            let base = self.resolve_pool_base(chain, parent_hash, pool);
+
+            indexed_events.sort_by_key(|(log_index, _)| *log_index);
+            let ordered = indexed_events
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect::<Vec<_>>();
+
+            if let Some(pool_state) = derive_pool_state(base.as_ref(), &ordered) {
+                derived.insert(pool, pool_state);
+            }
+        }
+
+        let blocks = self
+            .blocks
+            .with_pool_logs(block_hash, status)
+            .with_derived_pool_state(block_hash, derived);
+
+        State { blocks, ..self }
+    }
+
+    /// Stages subscription logs for a block not yet in the graph. Bounded by
+    /// [`MAX_STREAMED_LOG_BLOCKS`]: once full, logs for further new blocks are dropped (the
+    /// authoritative `GetBlockLogs` still covers them once the block arrives).
+    fn with_streamed_logs_buffered(mut self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
+        if self.streamed_logs.len() >= MAX_STREAMED_LOG_BLOCKS
+            && !self.streamed_logs.contains_key(&block_hash)
+        {
+            return self;
+        }
+
+        self.streamed_logs
+            .entry(block_hash)
+            .or_default()
+            .extend(logs);
+        self
+    }
+
+    /// Applies and clears any staged subscription logs for a block that has just entered the graph.
+    fn with_streamed_logs_drained(mut self, chain: ChainKey, block_hash: BlockHash) -> State {
+        match self.streamed_logs.remove(&block_hash) {
+            Some(logs) => self.with_block_logs_applied(chain, block_hash, logs, false),
+            None => self,
+        }
+    }
+
+    /// Resolves a pool's snapshot as of `parent_hash` for forward derivation by walking the
+    /// canonical ancestry newest→oldest. The first ancestor that changed the pool fixes the base to
+    /// its snapshot; if no ancestor changed the pool, the base is the finalized snapshot. Returns
+    /// `None` when the base is *uncertain* — an ancestor could have changed the pool without a
+    /// recorded snapshot (its logs are not yet resolved, or its change was not snapshotted). A
+    /// `None` base is still derivable when the block itself carries an absolute event; otherwise the
+    /// caller leaves the pool for the `GetPoolData` fallback.
+    fn resolve_pool_base(
+        &self,
+        chain: ChainKey,
+        parent_hash: BlockHash,
+        pool: PoolAddress,
+    ) -> Option<PoolState> {
+        let path = self
+            .blocks
+            .connected_path_hashes_oldest_to_newest(parent_hash, self.finalized_state.block_hash)?;
+
+        for block_hash in path.iter().rev() {
+            let block = self.blocks.get(block_hash)?;
+            let trusted_pools = self.trusted_pools_for_complete_pool_state_scan(chain, block)?;
+
+            if trusted_pools.contains(&pool) {
+                return block.pool_snapshots.get(&pool).cloned();
+            }
+        }
+
+        self.finalized_state.pool_snapshots.get(&pool).cloned()
     }
 
     /// Attempts to compact recent block data into the finalized snapshot.
@@ -820,6 +1006,7 @@ impl State {
             pool_registry,
             token_registry,
             tick,
+            streamed_logs: _,
         } = self;
 
         // Move each pool's latest snapshot out of its block instead of cloning. Every referenced
@@ -853,6 +1040,9 @@ impl State {
             pool_registry,
             token_registry,
             tick,
+            // Finalization evicts the staging buffer: any logs whose head has not arrived by now
+            // are almost certainly orphaned, and a real future block re-fetches authoritatively.
+            streamed_logs: HashMap::new(),
         }
     }
 }
@@ -909,7 +1099,12 @@ pub enum Event {
     },
     BlockLogsReceived {
         request_id: RequestId<GetBlockLogs>,
-        logs: HashSet<PoolCandidateAddress>,
+        logs: Vec<PoolLog>,
+    },
+    /// Best-effort logs from the live subscription: provisional (`Partial`), not authoritative.
+    LogObserved {
+        block_hash: BlockHash,
+        logs: Vec<PoolLog>,
     },
     PoolMetadataReceived {
         request_id: RequestId<GetPoolMetadata>,
@@ -978,6 +1173,7 @@ fn schedule_unknown_canonical_log_requests(
         pool_registry,
         token_registry,
         tick,
+        streamed_logs,
     } = state;
 
     let pending_log_hashes = pending_requests.pending_block_log_hashes();
@@ -1011,6 +1207,7 @@ fn schedule_unknown_canonical_log_requests(
             pool_registry,
             token_registry,
             tick,
+            streamed_logs,
         },
         effects,
     )
@@ -1031,6 +1228,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
         pool_registry,
         token_registry,
         tick,
+        streamed_logs,
     } = state;
 
     let pending_candidates = pending_requests.pending_pool_metadata_candidates();
@@ -1069,6 +1267,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
             pool_registry,
             token_registry,
             tick,
+            streamed_logs,
         },
         effects,
     )
@@ -1089,6 +1288,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
         pool_registry,
         token_registry,
         tick,
+        streamed_logs,
     } = state;
 
     let pending_tokens = pending_requests.pending_token_metadata_tokens();
@@ -1128,6 +1328,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
             pool_registry,
             token_registry,
             tick,
+            streamed_logs,
         },
         effects,
     )
@@ -1148,6 +1349,7 @@ fn schedule_unknown_canonical_pool_data_request(
         pool_registry,
         token_registry,
         tick,
+        streamed_logs,
     } = state;
 
     let pending_pool_data_by_block = pending_requests.pending_pool_data_pools_by_block();
@@ -1181,6 +1383,7 @@ fn schedule_unknown_canonical_pool_data_request(
             pool_registry,
             token_registry,
             tick,
+            streamed_logs,
         },
         effects,
     )
@@ -1245,7 +1448,8 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                         blocks,
                         canonical_tip: hash,
                         ..state
-                    },
+                    }
+                    .with_streamed_logs_drained(chain, hash),
                     vec![],
                 ),
                 Ok((blocks, Some(missing_hash))) => {
@@ -1259,7 +1463,8 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                             canonical_tip: hash,
                             pending_requests,
                             ..state
-                        },
+                        }
+                        .with_streamed_logs_drained(chain, hash),
                         effects,
                     )
                 }
@@ -1407,6 +1612,10 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                 ),
             };
 
+            // A header can be the first time a block enters the graph, so drain any logs the
+            // subscription staged for it before its head was processed.
+            let new_state = new_state.with_streamed_logs_drained(chain, hash);
+
             let (new_state, effects) = if let Some(PendingPayload {
                 payload: request_payload,
                 ..
@@ -1473,17 +1682,13 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     payload: GetBlockLogs { block_hash },
                     ..
                 }) => {
-                    let blocks = state.blocks.with_pool_logs(block_hash, logs);
+                    let state = State {
+                        pending_requests,
+                        ..state
+                    }
+                    .with_block_logs_applied(chain, block_hash, logs, true);
 
-                    schedule_unknown_canonical_requests(
-                        chain,
-                        State {
-                            blocks,
-                            pending_requests,
-                            ..state
-                        },
-                        vec![],
-                    )
+                    schedule_unknown_canonical_requests(chain, state, vec![])
                 }
                 None => (
                     State {
@@ -1492,6 +1697,17 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     },
                     vec![],
                 ),
+            }
+        }
+        Event::LogObserved { block_hash, logs } => {
+            if state.blocks.get(&block_hash).is_some() {
+                // Known block: apply provisionally, then schedule the authoritative `GetBlockLogs`
+                // (the block is now `Partial`, which still needs a complete fetch).
+                let state = state.with_block_logs_applied(chain, block_hash, logs, false);
+                schedule_unknown_canonical_requests(chain, state, vec![])
+            } else {
+                // The head has not arrived yet: stage the logs until the block enters the graph.
+                (state.with_streamed_logs_buffered(block_hash, logs), vec![])
             }
         }
         Event::PoolMetadataReceived {
@@ -1680,7 +1896,7 @@ mod tests {
     use alloy::primitives::{Address, U160, U256, aliases::I24};
 
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
-    use crate::{RangeLogBlock, bootstrap};
+    use crate::{PoolLogEvent, RangeLogBlock, bootstrap};
     use proptest::prelude::*;
 
     #[derive(Debug)]
@@ -1879,10 +2095,11 @@ mod tests {
                 break;
             };
 
-            if matches!(block.pool_logs, PoolLogsStatus::Unknown) {
+            // `Partial` logs are not yet authoritative, so they must still have a pending fetch.
+            if !matches!(block.pool_logs, PoolLogsStatus::Resolved(_)) {
                 assert!(
                     pending_log_hashes.contains(&current_hash),
-                    "canonical block with unknown logs must have a pending log request"
+                    "canonical block without resolved logs must have a pending log request"
                 );
             }
 
@@ -1907,12 +2124,12 @@ mod tests {
                 break;
             };
 
-            if let PoolLogsStatus::Resolved(candidates) = &block.pool_logs {
+            if let Some(candidates) = block.pool_logs.candidates() {
                 for candidate in candidates {
                     assert!(
                         state.pool_registry.is_known(ChainKey::Ethereum, *candidate)
                             || pending_candidates.contains(candidate),
-                        "canonical resolved log candidate must be known or pending metadata validation"
+                        "canonical observed log candidate must be known or pending metadata validation"
                     );
                 }
             }
@@ -2343,7 +2560,7 @@ mod tests {
                         state,
                         Event::BlockLogsReceived {
                             request_id,
-                            logs: HashSet::new(),
+                            logs: Vec::new(),
                         },
                     );
 
@@ -2426,7 +2643,7 @@ mod tests {
                         state,
                         Event::BlockLogsReceived {
                             request_id,
-                            logs: HashSet::new(),
+                            logs: Vec::new(),
                         },
                     );
 
@@ -2469,6 +2686,7 @@ mod tests {
             pool_registry: TrustedPoolRegistry::new(),
             token_registry: TokenRegistry::new(),
             tick: tick(0),
+            streamed_logs: HashMap::new(),
         }
     }
 
@@ -2773,6 +2991,70 @@ mod tests {
         PoolCandidateAddress(Address::with_last_byte(last_byte))
     }
 
+    /// Builds the `BlockLogsReceived` payload that names exactly `candidates`. Each log is a
+    /// liquidity delta with no base, so it derives to no snapshot: candidate-only tests keep their
+    /// existing semantics (the block resolves and the pools are dirtied, nothing is derived).
+    fn pool_logs(candidates: &HashSet<PoolCandidateAddress>) -> Vec<PoolLog> {
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| PoolLog {
+                address: candidate.0,
+                log_index: index as u64,
+                event: PoolLogEvent::Mint {
+                    tick_lower: I24::try_from(-1).expect("test tick fits int24"),
+                    tick_upper: I24::try_from(1).expect("test tick fits int24"),
+                    amount: 1,
+                },
+            })
+            .collect()
+    }
+
+    /// Builds a single `Swap` log whose absolute snapshot equals `pool_state`.
+    fn swap_log(
+        candidate: PoolCandidateAddress,
+        log_index: u64,
+        pool_state: &PoolState,
+    ) -> PoolLog {
+        PoolLog {
+            address: candidate.0,
+            log_index,
+            event: PoolLogEvent::Swap {
+                sqrt_price_x96: pool_state.sqrt_price_x96,
+                tick: pool_state.tick,
+                liquidity: pool_state.liquidity,
+            },
+        }
+    }
+
+    /// Builds a single `Mint` log carrying a liquidity delta over `[tick_lower, tick_upper)`.
+    fn mint_log(
+        candidate: PoolCandidateAddress,
+        log_index: u64,
+        tick_lower: i32,
+        tick_upper: i32,
+        amount: u128,
+    ) -> PoolLog {
+        PoolLog {
+            address: candidate.0,
+            log_index,
+            event: PoolLogEvent::Mint {
+                tick_lower: I24::try_from(tick_lower).expect("test tick fits int24"),
+                tick_upper: I24::try_from(tick_upper).expect("test tick fits int24"),
+                amount,
+            },
+        }
+    }
+
+    /// Reads a block's derived/stored snapshot for a pool, if any.
+    fn block_pool_snapshot<'a>(
+        state: &'a State,
+        block_hash: BlockHash,
+        pool: PoolAddress,
+    ) -> Option<&'a PoolState> {
+        state.blocks.get(&block_hash)?.pool_snapshots.get(&pool)
+    }
+
     /// Builds pool metadata fixtures directly.
     /// This lets registry/kernel tests avoid exercising RPC metadata decoding.
     fn pool_metadata(token0: u8, token1: u8, fee: UniswapV3Fee) -> PoolMetadata {
@@ -2947,7 +3229,7 @@ mod tests {
                 state,
                 Event::BlockLogsReceived {
                     request_id: *request_id,
-                    logs: HashSet::new(),
+                    logs: Vec::new(),
                 },
             );
 
@@ -4297,7 +4579,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id,
-                logs: logs.clone(),
+                logs: pool_logs(&logs),
             },
         );
 
@@ -4331,7 +4613,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id,
-                logs: logs.clone(),
+                logs: pool_logs(&logs),
             },
         );
 
@@ -4361,7 +4643,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id: RequestId::from_raw_for_test(99),
-                logs,
+                logs: pool_logs(&logs),
             },
         );
 
@@ -4390,7 +4672,10 @@ mod tests {
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::BlockLogsReceived { request_id, logs },
+            Event::BlockLogsReceived {
+                request_id,
+                logs: pool_logs(&logs),
+            },
         );
 
         assert!(effects.is_empty());
@@ -4425,7 +4710,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id,
-                logs: logs.clone(),
+                logs: pool_logs(&logs),
             },
         );
 
@@ -4464,7 +4749,10 @@ mod tests {
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::BlockLogsReceived { request_id, logs },
+            Event::BlockLogsReceived {
+                request_id,
+                logs: pool_logs(&logs),
+            },
         );
 
         let token_request_id = assert_single_token_metadata_request_effect(
@@ -4508,7 +4796,10 @@ mod tests {
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::BlockLogsReceived { request_id, logs },
+            Event::BlockLogsReceived {
+                request_id,
+                logs: pool_logs(&logs),
+            },
         );
 
         assert!(effects.is_empty());
@@ -4556,7 +4847,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id,
-                logs: HashSet::from([candidate]),
+                logs: pool_logs(&HashSet::from([candidate])),
             },
         );
 
@@ -4591,7 +4882,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id,
-                logs: HashSet::from([candidate]),
+                logs: pool_logs(&HashSet::from([candidate])),
             },
         );
 
@@ -4601,6 +4892,413 @@ mod tests {
             &HashSet::from([candidate]),
         );
         assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A Swap is an absolute snapshot, so a verified pool's state is derived straight from the log
+    // and no pool-data read is scheduled for it.
+    #[test]
+    fn block_logs_received_derives_snapshot_from_swap_and_skips_pool_data() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let derived = pool_state(7);
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![swap_log(candidate, 0, &derived)],
+            },
+        );
+
+        assert_eq!(
+            block_pool_snapshot(&next_state, block_hash, pool),
+            Some(&derived)
+        );
+        assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A Mint is a liquidity delta over the pool's prior snapshot: with a finalized base the new
+    // snapshot is the base with its in-range liquidity adjusted, again skipping the pool-data read.
+    #[test]
+    fn block_logs_received_derives_mint_delta_over_finalized_base() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
+        let base = PoolState {
+            sqrt_price_x96: U160::from(123u128),
+            tick: I24::try_from(5).unwrap(),
+            liquidity: 1_000,
+        };
+
+        let mut state = empty_state_at(finalized_hash);
+        state.finalized_state = FinalizedState::with_pool_snapshots_for_test(
+            finalized_hash,
+            HashMap::from([(pool, base.clone())]),
+        );
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![mint_log(candidate, 0, 0, 10, 500)],
+            },
+        );
+
+        assert_eq!(
+            block_pool_snapshot(&next_state, block_hash, pool),
+            Some(&PoolState {
+                liquidity: 1_500,
+                ..base
+            })
+        );
+        assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A Mint for a verified pool with no prior snapshot cannot be derived (a delta needs a base),
+    // so no snapshot is stored and the pool falls back to a pool-data read.
+    #[test]
+    fn block_logs_received_mint_without_base_falls_back_to_pool_data() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(1), Ok(token_metadata(6))),
+            (token_address(2), Ok(token_metadata(18))),
+        ]));
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![mint_log(candidate, 0, 0, 10, 500)],
+            },
+        );
+
+        assert_eq!(block_pool_snapshot(&next_state, block_hash, pool), None);
+        assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([pool]));
+        assert_state_invariants(&next_state);
+    }
+
+    // A `Swap` is an absolute snapshot, so it derives even when the pool's base is *uncertain* (an
+    // ancestor whose logs are not yet `Resolved` might have changed the pool unseen). The swap pins
+    // the exact post-block state regardless, so the block is snapshotted with no `GetPoolData` read.
+    #[test]
+    fn block_logs_received_derives_swap_with_unresolved_ancestor() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let ancestor_hash = BlockHash::with_last_byte(2);
+        let block_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = block_hash;
+        // The ancestor's logs are `Unknown`, so the base walk for `block_hash` is `Uncertain`.
+        state
+            .blocks
+            .0
+            .insert(ancestor_hash, block_with_parent(finalized_hash));
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(ancestor_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let derived = pool_state(7);
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![swap_log(candidate, 0, &derived)],
+            },
+        );
+
+        assert_eq!(
+            block_pool_snapshot(&next_state, block_hash, pool),
+            Some(&derived)
+        );
+        assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // Within a block a leading `Mint` with no base has nothing to apply to and is skipped; a later
+    // `Swap` seeds the run, so the derived snapshot is exactly the swap's absolute state.
+    #[test]
+    fn block_logs_received_derives_swap_after_leading_mint_without_base() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = PoolAddress(candidate.0, ChainKey::Ethereum);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized_hash));
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetBlockLogs { block_hash }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let derived = pool_state(7);
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![
+                    mint_log(candidate, 0, 0, 10, 500),
+                    swap_log(candidate, 1, &derived),
+                ],
+            },
+        );
+
+        assert_eq!(
+            block_pool_snapshot(&next_state, block_hash, pool),
+            Some(&derived)
+        );
+        assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    fn partial(
+        parent_hash: BlockHash,
+        candidates: HashSet<PoolCandidateAddress>,
+        pool_snapshots: HashMap<PoolAddress, PoolState>,
+    ) -> BlockNode {
+        BlockNode {
+            parent_hash,
+            pool_logs: PoolLogsStatus::Partial(candidates),
+            pool_snapshots,
+            pool_data_failures: HashMap::new(),
+        }
+    }
+
+    // A `Partial` block is provisional, so the authoritative log fetch is still scheduled for it
+    // (a `Resolved` block, by contrast, is done).
+    #[test]
+    fn partial_logs_still_need_an_authoritative_log_fetch() {
+        let finalized = BlockHash::with_last_byte(1);
+        let partial_tip = BlockHash::with_last_byte(2);
+        let resolved_tip = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+
+        let partial_graph = BlocksGraph(HashMap::from([(
+            partial_tip,
+            partial(finalized, HashSet::from([candidate]), HashMap::new()),
+        )]));
+        assert_eq!(
+            partial_graph.unknown_present_canonical_log_hashes(
+                partial_tip,
+                finalized,
+                &HashSet::new()
+            ),
+            vec![partial_tip]
+        );
+
+        let resolved_graph = BlocksGraph(HashMap::from([(
+            resolved_tip,
+            resolved_block_with_snapshots(finalized, HashSet::from([candidate]), HashMap::new()),
+        )]));
+        assert!(
+            resolved_graph
+                .unknown_present_canonical_log_hashes(resolved_tip, finalized, &HashSet::new())
+                .is_empty()
+        );
+    }
+
+    // The completeness scan must not advance through a `Partial` block even when it carries a
+    // snapshot: provisional state cannot contribute to a "complete" overlay.
+    #[test]
+    fn complete_pool_state_scan_stops_at_partial_block() {
+        let finalized = BlockHash::with_last_byte(1);
+        let tip = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = pool_address(3);
+        let mut state = empty_state_at(finalized);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = tip;
+        state.blocks.0.insert(
+            tip,
+            partial(
+                finalized,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, pool_state(3))]),
+            ),
+        );
+
+        let update = state
+            .latest_complete_pool_state_update_from(ChainKey::Ethereum, tip)
+            .expect("overlay query");
+        assert_eq!(update.block_hash, finalized);
+        assert!(update.pool_snapshot_blocks.is_empty());
+    }
+
+    // The same block resolved (authoritative) now advances the overlay frontier and contributes its
+    // snapshot.
+    #[test]
+    fn complete_pool_state_scan_advances_when_block_is_resolved() {
+        let finalized = BlockHash::with_last_byte(1);
+        let tip = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = pool_address(3);
+        let snapshot = pool_state(3);
+        let mut state = empty_state_at(finalized);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = tip;
+        state.blocks.0.insert(
+            tip,
+            resolved_block_with_snapshots(
+                finalized,
+                HashSet::from([candidate]),
+                HashMap::from([(pool, snapshot.clone())]),
+            ),
+        );
+
+        assert_eq!(
+            resolved_complete_pool_state_update_from(&state, tip),
+            Some(complete_pool_state_update(
+                tip,
+                HashMap::from([(pool, snapshot)])
+            ))
+        );
+    }
+
+    // A subscription log on a known block records a provisional (`Partial`) snapshot — enough to
+    // skip the pool-data read — while still scheduling the authoritative `GetBlockLogs`.
+    #[test]
+    fn log_observed_on_known_block_is_provisional_and_still_fetches_authoritative_logs() {
+        let finalized = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = pool_address(3);
+        let mut state = empty_state_at(finalized);
+
+        state.pool_registry = registry_verifying(candidate);
+        state.canonical_tip = block_hash;
+        state
+            .blocks
+            .0
+            .insert(block_hash, block_with_parent(finalized));
+
+        let derived = pool_state(7);
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::LogObserved {
+                block_hash,
+                logs: vec![swap_log(candidate, 0, &derived)],
+            },
+        );
+
+        assert!(matches!(
+            next_state.blocks.get(&block_hash).expect("block").pool_logs,
+            PoolLogsStatus::Partial(_)
+        ));
+        assert_eq!(
+            block_pool_snapshot(&next_state, block_hash, pool),
+            Some(&derived)
+        );
+        assert_single_block_log_request_effect(&effects, block_hash);
+        assert_no_pool_data_request_effect(&effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A subscription log can arrive before the block's head: it is staged and applied once the head
+    // brings the block into the graph.
+    #[test]
+    fn log_observed_for_unknown_block_buffers_until_head_arrives() {
+        let finalized = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let pool = pool_address(3);
+        let mut state = empty_state_at(finalized);
+
+        state.pool_registry = registry_verifying(candidate);
+
+        let derived = pool_state(7);
+        let (buffered_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::LogObserved {
+                block_hash,
+                logs: vec![swap_log(candidate, 0, &derived)],
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert!(buffered_state.blocks.get(&block_hash).is_none());
+
+        let (next_state, _effects) = transition(
+            ChainKey::Ethereum,
+            buffered_state,
+            Event::HeadObserved {
+                hash: block_hash,
+                parent_hash: finalized,
+            },
+        );
+
+        assert!(matches!(
+            next_state.blocks.get(&block_hash).expect("block").pool_logs,
+            PoolLogsStatus::Partial(_)
+        ));
+        assert_eq!(
+            block_pool_snapshot(&next_state, block_hash, pool),
+            Some(&derived)
+        );
+        assert!(next_state.streamed_logs.is_empty());
         assert_state_invariants(&next_state);
     }
 
@@ -4641,7 +5339,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id,
-                logs: HashSet::from([verified, rejected]),
+                logs: pool_logs(&HashSet::from([verified, rejected])),
             },
         );
 
@@ -4693,7 +5391,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id: parent_request_id,
-                logs: HashSet::from([candidate]),
+                logs: pool_logs(&HashSet::from([candidate])),
             },
         );
         let (next_state, second_effects) = transition(
@@ -4701,7 +5399,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id: head_request_id,
-                logs: HashSet::from([candidate]),
+                logs: pool_logs(&HashSet::from([candidate])),
             },
         );
 
@@ -5326,7 +6024,10 @@ mod tests {
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::BlockLogsReceived { request_id, logs },
+            Event::BlockLogsReceived {
+                request_id,
+                logs: pool_logs(&logs),
+            },
         );
 
         let pool_data_request_id =
@@ -5593,7 +6294,10 @@ mod tests {
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::BlockLogsReceived { request_id, logs },
+            Event::BlockLogsReceived {
+                request_id,
+                logs: pool_logs(&logs),
+            },
         );
 
         let token_request_id = assert_single_token_metadata_request_effect(
@@ -7323,7 +8027,7 @@ mod tests {
             state,
             Event::BlockLogsReceived {
                 request_id: log_request_id,
-                logs,
+                logs: pool_logs(&logs),
             },
         );
 
@@ -8917,7 +9621,7 @@ mod tests {
                             state,
                             Event::BlockLogsReceived {
                                 request_id,
-                                logs: candidates,
+                                logs: pool_logs(&candidates),
                             },
                         );
 
@@ -9437,7 +10141,7 @@ mod tests {
                             state,
                             Event::BlockLogsReceived {
                                 request_id,
-                                logs: candidates,
+                                logs: pool_logs(&candidates),
                             },
                         );
                         state = apply_pool_metadata_effects_for_property(next_state, effects);
@@ -9556,7 +10260,7 @@ mod tests {
                             state,
                             Event::BlockLogsReceived {
                                 request_id,
-                                logs: HashSet::new(),
+                                logs: Vec::new(),
                             },
                         );
 

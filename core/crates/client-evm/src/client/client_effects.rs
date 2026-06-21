@@ -8,6 +8,7 @@ use std::{
 
 use alloy::{
     primitives::{Address, BlockHash, Bytes, U256, Uint},
+    rpc::types::Log,
     sol_types::SolCall,
 };
 use serde::Deserialize;
@@ -16,18 +17,20 @@ use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 use crate::{
     ChainKey, ClientEvmError, PoolAddress, PoolCandidateAddress, PoolDataCall, PoolDataFailure,
-    PoolDataResult, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
-    PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals, TokenMetadata,
-    TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
+    PoolDataResult, PoolLog, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
+    PoolMetadataResult, PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals,
+    TokenMetadata, TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
     config::{compose_http_endpoint, compose_ws_endpoint},
+    decode_pool_log,
 };
 
 use super::{
     ClientEvent, ClientHead,
     client_utils::{
         build_block_header_request, build_block_logs_request, build_finalized_block_header_request,
-        build_new_heads_subscribe_request, build_pool_logs_range_request,
-        parse_block_header_response, parse_block_header_response_by_id, parse_block_logs_response,
+        build_new_heads_subscribe_request, build_pool_events_subscribe_request,
+        build_pool_logs_range_request, parse_block_header_response,
+        parse_block_header_response_by_id, parse_block_logs_response,
         parse_pool_logs_range_response, parse_subscription_response,
     },
     multicall3::{
@@ -198,7 +201,7 @@ pub fn fetch_block_logs(
     config: &RpcConfig,
     chain: ChainKey,
     block_hash: BlockHash,
-) -> Result<HashSet<PoolCandidateAddress>, ClientEvmError> {
+) -> Result<Vec<PoolLog>, ClientEvmError> {
     let endpoint = compose_http_endpoint(config, chain)?;
     let request = build_block_logs_request(HTTP_REQUEST_ID, block_hash);
     let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
@@ -707,6 +710,83 @@ where
     }
 }
 
+/// Subscribes to the live `logs` stream for pool events, mirroring [`subscribe_new_heads`]. Each
+/// state-relevant log is decoded and forwarded as a [`ClientEvent::PoolLogObserved`] for its block.
+pub fn subscribe_pool_events<T, F>(
+    config: &RpcConfig,
+    chain: ChainKey,
+    sender: &Sender<T>,
+    map_event: F,
+) -> Result<(), ClientEvmError>
+where
+    F: Fn(ClientEvent) -> Option<T>,
+{
+    let endpoint = compose_ws_endpoint(config, chain)?;
+    let (mut socket, _) =
+        connect(endpoint.as_str()).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
+
+    let subscribe_request = build_pool_events_subscribe_request(SUBSCRIBE_REQUEST_ID);
+    socket
+        .send(Message::text(subscribe_request.to_string()))
+        .map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
+
+    let subscription_id = read_subscription_id(&mut socket, SUBSCRIBE_REQUEST_ID)?;
+    send_event(
+        sender,
+        ClientEvent::Subscribed {
+            subscription_id: subscription_id.clone(),
+        },
+        &map_event,
+    )?;
+
+    read_pool_log_events(&mut socket, &subscription_id, sender, &map_event)
+}
+
+fn read_pool_log_events<T, F>(
+    socket: &mut BlockingWebSocket,
+    subscription_id: &str,
+    sender: &Sender<T>,
+    map_event: &F,
+) -> Result<(), ClientEvmError>
+where
+    F: Fn(ClientEvent) -> Option<T>,
+{
+    loop {
+        let Some(sub_notification) =
+            read_json_rpc_message::<SubscriptionNotification<Log>>(socket)?
+        else {
+            send_event(
+                sender,
+                ClientEvent::Closed {
+                    subscription_id: subscription_id.to_owned(),
+                },
+                map_event,
+            )?;
+            return Ok(());
+        };
+
+        if sub_notification.params.subscription != subscription_id {
+            continue;
+        }
+
+        let log = sub_notification.params.result;
+        // Drop logs we cannot attribute to a block or that are not state-relevant pool events.
+        let (Some(block_hash), Some(pool_log)) = (log.block_hash, decode_pool_log(&log)) else {
+            continue;
+        };
+
+        send_event(
+            sender,
+            ClientEvent::PoolLogObserved {
+                subscription_id: sub_notification.params.subscription,
+                block_hash,
+                log: pool_log,
+            },
+            map_event,
+        )?;
+    }
+}
+
 fn read_json_rpc_message<T>(socket: &mut BlockingWebSocket) -> Result<Option<T>, ClientEvmError>
 where
     T: for<'de> Deserialize<'de>,
@@ -880,15 +960,19 @@ mod tests {
         let config = rpc_config(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_block_logs(&agent, &config, ChainKey::Ethereum, block_hash);
+        let candidates = fetch_block_logs(&agent, &config, ChainKey::Ethereum, block_hash)
+            .expect("logs fetch")
+            .iter()
+            .map(|log| PoolCandidateAddress(log.address))
+            .collect::<HashSet<_>>();
 
-        assert!(matches!(
-            result,
-            Ok(ref pools)
-                if pools.len() == 2
-                    && pools.contains(&PoolCandidateAddress(first_pool))
-                    && pools.contains(&PoolCandidateAddress(second_pool))
-        ));
+        assert_eq!(
+            candidates,
+            HashSet::from([
+                PoolCandidateAddress(first_pool),
+                PoolCandidateAddress(second_pool),
+            ])
+        );
 
         let request = received_request
             .recv()
@@ -2209,18 +2293,33 @@ mod tests {
     }
 
     fn log_result(address: Address, block_hash: B256) -> Value {
-        json!({
-            "address": address,
-            "topics": [
-                crate::uniswap_v3::pool_event_signature_hashes()[0]
-            ],
-            "data": "0x",
-            "blockHash": block_hash,
-            "blockNumber": "0x4",
-            "transactionHash": B256::with_last_byte(5),
-            "transactionIndex": "0x6",
-            "logIndex": "0x7",
-            "removed": false
-        })
+        use alloy::primitives::{I256, U160, aliases::I24};
+        use alloy::sol_types::SolEvent;
+
+        use crate::uniswap_v3::Swap;
+
+        // A real, decodable Swap log: block-logs parsing now decodes events, so the fixture must
+        // carry valid topics and data rather than an empty placeholder.
+        let event = Swap {
+            sender: Address::with_last_byte(9),
+            recipient: Address::with_last_byte(10),
+            amount0: I256::ZERO,
+            amount1: I256::ZERO,
+            sqrtPriceX96: U160::from(1u128),
+            liquidity: 1,
+            tick: I24::ZERO,
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address,
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(4),
+            log_index: Some(7),
+            ..Default::default()
+        };
+
+        serde_json::to_value(&log).expect("log serializes to json")
     }
 }
