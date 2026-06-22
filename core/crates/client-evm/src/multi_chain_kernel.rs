@@ -1071,6 +1071,7 @@ mod tests {
             Event::ChainEvent {
                 chain,
                 event: kernel::Event::HeadObserved {
+                    logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: child_hash,
                     parent_hash: finalized_hash,
                 },
@@ -1130,6 +1131,7 @@ mod tests {
             Event::ChainEvent {
                 chain,
                 event: kernel::Event::HeadObserved {
+                    logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: observed_hash,
                     parent_hash: missing_parent_hash,
                 },
@@ -1161,6 +1163,7 @@ mod tests {
             Event::ChainEvent {
                 chain,
                 event: kernel::Event::HeadObserved {
+                    logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: observed_hash,
                     parent_hash: missing_parent_hash,
                 },
@@ -1309,6 +1312,7 @@ mod tests {
                 Event::ChainEvent {
                     chain,
                     event: kernel::Event::BlockHeaderReceived {
+                        logs_bloom: crate::Bloom::repeat_byte(0xff),
                         request_id,
                         hash: missing_hash,
                         parent_hash,
@@ -1345,6 +1349,7 @@ mod tests {
             Event::ChainEvent {
                 chain,
                 event: kernel::Event::HeadObserved {
+                    logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: compacted_hash,
                     parent_hash: finalized_hash,
                 },
@@ -1383,6 +1388,7 @@ mod tests {
             Event::ChainEvent {
                 chain,
                 event: kernel::Event::HeadObserved {
+                    logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: old_branch_hash,
                     parent_hash: finalized_hash,
                 },
@@ -2315,7 +2321,11 @@ mod tests {
             state,
             Event::ChainEvent {
                 chain,
-                event: kernel::Event::HeadObserved { hash, parent_hash },
+                event: kernel::Event::HeadObserved {
+                    hash,
+                    parent_hash,
+                    logs_bloom: crate::Bloom::repeat_byte(0xff),
+                },
             },
         )
     }

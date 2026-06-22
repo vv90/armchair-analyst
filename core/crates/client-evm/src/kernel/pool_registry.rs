@@ -129,6 +129,17 @@ impl TrustedPoolRegistry {
         self.verified.len()
     }
 
+    /// Returns the verified pool addresses on `chain`.
+    /// Added so the log-fetch gate can test a block's `logsBloom` against the trusted-pool set and
+    /// skip the authoritative fetch for blocks that provably touch none of them.
+    pub fn verified_addresses(&self, chain: ChainKey) -> HashSet<Address> {
+        self.verified
+            .keys()
+            .filter(|PoolAddress(_, pool_chain)| *pool_chain == chain)
+            .map(|PoolAddress(address, _)| *address)
+            .collect()
+    }
+
     pub fn verified_pool(
         &self,
         chain: ChainKey,
@@ -302,6 +313,30 @@ mod tests {
             Some(PoolAddress(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
+    }
+
+    #[test]
+    fn verified_addresses_returns_only_the_requested_chains_pools() {
+        let ethereum_pool = candidate(3);
+        let arbitrum_pool = candidate(4);
+        let registry = TrustedPoolRegistry::new()
+            .with_metadata_results(
+                ChainKey::Ethereum,
+                HashMap::from([(ethereum_pool, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)))]),
+            )
+            .with_metadata_results(
+                ChainKey::Arbitrum,
+                HashMap::from([(arbitrum_pool, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)))]),
+            );
+
+        assert_eq!(
+            registry.verified_addresses(ChainKey::Ethereum),
+            HashSet::from([ethereum_pool.0])
+        );
+        assert_eq!(
+            registry.verified_addresses(ChainKey::Arbitrum),
+            HashSet::from([arbitrum_pool.0])
+        );
     }
 
     #[test]

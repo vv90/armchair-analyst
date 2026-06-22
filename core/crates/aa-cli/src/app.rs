@@ -239,7 +239,9 @@ fn format_run_optimization_effect_log(input: &OptimizationPoolReserves) -> Strin
 
 fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
     match event {
-        kernel::Event::HeadObserved { hash, parent_hash } => {
+        kernel::Event::HeadObserved {
+            hash, parent_hash, ..
+        } => {
             format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}")
         }
         kernel::Event::FinalizedBlockObserved { block_hash } => {
@@ -249,6 +251,7 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             request_id,
             hash,
             parent_hash,
+            ..
         } => format!(
             "input chain={chain:?} block_header_received request={} hash={hash} parent={parent_hash}",
             format_typed_request_id_log(request_id),
@@ -456,6 +459,7 @@ fn map_client_chain_event(client_chain_event: ClientEvent) -> Option<client_evm:
         ClientEvent::NewHead { header, .. } => Some(client_evm::kernel::Event::HeadObserved {
             hash: header.inner.hash,
             parent_hash: header.inner.inner.parent_hash,
+            logs_bloom: header.inner.inner.logs_bloom,
         }),
         ClientEvent::PoolLogObserved {
             block_hash, log, ..
@@ -580,6 +584,7 @@ where
                             request_id,
                             hash: header.inner.hash,
                             parent_hash: header.inner.inner.parent_hash,
+                            logs_bloom: header.inner.inner.logs_bloom,
                         },
                     }],
                     Ok(None) => vec![Event::ChainEvent {
@@ -698,9 +703,9 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata, GetTokenMetadata,
-        IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolLog,
-        PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult,
+        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
+        GetTokenMetadata, IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult,
+        PoolLog, PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult,
     };
     use serde_json::json;
     use std::{sync::mpsc, time::Duration};
@@ -835,6 +840,7 @@ mod tests {
                 event: kernel::Event::HeadObserved {
                     hash: block_hash,
                     parent_hash,
+                    logs_bloom: Bloom::default(),
                 },
             }),
             format!("input chain=Ethereum head_observed hash={block_hash} parent={parent_hash}")
@@ -846,6 +852,7 @@ mod tests {
                     request_id,
                     hash: block_hash,
                     parent_hash,
+                    logs_bloom: Bloom::default(),
                 },
             }),
             format!(
@@ -1142,6 +1149,7 @@ mod tests {
                         request_id,
                         hash: event_hash,
                         parent_hash: event_parent_hash,
+                        ..
                     },
             }] if *event_chain == chain
                 && *request_id == expected_request_id
@@ -1521,6 +1529,7 @@ mod tests {
             kernel::Event::HeadObserved {
                 hash: observed_hash,
                 parent_hash: block_hash,
+                logs_bloom: Bloom::default(),
             },
         );
 

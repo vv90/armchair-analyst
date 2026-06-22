@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use alloy::primitives::BlockHash;
+use alloy::primitives::{Address, BlockHash, Bloom, BloomInput};
 
 pub(crate) mod pending_requests;
 pub(crate) mod pool_registry;
@@ -34,6 +34,10 @@ impl PoolLogsStatus {
 
 struct BlockNode {
     parent_hash: BlockHash,
+    /// The block header's `logsBloom`, when the block entered the graph from a header (head
+    /// observation or `GetBlockHeader`). `None` for blocks materialized without a header
+    /// (finalized anchor, bootstrap-inferred), which are never bloom-gated.
+    logs_bloom: Option<Bloom>,
     pool_logs: PoolLogsStatus,
     pool_snapshots: HashMap<PoolAddress, PoolState>,
     pool_data_failures: HashMap<PoolAddress, PoolDataFailure>,
@@ -77,6 +81,7 @@ impl BlocksGraph {
         self,
         hash: BlockHash,
         parent_hash: BlockHash,
+        logs_bloom: Bloom,
         finalized_hash: BlockHash,
     ) -> Result<(BlocksGraph, Option<BlockHash>), NewBlockError> {
         if hash == parent_hash {
@@ -101,6 +106,7 @@ impl BlocksGraph {
             hash,
             BlockNode {
                 parent_hash,
+                logs_bloom: Some(logs_bloom),
                 pool_logs: PoolLogsStatus::Unknown,
                 pool_snapshots: HashMap::new(),
                 pool_data_failures: HashMap::new(),
@@ -572,6 +578,7 @@ impl State {
                     hash,
                     BlockNode {
                         parent_hash,
+                        logs_bloom: None,
                         pool_logs: PoolLogsStatus::Resolved(candidates),
                         pool_snapshots: HashMap::new(),
                         pool_data_failures: HashMap::new(),
@@ -698,6 +705,7 @@ impl State {
             block_hash,
             BlockNode {
                 parent_hash: self.finalized_state.block_hash,
+                logs_bloom: None,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
                 pool_snapshots,
                 pool_data_failures: HashMap::new(),
@@ -1085,6 +1093,7 @@ pub enum Event {
     HeadObserved {
         hash: BlockHash,
         parent_hash: BlockHash,
+        logs_bloom: Bloom,
     },
     FinalizedBlockObserved {
         block_hash: BlockHash,
@@ -1093,6 +1102,7 @@ pub enum Event {
         request_id: RequestId<GetBlockHeader>,
         hash: BlockHash,
         parent_hash: BlockHash,
+        logs_bloom: Bloom,
     },
     BlockHeaderNotFound {
         request_id: RequestId<GetBlockHeader>,
@@ -1159,14 +1169,25 @@ fn block_descends_from(
     true
 }
 
+/// Tests whether a block's `logsBloom` may contain a log from any of the `trusted` addresses.
+/// The block `logsBloom` is a consensus field with no false negatives, so a `false` result proves
+/// none of the trusted pools emitted in the block; a `true` result is a maybe (bloom false positives).
+/// Added so the authoritative log fetch can be skipped for blocks that provably touch no trusted pool.
+fn block_may_touch_trusted_pool(bloom: &Bloom, trusted: &HashSet<Address>) -> bool {
+    trusted
+        .iter()
+        .any(|address| bloom.contains_input(BloomInput::Raw(address.as_slice())))
+}
+
 /// Emits log-fetch requests for present canonical blocks whose logs are unknown.
 /// Added so header connectivity automatically drives pool-affecting log discovery.
 fn schedule_unknown_canonical_log_requests(
+    chain: ChainKey,
     state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
     let State {
-        blocks,
+        mut blocks,
         canonical_tip,
         pending_requests,
         finalized_state,
@@ -1182,20 +1203,41 @@ fn schedule_unknown_canonical_log_requests(
         finalized_state.block_hash,
         &pending_log_hashes,
     );
+    let trusted_addresses = pool_registry.verified_addresses(chain);
     let mut pending_requests = pending_requests;
 
     for block_hash in block_hashes {
-        let request_payload = GetBlockLogs { block_hash };
-        let (next_pending_requests, request_id) =
-            pending_requests.with_new_request(request_payload.clone(), tick);
+        // Skip the authoritative fetch only when the block's header bloom proves none of the
+        // trusted pools emitted here. The bloom has no false negatives, so a trusted pool that
+        // did emit is never skipped, keeping trusted-pool log completeness unchanged. With no
+        // trusted pools yet, the per-block fetch is still the discovery channel, so we fetch.
+        let resolve_empty_candidates = blocks.get(&block_hash).and_then(|block| {
+            let bloom = block.logs_bloom.as_ref()?;
+            (!trusted_addresses.is_empty()
+                && !block_may_touch_trusted_pool(bloom, &trusted_addresses))
+            .then(|| block.pool_logs.candidates().cloned().unwrap_or_default())
+        });
 
-        pending_requests = next_pending_requests;
-        effects.push(Effect::Request(AnyIssuedRequest::BlockLogs(
-            IssuedRequest {
-                request_id,
-                request_payload,
-            },
-        )));
+        match resolve_empty_candidates {
+            // The block touches no trusted pool: promote it to `Resolved` (preserving any
+            // subscription-discovered candidates) without a fetch, so finalization is unblocked.
+            Some(candidates) => {
+                blocks = blocks.with_pool_logs(block_hash, PoolLogsStatus::Resolved(candidates));
+            }
+            None => {
+                let request_payload = GetBlockLogs { block_hash };
+                let (next_pending_requests, request_id) =
+                    pending_requests.with_new_request(request_payload.clone(), tick);
+
+                pending_requests = next_pending_requests;
+                effects.push(Effect::Request(AnyIssuedRequest::BlockLogs(
+                    IssuedRequest {
+                        request_id,
+                        request_payload,
+                    },
+                )));
+            }
+        }
     }
 
     (
@@ -1396,7 +1438,7 @@ fn schedule_unknown_canonical_requests(
     state: State,
     effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
-    let (state, effects) = schedule_unknown_canonical_log_requests(state, effects);
+    let (state, effects) = schedule_unknown_canonical_log_requests(chain, state, effects);
     let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(chain, state, effects);
     let (state, effects) =
         schedule_unknown_canonical_token_metadata_requests(chain, state, effects);
@@ -1437,11 +1479,17 @@ fn request_missing_header(
 /// Added as the pure deterministic boundary between EVM client state transitions and impure RPC/runtime work.
 pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Effect>) {
     match event {
-        Event::HeadObserved { hash, parent_hash } => {
-            match state
-                .blocks
-                .with_new_block(hash, parent_hash, state.finalized_state.block_hash)
-            {
+        Event::HeadObserved {
+            hash,
+            parent_hash,
+            logs_bloom,
+        } => {
+            match state.blocks.with_new_block(
+                hash,
+                parent_hash,
+                logs_bloom,
+                state.finalized_state.block_hash,
+            ) {
                 Ok((blocks, None)) => schedule_unknown_canonical_requests(
                     chain,
                     State {
@@ -1523,6 +1571,7 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             request_id,
             hash,
             parent_hash,
+            logs_bloom,
         } => {
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
 
@@ -1535,82 +1584,85 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                 None => None,
             };
 
-            let (new_state, effects, should_schedule_log_requests) = match state
-                .blocks
-                .with_new_block(hash, parent_hash, state.finalized_state.block_hash)
-            {
-                Ok((blocks, None)) => (
-                    State {
-                        blocks,
-                        pending_requests,
-                        ..state
-                    },
-                    vec![],
-                    true,
-                ),
-                Ok((blocks, Some(missing_hash))) => {
-                    let (pending_requests, effects) =
-                        request_missing_header(pending_requests, state.tick, missing_hash);
-
-                    (
+            let (new_state, effects, should_schedule_log_requests) =
+                match state.blocks.with_new_block(
+                    hash,
+                    parent_hash,
+                    logs_bloom,
+                    state.finalized_state.block_hash,
+                ) {
+                    Ok((blocks, None)) => (
                         State {
                             blocks,
                             pending_requests,
                             ..state
                         },
-                        effects,
+                        vec![],
                         true,
-                    )
-                }
-                Err(NewBlockError::SelfParentBlock(missing_hash, blocks)) => {
-                    let (pending_requests, effects) =
-                        request_missing_header(pending_requests, state.tick, missing_hash);
-                    (
+                    ),
+                    Ok((blocks, Some(missing_hash))) => {
+                        let (pending_requests, effects) =
+                            request_missing_header(pending_requests, state.tick, missing_hash);
+
+                        (
+                            State {
+                                blocks,
+                                pending_requests,
+                                ..state
+                            },
+                            effects,
+                            true,
+                        )
+                    }
+                    Err(NewBlockError::SelfParentBlock(missing_hash, blocks)) => {
+                        let (pending_requests, effects) =
+                            request_missing_header(pending_requests, state.tick, missing_hash);
+                        (
+                            State {
+                                blocks,
+                                pending_requests,
+                                ..state
+                            },
+                            effects,
+                            false,
+                        )
+                    }
+                    Err(NewBlockError::ExistingBlock(blocks)) => (
                         State {
                             blocks,
                             pending_requests,
                             ..state
                         },
-                        effects,
+                        vec![],
+                        true,
+                    ),
+                    Err(NewBlockError::ConflictingBlockParent) => (
+                        State {
+                            pending_requests,
+                            ..State::reset(
+                                state.finalized_state,
+                                state.tick,
+                                state.pool_registry,
+                                state.token_registry,
+                            )
+                        },
+                        vec![],
                         false,
-                    )
-                }
-                Err(NewBlockError::ExistingBlock(blocks)) => (
-                    State {
-                        blocks,
-                        pending_requests,
-                        ..state
-                    },
-                    vec![],
-                    true,
-                ),
-                Err(NewBlockError::ConflictingBlockParent) => (
-                    State {
-                        pending_requests,
-                        ..State::reset(
-                            state.finalized_state,
-                            state.tick,
-                            state.pool_registry,
-                            state.token_registry,
-                        )
-                    },
-                    vec![],
-                    false,
-                ),
-                Err(NewBlockError::CycleDetected) => (
-                    State {
-                        pending_requests,
-                        ..State::reset(
-                            state.finalized_state,
-                            state.tick,
-                            state.pool_registry,
-                            state.token_registry,
-                        )
-                    },
-                    vec![],
-                    false,
-                ),
-            };
+                    ),
+                    Err(NewBlockError::CycleDetected) => (
+                        State {
+                            pending_requests,
+                            ..State::reset(
+                                state.finalized_state,
+                                state.tick,
+                                state.pool_registry,
+                                state.token_registry,
+                            )
+                        },
+                        vec![],
+                        false,
+                    ),
+                };
 
             // A header can be the first time a block enters the graph, so drain any logs the
             // subscription staged for it before its head was processed.
@@ -1898,6 +1950,45 @@ mod tests {
     use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
     use crate::{PoolLogEvent, RangeLogBlock, bootstrap};
     use proptest::prelude::*;
+
+    /// An all-ones `logsBloom` that matches every address, so a block carrying it is never
+    /// bloom-gated. The behavior-preserving default for tests whose blocks enter the graph via a
+    /// header event but that do not exercise the gate.
+    fn bloom_matching_any() -> Bloom {
+        Bloom::repeat_byte(0xff)
+    }
+
+    /// Builds a `logsBloom` seeded with each address exactly as a node accrues a log's emitter,
+    /// so `block_may_touch_trusted_pool` sees the same bits a real header would carry.
+    fn bloom_containing(addresses: &[Address]) -> Bloom {
+        let mut bloom = Bloom::default();
+        for address in addresses {
+            bloom.accrue(BloomInput::Raw(address.as_slice()));
+        }
+        bloom
+    }
+
+    #[test]
+    fn block_may_touch_trusted_pool_detects_a_seeded_address() {
+        let trusted = Address::with_last_byte(1);
+        let other = Address::with_last_byte(2);
+        let bloom = bloom_containing(&[trusted]);
+
+        assert!(block_may_touch_trusted_pool(
+            &bloom,
+            &HashSet::from([trusted])
+        ));
+        assert!(!block_may_touch_trusted_pool(
+            &bloom,
+            &HashSet::from([other])
+        ));
+    }
+
+    #[test]
+    fn block_may_touch_trusted_pool_is_false_for_empty_trusted_set() {
+        let bloom = bloom_containing(&[Address::with_last_byte(1)]);
+        assert!(!block_may_touch_trusted_pool(&bloom, &HashSet::new()));
+    }
 
     #[derive(Debug)]
     struct GeneratedChain {
@@ -2344,6 +2435,7 @@ mod tests {
                 hash_index,
                 parent_index,
             } => Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: hash_for_node(hash_index),
                 parent_hash: hash_for_node(parent_index),
             },
@@ -2352,6 +2444,7 @@ mod tests {
                 hash_index,
                 parent_index,
             } => Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: RequestId::from_raw_for_test(u64::from(request_id)),
                 hash: hash_for_node(hash_index),
                 parent_hash: hash_for_node(parent_index),
@@ -2542,6 +2635,7 @@ mod tests {
                         ChainKey::Ethereum,
                         state,
                         Event::BlockHeaderReceived {
+                            logs_bloom: bloom_matching_any(),
                             request_id,
                             hash: block_hash,
                             parent_hash,
@@ -2624,6 +2718,7 @@ mod tests {
                         ChainKey::Ethereum,
                         state,
                         Event::BlockHeaderReceived {
+                            logs_bloom: bloom_matching_any(),
                             request_id: current_request_id,
                             hash: block_hash,
                             parent_hash,
@@ -2665,6 +2760,7 @@ mod tests {
     /// Scheduler and invariant tests use it when pool contents are irrelevant.
     fn block_with_parent(parent_hash: BlockHash) -> BlockNode {
         BlockNode {
+            logs_bloom: None,
             parent_hash,
             pool_logs: PoolLogsStatus::Unknown,
             pool_snapshots: HashMap::new(),
@@ -2841,6 +2937,20 @@ mod tests {
 
         assert_eq!(request_ids.len(), 1);
         request_ids[0]
+    }
+
+    /// Asserts no authoritative block-log request was emitted for `block_hash`.
+    /// Documents the bloom gate skipping the fetch for a block that touches no trusted pool.
+    fn assert_no_block_log_request_effect(effects: &[Effect], block_hash: BlockHash) {
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                request_payload: GetBlockLogs {
+                    block_hash: requested_hash,
+                },
+                ..
+            })) if *requested_hash == block_hash
+        )));
     }
 
     /// Extracts the single expected pool-data request for a block and pool set.
@@ -3108,6 +3218,7 @@ mod tests {
         pool_snapshots: HashMap<PoolAddress, PoolState>,
     ) -> BlockNode {
         BlockNode {
+            logs_bloom: None,
             parent_hash,
             pool_logs: PoolLogsStatus::Resolved(candidates),
             pool_snapshots,
@@ -3435,6 +3546,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: head_hash,
             },
@@ -3467,6 +3579,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -3511,6 +3624,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -3560,6 +3674,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -3656,6 +3771,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: new_head,
                 parent_hash: seed_hash,
             },
@@ -3941,6 +4057,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: fresh_head_hash(),
                 parent_hash: seed_tip,
             },
@@ -3988,6 +4105,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: fresh_head_hash(),
                 parent_hash: seed_tip,
             },
@@ -4122,6 +4240,7 @@ mod tests {
                     let (next_state, effects) = transition(ChainKey::Ethereum,
                         state,
                         Event::HeadObserved {
+                            logs_bloom: bloom_matching_any(),
                             hash: fresh_head_hash(),
                             parent_hash: seed_tip,
                         },
@@ -4151,6 +4270,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
             },
@@ -4187,6 +4307,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: cycle_hash,
                 parent_hash: second_hash,
             },
@@ -4210,6 +4331,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: finalized_hash,
                 parent_hash,
             },
@@ -4232,6 +4354,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
             },
@@ -4255,6 +4378,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -4283,6 +4407,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: first_head,
                 parent_hash: shared_missing_parent,
             },
@@ -4294,6 +4419,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: second_head,
                 parent_hash: shared_missing_parent,
             },
@@ -4335,6 +4461,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: first_head,
                 parent_hash: first_missing_parent,
             },
@@ -4344,6 +4471,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: second_head,
                 parent_hash: second_missing_parent,
             },
@@ -4377,6 +4505,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -4388,6 +4517,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -4431,6 +4561,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash,
             },
@@ -4458,6 +4589,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash,
             },
@@ -4468,6 +4600,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: parent_hash,
                 parent_hash: finalized_hash,
@@ -4479,6 +4612,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: parent_hash,
                 parent_hash: finalized_hash,
@@ -4513,6 +4647,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
             },
@@ -4533,6 +4668,7 @@ mod tests {
         state.blocks.0.insert(
             head_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
                 pool_snapshots: HashMap::new(),
@@ -4544,6 +4680,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
             },
@@ -5117,6 +5254,7 @@ mod tests {
         pool_snapshots: HashMap<PoolAddress, PoolState>,
     ) -> BlockNode {
         BlockNode {
+            logs_bloom: None,
             parent_hash,
             pool_logs: PoolLogsStatus::Partial(candidates),
             pool_snapshots,
@@ -5285,6 +5423,7 @@ mod tests {
             ChainKey::Ethereum,
             buffered_state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: block_hash,
                 parent_hash: finalized,
             },
@@ -5423,6 +5562,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(candidates.clone()),
                 pool_snapshots: HashMap::new(),
@@ -5486,6 +5626,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
                 pool_snapshots: HashMap::new(),
@@ -5552,6 +5693,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
                 pool_snapshots: HashMap::new(),
@@ -5594,6 +5736,7 @@ mod tests {
         pool_data_failures: HashMap<PoolAddress, PoolDataFailure>,
     ) -> BlockNode {
         BlockNode {
+            logs_bloom: None,
             parent_hash,
             pool_logs: PoolLogsStatus::Resolved(candidates),
             pool_snapshots: HashMap::new(),
@@ -5864,6 +6007,7 @@ mod tests {
                 nodes.insert(
                     block_hash,
                     BlockNode {
+                        logs_bloom: None,
                         parent_hash,
                         pool_logs: PoolLogsStatus::Resolved(candidates),
                         pool_snapshots: snapshots,
@@ -6073,6 +6217,7 @@ mod tests {
         state.blocks.0.insert(
             parent_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([first_candidate])),
                 pool_snapshots: HashMap::new(),
@@ -6082,6 +6227,7 @@ mod tests {
         state.blocks.0.insert(
             head_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([second_candidate])),
                 pool_snapshots: HashMap::new(),
@@ -6137,6 +6283,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([
                     first_candidate,
@@ -6159,6 +6306,177 @@ mod tests {
             schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
 
         assert_single_pool_data_request_effect(&effects, block_hash, &HashSet::from([second_pool]));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    /// Registers one verified pool and returns a state whose only canonical block (`block_hash`,
+    /// child of the finalized anchor) carries `logs_bloom`, plus the verified pool's address. The
+    /// scaffold for the bloom-gate tests below.
+    fn state_with_one_verified_pool_and_block(
+        finalized_hash: BlockHash,
+        block_hash: BlockHash,
+        logs_bloom: Option<Bloom>,
+        pool_logs: PoolLogsStatus,
+    ) -> (State, Address) {
+        let candidate = pool_candidate_address(3);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
+        state.canonical_tip = block_hash;
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                logs_bloom,
+                pool_logs,
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+        (state, candidate.0)
+    }
+
+    // A block whose bloom contains none of the trusted pool addresses is promoted to `Resolved`
+    // without an authoritative `GetBlockLogs`: the bloom proves no trusted pool emitted here.
+    #[test]
+    fn bloom_clear_block_resolves_empty_without_log_request() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let unrelated = Address::with_last_byte(9);
+        let (state, _pool) = state_with_one_verified_pool_and_block(
+            finalized_hash,
+            block_hash,
+            Some(bloom_containing(&[unrelated])),
+            PoolLogsStatus::Unknown,
+        );
+
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
+
+        assert_no_block_log_request_effect(&effects, block_hash);
+        assert!(matches!(
+            next_state.blocks.get(&block_hash).map(|block| &block.pool_logs),
+            Some(PoolLogsStatus::Resolved(candidates)) if candidates.is_empty()
+        ));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A block whose bloom contains a trusted pool address still gets the authoritative fetch, so
+    // trusted-pool log completeness is unchanged.
+    #[test]
+    fn bloom_with_trusted_address_still_requests_logs() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let (mut state, pool_address) = state_with_one_verified_pool_and_block(
+            finalized_hash,
+            block_hash,
+            // Seed the bloom with the trusted pool's address so the gate must fetch.
+            None,
+            PoolLogsStatus::Unknown,
+        );
+        state
+            .blocks
+            .0
+            .get_mut(&block_hash)
+            .expect("block present")
+            .logs_bloom = Some(bloom_containing(&[pool_address]));
+
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
+
+        let _ = assert_single_block_log_request_effect(&effects, block_hash);
+        assert!(matches!(
+            next_state
+                .blocks
+                .get(&block_hash)
+                .map(|block| &block.pool_logs),
+            Some(PoolLogsStatus::Unknown)
+        ));
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A bloom-clear `Partial` block keeps its subscription-discovered candidates when promoted to
+    // `Resolved`, so an unknown candidate still drives `PoolMetadata` validation (best-effort
+    // discovery survives the skipped fetch).
+    #[test]
+    fn partial_block_bloom_clear_preserves_candidates_for_discovery() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let undiscovered = pool_candidate_address(7);
+        let (state, _pool) = state_with_one_verified_pool_and_block(
+            finalized_hash,
+            block_hash,
+            Some(bloom_containing(&[undiscovered.0])),
+            PoolLogsStatus::Partial(HashSet::from([undiscovered])),
+        );
+
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
+
+        assert_no_block_log_request_effect(&effects, block_hash);
+        assert!(matches!(
+            next_state.blocks.get(&block_hash).map(|block| &block.pool_logs),
+            Some(PoolLogsStatus::Resolved(candidates)) if *candidates == HashSet::from([undiscovered])
+        ));
+        // The retained candidate is still offered to metadata validation.
+        let _ = assert_single_pool_metadata_request_effect(
+            &effects,
+            block_hash,
+            &HashSet::from([undiscovered]),
+        );
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A block with no recorded header bloom (bootstrap/finalized-anchor blocks) is fetched exactly
+    // as before — the gate only acts on proof, never on absence of it.
+    #[test]
+    fn none_bloom_block_requests_logs() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let (state, _pool) = state_with_one_verified_pool_and_block(
+            finalized_hash,
+            block_hash,
+            None,
+            PoolLogsStatus::Unknown,
+        );
+
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
+
+        let _ = assert_single_block_log_request_effect(&effects, block_hash);
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // With no verified pools there is nothing whose completeness to protect, but the per-block fetch
+    // is still the discovery channel during warmup, so a bloom-bearing block is fetched, not skipped.
+    #[test]
+    fn bloom_clear_block_with_no_trusted_pools_still_requests_logs() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let mut state = empty_state_at(finalized_hash);
+        state.canonical_tip = block_hash;
+        state.blocks.0.insert(
+            block_hash,
+            BlockNode {
+                parent_hash: finalized_hash,
+                logs_bloom: Some(bloom_containing(&[Address::with_last_byte(9)])),
+                pool_logs: PoolLogsStatus::Unknown,
+                pool_snapshots: HashMap::new(),
+                pool_data_failures: HashMap::new(),
+            },
+        );
+
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
+
+        let _ = assert_single_block_log_request_effect(&effects, block_hash);
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
     }
@@ -6186,6 +6504,7 @@ mod tests {
         state.blocks.0.insert(
             parent_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
                 pool_snapshots: HashMap::new(),
@@ -6195,6 +6514,7 @@ mod tests {
         state.blocks.0.insert(
             head_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
                 pool_snapshots: HashMap::new(),
@@ -6240,6 +6560,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
                 pool_snapshots: HashMap::new(),
@@ -6335,6 +6656,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([verified, rejected])),
                 pool_snapshots: HashMap::new(),
@@ -6988,6 +7310,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([candidate])),
                 pool_snapshots: HashMap::new(),
@@ -7486,6 +7809,7 @@ mod tests {
         state.blocks.0.insert(
             block_hash,
             BlockNode {
+                logs_bloom: None,
                 parent_hash: finalized_hash,
                 pool_logs: PoolLogsStatus::Resolved(HashSet::from([logged_candidate])),
                 pool_snapshots: HashMap::new(),
@@ -8004,6 +8328,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
             },
@@ -8014,6 +8339,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -8050,6 +8376,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8060,6 +8387,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -8093,6 +8421,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8151,6 +8480,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8197,6 +8527,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8207,6 +8538,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -8246,6 +8578,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8291,6 +8624,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8332,6 +8666,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8373,6 +8708,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8411,6 +8747,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8421,6 +8758,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: unrelated_hash,
                 parent_hash: finalized_hash,
@@ -8457,6 +8795,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8467,6 +8806,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: RequestId::from_raw_for_test(99),
                 hash: unrelated_hash,
                 parent_hash: finalized_hash,
@@ -8478,6 +8818,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: unrelated_hash,
                 parent_hash: conflicting_parent_hash,
@@ -8508,6 +8849,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: first_head_hash,
                 parent_hash: first_missing_parent_hash,
             },
@@ -8519,6 +8861,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: first_head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -8531,6 +8874,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: second_head_hash,
                 parent_hash: second_missing_parent_hash,
             },
@@ -8557,6 +8901,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8586,6 +8931,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8622,6 +8968,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8658,6 +9005,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8811,6 +9159,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8850,6 +9199,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8888,6 +9238,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8933,6 +9284,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8976,6 +9328,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -8987,6 +9340,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -9022,6 +9376,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9032,6 +9387,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -9071,6 +9427,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9090,6 +9447,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: failed_request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -9123,6 +9481,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9141,6 +9500,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: retry_request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -9180,6 +9540,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9192,6 +9553,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -9227,6 +9589,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9273,6 +9636,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9288,6 +9652,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
                 request_id: expired_request_id,
                 hash: missing_parent_hash,
                 parent_hash: finalized_hash,
@@ -9321,6 +9686,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
             },
@@ -9334,6 +9700,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
             },
@@ -9521,6 +9888,7 @@ mod tests {
             let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
+                    logs_bloom: bloom_matching_any(),
                     hash: tip_hash,
                     parent_hash: tip_parent_hash,
                 },
@@ -9542,6 +9910,7 @@ mod tests {
             let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
+                    logs_bloom: bloom_matching_any(),
                     hash: tip_hash,
                     parent_hash: tip_parent_hash,
                 },
@@ -9572,7 +9941,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
                 );
 
                 assert_present_canonical_logs_are_resolved(&state);
@@ -9598,6 +9967,7 @@ mod tests {
                 let (next_state, effects) = transition(ChainKey::Ethereum,
                     state,
                     Event::HeadObserved {
+                        logs_bloom: bloom_matching_any(),
                         hash: block_hash,
                         parent_hash,
                     },
@@ -9675,6 +10045,7 @@ mod tests {
                 state.blocks.0.insert(
                     block_hash,
                     BlockNode {
+                        logs_bloom: None,
                         parent_hash,
                         pool_logs: PoolLogsStatus::Resolved(candidates),
                         pool_snapshots: HashMap::new(),
@@ -9758,6 +10129,7 @@ mod tests {
             state.blocks.0.insert(
                 block_hash,
                 BlockNode {
+                    logs_bloom: None,
                     parent_hash: finalized_hash,
                     pool_logs: PoolLogsStatus::Resolved(
                         logged_bytes
@@ -9868,6 +10240,7 @@ mod tests {
                 state.blocks.0.insert(
                     block_hash,
                     BlockNode {
+                        logs_bloom: None,
                         parent_hash,
                         pool_logs: PoolLogsStatus::Resolved(
                             candidate_bytes
@@ -9968,6 +10341,7 @@ mod tests {
                 state.blocks.0.insert(
                     block_hash,
                     BlockNode {
+                        logs_bloom: None,
                         parent_hash,
                         pool_logs: PoolLogsStatus::Resolved(
                             candidate_bytes
@@ -10065,6 +10439,7 @@ mod tests {
                     state.blocks.0.insert(
                         hash_for_node(node_index),
                         BlockNode {
+                            logs_bloom: None,
                             parent_hash: hash_for_node(parent_index(&chain, node_index)),
                             pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
                             pool_snapshots: HashMap::new(),
@@ -10120,6 +10495,7 @@ mod tests {
                 let (next_state, effects) = transition(ChainKey::Ethereum,
                     state,
                     Event::HeadObserved {
+                        logs_bloom: bloom_matching_any(),
                         hash: block_hash,
                         parent_hash,
                     },
@@ -10179,7 +10555,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
                 );
             }
 
@@ -10222,7 +10598,15 @@ mod tests {
                 let hash = hash_for_node(*head_index);
                 let parent_hash = hash_for_node(parent_index(&chain, *head_index));
                 let (next_state, effects) =
-                    transition(ChainKey::Ethereum, state, Event::HeadObserved { hash, parent_hash });
+                    transition(
+                        ChainKey::Ethereum,
+                        state,
+                        Event::HeadObserved {
+                            hash,
+                            parent_hash,
+                            logs_bloom: bloom_matching_any(),
+                        },
+                    );
 
                 state = next_state;
                 pending_effects.extend(effects);
@@ -10243,6 +10627,7 @@ mod tests {
                         let (next_state, effects) = transition(ChainKey::Ethereum,
                             state,
                             Event::BlockHeaderReceived {
+                                logs_bloom: bloom_matching_any(),
                                 request_id,
                                 hash: block_hash,
                                 parent_hash,
@@ -10306,7 +10691,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers_with_retries(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
                     &retry_plans,
                 );
             }
@@ -10493,6 +10878,7 @@ mod tests {
             let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
+                    logs_bloom: bloom_matching_any(),
                     hash: first_head_hash,
                     parent_hash: first_parent_hash,
                 },
@@ -10515,7 +10901,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
                 );
             }
 
