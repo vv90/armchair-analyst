@@ -470,7 +470,19 @@ impl ClientEvmRuntime {
             bootstrap::AnyIssuedRequest::PoolMetadata(request) => {
                 let request_id = request.request_id;
                 let at = request.request_payload.at;
-                let candidates = request.request_payload.candidates;
+                let mut candidates = request.request_payload.candidates;
+
+                // Widen the finalized..tip discovery with the full known pool set from the cache so a
+                // narrowed scan still re-activates every previously-validated pool: cached addresses
+                // resolve as hits in `cached_pool_metadata` (no RPC); only genuinely new pools are
+                // fetched. A cache fault degrades to the scan-only set rather than failing bootstrap.
+                // This is bootstrap-only — the live closures stay scoped to their specific candidate.
+                match self.metadata_cache.load_pool_addresses(chain) {
+                    Ok(known) => candidates.extend(known),
+                    Err(error) => self.logger.log(&format!(
+                        "error chain={chain:?} metadata_cache_load_failed kind=pool_addresses error={error}"
+                    )),
+                }
 
                 match self.cached_pool_metadata(chain, at, candidates) {
                     Ok(metadata) => bootstrap::Event::PoolMetadataReceived {
@@ -791,7 +803,8 @@ mod tests {
     use client_evm::{
         Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
         GetTokenMetadata, IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult,
-        PoolLog, PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult,
+        PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult,
+        UniswapV3Fee,
     };
     use serde_json::json;
     use std::{sync::mpsc, time::Duration};
@@ -801,8 +814,12 @@ mod tests {
     #[test]
     fn runtime_constructor_stores_rpc_config() {
         let config = rpc_config();
-        let runtime =
-            ClientEvmRuntime::new(config.clone(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            config.clone(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
 
         assert_eq!(runtime.rpc_config(), &config);
     }
@@ -873,7 +890,12 @@ mod tests {
 
     #[test]
     fn runtime_starts_with_uninitialized_optimization_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
 
         assert!(runtime.optimization_sender.get().is_none());
     }
@@ -1070,8 +1092,53 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_pool_metadata_unions_the_cached_pool_set_as_hits_without_rpc() {
+        // Prime the cache with a pool that is absent from the (narrowed) discovery scan.
+        let cache = in_memory_metadata_cache();
+        let cached = pool_candidate_address(7);
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(cached, Ok(pool_metadata(7)))]),
+            )
+            .expect("store cached pool");
+
+        let runtime = ClientEvmRuntime::new(rpc_config(), cache, Logger::sink(), View::sink());
+
+        // The scan yielded no candidates; the union must still surface the cached pool, resolved as
+        // a hit. `rpc_config()` points nowhere, so any RPC (a cache miss) would error/panic instead.
+        let request = bootstrap::AnyIssuedRequest::PoolMetadata(IssuedRequest {
+            request_id: RequestId::from_raw_for_test(1),
+            request_payload: GetPoolMetadata {
+                at: hash(1),
+                candidates: HashSet::new(),
+            },
+        });
+        let events = runtime
+            .execute_bootstrap_effect(ChainKey::Ethereum, bootstrap::Effect::Request(request));
+
+        let event = match events.as_slice() {
+            [event] => event,
+            _ => panic!("expected exactly one bootstrap event"),
+        };
+        let metadata = match event {
+            Event::BootstrapEvent {
+                event: bootstrap::Event::PoolMetadataReceived { metadata, .. },
+                ..
+            } => metadata,
+            _ => panic!("expected a PoolMetadataReceived bootstrap event"),
+        };
+        assert!(metadata.get(&cached).is_some_and(|result| result.is_ok()));
+    }
+
+    #[test]
     fn run_optimization_effect_returns_no_events() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input(hash(7)),
         });
@@ -1100,7 +1167,12 @@ mod tests {
 
     #[test]
     fn empty_optimization_snapshot_is_dropped() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
 
@@ -1114,7 +1186,12 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
         let input = optimization_input_with_reserves(hash(7));
@@ -1129,7 +1206,12 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
 
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input_with_reserves(hash(7)),
@@ -1141,7 +1223,12 @@ mod tests {
 
     #[test]
     fn optimization_subscription_initializes_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -1151,7 +1238,12 @@ mod tests {
 
     #[test]
     fn optimization_subscription_starts_only_once() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -1724,6 +1816,14 @@ mod tests {
             .expect("test address must parse");
 
         PoolCandidateAddress(address)
+    }
+
+    fn pool_metadata(last_byte: u8) -> PoolMetadata {
+        PoolMetadata {
+            token0: pool_candidate_address(last_byte).0,
+            token1: pool_candidate_address(last_byte.wrapping_add(1)).0,
+            fee: UniswapV3Fee::Fee3000,
+        }
     }
 
     fn token_address(last_byte: u8) -> TokenAddress {

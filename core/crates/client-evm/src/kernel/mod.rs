@@ -4158,7 +4158,6 @@ mod tests {
     #[test]
     fn clean_full_bootstrap_activation_satisfies_all_invariants() {
         let policy = bootstrap::BootstrapPolicy {
-            look_back_depth: 64,
             tip_trim: 0,
             deadline_ticks: 100,
         };
@@ -4208,7 +4207,6 @@ mod tests {
     #[test]
     fn degraded_bootstrap_before_pool_metadata_keeps_canonical_candidates_known_or_pending() {
         let policy = bootstrap::BootstrapPolicy {
-            look_back_depth: 64,
             tip_trim: 0,
             deadline_ticks: 3,
         };
@@ -4256,7 +4254,6 @@ mod tests {
     #[test]
     fn bootstrap_log_gap_is_bridged_by_a_filler_without_header_requests() {
         let policy = bootstrap::BootstrapPolicy {
-            look_back_depth: 64,
             tip_trim: 0,
             deadline_ticks: 100,
         };
@@ -4332,7 +4329,6 @@ mod tests {
                 .map(|offset| range_log_block(anchor_number + offset))
                 .collect::<Vec<_>>();
             let policy = bootstrap::BootstrapPolicy {
-                look_back_depth: 64,
                 tip_trim,
                 deadline_ticks: 4,
             };
@@ -4369,7 +4365,6 @@ mod tests {
                 .map(|offset| range_log_block(anchor_number + offset))
                 .collect::<Vec<_>>();
             let policy = bootstrap::BootstrapPolicy {
-                look_back_depth: 64,
                 tip_trim,
                 deadline_ticks: 4,
             };

@@ -95,7 +95,9 @@ impl MetadataCache {
     ) -> Result<(), MetadataCacheError> {
         let entries = results
             .iter()
-            .filter_map(|(candidate, result)| result.as_ref().ok().map(|metadata| (candidate, metadata)))
+            .filter_map(|(candidate, result)| {
+                result.as_ref().ok().map(|metadata| (candidate, metadata))
+            })
             .collect::<Vec<_>>();
         if entries.is_empty() {
             return Ok(());
@@ -115,6 +117,42 @@ impl MetadataCache {
         write.commit().map_err(database_error)?;
 
         Ok(())
+    }
+
+    /// Returns every pool address stored for `chain` via a prefix range scan over the chain tag.
+    ///
+    /// Bootstrap uses this to widen its candidate set with the full known pool set, so a narrowed
+    /// `finalized..tip` scan still re-activates every previously-validated pool (those resolve as
+    /// cache hits; only genuinely new pools hit RPC).
+    pub fn load_pool_addresses(
+        &self,
+        chain: ChainKey,
+    ) -> Result<HashSet<PoolCandidateAddress>, MetadataCacheError> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(POOLS_TABLE).map_err(database_error)?;
+
+        // The composite key sorts by chain tag first, so a chain's rows are one contiguous range
+        // `[tag, 0x00..] ..= [tag, 0xFF..]` — no tag arithmetic, no risk of spanning another chain.
+        let tag = chain_tag(chain);
+        let mut lower = [0u8; KEY_LEN];
+        lower[0] = tag;
+        let mut upper = [0xFFu8; KEY_LEN];
+        upper[0] = tag;
+        let range = table
+            .range::<&[u8]>(lower.as_slice()..=upper.as_slice())
+            .map_err(database_error)?;
+
+        let mut addresses = HashSet::new();
+        for entry in range {
+            let (key, _value) = entry.map_err(database_error)?;
+            if let Some(address_bytes) = key.value().get(1..) {
+                if let Ok(address) = alloy::primitives::Address::try_from(address_bytes) {
+                    addresses.insert(PoolCandidateAddress(address));
+                }
+            }
+        }
+
+        Ok(addresses)
     }
 
     /// Returns the cached metadata for whichever requested tokens are already known.
@@ -319,6 +357,44 @@ mod tests {
         let loaded = cache
             .load_pool_metadata(ChainKey::Ethereum, &HashSet::from([pool_candidate(3)]))
             .unwrap();
+
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_pool_addresses_enumerates_only_the_requested_chain() {
+        let cache = MetadataCache::in_memory().unwrap();
+        let ethereum_a = pool_candidate(1);
+        let ethereum_b = pool_candidate(2);
+        let arbitrum = pool_candidate(1);
+
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([
+                    (ethereum_a, Ok(pool_metadata(1))),
+                    (ethereum_b, Ok(pool_metadata(2))),
+                ]),
+            )
+            .unwrap();
+        cache
+            .store_pool_metadata(
+                ChainKey::Arbitrum,
+                &HashMap::from([(arbitrum, Ok(pool_metadata(1)))]),
+            )
+            .unwrap();
+
+        let ethereum = cache.load_pool_addresses(ChainKey::Ethereum).unwrap();
+
+        // Same last byte exists on Arbitrum, but the chain-tagged prefix scan must not include it.
+        assert_eq!(ethereum, HashSet::from([ethereum_a, ethereum_b]));
+    }
+
+    #[test]
+    fn load_pool_addresses_is_empty_on_a_cold_table() {
+        let cache = MetadataCache::in_memory().unwrap();
+
+        let loaded = cache.load_pool_addresses(ChainKey::Ethereum).unwrap();
 
         assert!(loaded.is_empty());
     }

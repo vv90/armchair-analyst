@@ -59,8 +59,6 @@ const ETHEREUM_APPROX_FINALIZED_BLOCK_AGE: usize = 64;
 const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
 const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
 
-/// Pool-candidate discovery window scanned below the finalized anchor during bootstrap.
-const ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 64;
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 4;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
@@ -74,8 +72,6 @@ const ARBITRUM_APPROX_FINALIZED_BLOCK_AGE: usize = 1_000;
 const ARBITRUM_FINALIZED_RETENTION_MARGIN: usize = 64;
 const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
 
-/// Pool-candidate discovery window scanned below the finalized anchor during bootstrap.
-const ARBITRUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 2_000;
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ARBITRUM_BOOTSTRAP_TIP_TRIM: usize = 8;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
@@ -834,12 +830,10 @@ fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
 fn bootstrap_policy(chain: ChainKey) -> bootstrap::BootstrapPolicy {
     match chain {
         ChainKey::Ethereum => bootstrap::BootstrapPolicy {
-            look_back_depth: ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH,
             tip_trim: ETHEREUM_BOOTSTRAP_TIP_TRIM,
             deadline_ticks: ETHEREUM_BOOTSTRAP_DEADLINE_TICKS,
         },
         ChainKey::Arbitrum => bootstrap::BootstrapPolicy {
-            look_back_depth: ARBITRUM_BOOTSTRAP_LOOK_BACK_DEPTH,
             tip_trim: ARBITRUM_BOOTSTRAP_TIP_TRIM,
             deadline_ticks: ARBITRUM_BOOTSTRAP_DEADLINE_TICKS,
         },

@@ -27,8 +27,6 @@ pub use pending_requests::{
 /// Per-chain tuning for the bootstrap phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapPolicy {
-    /// How many blocks below the finalized anchor the candidate look-back scans.
-    pub look_back_depth: u64,
     /// Reorg-prone blocks nearest the tip to leave out of the seeded graph.
     pub tip_trim: usize,
     /// Ticks after which bootstrap gives up and activates best-effort with what it has.
@@ -312,8 +310,11 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             let (pending, taken) = pending.take(&request_id);
             match phase {
                 Phase::AnchoringChain if taken.is_some() => {
+                    // Scan only `finalized..tip`: the seed graph already discards every block at or
+                    // below the anchor, and the historical pool set below finalized is owned by the
+                    // persistent metadata cache (unioned into the candidate set by the runtime).
                     let payload = GetPoolCandidatesInRange {
-                        from_block: anchor.number.saturating_sub(policy.look_back_depth),
+                        from_block: anchor.number,
                     };
                     let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
 
@@ -891,7 +892,6 @@ mod tests {
 
     fn test_policy() -> BootstrapPolicy {
         BootstrapPolicy {
-            look_back_depth: 5,
             tip_trim: 0,
             deadline_ticks: 100,
         }
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_request_uses_the_look_back_window_below_the_anchor() {
+    fn discovery_request_scans_from_the_finalized_anchor_to_the_tip() {
         let (state, effects) = init(test_policy());
         let (_state, effects) = transition(
             ChainKey::Ethereum,
@@ -1032,8 +1032,12 @@ mod tests {
             },
         );
 
-        // anchor.number (10) - look_back_depth (5)
-        assert_eq!(candidates_request(&effects).request_payload.from_block, 5);
+        // The scan starts at the finalized anchor itself; the historical region below finalized is
+        // owned by the persistent metadata cache.
+        assert_eq!(
+            candidates_request(&effects).request_payload.from_block,
+            test_anchor().number
+        );
     }
 
     #[test]
@@ -1170,7 +1174,6 @@ mod tests {
     #[test]
     fn deadline_after_anchor_degrades_to_ready_with_seed_and_empty_snapshot() {
         let policy = BootstrapPolicy {
-            look_back_depth: 5,
             tip_trim: 0,
             deadline_ticks: 3,
         };
@@ -1214,7 +1217,6 @@ mod tests {
     #[test]
     fn deadline_before_anchor_abandons_the_chain() {
         let policy = BootstrapPolicy {
-            look_back_depth: 5,
             tip_trim: 0,
             deadline_ticks: 2,
         };
