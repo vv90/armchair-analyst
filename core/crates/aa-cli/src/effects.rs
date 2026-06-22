@@ -1,11 +1,11 @@
 use std::{env, io, io::Write, process::ExitCode, thread};
 
-use client_evm::RpcConfig;
+use client_evm::{MetadataCache, RpcConfig};
 
 use crate::{
     app::start_runtime,
     logger::Logger,
-    utils::{CliError, load_rpc_config_with},
+    utils::{CliError, load_rpc_config_with, metadata_cache_path_with},
     view::View,
 };
 
@@ -21,11 +21,12 @@ pub(crate) fn main_exit_code() -> ExitCode {
 
 fn run() -> Result<(), CliError> {
     let config = load_rpc_config()?;
+    let metadata_cache = open_metadata_cache()?;
     let logger = Logger::create_for_run().map_err(|error| CliError::LogInitFailed {
         message: error.to_string(),
     })?;
     let view = View::for_run();
-    let handle = start_runtime(config, logger, view.clone());
+    let handle = start_runtime(config, metadata_cache, logger, view.clone());
 
     let result = finish_runtime(handle.join());
     view.finish();
@@ -35,6 +36,13 @@ fn run() -> Result<(), CliError> {
 
 fn load_rpc_config() -> Result<RpcConfig, CliError> {
     load_rpc_config_with(|name| env::var(name).ok(), prompt_for_value)
+}
+
+fn open_metadata_cache() -> Result<MetadataCache, CliError> {
+    let path = metadata_cache_path_with(|name| env::var(name).ok());
+    MetadataCache::open(&path).map_err(|error| CliError::CacheInitFailed {
+        message: error.to_string(),
+    })
 }
 
 fn finish_runtime(result: thread::Result<()>) -> Result<(), CliError> {

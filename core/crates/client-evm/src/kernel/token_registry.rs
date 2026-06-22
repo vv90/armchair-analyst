@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, U256};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::ChainKey;
 
@@ -26,7 +27,29 @@ impl TokenDecimals {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Serialize as the bare decimal count, and re-validate the `MAX_SUPPORTED` bound on the way back in so
+// a corrupted metadata-cache entry can never reintroduce an unrepresentable decimals value.
+impl Serialize for TokenDecimals {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenDecimals {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<TokenDecimals, D::Error> {
+        let value = u8::deserialize(deserializer)?;
+        if value <= Self::MAX_SUPPORTED {
+            Ok(TokenDecimals(value))
+        } else {
+            Err(D::Error::custom(format!(
+                "token decimals {value} exceeds supported maximum {}",
+                Self::MAX_SUPPORTED
+            )))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenMetadata {
     pub decimals: TokenDecimals,
 }

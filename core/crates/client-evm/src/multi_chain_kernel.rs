@@ -60,7 +60,7 @@ const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
 const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
 
 /// Pool-candidate discovery window scanned below the finalized anchor during bootstrap.
-const ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 200;
+const ETHEREUM_BOOTSTRAP_LOOK_BACK_DEPTH: u64 = 64;
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 4;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).

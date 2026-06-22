@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::Address;
+use serde::{Deserialize, Serialize};
 
 use crate::ChainKey;
 use crate::pool_state::PoolAddress;
@@ -8,14 +9,16 @@ use crate::pool_state::PoolAddress;
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolCandidateAddress(pub Address);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `PoolMetadata` is immutable for a given pool address, so it is persisted to the metadata cache
+// (`client::metadata_cache`) and reused across runs. Serde is the cache's on-disk representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolMetadata {
     pub token0: Address,
     pub token1: Address,
     pub fee: UniswapV3Fee,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UniswapV3Fee {
     Fee100,
     Fee500,

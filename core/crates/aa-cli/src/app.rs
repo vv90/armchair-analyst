@@ -1,9 +1,9 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent,
-    ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, PoolAddress, PoolCandidateAddress,
-    PoolDataResult, PoolLog, PoolMetadataResult, RequestId, RpcConfig, TokenAddress,
-    TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
+    ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, MetadataCache, PoolAddress,
+    PoolCandidateAddress, PoolDataResult, PoolLog, PoolMetadataResult, RequestId, RpcConfig,
+    TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, kernel,
     multi_chain_kernel::{
@@ -33,16 +33,23 @@ pub(crate) struct ClientEvmApp {}
 pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     rpc_config: RpcConfig,
+    metadata_cache: MetadataCache,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
     view: View,
     logger: Logger,
 }
 
 impl ClientEvmRuntime {
-    pub(crate) fn new(rpc_config: RpcConfig, logger: Logger, view: View) -> ClientEvmRuntime {
+    pub(crate) fn new(
+        rpc_config: RpcConfig,
+        metadata_cache: MetadataCache,
+        logger: Logger,
+        view: View,
+    ) -> ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             rpc_config,
+            metadata_cache,
             optimization_sender: OnceLock::new(),
             view,
             logger,
@@ -51,6 +58,82 @@ impl ClientEvmRuntime {
 
     fn rpc_config(&self) -> &RpcConfig {
         &self.rpc_config
+    }
+
+    /// Resolves pool metadata through the persistent cache: known pools are served from disk, only
+    /// the misses hit RPC, and freshly validated metadata is written back. A cache fault degrades to
+    /// a plain RPC fetch, so the cache can never make a request fail that would otherwise succeed.
+    fn cached_pool_metadata(
+        &self,
+        chain: ChainKey,
+        at: BlockHash,
+        candidates: HashSet<PoolCandidateAddress>,
+    ) -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError> {
+        let cached = match self.metadata_cache.load_pool_metadata(chain, &candidates) {
+            Ok(cached) => cached,
+            Err(error) => {
+                self.logger.log(&format!(
+                    "error chain={chain:?} metadata_cache_load_failed kind=pool error={error}"
+                ));
+                HashMap::new()
+            }
+        };
+
+        let misses = candidates
+            .into_iter()
+            .filter(|candidate| !cached.contains_key(candidate))
+            .collect::<HashSet<_>>();
+
+        let mut metadata = fetch_pool_metadata(&self.agent, self.rpc_config(), chain, at, misses)?;
+
+        if let Err(error) = self.metadata_cache.store_pool_metadata(chain, &metadata) {
+            self.logger.log(&format!(
+                "error chain={chain:?} metadata_cache_store_failed kind=pool error={error}"
+            ));
+        }
+
+        metadata.extend(
+            cached
+                .into_iter()
+                .map(|(candidate, value)| (candidate, Ok(value))),
+        );
+
+        Ok(metadata)
+    }
+
+    /// Token-metadata counterpart of [`ClientEvmRuntime::cached_pool_metadata`].
+    fn cached_token_metadata(
+        &self,
+        chain: ChainKey,
+        at: BlockHash,
+        tokens: HashSet<TokenAddress>,
+    ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
+        let cached = match self.metadata_cache.load_token_metadata(&tokens) {
+            Ok(cached) => cached,
+            Err(error) => {
+                self.logger.log(&format!(
+                    "error chain={chain:?} metadata_cache_load_failed kind=token error={error}"
+                ));
+                HashMap::new()
+            }
+        };
+
+        let misses = tokens
+            .into_iter()
+            .filter(|token| !cached.contains_key(token))
+            .collect::<HashSet<_>>();
+
+        let mut metadata = fetch_token_metadata(&self.agent, self.rpc_config(), chain, at, misses)?;
+
+        if let Err(error) = self.metadata_cache.store_token_metadata(&metadata) {
+            self.logger.log(&format!(
+                "error chain={chain:?} metadata_cache_store_failed kind=token error={error}"
+            ));
+        }
+
+        metadata.extend(cached.into_iter().map(|(token, value)| (token, Ok(value))));
+
+        Ok(metadata)
     }
 }
 
@@ -198,9 +281,14 @@ impl ClientEvmRuntime {
     }
 }
 
-pub(crate) fn start_runtime(config: RpcConfig, logger: Logger, view: View) -> JoinHandle<()> {
+pub(crate) fn start_runtime(
+    config: RpcConfig,
+    metadata_cache: MetadataCache,
+    logger: Logger,
+    view: View,
+) -> JoinHandle<()> {
     let (_sender, handle) = <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(
-        ClientEvmRuntime::new(config, logger, view),
+        ClientEvmRuntime::new(config, metadata_cache, logger, view),
     );
 
     handle
@@ -384,7 +472,7 @@ impl ClientEvmRuntime {
                 let at = request.request_payload.at;
                 let candidates = request.request_payload.candidates;
 
-                match fetch_pool_metadata(&self.agent, config, chain, at, candidates) {
+                match self.cached_pool_metadata(chain, at, candidates) {
                     Ok(metadata) => bootstrap::Event::PoolMetadataReceived {
                         request_id,
                         metadata,
@@ -403,7 +491,7 @@ impl ClientEvmRuntime {
                 let at = request.request_payload.at;
                 let tokens = request.request_payload.tokens;
 
-                match fetch_token_metadata(&self.agent, config, chain, at, tokens) {
+                match self.cached_token_metadata(chain, at, tokens) {
                     Ok(metadata) => bootstrap::Event::TokenMetadataReceived {
                         request_id,
                         metadata,
@@ -446,10 +534,8 @@ impl ClientEvmRuntime {
             |block_hash| fetch_block_header(&self.agent, self.rpc_config(), chain, block_hash),
             |block_hash| fetch_block_logs(&self.agent, self.rpc_config(), chain, block_hash),
             |at, pools| fetch_pool_data(&self.agent, self.rpc_config(), chain, at, pools),
-            |at, candidates| {
-                fetch_pool_metadata(&self.agent, self.rpc_config(), chain, at, candidates)
-            },
-            |at, tokens| fetch_token_metadata(&self.agent, self.rpc_config(), chain, at, tokens),
+            |at, candidates| self.cached_pool_metadata(chain, at, candidates),
+            |at, tokens| self.cached_token_metadata(chain, at, tokens),
         )
     }
 }
@@ -715,7 +801,8 @@ mod tests {
     #[test]
     fn runtime_constructor_stores_rpc_config() {
         let config = rpc_config();
-        let runtime = ClientEvmRuntime::new(config.clone(), Logger::sink(), View::sink());
+        let runtime =
+            ClientEvmRuntime::new(config.clone(), in_memory_metadata_cache(), Logger::sink(), View::sink());
 
         assert_eq!(runtime.rpc_config(), &config);
     }
@@ -786,7 +873,7 @@ mod tests {
 
     #[test]
     fn runtime_starts_with_uninitialized_optimization_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
 
         assert!(runtime.optimization_sender.get().is_none());
     }
@@ -984,7 +1071,7 @@ mod tests {
 
     #[test]
     fn run_optimization_effect_returns_no_events() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input(hash(7)),
         });
@@ -1013,7 +1100,7 @@ mod tests {
 
     #[test]
     fn empty_optimization_snapshot_is_dropped() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
 
@@ -1027,7 +1114,7 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         assert!(runtime.optimization_sender.set(slot_sender).is_ok());
         let input = optimization_input_with_reserves(hash(7));
@@ -1042,7 +1129,7 @@ mod tests {
 
     #[test]
     fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
 
         let events = runtime.execute_effect(Effect::RunOptimization {
             input: optimization_input_with_reserves(hash(7)),
@@ -1054,7 +1141,7 @@ mod tests {
 
     #[test]
     fn optimization_subscription_initializes_sender() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -1064,7 +1151,7 @@ mod tests {
 
     #[test]
     fn optimization_subscription_starts_only_once() {
-        let runtime = ClientEvmRuntime::new(rpc_config(), Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(rpc_config(), in_memory_metadata_cache(), Logger::sink(), View::sink());
         let (sender, _receiver) = mpsc::channel();
 
         runtime.spawn_subscription(&sender, Subscription::OptimizationSubscription);
@@ -1726,5 +1813,9 @@ mod tests {
             ws_url: "wss://example.invalid/ws".to_owned(),
             api_key: "api-key".to_owned(),
         }
+    }
+
+    fn in_memory_metadata_cache() -> MetadataCache {
+        MetadataCache::in_memory().expect("in-memory metadata cache")
     }
 }

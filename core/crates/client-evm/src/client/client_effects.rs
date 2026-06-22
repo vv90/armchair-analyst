@@ -44,7 +44,7 @@ const SUBSCRIBE_REQUEST_ID: u64 = 1;
 
 /// Maximum `aggregate3` sub-calls packed into one `eth_call`. Bounds each call's response/gas so a
 /// dense chain (e.g. Arbitrum) cannot produce a single multicall the node rejects.
-const MULTICALL_CHUNK_SIZE: usize = 1000;
+const MULTICALL_CHUNK_SIZE: usize = 500;
 /// Maximum `eth_call` entries packed into one JSON-RPC batch (one HTTP round-trip). Bounds the batch
 /// payload; call sets larger than `MULTICALL_CHUNK_SIZE * MULTICALL_MAX_BATCH_ITEMS` span several
 /// batches.

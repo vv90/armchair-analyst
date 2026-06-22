@@ -1,10 +1,13 @@
-use std::{error, fmt};
+use std::{error, fmt, path::PathBuf};
 
 use client_evm::RpcConfig;
 
 pub(crate) const RPC_HTTP_URL_ENV: &str = "AA_RPC_HTTP_URL";
 pub(crate) const RPC_WS_URL_ENV: &str = "AA_RPC_WS_URL";
 pub(crate) const RPC_API_KEY_ENV: &str = "AA_RPC_API_KEY";
+pub(crate) const METADATA_CACHE_PATH_ENV: &str = "AA_METADATA_CACHE_PATH";
+
+const DEFAULT_METADATA_CACHE_PATH: &str = "metadata-cache.redb";
 
 const RPC_HTTP_URL_PROMPT: &str = "RPC HTTP URL:";
 pub(crate) const RPC_WS_URL_PROMPT: &str = "RPC WebSocket URL:";
@@ -25,6 +28,9 @@ pub(crate) enum CliError {
     LogInitFailed {
         message: String,
     },
+    CacheInitFailed {
+        message: String,
+    },
 }
 
 impl fmt::Display for CliError {
@@ -42,11 +48,26 @@ impl fmt::Display for CliError {
             Self::LogInitFailed { message } => {
                 write!(formatter, "failed to initialize log file: {message}")
             }
+            Self::CacheInitFailed { message } => {
+                write!(formatter, "failed to open metadata cache: {message}")
+            }
         }
     }
 }
 
 impl error::Error for CliError {}
+
+/// Resolves the metadata-cache file path from the environment, defaulting to a file in the working
+/// directory when unset.
+pub(crate) fn metadata_cache_path_with<Env>(mut read_env: Env) -> PathBuf
+where
+    Env: FnMut(&'static str) -> Option<String>,
+{
+    read_env(METADATA_CACHE_PATH_ENV)
+        .and_then(normalize_config_value)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_METADATA_CACHE_PATH))
+}
 
 pub(crate) fn load_rpc_config_with<Env, Prompt>(
     mut read_env: Env,

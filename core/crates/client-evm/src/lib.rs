@@ -21,8 +21,8 @@ mod utils;
 
 pub use chain::{ACTIVE_CHAINS, ChainKey, drpc_network_path};
 pub use client::{
-    ClientEvent, ClientHead, RangeLogBlock, fetch_block_header, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
+    ClientEvent, ClientHead, MetadataCache, MetadataCacheError, RangeLogBlock, fetch_block_header,
+    fetch_block_logs, fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads, subscribe_pool_events,
 };
 pub use config::RpcConfig;
