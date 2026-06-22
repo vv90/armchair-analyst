@@ -6,7 +6,7 @@ pub(crate) mod pending_requests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use alloy::primitives::BlockHash;
+use alloy::primitives::{BlockHash, keccak256};
 
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
@@ -57,12 +57,33 @@ pub struct GraphSeed {
     blocks: Vec<SeedBlock>,
 }
 
+/// Domain tag distinguishing a filler-hash preimage from any other keccak input.
+const FILLER_DOMAIN: &[u8] = b"aa-gap-filler";
+
+/// Deterministic synthetic hash for the filler block bridging a no-log gap between two real blocks.
+///
+/// Derived as a domain-separated keccak of the two real block hashes it connects, so it is
+/// reproducible (bootstrap is pure), unique per gap, and — by keccak preimage resistance — collides
+/// with neither a real block hash nor its own `lower`/`upper` bounds. A filler carries no logs and no
+/// pool state; its only role is to thread one `parent_hash` link across the gap.
+fn filler_hash(lower: BlockHash, upper: BlockHash) -> BlockHash {
+    let mut preimage = Vec::with_capacity(FILLER_DOMAIN.len() + 64);
+    preimage.extend_from_slice(FILLER_DOMAIN);
+    preimage.extend_from_slice(lower.as_slice());
+    preimage.extend_from_slice(upper.as_slice());
+    keccak256(preimage)
+}
+
 impl GraphSeed {
     /// Infers the `finalized..tip` block graph from a ranged-logs snapshot.
-    /// A single `eth_getLogs` response is one canonical view, so a block's parent is the window
-    /// block one number below it; the run anchored at `F+1` links to `F`, other runs seed as
-    /// floating segments (their bottom block, whose parent is an unobserved no-log block, is
-    /// dropped). The top `tip_trim` blocks near the tip are reorg-prone and left out.
+    ///
+    /// A single `eth_getLogs` response is one canonical view, so consecutive retained blocks are
+    /// parent-linked by number adjacency. No-log blocks are absent from the response, leaving gaps;
+    /// rather than dropping the blocks above a gap (which would force a per-block header walk to
+    /// reconnect them), each gap is bridged by a single synthetic [`filler_hash`] block whose only
+    /// role is connectivity. Every retained block — and the run anchored above the finalized block —
+    /// therefore links down to the anchor. The top `tip_trim` blocks near the tip are reorg-prone and
+    /// left out.
     fn from_window(
         window: &[RangeLogBlock],
         anchor: FinalizedAnchor,
@@ -80,32 +101,43 @@ impl GraphSeed {
             return GraphSeed { blocks: Vec::new() };
         };
 
-        // Drop the reorg-prone blocks within `tip_trim` of the observed tip.
+        // Drop the reorg-prone blocks within `tip_trim` of the observed tip. The highest retained
+        // block stays a real log-bearing block, which the live head-walk relies on as a join point.
         let highest_retained = max_number.saturating_sub(tip_trim as u64);
         let retained: BTreeMap<u64, &RangeLogBlock> = recent
             .into_iter()
             .filter(|(number, _)| *number <= highest_retained)
             .collect();
 
-        let blocks = retained
-            .iter()
-            .filter_map(|(number, block)| {
-                // Parent is the block one number below: the anchor for the `F+1` block, an
-                // adjacent retained block otherwise. A missing predecessor (no-log gap) makes
-                // this a run bottom with an unknown parent, so it is dropped.
-                let parent_hash = match number.checked_sub(1) {
-                    Some(previous) if previous == anchor.number => Some(anchor.hash),
-                    Some(previous) => retained.get(&previous).map(|parent| parent.hash),
-                    None => None,
-                }?;
+        // Walk retained blocks oldest→newest, tracking the previous connected block (starting at the
+        // anchor). Adjacent blocks link directly; a gap inserts one filler bridging the previous
+        // connected hash to this block, so nothing is ever dropped.
+        let mut blocks = Vec::new();
+        let mut previous_number = anchor.number;
+        let mut previous_hash = anchor.hash;
 
-                Some(SeedBlock {
-                    hash: block.hash,
-                    parent_hash,
-                    candidates: block.candidates.clone(),
-                })
-            })
-            .collect();
+        for (number, block) in &retained {
+            let parent_hash = if *number == previous_number + 1 {
+                previous_hash
+            } else {
+                let filler = filler_hash(previous_hash, block.hash);
+                blocks.push(SeedBlock {
+                    hash: filler,
+                    parent_hash: previous_hash,
+                    candidates: HashSet::new(),
+                });
+                filler
+            };
+
+            blocks.push(SeedBlock {
+                hash: block.hash,
+                parent_hash,
+                candidates: block.candidates.clone(),
+            });
+
+            previous_number = *number;
+            previous_hash = block.hash;
+        }
 
         GraphSeed { blocks }
     }
@@ -596,6 +628,24 @@ mod tests {
         }
     }
 
+    /// A real seed block whose parent is an arbitrary hash (e.g. a filler), not a window block.
+    fn seed_block_with_parent(hash_byte: u8, parent_hash: BlockHash) -> SeedBlock {
+        SeedBlock {
+            hash: hash(hash_byte),
+            parent_hash,
+            candidates: HashSet::from([candidate(hash_byte)]),
+        }
+    }
+
+    /// The filler bridging the gap between the real blocks `lower_byte` and `upper_byte`.
+    fn filler(lower_byte: u8, upper_byte: u8) -> SeedBlock {
+        SeedBlock {
+            hash: filler_hash(hash(lower_byte), hash(upper_byte)),
+            parent_hash: hash(lower_byte),
+            candidates: HashSet::new(),
+        }
+    }
+
     #[test]
     fn contiguous_window_links_first_block_to_anchor_then_chains() {
         let anchor = anchor(10, 100);
@@ -614,9 +664,9 @@ mod tests {
     }
 
     #[test]
-    fn gap_drops_run_bottom_and_floats_next_segment() {
+    fn gap_is_bridged_by_a_filler_connecting_both_segments() {
         let anchor = anchor(10, 100);
-        // 13 is a no-log block: absent from the window.
+        // 13 is a no-log block: absent from the window, leaving a gap between 12 and 14.
         let window = [
             window_block(11, 11),
             window_block(12, 12),
@@ -631,10 +681,75 @@ mod tests {
             vec![
                 seed_block(11, 100),
                 seed_block(12, 11),
-                // 14 dropped: parent 13 is an unobserved no-log block.
+                // The 13-gap is bridged: a filler parented to 12, then 14 parented to the filler.
+                filler(12, 14),
+                seed_block_with_parent(14, filler_hash(hash(12), hash(14))),
                 seed_block(15, 14),
             ]
         );
+    }
+
+    #[test]
+    fn gap_between_anchor_and_first_block_is_bridged() {
+        let anchor = anchor(10, 100);
+        // 11..=13 are no-log blocks: the first observed block is 14.
+        let window = [window_block(14, 14), window_block(15, 15)];
+
+        let seed = GraphSeed::from_window(&window, anchor, 0);
+
+        assert_eq!(
+            seed.into_blocks(),
+            vec![
+                filler(100, 14),
+                seed_block_with_parent(14, filler_hash(hash(100), hash(14))),
+                seed_block(15, 14),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_gaps_each_get_a_distinct_filler() {
+        let anchor = anchor(10, 100);
+        let window = [
+            window_block(12, 12),
+            window_block(15, 15),
+            window_block(18, 18),
+        ];
+
+        let blocks = GraphSeed::from_window(&window, anchor, 0).into_blocks();
+
+        assert_eq!(
+            blocks,
+            vec![
+                filler(100, 12),
+                seed_block_with_parent(12, filler_hash(hash(100), hash(12))),
+                filler(12, 15),
+                seed_block_with_parent(15, filler_hash(hash(12), hash(15))),
+                filler(15, 18),
+                seed_block_with_parent(18, filler_hash(hash(15), hash(18))),
+            ]
+        );
+
+        // The three fillers are distinct nodes.
+        let filler_hashes = HashSet::from([
+            filler_hash(hash(100), hash(12)),
+            filler_hash(hash(12), hash(15)),
+            filler_hash(hash(15), hash(18)),
+        ]);
+        assert_eq!(filler_hashes.len(), 3);
+    }
+
+    #[test]
+    fn filler_hash_is_deterministic_and_distinct_from_its_bounds() {
+        let lower = hash(100);
+        let upper = hash(14);
+
+        // Reproducible.
+        assert_eq!(filler_hash(lower, upper), filler_hash(lower, upper));
+        // Distinct from both bounds and order-sensitive, so no collisions with real or sibling nodes.
+        assert_ne!(filler_hash(lower, upper), lower);
+        assert_ne!(filler_hash(lower, upper), upper);
+        assert_ne!(filler_hash(lower, upper), filler_hash(upper, lower));
     }
 
     #[test]
@@ -680,7 +795,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn every_seed_block_parent_is_the_block_one_number_below(
+        fn every_seed_block_connects_to_the_anchor(
             anchor_number in 0u64..50,
             offsets in prop::collection::hash_set(1u64..60, 0..25),
             tip_trim in 0usize..12,
@@ -694,7 +809,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            // Map every known block hash (anchor + window) back to its number.
+            // Map every real block hash (anchor + window) back to its number; fillers are absent here.
             let mut number_by_hash = std::collections::HashMap::new();
             number_by_hash.insert(anchor.hash, anchor.number);
             for block in &window {
@@ -703,23 +818,52 @@ mod tests {
 
             let max_number = window.iter().map(|block| block.number).max();
             let blocks = GraphSeed::from_window(&window, anchor, tip_trim).into_blocks();
+            let by_hash: std::collections::HashMap<_, _> =
+                blocks.iter().map(|seed| (seed.hash, seed)).collect();
 
-            let mut previous_number = None;
+            // No node is emitted twice (distinct real blocks, distinct synthetic fillers).
+            prop_assert_eq!(by_hash.len(), blocks.len());
+
+            // Completeness: every retained window block (above the anchor, within the untrimmed
+            // range) is present — nothing is dropped at a gap.
+            if let Some(max_number) = max_number {
+                let highest_retained = max_number.saturating_sub(tip_trim as u64);
+                for block in &window {
+                    if block.number > anchor.number && block.number <= highest_retained {
+                        prop_assert!(by_hash.contains_key(&block.hash));
+                    }
+                }
+            }
+
+            let mut previous_real_number = None;
             for seed in &blocks {
-                let number = *number_by_hash.get(&seed.hash).expect("seed hash is a window block");
-                // Above the anchor and within the untrimmed range.
-                prop_assert!(number > anchor.number);
-                if let Some(max_number) = max_number {
-                    prop_assert!(number <= max_number.saturating_sub(tip_trim as u64));
+                match number_by_hash.get(&seed.hash).copied() {
+                    // A real block: above the anchor, within range, emitted in increasing order.
+                    Some(number) => {
+                        prop_assert!(number > anchor.number);
+                        if let Some(max_number) = max_number {
+                            prop_assert!(number <= max_number.saturating_sub(tip_trim as u64));
+                        }
+                        if let Some(previous) = previous_real_number {
+                            prop_assert!(number > previous);
+                        }
+                        previous_real_number = Some(number);
+                    }
+                    // A filler: a synthetic node, never a window block, carrying no candidates.
+                    None => prop_assert!(seed.candidates.is_empty()),
                 }
-                // Parent is exactly the known block one number below.
-                let parent_number = number_by_hash.get(&seed.parent_hash).copied();
-                prop_assert_eq!(parent_number, Some(number - 1));
-                // Emitted oldest-to-newest, strictly increasing.
-                if let Some(previous_number) = previous_number {
-                    prop_assert!(number > previous_number);
+
+                // Connectivity: following parent_hash from this block reaches the anchor through
+                // nodes that are all present in the seed.
+                let mut current = seed.parent_hash;
+                let mut steps = 0;
+                while current != anchor.hash {
+                    let node = by_hash.get(&current);
+                    prop_assert!(node.is_some());
+                    current = node.expect("present per assert above").parent_hash;
+                    steps += 1;
+                    prop_assert!(steps <= blocks.len() + 1);
                 }
-                previous_number = Some(number);
             }
         }
 

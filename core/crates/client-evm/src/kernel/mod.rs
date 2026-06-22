@@ -3800,6 +3800,141 @@ mod tests {
         assert_state_invariants(&state);
     }
 
+    // A seed whose real block sits above a no-log gap is bridged by a filler (empty candidates)
+    // parented to the anchor. The kernel treats the filler as an ordinary resolved, log-free block:
+    // activation issues no `GetBlockHeader`, and a head built on the seed connects straight through
+    // the filler down to the anchor.
+    #[test]
+    fn activate_from_seed_with_filler_bridges_gap_without_header_requests() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let filler = BlockHash::with_last_byte(9);
+        let seed_hash = BlockHash::with_last_byte(2);
+        let new_head = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
+
+        let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(metadata))]),
+        );
+        let token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(6), Ok(token_metadata(18))),
+            (token_address(7), Ok(token_metadata(6))),
+        ]));
+
+        let (state, activation_effects) = State::activate_from_seed(
+            finalized_hash,
+            HashMap::new(),
+            pool_registry,
+            token_registry,
+            vec![
+                // Filler bridging the gap to the anchor, then the real block parented to the filler.
+                (filler, finalized_hash, HashSet::new()),
+                (seed_hash, filler, HashSet::from([candidate])),
+            ],
+        );
+
+        // The graph is fully connected, so no ancestor needs fetching.
+        assert!(activation_effects.is_empty());
+
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
+                hash: new_head,
+                parent_hash: seed_hash,
+            },
+        );
+
+        assert_eq!(state.canonical_tip, new_head);
+        // head -> seed -> filler -> anchor: three connected blocks above the finalized anchor.
+        assert_eq!(state.canonical_path_len_from_finalized(), Some(3));
+        assert_state_invariants(&state);
+    }
+
+    // A reorg whose new branch re-enters a bridged gap is handled normally: the new branch's real
+    // blocks are materialized and connect to the anchor, while the filler-bridged old branch is left
+    // orphaned (pruned only at finalization) — no reset, because a filler's synthetic hash is never
+    // re-inserted or mistaken for a real one.
+    #[test]
+    fn reorg_into_bridged_gap_materializes_new_branch_without_reset() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let filler = BlockHash::with_last_byte(9);
+        let seed_hash = BlockHash::with_last_byte(2);
+        let old_head = BlockHash::with_last_byte(3);
+        let new_head = BlockHash::with_last_byte(5);
+        let new_gap_block = BlockHash::with_last_byte(6);
+        let candidate = pool_candidate_address(4);
+        let metadata = pool_metadata(6, 7, UniswapV3Fee::Fee3000);
+
+        let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(metadata))]),
+        );
+        let token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
+            (token_address(6), Ok(token_metadata(18))),
+            (token_address(7), Ok(token_metadata(6))),
+        ]));
+
+        // Seed: anchor <- filler <- seed_hash, then a head built on the seed.
+        let (state, _effects) = State::activate_from_seed(
+            finalized_hash,
+            HashMap::new(),
+            pool_registry,
+            token_registry,
+            vec![
+                (filler, finalized_hash, HashSet::new()),
+                (seed_hash, filler, HashSet::from([candidate])),
+            ],
+        );
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
+                hash: old_head,
+                parent_hash: seed_hash,
+            },
+        );
+        assert_eq!(state.canonical_tip, old_head);
+
+        // Reorg: a competing head whose parent is a real block inside the formerly-bridged region.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                logs_bloom: bloom_matching_any(),
+                hash: new_head,
+                parent_hash: new_gap_block,
+            },
+        );
+        // The new branch's missing real ancestor is fetched — the graph grew, it did not reset.
+        let header_request_id = assert_single_block_header_request_effect(&effects, new_gap_block);
+        assert_eq!(state.canonical_tip, new_head);
+
+        // The real gap block resolves, forking at the anchor: the new branch connects through.
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockHeaderReceived {
+                logs_bloom: bloom_matching_any(),
+                request_id: header_request_id,
+                hash: new_gap_block,
+                parent_hash: finalized_hash,
+            },
+        );
+
+        assert_eq!(state.canonical_tip, new_head);
+        // new_head -> new_gap_block -> anchor: the winning branch is real, with no filler.
+        assert_eq!(state.canonical_path_len_from_finalized(), Some(2));
+        // The filler and the old branch survive as an orphan (no reset would have kept them).
+        assert!(state.blocks.0.contains_key(&filler));
+        assert!(state.blocks.0.contains_key(&seed_hash));
+        assert!(state.blocks.0.contains_key(&old_head));
+        assert_state_invariants(&state);
+    }
+
     // ===== Bootstrap-activation invariant coverage =====
     // These exercises feed real `bootstrap` outcomes through `activate_from_seed` (mirroring
     // `multi_chain_kernel::activate_bootstrap_outcome`) and hold the resulting kernel state to
@@ -4114,18 +4249,18 @@ mod tests {
         assert_canonical_resolved_candidates_are_known_or_pending(&next_state);
     }
 
-    // A no-log block leaves a gap in the range-logs window, so the segment above it floats: the
-    // bootstrap seeds the floating block with a parent it never seeds. Every known block with a
-    // missing ancestor must have a pending header request, or ancestry reconstruction stalls.
+    // A no-log block leaves a gap in the range-logs window. Rather than dropping the blocks above it
+    // (which would force a per-block header walk to reconnect them), the bootstrap bridges the gap
+    // with a single synthetic filler, so the activated graph is fully connected and the deep
+    // header-walk never starts.
     #[test]
-    fn bootstrap_log_gap_leaves_seed_parent_with_pending_header() {
+    fn bootstrap_log_gap_is_bridged_by_a_filler_without_header_requests() {
         let policy = bootstrap::BootstrapPolicy {
             look_back_depth: 64,
             tip_trim: 0,
             deadline_ticks: 100,
         };
-        // Block 103 has no pool logs (absent from the window). Block 104 then floats — its parent
-        // 103 is unobserved — so the seed links 105 -> 104 while never seeding 104 itself.
+        // Block 103 has no pool logs (absent from the window), leaving a gap between 102 and 104.
         let window = vec![
             range_log_block(101),
             range_log_block(102),
@@ -4144,7 +4279,7 @@ mod tests {
             other => panic!("expected ready outcome, got {other:?}"),
         };
 
-        // Precondition: a seed block references a parent that is neither seeded nor the anchor.
+        // Every seed block links to a seeded ancestor or the anchor: nothing floats.
         let seeded = outcome
             .seed_blocks
             .iter()
@@ -4154,11 +4289,27 @@ mod tests {
             !seeded.contains(&block.parent_hash) && block.parent_hash != bootstrap_anchor().hash
         });
         assert!(
-            has_floating_parent,
-            "fixture must produce a floating seed segment"
+            !has_floating_parent,
+            "the gap must be bridged, leaving no floating parent"
+        );
+
+        // The bridge is a filler: a seeded block with no candidates (real blocks each contribute one).
+        let filler_count = outcome
+            .seed_blocks
+            .iter()
+            .filter(|block| block.candidates.is_empty())
+            .count();
+        assert_eq!(
+            filler_count, 1,
+            "the single gap is bridged by exactly one filler"
         );
 
         let (state, activation_effects) = activate_bootstrap_outcome_for_test(outcome);
+        // The deep header-walk never starts: a fully connected seed needs no header fetch.
+        assert!(
+            activation_effects.is_empty(),
+            "a fully connected seed issues no header request"
+        );
         assert_missing_parents_for_known_blocks_are_pending(&state);
         assert_effects_are_well_formed(&state, &activation_effects);
     }
