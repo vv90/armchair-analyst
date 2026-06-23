@@ -11,11 +11,10 @@ use alloy::primitives::{BlockHash, keccak256};
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
 use crate::{
-    ChainKey, PoolAddress, PoolCandidateAddress, PoolDataResult, PoolMetadataResult, PoolState,
-    RangeLogBlock, TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry,
-    tick::Tick,
+    ChainKey, PoolAddress, PoolCandidateAddress, PoolMetadataResult, PoolState, RangeLogBlock,
+    TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry, tick::Tick,
 };
-pub use crate::{GetPoolData, GetPoolMetadata, GetTokenMetadata};
+pub use crate::{GetPoolMetadata, GetTokenMetadata};
 use pending_requests::PendingRequests;
 // Re-exported so runtimes can dispatch bootstrap requests and build their response events, mirroring
 // the kernel's crate-level request re-exports.
@@ -153,14 +152,6 @@ struct VerifiedPools {
 }
 
 impl VerifiedPools {
-    fn verified_pools(&self, chain: ChainKey) -> HashSet<PoolAddress> {
-        self.metadata
-            .iter()
-            .filter(|(_, result)| result.is_ok())
-            .map(|(candidate, _)| PoolAddress(candidate.0, chain))
-            .collect()
-    }
-
     fn referenced_tokens(&self, chain: ChainKey) -> HashSet<TokenAddress> {
         self.metadata
             .values()
@@ -213,12 +204,6 @@ enum Phase {
         seed: GraphSeed,
         verified: VerifiedPools,
     },
-    Snapshotting {
-        anchor: FinalizedAnchor,
-        seed: GraphSeed,
-        verified: VerifiedPools,
-        tokens: TokenRegistry,
-    },
     Ready(BootstrapOutcome),
     Abandoned,
 }
@@ -247,10 +232,6 @@ pub enum Event {
     TokenMetadataReceived {
         request_id: RequestId<GetTokenMetadata>,
         metadata: HashMap<TokenAddress, TokenMetadataResult>,
-    },
-    PoolDataReceived {
-        request_id: RequestId<GetPoolData>,
-        pools: HashMap<PoolAddress, PoolDataResult>,
     },
     RequestFailed {
         request_id: AnyRequestId,
@@ -417,53 +398,14 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     seed,
                     verified,
                 } if taken.is_some() => {
-                    let tokens = TokenRegistry::new().with_metadata_results(metadata);
-                    let payload = GetPoolData {
-                        at: anchor.hash,
-                        pools: verified.verified_pools(chain),
-                    };
-                    let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
-
-                    (
-                        rebuild(
-                            pending,
-                            Phase::Snapshotting {
-                                anchor,
-                                seed,
-                                verified,
-                                tokens,
-                            },
-                            policy,
-                            started_at,
-                            tick,
-                        ),
-                        vec![issued(AnyIssuedRequest::PoolData, request_id, payload)],
-                    )
-                }
-                phase => (
-                    rebuild(pending, phase, policy, started_at, tick),
-                    Vec::new(),
-                ),
-            }
-        }
-        Event::PoolDataReceived { request_id, pools } => {
-            let (pending, taken) = pending.take(&request_id);
-            match phase {
-                Phase::Snapshotting {
-                    anchor,
-                    seed,
-                    verified,
-                    tokens,
-                } if taken.is_some() => {
-                    let pool_snapshots = pools
-                        .into_iter()
-                        .filter_map(|(pool, result)| result.ok().map(|state| (pool, state)))
-                        .collect();
+                    // Activation no longer blocks on a pool-state snapshot: hand the kernel an empty
+                    // finalized snapshot and let its live dirty-pool / backfill paths fetch state at
+                    // the tip after activation, prioritizing frontier freshness over a complete set.
                     let outcome = BootstrapOutcome {
                         anchor,
-                        pool_snapshots,
+                        pool_snapshots: HashMap::new(),
                         pool_registry: verified.into_registry(chain),
-                        token_registry: tokens,
+                        token_registry: TokenRegistry::new().with_metadata_results(metadata),
                         seed_blocks: seed.into_blocks(),
                     };
 
@@ -570,32 +512,19 @@ fn degraded(chain: ChainKey, phase: Phase) -> Phase {
             token_registry: TokenRegistry::new(),
             seed_blocks: seed.into_blocks(),
         }),
-        Phase::Snapshotting {
-            anchor,
-            seed,
-            verified,
-            tokens,
-        } => Phase::Ready(BootstrapOutcome {
-            anchor,
-            pool_snapshots: HashMap::new(),
-            pool_registry: verified.into_registry(chain),
-            token_registry: tokens,
-            seed_blocks: seed.into_blocks(),
-        }),
         terminal @ (Phase::Ready(_) | Phase::Abandoned) => terminal,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U160, U256, aliases::I24};
+    use alloy::primitives::{Address, U256};
     use proptest::prelude::*;
 
     use super::*;
     use crate::{
-        PoolDataCall, PoolDataFailure, PoolDataResult, PoolMetadata, PoolMetadataCall,
-        PoolMetadataFailure, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
-        TokenMetadataResult, UniswapV3Fee,
+        PoolMetadata, PoolMetadataCall, PoolMetadataFailure, TokenDecimals, TokenMetadata,
+        TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
     };
 
     fn hash(byte: u8) -> BlockHash {
@@ -939,14 +868,6 @@ mod tests {
         }
     }
 
-    fn balanced_pool_state() -> PoolState {
-        PoolState {
-            sqrt_price_x96: U160::from(79_228_162_514_264_337_593_543_950_336_u128),
-            liquidity: 1_000_000,
-            tick: I24::from_limbs([0]),
-        }
-    }
-
     fn single_request(effects: &[Effect]) -> &AnyIssuedRequest {
         match effects {
             [Effect::Request(issued)] => issued,
@@ -986,13 +907,6 @@ mod tests {
         match single_request(effects) {
             AnyIssuedRequest::TokenMetadata(issued) => issued,
             _ => panic!("expected token metadata request"),
-        }
-    }
-
-    fn pool_data_request(effects: &[Effect]) -> &IssuedRequest<GetPoolData> {
-        match single_request(effects) {
-            AnyIssuedRequest::PoolData(issued) => issued,
-            _ => panic!("expected pool data request"),
         }
     }
 
@@ -1069,18 +983,8 @@ mod tests {
                 ]),
             },
         );
-        let pool_data = pool_data_request(&effects);
-        assert!(pool_data.request_payload.pools.contains(&pool(11)));
-        let pool_data_id = pool_data.request_id;
-
-        let (state, effects) = transition(
-            ChainKey::Ethereum,
-            state,
-            Event::PoolDataReceived {
-                request_id: pool_data_id,
-                pools: HashMap::from([(pool(11), Ok(balanced_pool_state()))]),
-            },
-        );
+        // Token metadata is the final bootstrap step: activation no longer blocks on a pool-state
+        // snapshot, so the chain is Ready immediately with an empty finalized snapshot.
         assert!(effects.is_empty());
 
         let outcome = match completion(&state) {
@@ -1088,15 +992,12 @@ mod tests {
             other => panic!("expected ready, got {other:?}"),
         };
         assert_eq!(outcome.anchor, anchor);
-        // Graph seed covers every candidate block; the snapshot only the verified pool.
+        // Graph seed covers every candidate block; pool state is fetched live after activation.
         assert_eq!(
             outcome.seed_blocks,
             vec![seed_block(11, 200), seed_block(12, 11)]
         );
-        assert_eq!(
-            outcome.pool_snapshots,
-            HashMap::from([(pool(11), balanced_pool_state())])
-        );
+        assert!(outcome.pool_snapshots.is_empty());
         assert!(outcome.pool_registry.verified_metadata(pool(11)).is_some());
         assert!(outcome.token_registry.verified_metadata(token(1)).is_some());
     }
@@ -1238,7 +1139,6 @@ mod tests {
     fn drive_to_ready(
         pool_metadata: HashMap<PoolCandidateAddress, PoolMetadataResult>,
         token_response: impl Fn(&TokenAddress) -> TokenMetadataResult,
-        pool_data_response: impl Fn(&PoolAddress) -> PoolDataResult,
     ) -> BootstrapOutcome {
         let (state, effects) = init(test_policy());
         let (state, effects) = transition(
@@ -1276,29 +1176,12 @@ mod tests {
             .iter()
             .map(|token| (*token, token_response(token)))
             .collect();
-        let (state, effects) = transition(
+        let (state, _effects) = transition(
             ChainKey::Ethereum,
             state,
             Event::TokenMetadataReceived {
                 request_id: token_id,
                 metadata: token_metadata,
-            },
-        );
-
-        let pool_data_request = pool_data_request(&effects);
-        let pool_data_id = pool_data_request.request_id;
-        let pools = pool_data_request
-            .request_payload
-            .pools
-            .iter()
-            .map(|pool| (*pool, pool_data_response(pool)))
-            .collect();
-        let (state, _effects) = transition(
-            ChainKey::Ethereum,
-            state,
-            Event::PoolDataReceived {
-                request_id: pool_data_id,
-                pools,
             },
         );
 
@@ -1346,15 +1229,6 @@ mod tests {
                     .map(|token| (*token, Ok(token_metadata(18))))
                     .collect(),
             },
-            AnyIssuedRequest::PoolData(request) => Event::PoolDataReceived {
-                request_id: request.request_id,
-                pools: request
-                    .request_payload
-                    .pools
-                    .iter()
-                    .map(|pool| (*pool, Ok(balanced_pool_state())))
-                    .collect(),
-            },
         }
     }
 
@@ -1373,7 +1247,6 @@ mod tests {
             AnyIssuedRequest::TokenMetadata(request) => {
                 AnyRequestId::TokenMetadata(request.request_id)
             }
-            AnyIssuedRequest::PoolData(request) => AnyRequestId::PoolData(request.request_id),
         };
 
         Event::RequestFailed { request_id }
@@ -1456,7 +1329,6 @@ mod tests {
             let outcome = drive_to_ready(
                 metadata,
                 |_| Ok(token_metadata(18)),
-                |_| Ok(balanced_pool_state()),
             );
 
             for pool in outcome.pool_registry.verified_pools_for_test() {
@@ -1490,7 +1362,6 @@ mod tests {
                         Ok(token_metadata(18))
                     }
                 },
-                |_| Ok(balanced_pool_state()),
             );
 
             for token in outcome.token_registry.verified_tokens_for_test() {
@@ -1498,57 +1369,27 @@ mod tests {
             }
         }
 
-        // Mirrors `kernel::scheduled_pool_data_requests_include_only_verified_uncovered_pools`:
-        // the kernel only ever asks pool data for verified pools, so the bootstrap snapshot it
-        // produces must contain exactly the verified pools whose data call succeeded — never a
-        // rejected pool and never one whose data call failed.
+        // Bootstrap no longer snapshots pool state (activation hands the kernel an empty finalized
+        // snapshot and the live dirty-pool / backfill paths fetch it at the tip), so the outcome's
+        // `pool_snapshots` is always empty. The "snapshots cover only verified pools" invariant now
+        // lives in the kernel's live pool-data scheduling tests.
         #[test]
-        fn outcome_snapshots_cover_only_verified_pools_with_successful_data(
+        fn outcome_carries_no_pool_snapshots(
             verified_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
-            rejected_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
-            failed_data_bytes in proptest::collection::hash_set(any::<u8>(), 0..16),
         ) {
-            let mut metadata = HashMap::new();
-            for byte in &verified_bytes {
-                metadata.insert(
-                    candidate(*byte),
-                    Ok(pool_metadata_with_tokens(*byte, byte.wrapping_add(64))),
-                );
-            }
-            for byte in rejected_bytes.iter().filter(|byte| !verified_bytes.contains(byte)) {
-                metadata.insert(
-                    candidate(*byte),
-                    Err(PoolMetadataFailure::CallFailed(PoolMetadataCall::Token0)),
-                );
-            }
-
-            let outcome = drive_to_ready(
-                metadata,
-                |_| Ok(token_metadata(18)),
-                |pool| {
-                    if failed_data_bytes.contains(&last_byte(&pool.0)) {
-                        Err(PoolDataFailure::CallFailed(PoolDataCall::Slot0))
-                    } else {
-                        Ok(balanced_pool_state())
-                    }
-                },
-            );
-
-            let expected = verified_bytes
+            let metadata = verified_bytes
                 .iter()
-                .filter(|byte| !failed_data_bytes.contains(byte))
-                .map(|byte| pool(*byte))
-                .collect::<HashSet<_>>();
-            let snapshotted = outcome
-                .pool_snapshots
-                .keys()
-                .copied()
-                .collect::<HashSet<_>>();
-            prop_assert_eq!(snapshotted, expected);
+                .map(|byte| {
+                    (
+                        candidate(*byte),
+                        Ok(pool_metadata_with_tokens(*byte, byte.wrapping_add(64))),
+                    )
+                })
+                .collect();
 
-            for snapshot_pool in outcome.pool_snapshots.keys() {
-                prop_assert!(outcome.pool_registry.verified_metadata(*snapshot_pool).is_some());
-            }
+            let outcome = drive_to_ready(metadata, |_| Ok(token_metadata(18)));
+
+            prop_assert!(outcome.pool_snapshots.is_empty());
         }
 
         // Mirrors `kernel::canonical_verified_pool_tokens_are_known_or_pending`: every token of a
@@ -1571,7 +1412,6 @@ mod tests {
             let outcome = drive_to_ready(
                 metadata,
                 |_| Ok(token_metadata(18)),
-                |_| Ok(balanced_pool_state()),
             );
 
             for byte in &verified_bytes {

@@ -7,7 +7,7 @@ use client_evm::{
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, kernel,
     multi_chain_kernel::{
-        Effect, Event, OptimizationPoolReserves, State, Subscription, transition,
+        Effect, Event, OptimizationPoolReserves, State, Subscription, SubscriptionData, transition,
     },
     subscribe_new_heads, subscribe_pool_events,
 };
@@ -211,15 +211,15 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
         match subscription {
             Subscription::NewHeadsSubscription(chain) => {
                 let map_client_event = |client_event: ClientEvent| {
-                    map_client_chain_event(client_event)
-                        .map(|event| Event::ChainEvent { chain, event })
+                    map_client_subscription_data(client_event)
+                        .map(|data| Event::SubscriptionData { chain, data })
                 };
                 let _ = subscribe_new_heads(self.rpc_config(), chain, sender, map_client_event);
             }
             Subscription::PoolEventsSubscription(chain) => {
                 let map_client_event = |client_event: ClientEvent| {
-                    map_client_chain_event(client_event)
-                        .map(|event| Event::ChainEvent { chain, event })
+                    map_client_subscription_data(client_event)
+                        .map(|data| Event::SubscriptionData { chain, data })
                 };
                 let _ = subscribe_pool_events(self.rpc_config(), chain, sender, map_client_event);
             }
@@ -302,6 +302,7 @@ fn format_input_log(input: &Event) -> String {
         Event::FinalizedHeaderUnavailable { chain } => {
             format!("input finalized_header_unavailable chain={chain:?}")
         }
+        Event::SubscriptionData { chain, data } => format_subscription_data_log(*chain, data),
         Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
         Event::BootstrapEvent { chain, event } => format_bootstrap_event_log(*chain, event),
         Event::OptimizationStepCompleted { result } => format!(
@@ -323,6 +324,17 @@ fn format_run_optimization_effect_log(input: &OptimizationPoolReserves) -> Strin
         "effect run_optimization blocks={blocks} reserves={}",
         input.reserves.len()
     )
+}
+
+fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> String {
+    match data {
+        SubscriptionData::NewHead {
+            hash, parent_hash, ..
+        } => format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}"),
+        SubscriptionData::PoolLog { block_hash, .. } => {
+            format!("input chain={chain:?} log_observed block={block_hash} pools=1")
+        }
+    }
 }
 
 fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
@@ -403,10 +415,6 @@ fn format_bootstrap_event_log(chain: ChainKey, event: &bootstrap::Event) -> Stri
         bootstrap::Event::TokenMetadataReceived { metadata, .. } => format!(
             "input chain={chain:?} bootstrap_token_metadata_received tokens={}",
             metadata.len(),
-        ),
-        bootstrap::Event::PoolDataReceived { pools, .. } => format!(
-            "input chain={chain:?} bootstrap_pool_data_received pools={}",
-            pools.len(),
         ),
         bootstrap::Event::RequestFailed { request_id } => {
             format!("input chain={chain:?} bootstrap_request_failed request={request_id:?}")
@@ -517,22 +525,6 @@ impl ClientEvmRuntime {
                     }
                 }
             }
-            bootstrap::AnyIssuedRequest::PoolData(request) => {
-                let request_id = request.request_id;
-                let at = request.request_payload.at;
-                let pools = request.request_payload.pools;
-
-                match fetch_pool_data(&self.agent, config, chain, at, pools) {
-                    Ok(pools) => bootstrap::Event::PoolDataReceived { request_id, pools },
-                    Err(error) => {
-                        let request_id = bootstrap::AnyRequestId::PoolData(request_id);
-                        self.logger.log(&format!(
-                            "error chain={chain:?} bootstrap_request_failed request={request_id:?} error={error}"
-                        ));
-                        bootstrap::Event::RequestFailed { request_id }
-                    }
-                }
-            }
         };
 
         vec![Event::BootstrapEvent { chain, event }]
@@ -552,19 +544,16 @@ impl ClientEvmRuntime {
     }
 }
 
-fn map_client_chain_event(client_chain_event: ClientEvent) -> Option<client_evm::kernel::Event> {
+fn map_client_subscription_data(client_chain_event: ClientEvent) -> Option<SubscriptionData> {
     match client_chain_event {
-        ClientEvent::NewHead { header, .. } => Some(client_evm::kernel::Event::HeadObserved {
+        ClientEvent::NewHead { header, .. } => Some(SubscriptionData::NewHead {
             hash: header.inner.hash,
             parent_hash: header.inner.inner.parent_hash,
             logs_bloom: header.inner.inner.logs_bloom,
         }),
         ClientEvent::PoolLogObserved {
             block_hash, log, ..
-        } => Some(client_evm::kernel::Event::LogObserved {
-            block_hash,
-            logs: vec![log],
-        }),
+        } => Some(SubscriptionData::PoolLog { block_hash, log }),
         ClientEvent::Subscribed { .. } => None,
         ClientEvent::Closed { .. } => None,
     }

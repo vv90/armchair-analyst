@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::{GetPoolData, GetPoolMetadata, GetTokenMetadata};
+use super::{GetPoolMetadata, GetTokenMetadata};
 pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
 use crate::{
     request_tracking::{
@@ -26,7 +26,6 @@ pub enum AnyRequestId {
     PoolCandidates(RequestId<GetPoolCandidatesInRange>),
     PoolMetadata(RequestId<GetPoolMetadata>),
     TokenMetadata(RequestId<GetTokenMetadata>),
-    PoolData(RequestId<GetPoolData>),
 }
 
 impl fmt::Debug for AnyRequestId {
@@ -44,7 +43,6 @@ impl fmt::Debug for AnyRequestId {
             AnyRequestId::TokenMetadata(request_id) => {
                 write!(formatter, "token_metadata#{request_id:?}")
             }
-            AnyRequestId::PoolData(request_id) => write!(formatter, "pool_data#{request_id:?}"),
         }
     }
 }
@@ -54,7 +52,6 @@ pub enum AnyIssuedRequest {
     PoolCandidates(IssuedRequest<GetPoolCandidatesInRange>),
     PoolMetadata(IssuedRequest<GetPoolMetadata>),
     TokenMetadata(IssuedRequest<GetTokenMetadata>),
-    PoolData(IssuedRequest<GetPoolData>),
 }
 
 /// Single-host request ledger for the bootstrap phase, mirroring `kernel::pending_requests`.
@@ -66,7 +63,6 @@ pub struct PendingRequests {
     pool_candidates: RequestCollection<GetPoolCandidatesInRange>,
     pool_metadata: RequestCollection<GetPoolMetadata>,
     token_metadata: RequestCollection<GetTokenMetadata>,
-    pool_data: RequestCollection<GetPoolData>,
 }
 
 impl PendingRequests {
@@ -77,7 +73,6 @@ impl PendingRequests {
             pool_candidates: RequestCollection::new(),
             pool_metadata: RequestCollection::new(),
             token_metadata: RequestCollection::new(),
-            pool_data: RequestCollection::new(),
         }
     }
 
@@ -126,11 +121,6 @@ impl PendingRequests {
                     .into_iter()
                     .map(AnyRequestId::TokenMetadata),
             )
-            .chain(
-                expired_request_ids::<Self, GetPoolData>(self, tick)
-                    .into_iter()
-                    .map(AnyRequestId::PoolData),
-            )
             .collect()
     }
 
@@ -151,9 +141,6 @@ impl PendingRequests {
             }
             AnyRequestId::TokenMetadata(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::TokenMetadata)
-            }
-            AnyRequestId::PoolData(request_id) => {
-                self.retry_typed(request_id, tick, AnyIssuedRequest::PoolData)
             }
         }
     }
@@ -181,7 +168,6 @@ impl PendingRequests {
             + self.pool_candidates.len()
             + self.pool_metadata.len()
             + self.token_metadata.len()
-            + self.pool_data.len()
     }
 }
 
@@ -228,16 +214,6 @@ impl RequestStore<GetTokenMetadata> for PendingRequests {
 
     fn request_collection_mut(&mut self) -> &mut RequestCollection<GetTokenMetadata> {
         &mut self.token_metadata
-    }
-}
-
-impl RequestStore<GetPoolData> for PendingRequests {
-    fn request_collection(&self) -> &RequestCollection<GetPoolData> {
-        &self.pool_data
-    }
-
-    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetPoolData> {
-        &mut self.pool_data
     }
 }
 

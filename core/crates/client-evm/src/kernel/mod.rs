@@ -355,6 +355,39 @@ impl BlocksGraph {
         (!dirty_pools.is_empty()).then_some((target_hash, dirty_pools))
     }
 
+    /// Up to `limit` verified pools (lowest address first) with no snapshot or failure anywhere
+    /// reachable — neither in the finalized snapshot nor on the present canonical suffix. These are the
+    /// never-covered pools the dirty-pool path never asks for because they have not traded; the
+    /// background backfill snapshots them so the frontier broadens over time. Address-sorted for stable,
+    /// resumable chunking: each fetched chunk becomes covered and drops out of the next selection, so
+    /// the sweep advances without a stored cursor.
+    fn uncovered_verified_pool_chunk(
+        &self,
+        chain: ChainKey,
+        tip_hash: BlockHash,
+        finalized_hash: BlockHash,
+        finalized_snapshots: &HashMap<PoolAddress, PoolState>,
+        registry: &TrustedPoolRegistry,
+        limit: usize,
+    ) -> HashSet<PoolAddress> {
+        let mut covered: HashSet<PoolAddress> = finalized_snapshots.keys().copied().collect();
+        for block_hash in self.present_canonical_hashes_oldest_to_newest(tip_hash, finalized_hash) {
+            if let Some(block) = self.get(&block_hash) {
+                covered.extend(block.pool_snapshots.keys().copied());
+                covered.extend(block.pool_data_failures.keys().copied());
+            }
+        }
+
+        let mut uncovered = registry
+            .verified_addresses(chain)
+            .into_iter()
+            .map(|address| PoolAddress(address, chain))
+            .filter(|pool| !covered.contains(pool))
+            .collect::<Vec<_>>();
+        uncovered.sort_by(|left, right| left.0.cmp(&right.0));
+        uncovered.into_iter().take(limit).collect()
+    }
+
     /// Finds present canonical blocks whose logs are still unknown and not pending.
     /// Added so every connected canonical block eventually gets log data without duplicating in-flight requests.
     fn unknown_present_canonical_log_hashes(
@@ -1431,6 +1464,76 @@ fn schedule_unknown_canonical_pool_data_request(
     )
 }
 
+/// Pools per background backfill request. Bounds each `GetPoolData` against the provider's per-request
+/// budget; the next chunk waits until this one resolves, so the sweep is sequential.
+const REGISTRY_BACKFILL_CHUNK: usize = 100;
+
+/// Background sweep that snapshots never-covered registry pools in bounded chunks, but only when no
+/// request is pending — so chain reconstruction and frontier freshness (which keep the pending tier
+/// busy) always preempt it. Runs after every event from the kernel `transition` tail, so progress
+/// tracks tip cadence rather than the coarse tick. One chunk is issued at a time: the chunk itself is
+/// pending until it resolves, after which the next idle event issues the following chunk. Each fetched
+/// pool becomes covered and leaves the uncovered set, so the sweep advances without a stored cursor.
+fn schedule_registry_backfill_pool_data(
+    chain: ChainKey,
+    state: State,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    if !state.pending_requests.is_empty() {
+        return (state, effects);
+    }
+
+    let State {
+        blocks,
+        canonical_tip,
+        pending_requests,
+        finalized_state,
+        pool_registry,
+        token_registry,
+        tick,
+        streamed_logs,
+    } = state;
+
+    let pools = blocks.uncovered_verified_pool_chunk(
+        chain,
+        canonical_tip,
+        finalized_state.block_hash,
+        &finalized_state.pool_snapshots,
+        &pool_registry,
+        REGISTRY_BACKFILL_CHUNK,
+    );
+    let mut pending_requests = pending_requests;
+
+    if !pools.is_empty() {
+        let request_payload = GetPoolData {
+            at: canonical_tip,
+            pools,
+        };
+        let (next_pending_requests, request_id) =
+            pending_requests.with_new_request(request_payload.clone(), tick);
+
+        pending_requests = next_pending_requests;
+        effects.push(Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+            request_id,
+            request_payload,
+        })));
+    }
+
+    (
+        State {
+            blocks,
+            canonical_tip,
+            pending_requests,
+            finalized_state,
+            pool_registry,
+            token_registry,
+            tick,
+            streamed_logs,
+        },
+        effects,
+    )
+}
+
 /// Runs every canonical follow-up scheduler in the order needed for dependencies between requests.
 /// Added so all transitions converge through one scheduling path instead of duplicating follow-up logic per event arm.
 fn schedule_unknown_canonical_requests(
@@ -1478,7 +1581,7 @@ fn request_missing_header(
 /// Applies one kernel event to state and returns the side effects the runtime must execute.
 /// Added as the pure deterministic boundary between EVM client state transitions and impure RPC/runtime work.
 pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Effect>) {
-    match event {
+    let (state, effects) = match event {
         Event::HeadObserved {
             hash,
             parent_hash,
@@ -1896,7 +1999,12 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                 issued_requests.into_iter().map(Effect::Request).collect(),
             )
         }
-    }
+    };
+
+    // After every event, when the priority tier is idle (no request pending), spend one slot on the
+    // background registry pool-state backfill. Tip cadence (not the coarse tick) drives this, so fast
+    // chains make progress between blocks; any pending priority request pauses it.
+    schedule_registry_backfill_pool_data(chain, state, effects)
 }
 
 /// Walks from a tip toward finality and returns the first missing block hash, if any.
@@ -3631,7 +3739,9 @@ mod tests {
         );
 
         assert_chain_reset_at(&next_state, finalized_hash);
-        assert!(effects.is_empty());
+        // A reset issues no reconstruction requests; the preserved verified pool is now uncovered, so
+        // the only follow-up is the background backfill snapshotting it at the (finalized) tip.
+        assert_no_priority_effects(&effects);
         assert_eq!(
             next_state
                 .pool_registry
@@ -3986,14 +4096,13 @@ mod tests {
             .next()
     }
 
-    /// A well-formed response answering whatever bootstrap request is outstanding, with metadata,
-    /// token, and pool-data results decided by the caller-supplied failing-byte sets.
+    /// A well-formed response answering whatever bootstrap request is outstanding, with metadata and
+    /// token results decided by the caller-supplied failing-byte sets.
     fn bootstrap_response(
         issued: &bootstrap::AnyIssuedRequest,
         window: &[RangeLogBlock],
         metadata_fails: &HashSet<u8>,
         token_fails: &HashSet<u8>,
-        data_fails: &HashSet<u8>,
     ) -> bootstrap::Event {
         match issued {
             bootstrap::AnyIssuedRequest::FinalizedHeader(request) => {
@@ -4053,26 +4162,6 @@ mod tests {
                     metadata,
                 }
             }
-            bootstrap::AnyIssuedRequest::PoolData(request) => {
-                let pools = request
-                    .request_payload
-                    .pools
-                    .iter()
-                    .map(|pool| {
-                        let byte = address_last_byte(&pool.0);
-                        let result = if data_fails.contains(&byte) {
-                            Err(PoolDataFailure::CallFailed(PoolDataCall::Slot0))
-                        } else {
-                            Ok(pool_state(byte))
-                        };
-                        (*pool, result)
-                    })
-                    .collect();
-                bootstrap::Event::PoolDataReceived {
-                    request_id: request.request_id,
-                    pools,
-                }
-            }
         }
     }
 
@@ -4084,7 +4173,6 @@ mod tests {
         window: &[RangeLogBlock],
         metadata_fails: &HashSet<u8>,
         token_fails: &HashSet<u8>,
-        data_fails: &HashSet<u8>,
         deliver_limit: usize,
     ) -> bootstrap::Completion {
         let (mut state, effects) = bootstrap::init(policy);
@@ -4099,7 +4187,7 @@ mod tests {
             let event = match outstanding.as_ref() {
                 Some(request) if delivered < deliver_limit => {
                     delivered += 1;
-                    bootstrap_response(request, window, metadata_fails, token_fails, data_fails)
+                    bootstrap_response(request, window, metadata_fails, token_fails)
                 }
                 _ => bootstrap::Event::Tick,
             };
@@ -4152,6 +4240,60 @@ mod tests {
         BlockHash::with_last_byte(250)
     }
 
+    /// Asserts the transition scheduled no priority (reconstruction/freshness) work. The only follow-up
+    /// permitted once the pending tier is idle is the background registry pool-state backfill, which is
+    /// always a `GetPoolData` request — so any other effect indicates unexpected priority scheduling.
+    fn assert_no_priority_effects(effects: &[Effect]) {
+        for effect in effects {
+            assert!(
+                matches!(effect, Effect::Request(AnyIssuedRequest::PoolData(_))),
+                "expected only background backfill pool-data effects"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_transition_backfills_uncovered_verified_pools_one_chunk_at_a_time() {
+        let finalized = BlockHash::with_last_byte(1);
+        let candidate = pool_candidate_address(3);
+        let mut state = empty_state_at(finalized);
+        state.pool_registry = registry_verifying(candidate);
+
+        // Idle pending tier: a tick (no priority work) issues exactly one backfill request covering the
+        // uncovered verified pool, snapshotted at the (finalized) tip.
+        let (state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
+        let request = match effects.as_slice() {
+            [Effect::Request(AnyIssuedRequest::PoolData(request))] => request,
+            _ => panic!("expected exactly one backfill pool-data request"),
+        };
+        assert_eq!(request.request_payload.at, finalized);
+        assert!(request.request_payload.pools.contains(&pool_address(3)));
+
+        // The chunk is now pending, so a second idle tick issues no further backfill (sequential).
+        let (_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn backfill_is_suppressed_while_a_request_is_pending() {
+        let finalized = BlockHash::with_last_byte(1);
+        let candidate = pool_candidate_address(3);
+        let mut state = empty_state_at(finalized);
+        state.pool_registry = registry_verifying(candidate);
+
+        // A fresh (non-expired) request occupies the priority tier; the tick must not start a backfill.
+        let (pending_requests, _request_id) = state.pending_requests.with_new_request(
+            GetBlockHeader {
+                block_hash: BlockHash::with_last_byte(50),
+            },
+            state.tick,
+        );
+        state.pending_requests = pending_requests;
+
+        let (_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
+        assert!(effects.is_empty());
+    }
+
     // Positive control: a clean full bootstrap (contiguous window, all calls succeed) activates
     // into a state that satisfies every invariant, both at activation and after a head builds on
     // the seeded tip. If this fails, the harness or the bridge mapping is wrong, not the logic.
@@ -4169,7 +4311,6 @@ mod tests {
         let outcome = match drive_bootstrap_to_completion(
             policy,
             &window,
-            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             5,
@@ -4215,7 +4356,6 @@ mod tests {
         let outcome = match drive_bootstrap_to_completion(
             policy,
             &window,
-            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             2,
@@ -4269,7 +4409,6 @@ mod tests {
             &window,
             &HashSet::new(),
             &HashSet::new(),
-            &HashSet::new(),
             5,
         ) {
             bootstrap::Completion::Ready(outcome) => outcome,
@@ -4319,7 +4458,6 @@ mod tests {
             offsets in prop::collection::hash_set(1u64..40, 0..16),
             metadata_fails in prop::collection::hash_set(any::<u8>(), 0..16),
             token_fails in prop::collection::hash_set(any::<u8>(), 0..16),
-            data_fails in prop::collection::hash_set(any::<u8>(), 0..16),
             tip_trim in 0usize..6,
             deliver_limit in 0usize..6,
         ) {
@@ -4338,7 +4476,6 @@ mod tests {
                 &window,
                 &metadata_fails,
                 &token_fails,
-                &data_fails,
                 deliver_limit,
             ) {
                 let (state, activation_effects) = activate_bootstrap_outcome_for_test(outcome);
@@ -4355,7 +4492,6 @@ mod tests {
             offsets in prop::collection::hash_set(1u64..40, 0..16),
             metadata_fails in prop::collection::hash_set(any::<u8>(), 0..16),
             token_fails in prop::collection::hash_set(any::<u8>(), 0..16),
-            data_fails in prop::collection::hash_set(any::<u8>(), 0..16),
             tip_trim in 0usize..6,
             deliver_limit in 0usize..6,
         ) {
@@ -4374,7 +4510,6 @@ mod tests {
                 &window,
                 &metadata_fails,
                 &token_fails,
-                &data_fails,
                 deliver_limit,
             ) {
                 let seed_tip = outcome.seed_blocks.last().map(|block| block.hash);
@@ -5562,7 +5697,8 @@ mod tests {
             },
         );
 
-        assert!(effects.is_empty());
+        // Buffering the log emits nothing; the verified-but-uncovered pool draws a background backfill.
+        assert_no_priority_effects(&effects);
         assert!(buffered_state.blocks.get(&block_hash).is_none());
 
         let (next_state, _effects) = transition(
@@ -9930,7 +10066,8 @@ mod tests {
                 );
 
                 state = next_state;
-                assert!(effects.is_empty());
+                // Token metadata is the last priority step; any follow-up is background backfill only.
+                assert_no_priority_effects(&effects);
             }
         }
 
@@ -10551,7 +10688,9 @@ mod tests {
                 },
             );
 
-            prop_assert!(effects.is_empty());
+            // Compaction itself schedules nothing; with an idle pending tier the only follow-up is the
+            // background backfill of uncovered verified pools.
+            assert_no_priority_effects(&effects);
             prop_assert_eq!(
                 state.finalized_state.block_hash,
                 hash_for_node(expected_finalized_index)

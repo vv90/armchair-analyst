@@ -148,6 +148,16 @@ impl PendingRequests {
         issue_request(self, payload, tick)
     }
 
+    /// Reports whether no request is in flight across any collection. Used to gate the background
+    /// pool-state backfill behind an idle priority tier.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.block_headers.values().next().is_none()
+            && self.block_logs.values().next().is_none()
+            && self.pool_data.values().next().is_none()
+            && self.pool_metadata.values().next().is_none()
+            && self.token_metadata.values().next().is_none()
+    }
+
     pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
         self.block_logs
             .values()

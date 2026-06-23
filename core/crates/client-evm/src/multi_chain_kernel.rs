@@ -3,13 +3,14 @@ use std::{
     time::Duration,
 };
 
-use alloy::primitives::{BlockHash, U256};
+use alloy::primitives::{BlockHash, Bloom, U256};
 use optimization::{Invertible, OptimizationStepResult, PoolReserves, VirtualReserveValues};
 use thiserror::Error;
 
 use crate::{
-    PoolAddress, PoolMetadata, PoolState, PoolStateError, TokenAddress, TokenAmountConversionError,
-    TokenDecimals, UniswapV3Fee, bootstrap, chain::ChainKey, kernel, u256_token_amount_to_f32,
+    PoolAddress, PoolLog, PoolMetadata, PoolState, PoolStateError, TokenAddress,
+    TokenAmountConversionError, TokenDecimals, UniswapV3Fee, bootstrap, chain::ChainKey, kernel,
+    u256_token_amount_to_f32,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,7 +46,10 @@ pub struct State {
 }
 
 enum ChainLifecycle {
-    Bootstrapping(bootstrap::State),
+    /// A chain still fetching its anchor/discovery seed. The `Vec<SubscriptionData>` buffers the live
+    /// heads/logs that arrive meanwhile so they can be replayed onto the seeded graph at activation,
+    /// avoiding a per-block header walk to bridge `seed-tip..now`.
+    Bootstrapping(bootstrap::State, Vec<SubscriptionData>),
     Active(kernel::State),
 }
 
@@ -142,7 +146,10 @@ impl State {
 
         for &chain in chains {
             let (bootstrap_state, bootstrap_effects) = bootstrap::init(bootstrap_policy(chain));
-            chain_map.insert(chain, ChainLifecycle::Bootstrapping(bootstrap_state));
+            chain_map.insert(
+                chain,
+                ChainLifecycle::Bootstrapping(bootstrap_state, Vec::new()),
+            );
             effects.extend(wrap_bootstrap_effects(chain, bootstrap_effects));
         }
 
@@ -168,7 +175,7 @@ impl State {
         self.chains
             .get(&chain)
             .map(|chain_state| match chain_state {
-                ChainLifecycle::Bootstrapping(_) => ChainStatus::Initializing,
+                ChainLifecycle::Bootstrapping(..) => ChainStatus::Initializing,
                 ChainLifecycle::Active(_) => ChainStatus::Active,
             })
     }
@@ -198,7 +205,7 @@ fn observe_chain(
     last_optimized_block: Option<BlockHash>,
 ) -> ChainObservation {
     match chain_state {
-        ChainLifecycle::Bootstrapping(_) => ChainObservation::Initializing,
+        ChainLifecycle::Bootstrapping(..) => ChainObservation::Initializing,
         ChainLifecycle::Active(chain_state) => ChainObservation::Active(ChainProgress {
             verified_pools: chain_state.verified_pool_count(),
             blocks_behind_tip: last_optimized_block
@@ -423,6 +430,42 @@ fn convert_pool_amount(
     })
 }
 
+/// Live subscription payload — exactly the two cases a `newHeads`/`logs` subscription can deliver.
+/// Buffered verbatim while a chain bootstraps, then mapped to a `kernel::Event` on activation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionData {
+    NewHead {
+        hash: BlockHash,
+        parent_hash: BlockHash,
+        logs_bloom: Bloom,
+    },
+    PoolLog {
+        block_hash: BlockHash,
+        log: PoolLog,
+    },
+}
+
+impl SubscriptionData {
+    /// Maps the buffered subscription payload into the kernel event it drives.
+    fn into_kernel_event(self) -> kernel::Event {
+        match self {
+            SubscriptionData::NewHead {
+                hash,
+                parent_hash,
+                logs_bloom,
+            } => kernel::Event::HeadObserved {
+                hash,
+                parent_hash,
+                logs_bloom,
+            },
+            SubscriptionData::PoolLog { block_hash, log } => kernel::Event::LogObserved {
+                block_hash,
+                logs: vec![log],
+            },
+        }
+    }
+}
+
 pub enum Event {
     FinalizedHeaderReceived {
         chain: ChainKey,
@@ -431,6 +474,14 @@ pub enum Event {
     FinalizedHeaderUnavailable {
         chain: ChainKey,
     },
+    /// Live subscription data (heads/logs). Carried as the narrow [`SubscriptionData`] rather than a
+    /// `kernel::Event` so it can be buffered while a chain bootstraps without making RPC-response
+    /// variants (which never originate from a subscription) representable in that buffer.
+    SubscriptionData {
+        chain: ChainKey,
+        data: SubscriptionData,
+    },
+    /// A `kernel::Event` produced by executing an RPC effect for an already-active chain.
     ChainEvent {
         chain: ChainKey,
         event: kernel::Event,
@@ -477,6 +528,7 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
             finalized_header_received(state, chain, block_hash)
         }
         Event::FinalizedHeaderUnavailable { chain } => finalized_header_unavailable(state, chain),
+        Event::SubscriptionData { chain, data } => subscription_data(state, chain, data),
         Event::ChainEvent { chain, event } => chain_event(state, chain, event),
         Event::BootstrapEvent { chain, event } => bootstrap_event(state, chain, event),
         Event::OptimizationStepCompleted { result } => optimization_step_completed(state, result),
@@ -574,8 +626,8 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
     } = state;
 
     match chains.remove(&chain) {
-        Some(ChainLifecycle::Bootstrapping(bootstrap_state)) => {
-            let (lifecycle, effects) = advance_bootstrap(chain, bootstrap_state, event);
+        Some(ChainLifecycle::Bootstrapping(bootstrap_state, buffered)) => {
+            let (lifecycle, effects) = advance_bootstrap(chain, bootstrap_state, buffered, event);
             if let Some(lifecycle) = lifecycle {
                 chains.insert(chain, lifecycle);
             }
@@ -616,6 +668,7 @@ fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (S
 fn advance_bootstrap(
     chain: ChainKey,
     bootstrap_state: bootstrap::State,
+    buffered: Vec<SubscriptionData>,
     event: bootstrap::Event,
 ) -> (Option<ChainLifecycle>, Vec<Effect>) {
     let (bootstrap_state, effects) = bootstrap::transition(chain, bootstrap_state, event);
@@ -629,14 +682,43 @@ fn advance_bootstrap(
                     .into_iter()
                     .map(|effect| Effect::ChainEffect { chain, effect }),
             );
+            // Replay the live subscription data buffered during bootstrap onto the seeded kernel, so
+            // the graph reaches the current tip from the events we already received instead of a
+            // per-block header walk. Replay drives the inner kernel directly (no optimization
+            // dispatch); the next live event re-derives the overlay.
+            let (chain_state, replay_effects) =
+                replay_buffered_subscription_data(chain, chain_state, buffered);
+            effects.extend(replay_effects);
             (Some(ChainLifecycle::Active(chain_state)), effects)
         }
         Some(bootstrap::Completion::Abandoned) => (None, effects),
         None => (
-            Some(ChainLifecycle::Bootstrapping(bootstrap_state)),
+            Some(ChainLifecycle::Bootstrapping(bootstrap_state, buffered)),
             effects,
         ),
     }
+}
+
+/// Folds the buffered subscription data through the freshly-activated kernel, threading state so each
+/// scheduler dedups against the growing pending set. Wraps the resulting inner effects with the chain.
+fn replay_buffered_subscription_data(
+    chain: ChainKey,
+    chain_state: kernel::State,
+    buffered: Vec<SubscriptionData>,
+) -> (kernel::State, Vec<Effect>) {
+    buffered.into_iter().fold(
+        (chain_state, Vec::new()),
+        |(chain_state, mut effects), data| {
+            let (chain_state, kernel_effects) =
+                kernel::transition(chain, chain_state, data.into_kernel_event());
+            effects.extend(
+                kernel_effects
+                    .into_iter()
+                    .map(|effect| Effect::ChainEffect { chain, effect }),
+            );
+            (chain_state, effects)
+        },
+    )
 }
 
 /// Seeds an active kernel state from a completed bootstrap outcome.
@@ -673,6 +755,55 @@ fn wrap_bootstrap_effects(chain: ChainKey, effects: Vec<bootstrap::Effect>) -> V
         .into_iter()
         .map(|effect| Effect::BootstrapEffect { chain, effect })
         .collect()
+}
+
+/// Routes live subscription data: a bootstrapping chain buffers it for replay at activation; an active
+/// chain maps it to a `kernel::Event` and processes it immediately through the normal kernel path.
+fn subscription_data(
+    state: State,
+    chain: ChainKey,
+    data: SubscriptionData,
+) -> (State, Vec<Effect>) {
+    match state.chains.get(&chain) {
+        Some(ChainLifecycle::Bootstrapping(..)) => buffer_subscription_data(state, chain, data),
+        _ => chain_event(state, chain, data.into_kernel_event()),
+    }
+}
+
+/// Appends subscription data to a bootstrapping chain's replay buffer; a no-op for any other state.
+fn buffer_subscription_data(
+    state: State,
+    chain: ChainKey,
+    data: SubscriptionData,
+) -> (State, Vec<Effect>) {
+    let State {
+        mut chains,
+        latest_optimization_result,
+        last_optimized_block,
+    } = state;
+
+    match chains.remove(&chain) {
+        Some(ChainLifecycle::Bootstrapping(bootstrap_state, mut buffered)) => {
+            buffered.push(data);
+            chains.insert(
+                chain,
+                ChainLifecycle::Bootstrapping(bootstrap_state, buffered),
+            );
+        }
+        Some(other) => {
+            chains.insert(chain, other);
+        }
+        None => {}
+    }
+
+    (
+        State {
+            chains,
+            latest_optimization_result,
+            last_optimized_block,
+        },
+        Vec::new(),
+    )
 }
 
 /// Forwards an inner kernel event to an active chain and wraps its effects with the chain key.
@@ -780,9 +911,9 @@ fn tick(state: State) -> (State, Vec<Effect>) {
         (BTreeMap::new(), Vec::new()),
         |(mut chains, mut effects), (chain, chain_state)| {
             match chain_state {
-                ChainLifecycle::Bootstrapping(bootstrap_state) => {
+                ChainLifecycle::Bootstrapping(bootstrap_state, buffered) => {
                     let (lifecycle, chain_effects) =
-                        advance_bootstrap(chain, bootstrap_state, bootstrap::Event::Tick);
+                        advance_bootstrap(chain, bootstrap_state, buffered, bootstrap::Event::Tick);
                     if let Some(lifecycle) = lifecycle {
                         chains.insert(chain, lifecycle);
                     }
@@ -844,7 +975,7 @@ fn bootstrap_policy(chain: ChainKey) -> bootstrap::BootstrapPolicy {
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
-    use alloy::primitives::{Address, BlockHash, U160, U256, aliases::I24};
+    use alloy::primitives::{Address, BlockHash, Bloom, U160, U256, aliases::I24};
     use optimization::{
         Invertible, OptimizationStepResult, OptimizationStepStatus, VirtualReserveValues,
     };
@@ -2218,10 +2349,6 @@ mod tests {
                 request_id: issued.request_id,
                 metadata: HashMap::new(),
             },
-            AnyIssuedRequest::PoolData(issued) => bootstrap::Event::PoolDataReceived {
-                request_id: issued.request_id,
-                pools: HashMap::new(),
-            },
         };
 
         Event::BootstrapEvent { chain, event }
@@ -2244,6 +2371,55 @@ mod tests {
         }
 
         state
+    }
+
+    #[test]
+    fn subscription_data_during_bootstrap_is_buffered_then_replayed_on_activation() {
+        let chain = ChainKey::Ethereum;
+        let finalized = BlockHash::with_last_byte(9);
+        let head = BlockHash::with_last_byte(20);
+
+        let (mut state, effects) = State::init(&[chain]);
+
+        // A live head (building on the finalized anchor) arrives while bootstrapping. It must be
+        // buffered — no effect, chain still initializing — not dropped or applied to a missing kernel.
+        let (next_state, buffer_effects) = transition(
+            state,
+            Event::SubscriptionData {
+                chain,
+                data: SubscriptionData::NewHead {
+                    hash: head,
+                    parent_hash: finalized,
+                    logs_bloom: Bloom::ZERO,
+                },
+            },
+        );
+        state = next_state;
+        assert!(buffer_effects.is_empty());
+        assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
+
+        // Complete bootstrap with empty responses (anchored at `finalized`, empty seed). Buffering left
+        // the outstanding bootstrap request untouched, so the captured `effects` still drive it.
+        let mut effects = effects;
+        while state.status(chain) == Some(ChainStatus::Initializing) {
+            let event =
+                bootstrap_success_event(chain, finalized, single_bootstrap_effect(&effects, chain));
+            let result = transition(state, event);
+            state = result.0;
+            effects = result.1;
+        }
+
+        // On activation the buffered head was replayed onto the seeded graph, so it is part of the
+        // active kernel's canonical graph rather than lost to a header-walk gap.
+        match state.chains.get(&chain) {
+            Some(ChainLifecycle::Active(kernel_state)) => {
+                assert!(
+                    kernel_state.blocks_behind(head).is_some(),
+                    "buffered head should be on the activated canonical path"
+                );
+            }
+            _ => panic!("chain should be active after bootstrap"),
+        }
     }
 
     fn assert_single_fetch_finalized_header_effect_for_chain(effects: &[Effect], chain: ChainKey) {
