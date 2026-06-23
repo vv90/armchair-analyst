@@ -20,8 +20,9 @@ use crate::{
     PoolDataResult, PoolLog, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
     PoolMetadataResult, PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals,
     TokenMetadata, TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
-    config::{compose_http_endpoint, compose_ws_endpoint},
+    config::compose_ws_endpoint,
     decode_pool_log,
+    endpoints::{ChainEndpoints, EndpointPool},
 };
 
 use super::{
@@ -34,7 +35,7 @@ use super::{
         parse_pool_logs_range_response, parse_subscription_response,
     },
     multicall3::{
-        MulticallCall, MulticallCallResult, build_multicall3_batch_request,
+        MulticallBlock, MulticallCall, MulticallCallResult, build_multicall3_batch_request,
         parse_multicall3_batch_response,
     },
 };
@@ -114,14 +115,16 @@ fn sanitize_error_body(body: &str) -> String {
 /// own per-chunk counts, so batches share no state and can run concurrently.
 fn run_multicall_batch(
     agent: &ureq::Agent,
-    endpoint: &str,
-    at: BlockHash,
+    pool: &EndpointPool,
+    block: MulticallBlock,
     batch: &[&[MulticallCall]],
 ) -> Result<Vec<MulticallCallResult>, ClientEvmError> {
-    let request = build_multicall3_batch_request(at, batch);
+    let request = build_multicall3_batch_request(block, batch);
     let expected_counts: Vec<usize> = batch.iter().map(|chunk| chunk.len()).collect();
-    let response_value = send_rpc_request(agent, endpoint, &request)?;
-    parse_multicall3_batch_response(&response_value, &expected_counts)
+    pool.with_failover(|endpoint| {
+        let response_value = send_rpc_request(agent, endpoint, &request)?;
+        parse_multicall3_batch_response(&response_value, &expected_counts)
+    })
 }
 
 /// Executes a Multicall3 `aggregate3` over an arbitrary number of calls by chunking them into
@@ -131,8 +134,8 @@ fn run_multicall_batch(
 /// order, exactly as a single `aggregate3` would — callers stay oblivious to the chunking.
 fn aggregate3_batched(
     agent: &ureq::Agent,
-    endpoint: &str,
-    at: BlockHash,
+    pool: &EndpointPool,
+    block: MulticallBlock,
     calls: &[MulticallCall],
 ) -> Result<Vec<MulticallCallResult>, ClientEvmError> {
     if calls.is_empty() {
@@ -147,7 +150,7 @@ fn aggregate3_batched(
         let window_results = thread::scope(|scope| {
             let handles: Vec<_> = window
                 .iter()
-                .map(|batch| scope.spawn(move || run_multicall_batch(agent, endpoint, at, batch)))
+                .map(|batch| scope.spawn(move || run_multicall_batch(agent, pool, block, batch)))
                 .collect();
             handles
                 .into_iter()
@@ -185,46 +188,49 @@ struct SubscriptionNotification<T> {
 
 pub fn fetch_block_header(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
     block_hash: BlockHash,
 ) -> Result<Option<ClientHead>, ClientEvmError> {
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let pool = endpoints.pool(chain)?;
     let request = build_block_header_request(HTTP_REQUEST_ID, block_hash);
-    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
-
-    parse_block_header_response(&response_value, HTTP_REQUEST_ID, block_hash)
+    pool.with_failover(|endpoint| {
+        let response_value = send_rpc_request(agent, endpoint, &request)?;
+        parse_block_header_response(&response_value, HTTP_REQUEST_ID, block_hash)
+    })
 }
 
 pub fn fetch_block_logs(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
     block_hash: BlockHash,
 ) -> Result<Vec<PoolLog>, ClientEvmError> {
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let pool = endpoints.pool(chain)?;
     let request = build_block_logs_request(HTTP_REQUEST_ID, block_hash);
-    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
-
-    parse_block_logs_response(&response_value, HTTP_REQUEST_ID, block_hash)
+    pool.with_failover(|endpoint| {
+        let response_value = send_rpc_request(agent, endpoint, &request)?;
+        parse_block_logs_response(&response_value, HTTP_REQUEST_ID, block_hash)
+    })
 }
 
 pub fn fetch_pool_candidates_in_range(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
     from_block: u64,
 ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let pool = endpoints.pool(chain)?;
     let request = build_pool_logs_range_request(HTTP_REQUEST_ID, from_block);
-    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
-
-    parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
+    pool.with_failover(|endpoint| {
+        let response_value = send_rpc_request(agent, endpoint, &request)?;
+        parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
+    })
 }
 
 pub fn fetch_pool_data(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
     at: BlockHash,
     pools: HashSet<PoolAddress>,
@@ -233,29 +239,32 @@ pub fn fetch_pool_data(
         return Ok(HashMap::new());
     }
 
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let endpoint_pool = endpoints.pool(chain)?;
     let pools = sorted_pool_addresses(pools);
     let calls = pool_data_multicall_calls(&pools);
-    let results = aggregate3_batched(agent, endpoint.as_str(), at, &calls)?;
+    let results = aggregate3_batched(agent, endpoint_pool, MulticallBlock::Hash(at), &calls)?;
 
     Ok(decode_pool_data_results(&pools, &results))
 }
 
 pub fn fetch_pool_metadata(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
-    at: BlockHash,
+    // Pool metadata (token0/token1/fee/tickSpacing) is immutable, so it is read at `latest` rather
+    // than the anchor block: this avoids historical-state execution that pruned free-tier upstreams
+    // reject outright. The anchor `_at` is retained for request plumbing/symmetry with pool data.
+    _at: BlockHash,
     candidates: HashSet<PoolCandidateAddress>,
 ) -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError> {
     if candidates.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let endpoint_pool = endpoints.pool(chain)?;
     let candidates = sorted_pool_candidate_addresses(candidates);
     let calls = pool_metadata_candidate_multicall_calls(&candidates);
-    let results = aggregate3_batched(agent, endpoint.as_str(), at, &calls)?;
+    let results = aggregate3_batched(agent, endpoint_pool, MulticallBlock::Latest, &calls)?;
     let (mut metadata_results, factory_inputs) =
         decode_pool_metadata_candidate_results(&candidates, &results);
 
@@ -264,7 +273,8 @@ pub fn fetch_pool_metadata(
     }
 
     let factory_calls = pool_metadata_factory_multicall_calls(&factory_inputs);
-    let factory_results = aggregate3_batched(agent, endpoint.as_str(), at, &factory_calls)?;
+    let factory_results =
+        aggregate3_batched(agent, endpoint_pool, MulticallBlock::Latest, &factory_calls)?;
 
     metadata_results.extend(decode_pool_metadata_factory_results(
         &factory_inputs,
@@ -276,19 +286,21 @@ pub fn fetch_pool_metadata(
 
 pub fn fetch_token_metadata(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
-    at: BlockHash,
+    // Token metadata (decimals) is immutable, so it is read at `latest` rather than the anchor block
+    // for the same reason as pool metadata. The anchor `_at` is retained for request plumbing.
+    _at: BlockHash,
     tokens: HashSet<TokenAddress>,
 ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
     if tokens.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let endpoint_pool = endpoints.pool(chain)?;
     let tokens = sorted_token_addresses(tokens);
     let calls = token_metadata_multicall_calls(&tokens);
-    let results = aggregate3_batched(agent, endpoint.as_str(), at, &calls)?;
+    let results = aggregate3_batched(agent, endpoint_pool, MulticallBlock::Latest, &calls)?;
 
     Ok(decode_token_metadata_results(&tokens, &results))
 }
@@ -610,14 +622,15 @@ fn decode_multicall_result<T>(
 
 pub fn fetch_finalized_block_header(
     agent: &ureq::Agent,
-    config: &RpcConfig,
+    endpoints: &ChainEndpoints,
     chain: ChainKey,
 ) -> Result<Option<ClientHead>, ClientEvmError> {
-    let endpoint = compose_http_endpoint(config, chain)?;
+    let pool = endpoints.pool(chain)?;
     let request = build_finalized_block_header_request(HTTP_REQUEST_ID);
-    let response_value = send_rpc_request(agent, endpoint.as_str(), &request)?;
-
-    parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)
+    pool.with_failover(|endpoint| {
+        let response_value = send_rpc_request(agent, endpoint, &request)?;
+        parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)
+    })
 }
 
 pub fn subscribe_new_heads<T, F>(
@@ -878,10 +891,10 @@ mod tests {
             "result": block_header_result(block_hash)
         });
         let (http_url, received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_block_header(&agent, &config, ChainKey::Ethereum, block_hash);
+        let result = fetch_block_header(&agent, &endpoints, ChainKey::Ethereum, block_hash);
 
         assert!(matches!(
             result,
@@ -913,11 +926,15 @@ mod tests {
             .local_addr()
             .expect("test listener must have local address");
         drop(listener);
-        let config = rpc_config(&format!("http://{address}"));
+        let endpoints = endpoints_for(&format!("http://{address}"));
         let agent = ureq::Agent::new_with_defaults();
 
-        let result =
-            fetch_block_header(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
+        let result = fetch_block_header(
+            &agent,
+            &endpoints,
+            ChainKey::Ethereum,
+            B256::with_last_byte(1),
+        );
 
         assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
@@ -928,11 +945,15 @@ mod tests {
             "500 Internal Server Error",
             "{\"error\":\"response size exceeded\"}",
         );
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result =
-            fetch_block_header(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
+        let result = fetch_block_header(
+            &agent,
+            &endpoints,
+            ChainKey::Ethereum,
+            B256::with_last_byte(1),
+        );
 
         assert!(matches!(
             result,
@@ -957,10 +978,10 @@ mod tests {
             ]
         });
         let (http_url, received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let candidates = fetch_block_logs(&agent, &config, ChainKey::Ethereum, block_hash)
+        let candidates = fetch_block_logs(&agent, &endpoints, ChainKey::Ethereum, block_hash)
             .expect("logs fetch")
             .iter()
             .map(|log| PoolCandidateAddress(log.address))
@@ -1003,22 +1024,27 @@ mod tests {
             .local_addr()
             .expect("test listener must have local address");
         drop(listener);
-        let config = rpc_config(&format!("http://{address}"));
+        let endpoints = endpoints_for(&format!("http://{address}"));
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_block_logs(&agent, &config, ChainKey::Ethereum, B256::with_last_byte(1));
+        let result = fetch_block_logs(
+            &agent,
+            &endpoints,
+            ChainKey::Ethereum,
+            B256::with_last_byte(1),
+        );
 
         assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
 
     #[test]
     fn fetch_pool_data_with_empty_pool_set_returns_empty_results_without_http() {
-        let config = rpc_config("http://127.0.0.1:9");
+        let endpoints = endpoints_for("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_data(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::new(),
@@ -1041,12 +1067,12 @@ mod tests {
             successful_multicall_result(liquidity_return_data(second_state.liquidity)),
         ]);
         let (http_url, received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_data(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([second_pool, first_pool]),
@@ -1092,12 +1118,12 @@ mod tests {
             failed_multicall_result(),
         ]);
         let (http_url, _received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_data(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([first_pool, second_pool]),
@@ -1122,12 +1148,12 @@ mod tests {
             successful_multicall_result(liquidity_return_data(state.liquidity)),
         ]);
         let (http_url, _received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_data(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([pool]),
@@ -1148,12 +1174,12 @@ mod tests {
             .local_addr()
             .expect("test listener must have local address");
         drop(listener);
-        let config = rpc_config(&format!("http://{address}"));
+        let endpoints = endpoints_for(&format!("http://{address}"));
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_data(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::from([PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
@@ -1164,12 +1190,12 @@ mod tests {
 
     #[test]
     fn fetch_pool_metadata_with_empty_candidate_set_returns_empty_results_without_http() {
-        let config = rpc_config("http://127.0.0.1:9");
+        let endpoints = endpoints_for("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::new(),
@@ -1204,12 +1230,12 @@ mod tests {
         ]);
         let (http_url, received_request, server) =
             spawn_json_rpc_server_sequence(vec![first_response, second_response]);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([second_candidate, first_candidate]),
@@ -1235,7 +1261,7 @@ mod tests {
             .recv()
             .expect("server must report first request");
         assert_eq!(first_request.path, "/ethereum/api-key");
-        assert_multicall_request_at(&first_request.body, at);
+        assert_multicall_request_at_latest(&first_request.body);
         let first_calls = multicall_calls_from_request(&first_request.body);
         assert_eq!(
             first_calls
@@ -1255,7 +1281,7 @@ mod tests {
         let second_request = received_request
             .recv()
             .expect("server must report second request");
-        assert_multicall_request_at(&second_request.body, at);
+        assert_multicall_request_at_latest(&second_request.body);
         let second_calls = multicall_calls_from_request(&second_request.body);
         assert_eq!(
             second_calls
@@ -1286,12 +1312,12 @@ mod tests {
             successful_multicall_result(fee_return_data(2500)),
         ]);
         let (http_url, received_request, server) = spawn_json_rpc_server_sequence(vec![response]);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([candidate]),
@@ -1321,12 +1347,12 @@ mod tests {
             successful_multicall_result(fee_return_data(UniswapV3Fee::Fee3000.pips())),
         ]);
         let (http_url, _received_request, server) = spawn_json_rpc_server_sequence(vec![response]);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([failed_candidate, malformed_candidate]),
@@ -1364,12 +1390,12 @@ mod tests {
         )]);
         let (http_url, _received_request, server) =
             spawn_json_rpc_server_sequence(vec![response, factory_response]);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([candidate]),
@@ -1406,12 +1432,12 @@ mod tests {
         ]);
         let (http_url, _received_request, server) =
             spawn_json_rpc_server_sequence(vec![response, factory_response]);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_pool_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([failed_candidate, malformed_candidate]),
@@ -1435,12 +1461,12 @@ mod tests {
 
     #[test]
     fn fetch_token_metadata_with_empty_token_set_returns_empty_results_without_http() {
-        let config = rpc_config("http://127.0.0.1:9");
+        let endpoints = endpoints_for("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_token_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::new(),
@@ -1459,12 +1485,12 @@ mod tests {
             successful_multicall_result(decimals_return_data(18)),
         ]);
         let (http_url, received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_token_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([second_token, first_token]),
@@ -1488,7 +1514,7 @@ mod tests {
             .recv()
             .expect("server must report received request");
         assert_eq!(request.path, "/ethereum/api-key");
-        assert_multicall_request_at(&request.body, at);
+        assert_multicall_request_at_latest(&request.body);
         let calls = multicall_calls_from_request(&request.body);
         assert_eq!(
             calls
@@ -1515,12 +1541,12 @@ mod tests {
             successful_multicall_result(decimals_return_data(37)),
         ]);
         let (http_url, _received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_token_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             HashSet::from([failed_token, malformed_token, unsupported_token]),
@@ -1577,12 +1603,12 @@ mod tests {
             }
         ]);
         let (http_url, received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_token_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             at,
             tokens.iter().copied().collect(),
@@ -1634,10 +1660,10 @@ mod tests {
         let chunk_count = call_count.div_ceil(MULTICALL_CHUNK_SIZE);
         let batch_count = chunk_count.div_ceil(MULTICALL_MAX_BATCH_ITEMS);
         let (http_url, server) = spawn_concurrent_multicall_echo_server(batch_count);
-        let endpoint = format!("{http_url}/ethereum/api-key");
+        let endpoint_pool = EndpointPool::single("drpc", format!("{http_url}/ethereum/api-key"));
         let agent = ureq::Agent::new_with_defaults();
 
-        let results = aggregate3_batched(&agent, &endpoint, at, &calls)
+        let results = aggregate3_batched(&agent, &endpoint_pool, MulticallBlock::Hash(at), &calls)
             .expect("batched aggregate must succeed");
 
         assert_eq!(results.len(), call_count);
@@ -1668,10 +1694,10 @@ mod tests {
         let chunk_count = call_count.div_ceil(MULTICALL_CHUNK_SIZE);
         let batch_count = chunk_count.div_ceil(MULTICALL_MAX_BATCH_ITEMS);
         let (http_url, server) = spawn_concurrent_multicall_echo_server(batch_count);
-        let endpoint = format!("{http_url}/ethereum/api-key");
+        let endpoint_pool = EndpointPool::single("drpc", format!("{http_url}/ethereum/api-key"));
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = aggregate3_batched(&agent, &endpoint, at, &calls);
+        let result = aggregate3_batched(&agent, &endpoint_pool, MulticallBlock::Hash(at), &calls);
 
         assert!(matches!(result, Err(ClientEvmError::JsonRpcError { .. })));
         server.join().expect("server thread must complete");
@@ -1691,12 +1717,12 @@ mod tests {
             .local_addr()
             .expect("test listener must have local address");
         drop(listener);
-        let config = rpc_config(&format!("http://{address}"));
+        let endpoints = endpoints_for(&format!("http://{address}"));
         let agent = ureq::Agent::new_with_defaults();
 
         let result = fetch_token_metadata(
             &agent,
-            &config,
+            &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
             HashSet::from([TokenAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
@@ -1714,10 +1740,10 @@ mod tests {
             "result": block_header_result(block_hash)
         });
         let (http_url, received_request, server) = spawn_json_rpc_server(response);
-        let config = rpc_config(&http_url);
+        let endpoints = endpoints_for(&http_url);
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_finalized_block_header(&agent, &config, ChainKey::Ethereum);
+        let result = fetch_finalized_block_header(&agent, &endpoints, ChainKey::Ethereum);
 
         assert!(matches!(
             result,
@@ -1749,10 +1775,10 @@ mod tests {
             .local_addr()
             .expect("test listener must have local address");
         drop(listener);
-        let config = rpc_config(&format!("http://{address}"));
+        let endpoints = endpoints_for(&format!("http://{address}"));
         let agent = ureq::Agent::new_with_defaults();
 
-        let result = fetch_finalized_block_header(&agent, &config, ChainKey::Ethereum);
+        let result = fetch_finalized_block_header(&agent, &endpoints, ChainKey::Ethereum);
 
         assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
     }
@@ -1958,7 +1984,7 @@ mod tests {
             .expect("multicall request must be a json-rpc batch array")
     }
 
-    fn assert_multicall_request_at(request: &Value, at: B256) {
+    fn assert_multicall_request_block(request: &Value, expected_block: Value) {
         let request = first_batch_entry(request);
         assert_eq!(request.get("method"), Some(&json!("eth_call")));
         assert_eq!(
@@ -1974,8 +2000,18 @@ mod tests {
                 .get("params")
                 .and_then(Value::as_array)
                 .and_then(|params| params.get(1)),
-            Some(&json!({ "blockHash": at }))
+            Some(&expected_block)
         );
+    }
+
+    /// State-sensitive reads (pool data) pin the anchor block hash.
+    fn assert_multicall_request_at(request: &Value, at: B256) {
+        assert_multicall_request_block(request, json!({ "blockHash": at }));
+    }
+
+    /// Immutable reads (pool/token metadata) are served at `latest`.
+    fn assert_multicall_request_at_latest(request: &Value) {
+        assert_multicall_request_block(request, json!("latest"));
     }
 
     fn multicall_batch_calls_from_request(request: &Value) -> Vec<MulticallCall> {
@@ -2262,12 +2298,14 @@ mod tests {
         ReceivedHttpRequest { path, body }
     }
 
-    fn rpc_config(http_url: &str) -> RpcConfig {
-        RpcConfig {
-            http_url: http_url.to_owned(),
-            ws_url: "wss://example.invalid".to_owned(),
-            api_key: "api-key".to_owned(),
-        }
+    // Builds a single-endpoint pool whose URL mirrors the dRPC composition (`{http}/ethereum/api-key`),
+    // so the fetch tests' path assertions are unchanged by the move to a multi-provider pool.
+    fn endpoints_for(http_url: &str) -> ChainEndpoints {
+        ChainEndpoints::single(
+            ChainKey::Ethereum,
+            "drpc",
+            format!("{}/ethereum/api-key", http_url.trim_end_matches('/')),
+        )
     }
 
     fn block_header_result(block_hash: B256) -> Value {

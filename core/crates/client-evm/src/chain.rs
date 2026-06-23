@@ -16,6 +16,15 @@ pub fn drpc_network_path(chain: ChainKey) -> &'static str {
     }
 }
 
+/// Inverse of [`drpc_network_path`]: resolves an active chain from its network slug. Used to map the
+/// per-chain keys of the endpoints config file onto [`ChainKey`]. Unknown slugs return `None`.
+pub fn chain_key_for_network_path(path: &str) -> Option<ChainKey> {
+    ACTIVE_CHAINS
+        .iter()
+        .copied()
+        .find(|&chain| drpc_network_path(chain) == path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

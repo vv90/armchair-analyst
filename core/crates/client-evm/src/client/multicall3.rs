@@ -17,6 +17,25 @@ pub(crate) struct MulticallCall {
     pub(crate) call_data: Bytes,
 }
 
+/// The `eth_call` block specifier for a multicall. State-sensitive reads (pool reserves/prices) must
+/// pin a specific block hash, but immutable reads (pool/token metadata) use `latest`: this avoids
+/// historical-state execution on pruned free-tier upstreams (which fail the call outright) and routes
+/// to any node rather than only those still holding the anchor block's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MulticallBlock {
+    Hash(BlockHash),
+    Latest,
+}
+
+impl MulticallBlock {
+    fn to_param(self) -> Value {
+        match self {
+            MulticallBlock::Hash(hash) => json!({ "blockHash": hash }),
+            MulticallBlock::Latest => json!("latest"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MulticallCallResult {
     pub(crate) success: bool,
@@ -44,7 +63,7 @@ sol! {
 
 pub(crate) fn build_multicall3_request(
     request_id: u64,
-    at: BlockHash,
+    block: MulticallBlock,
     calls: &[MulticallCall],
 ) -> Value {
     let call = Multicall3::aggregate3Call {
@@ -67,9 +86,7 @@ pub(crate) fn build_multicall3_request(
                 "to": MULTICALL3_ADDRESS,
                 "data": Bytes::from(call.abi_encode())
             },
-            {
-                "blockHash": at
-            }
+            block.to_param()
         ]
     })
 }
@@ -120,12 +137,15 @@ pub(crate) fn parse_multicall3_response(
 /// its chunk even if the provider reorders entries. Splitting a large call set into bounded chunks
 /// keeps each individual `eth_call` under the node's response/gas limit; batching keeps the whole set
 /// to one HTTP round-trip.
-pub(crate) fn build_multicall3_batch_request(at: BlockHash, chunks: &[&[MulticallCall]]) -> Value {
+pub(crate) fn build_multicall3_batch_request(
+    block: MulticallBlock,
+    chunks: &[&[MulticallCall]],
+) -> Value {
     Value::Array(
         chunks
             .iter()
             .enumerate()
-            .map(|(index, chunk)| build_multicall3_request(index as u64 + 1, at, chunk))
+            .map(|(index, chunk)| build_multicall3_request(index as u64 + 1, block, chunk))
             .collect(),
     )
 }
@@ -220,7 +240,7 @@ mod tests {
         let call_data = Bytes::from(vec![0x12, 0x34]);
         let request = build_multicall3_request(
             9,
-            at,
+            MulticallBlock::Hash(at),
             &[MulticallCall {
                 target,
                 call_data: call_data.clone(),
@@ -377,7 +397,7 @@ mod tests {
         let at = B256::with_last_byte(7);
         let first = [call(1), call(2)];
         let second = [call(3)];
-        let request = build_multicall3_batch_request(at, &[&first, &second]);
+        let request = build_multicall3_batch_request(MulticallBlock::Hash(at), &[&first, &second]);
 
         let entries = request.as_array().expect("batch request must be an array");
         assert_eq!(entries.len(), 2);

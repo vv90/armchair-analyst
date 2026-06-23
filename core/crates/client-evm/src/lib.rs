@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod chain;
 pub mod client;
 mod config;
+pub mod endpoints;
 mod erc20;
 mod error;
 pub mod kernel;
@@ -19,7 +20,7 @@ mod tokens;
 pub mod uniswap_v3;
 mod utils;
 
-pub use chain::{ACTIVE_CHAINS, ChainKey, drpc_network_path};
+pub use chain::{ACTIVE_CHAINS, ChainKey, chain_key_for_network_path, drpc_network_path};
 pub use client::{
     ClientEvent, ClientHead, MetadataCache, MetadataCacheError, RangeLogBlock, fetch_block_header,
     fetch_block_logs, fetch_finalized_block_header, fetch_pool_candidates_in_range,
@@ -27,6 +28,9 @@ pub use client::{
     subscribe_pool_events,
 };
 pub use config::RpcConfig;
+pub use endpoints::{
+    ChainEndpoints, EndpointPool, EndpointSpec, assemble_chain_endpoints, default_public_endpoints,
+};
 pub use error::{ClientEvmError, ConfigScope};
 pub use kernel::pending_requests::{
     AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,

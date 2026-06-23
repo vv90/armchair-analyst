@@ -1,9 +1,9 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
-    ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainKey, ClientEvent,
-    ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, MetadataCache, PoolAddress,
-    PoolCandidateAddress, PoolDataResult, PoolLog, PoolMetadataResult, RequestId, RpcConfig,
-    TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
+    ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
+    ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, MetadataCache,
+    PoolAddress, PoolCandidateAddress, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
+    RpcConfig, TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, kernel,
     multi_chain_kernel::{
@@ -33,6 +33,7 @@ pub(crate) struct ClientEvmApp {}
 pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     rpc_config: RpcConfig,
+    endpoints: ChainEndpoints,
     metadata_cache: MetadataCache,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
     view: View,
@@ -42,6 +43,7 @@ pub(crate) struct ClientEvmRuntime {
 impl ClientEvmRuntime {
     pub(crate) fn new(
         rpc_config: RpcConfig,
+        endpoints: ChainEndpoints,
         metadata_cache: MetadataCache,
         logger: Logger,
         view: View,
@@ -49,6 +51,7 @@ impl ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             rpc_config,
+            endpoints,
             metadata_cache,
             optimization_sender: OnceLock::new(),
             view,
@@ -56,8 +59,14 @@ impl ClientEvmRuntime {
         }
     }
 
+    /// dRPC/websocket config used by the subscription channel (still single-provider).
     fn rpc_config(&self) -> &RpcConfig {
         &self.rpc_config
+    }
+
+    /// Per-chain HTTP endpoint pools used by every RPC fetch (multi-provider, with failover).
+    fn endpoints(&self) -> &ChainEndpoints {
+        &self.endpoints
     }
 
     /// Resolves pool metadata through the persistent cache: known pools are served from disk, only
@@ -84,7 +93,7 @@ impl ClientEvmRuntime {
             .filter(|candidate| !cached.contains_key(candidate))
             .collect::<HashSet<_>>();
 
-        let mut metadata = fetch_pool_metadata(&self.agent, self.rpc_config(), chain, at, misses)?;
+        let mut metadata = fetch_pool_metadata(&self.agent, self.endpoints(), chain, at, misses)?;
 
         if let Err(error) = self.metadata_cache.store_pool_metadata(chain, &metadata) {
             self.logger.log(&format!(
@@ -123,7 +132,7 @@ impl ClientEvmRuntime {
             .filter(|token| !cached.contains_key(token))
             .collect::<HashSet<_>>();
 
-        let mut metadata = fetch_token_metadata(&self.agent, self.rpc_config(), chain, at, misses)?;
+        let mut metadata = fetch_token_metadata(&self.agent, self.endpoints(), chain, at, misses)?;
 
         if let Err(error) = self.metadata_cache.store_token_metadata(&metadata) {
             self.logger.log(&format!(
@@ -181,7 +190,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     ) -> Vec<<ClientEvmApp as Application>::Input> {
         match effect {
             Effect::FetchFinalizedHeader { chain } => {
-                let r = fetch_finalized_block_header(&self.agent, self.rpc_config(), chain);
+                let r = fetch_finalized_block_header(&self.agent, self.endpoints(), chain);
                 match r {
                     Ok(Some(header)) => vec![Event::FinalizedHeaderReceived {
                         chain,
@@ -283,12 +292,13 @@ impl ClientEvmRuntime {
 
 pub(crate) fn start_runtime(
     config: RpcConfig,
+    endpoints: ChainEndpoints,
     metadata_cache: MetadataCache,
     logger: Logger,
     view: View,
 ) -> JoinHandle<()> {
     let (_sender, handle) = <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(
-        ClientEvmRuntime::new(config, metadata_cache, logger, view),
+        ClientEvmRuntime::new(config, endpoints, metadata_cache, logger, view),
     );
 
     handle
@@ -433,14 +443,14 @@ fn format_request_id_log(request_id: &AnyRequestId) -> String {
 
 impl ClientEvmRuntime {
     fn execute_bootstrap_effect(&self, chain: ChainKey, effect: bootstrap::Effect) -> Vec<Event> {
-        let config = self.rpc_config();
+        let endpoints = self.endpoints();
         let bootstrap::Effect::Request(request) = effect;
 
         let event = match request {
             bootstrap::AnyIssuedRequest::FinalizedHeader(request) => {
                 let request_id = request.request_id;
 
-                match fetch_finalized_block_header(&self.agent, config, chain) {
+                match fetch_finalized_block_header(&self.agent, endpoints, chain) {
                     Ok(Some(header)) => bootstrap::Event::FinalizedHeaderReceived {
                         request_id,
                         anchor: bootstrap::FinalizedAnchor {
@@ -464,7 +474,7 @@ impl ClientEvmRuntime {
                 let request_id = request.request_id;
                 let from_block = request.request_payload.from_block;
 
-                match fetch_pool_candidates_in_range(&self.agent, config, chain, from_block) {
+                match fetch_pool_candidates_in_range(&self.agent, endpoints, chain, from_block) {
                     Ok(blocks) => bootstrap::Event::PoolCandidatesReceived { request_id, blocks },
                     Err(error) => {
                         let request_id = bootstrap::AnyRequestId::PoolCandidates(request_id);
@@ -535,9 +545,9 @@ impl ClientEvmRuntime {
             chain,
             effect,
             &self.logger,
-            |block_hash| fetch_block_header(&self.agent, self.rpc_config(), chain, block_hash),
-            |block_hash| fetch_block_logs(&self.agent, self.rpc_config(), chain, block_hash),
-            |at, pools| fetch_pool_data(&self.agent, self.rpc_config(), chain, at, pools),
+            |block_hash| fetch_block_header(&self.agent, self.endpoints(), chain, block_hash),
+            |block_hash| fetch_block_logs(&self.agent, self.endpoints(), chain, block_hash),
+            |at, pools| fetch_pool_data(&self.agent, self.endpoints(), chain, at, pools),
             |at, candidates| self.cached_pool_metadata(chain, at, candidates),
             |at, tokens| self.cached_token_metadata(chain, at, tokens),
         )
@@ -805,6 +815,7 @@ mod tests {
         let config = rpc_config();
         let runtime = ClientEvmRuntime::new(
             config.clone(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -881,6 +892,7 @@ mod tests {
     fn runtime_starts_with_uninitialized_optimization_sender() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1092,7 +1104,13 @@ mod tests {
             )
             .expect("store cached pool");
 
-        let runtime = ClientEvmRuntime::new(rpc_config(), cache, Logger::sink(), View::sink());
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            test_endpoints(),
+            cache,
+            Logger::sink(),
+            View::sink(),
+        );
 
         // The scan yielded no candidates; the union must still surface the cached pool, resolved as
         // a hit. `rpc_config()` points nowhere, so any RPC (a cache miss) would error/panic instead.
@@ -1124,6 +1142,7 @@ mod tests {
     fn run_optimization_effect_returns_no_events() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1158,6 +1177,7 @@ mod tests {
     fn empty_optimization_snapshot_is_dropped() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1177,6 +1197,7 @@ mod tests {
     fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1197,6 +1218,7 @@ mod tests {
     fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1214,6 +1236,7 @@ mod tests {
     fn optimization_subscription_initializes_sender() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1229,6 +1252,7 @@ mod tests {
     fn optimization_subscription_starts_only_once() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
+            test_endpoints(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1902,6 +1926,17 @@ mod tests {
             ws_url: "wss://example.invalid/ws".to_owned(),
             api_key: "api-key".to_owned(),
         }
+    }
+
+    // Endpoint pools pointing at the (unreachable) test dRPC URL, public fallbacks disabled — so any
+    // RPC a test triggers errors instead of escaping to a real provider.
+    fn test_endpoints() -> ChainEndpoints {
+        client_evm::assemble_chain_endpoints(
+            &rpc_config(),
+            &std::collections::BTreeMap::new(),
+            false,
+        )
+        .expect("test endpoint assembly")
     }
 
     fn in_memory_metadata_cache() -> MetadataCache {
