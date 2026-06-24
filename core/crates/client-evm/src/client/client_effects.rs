@@ -16,7 +16,7 @@ use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 use crate::{
-    ChainKey, ClientEvmError, PoolAddress, PoolCandidateAddress, PoolDataCall, PoolDataFailure,
+    ChainKey, ClientEvmError, PoolFee, PoolRef, PoolCandidateAddress, PoolDataCall, PoolDataFailure,
     PoolDataResult, PoolLog, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
     PoolMetadataResult, PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals,
     TokenMetadata, TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
@@ -233,18 +233,18 @@ pub fn fetch_pool_data(
     endpoints: &ChainEndpoints,
     chain: ChainKey,
     at: BlockHash,
-    pools: HashSet<PoolAddress>,
-) -> Result<HashMap<PoolAddress, PoolDataResult>, ClientEvmError> {
+    pools: HashSet<PoolRef>,
+) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError> {
     if pools.is_empty() {
         return Ok(HashMap::new());
     }
 
     let endpoint_pool = endpoints.pool(chain)?;
-    let pools = sorted_pool_addresses(pools);
-    let calls = pool_data_multicall_calls(&pools);
+    let targets = sorted_v3_pool_data_targets(pools);
+    let calls = pool_data_multicall_calls(&targets);
     let results = aggregate3_batched(agent, endpoint_pool, MulticallBlock::Hash(at), &calls)?;
 
-    Ok(decode_pool_data_results(&pools, &results))
+    Ok(decode_pool_data_results(&targets, &results))
 }
 
 pub fn fetch_pool_metadata(
@@ -448,13 +448,13 @@ fn decode_pool_metadata_candidate_result(
     let token0 = decode_pool_metadata_token0(token0)?;
     let token1 = decode_pool_metadata_token1(token1)?;
     let fee_pips = decode_pool_metadata_fee(fee)?;
-    let fee = UniswapV3Fee::try_from_pips(fee_pips)
+    let tier = UniswapV3Fee::try_from_pips(fee_pips)
         .ok_or(PoolMetadataFailure::UnsupportedFee(fee_pips))?;
 
     Ok(PoolMetadata {
         token0,
         token1,
-        fee,
+        fee: PoolFee::Tiered(tier),
     })
 }
 
@@ -536,23 +536,30 @@ fn decode_pool_metadata_multicall_result<T>(
     }
 }
 
-fn sorted_pool_addresses(pools: HashSet<PoolAddress>) -> Vec<PoolAddress> {
-    let mut pools = pools.into_iter().collect::<Vec<_>>();
-    pools.sort_by(|left, right| left.0.cmp(&right.0));
-    pools
+/// The v3 pools to query, each paired with the contract address its `slot0`/`liquidity` calls
+/// target, sorted by address for deterministic multicall ordering. v4 pools have no per-pool address
+/// (they live in the singleton `PoolManager`) and are read through a separate StateView path, so
+/// they are skipped here rather than producing an address-less call.
+fn sorted_v3_pool_data_targets(pools: HashSet<PoolRef>) -> Vec<(PoolRef, Address)> {
+    let mut targets = pools
+        .into_iter()
+        .filter_map(|pool| pool.uniswap_v3_address().map(|address| (pool, address)))
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.1.cmp(&right.1));
+    targets
 }
 
-fn pool_data_multicall_calls(pools: &[PoolAddress]) -> Vec<MulticallCall> {
-    pools
+fn pool_data_multicall_calls(targets: &[(PoolRef, Address)]) -> Vec<MulticallCall> {
+    targets
         .iter()
-        .flat_map(|pool| {
+        .flat_map(|(_, address)| {
             [
                 MulticallCall {
-                    target: pool.0,
+                    target: *address,
                     call_data: Bytes::from(crate::uniswap_v3::slot0Call {}.abi_encode()),
                 },
                 MulticallCall {
-                    target: pool.0,
+                    target: *address,
                     call_data: Bytes::from(crate::uniswap_v3::liquidityCall {}.abi_encode()),
                 },
             ]
@@ -561,14 +568,14 @@ fn pool_data_multicall_calls(pools: &[PoolAddress]) -> Vec<MulticallCall> {
 }
 
 fn decode_pool_data_results(
-    pools: &[PoolAddress],
+    targets: &[(PoolRef, Address)],
     results: &[MulticallCallResult],
-) -> HashMap<PoolAddress, PoolDataResult> {
+) -> HashMap<PoolRef, PoolDataResult> {
     let mut result_chunks = results.chunks(2);
 
-    pools
+    targets
         .iter()
-        .map(|pool| {
+        .map(|(pool, _)| {
             let result_chunk = result_chunks.next().unwrap_or(&[]);
             (
                 *pool,
@@ -871,7 +878,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        PoolAddress, PoolCandidateAddress, PoolDataCall, PoolDataFailure, PoolMetadataCall,
+        PoolRef, PoolCandidateAddress, PoolDataCall, PoolDataFailure, PoolMetadataCall,
         PoolMetadataFailure, PoolState, TokenAddress, TokenDecimals, TokenMetadata,
         TokenMetadataCall, TokenMetadataFailure, UniswapV3Fee,
         client::multicall3::{
@@ -1056,8 +1063,8 @@ mod tests {
     #[test]
     fn fetch_pool_data_posts_multicall3_request_and_decodes_pool_states() {
         let at = B256::with_last_byte(1);
-        let first_pool = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
-        let second_pool = PoolAddress(Address::with_last_byte(3), ChainKey::Ethereum);
+        let first_pool = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
+        let second_pool = PoolRef::uniswap_v3(Address::with_last_byte(3), ChainKey::Ethereum);
         let first_state = pool_state(11, -12, 13);
         let second_state = pool_state(21, 22, 23);
         let response = multicall3_response([
@@ -1088,16 +1095,18 @@ mod tests {
         assert_eq!(request.path, "/ethereum/api-key");
         assert_multicall_request_at(&request.body, at);
         let calls = multicall_calls_from_request(&request.body);
+        let first_target = first_pool.uniswap_v3_address().expect("v3 pool");
+        let second_target = second_pool.uniswap_v3_address().expect("v3 pool");
         assert_eq!(
             calls
                 .iter()
                 .map(|call| (call.target, call.call_data.clone()))
                 .collect::<Vec<_>>(),
             vec![
-                (first_pool.0, slot0_call_data()),
-                (first_pool.0, liquidity_call_data()),
-                (second_pool.0, slot0_call_data()),
-                (second_pool.0, liquidity_call_data()),
+                (first_target, slot0_call_data()),
+                (first_target, liquidity_call_data()),
+                (second_target, slot0_call_data()),
+                (second_target, liquidity_call_data()),
             ]
         );
 
@@ -1107,8 +1116,8 @@ mod tests {
     #[test]
     fn fetch_pool_data_returns_per_pool_failure_for_failed_inner_call() {
         let at = B256::with_last_byte(1);
-        let first_pool = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
-        let second_pool = PoolAddress(Address::with_last_byte(3), ChainKey::Ethereum);
+        let first_pool = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
+        let second_pool = PoolRef::uniswap_v3(Address::with_last_byte(3), ChainKey::Ethereum);
         let first_state = pool_state(11, -12, 13);
         let second_state = pool_state(21, 22, 23);
         let response = multicall3_response([
@@ -1141,7 +1150,7 @@ mod tests {
     #[test]
     fn fetch_pool_data_returns_per_pool_failure_for_malformed_inner_return_data() {
         let at = B256::with_last_byte(1);
-        let pool = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
+        let pool = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
         let state = pool_state(11, -12, 13);
         let response = multicall3_response([
             successful_multicall_result(Bytes::from(vec![0x12])),
@@ -1182,7 +1191,7 @@ mod tests {
             &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
-            HashSet::from([PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum)]),
+            HashSet::from([PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum)]),
         );
 
         assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
@@ -1247,7 +1256,7 @@ mod tests {
             Some(&Ok(crate::PoolMetadata {
                 token0: first_token0,
                 token1: first_token1,
-                fee: first_fee,
+                fee: PoolFee::Tiered(first_fee),
             }))
         );
         assert_eq!(

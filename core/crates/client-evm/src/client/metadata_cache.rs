@@ -226,7 +226,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
 
     use super::*;
-    use crate::{PoolMetadataCall, PoolMetadataFailure, TokenDecimals, UniswapV3Fee};
+    use crate::{PoolFee, PoolMetadataCall, PoolMetadataFailure, TokenDecimals, UniswapV3Fee};
 
     fn pool_candidate(byte: u8) -> PoolCandidateAddress {
         PoolCandidateAddress(Address::with_last_byte(byte))
@@ -236,7 +236,7 @@ mod tests {
         PoolMetadata {
             token0: Address::with_last_byte(byte),
             token1: Address::with_last_byte(byte.wrapping_add(1)),
-            fee: UniswapV3Fee::Fee3000,
+            fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
         }
     }
 

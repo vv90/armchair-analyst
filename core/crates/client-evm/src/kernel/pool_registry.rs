@@ -4,7 +4,7 @@ use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
 use crate::ChainKey;
-use crate::pool_state::PoolAddress;
+use crate::pool_state::PoolRef;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolCandidateAddress(pub Address);
@@ -15,7 +15,35 @@ pub struct PoolCandidateAddress(pub Address);
 pub struct PoolMetadata {
     pub token0: Address,
     pub token1: Address,
-    pub fee: UniswapV3Fee,
+    pub fee: PoolFee,
+}
+
+/// A pool's fee and tick spacing. Uniswap v3 pools use one of four fee tiers, whose tick spacing is
+/// derived from the tier and so is never stored. Uniswap v4 pools set fee and tick spacing
+/// independently, so both are stored; dynamic-fee pools (whose fee is set per-swap by a hook) fall
+/// outside constant-fee swap math and are rejected at the v4 decode boundary rather than represented
+/// here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoolFee {
+    Tiered(UniswapV3Fee),
+    Static { pips: u32, tick_spacing: u16 },
+}
+
+impl PoolFee {
+    pub fn pips(self) -> u32 {
+        match self {
+            PoolFee::Tiered(tier) => tier.pips(),
+            PoolFee::Static { pips, .. } => pips,
+        }
+    }
+
+    pub fn tick_spacing(self) -> u16 {
+        match self {
+            // v3 tier spacings (1/10/60/200) are always in u16 range.
+            PoolFee::Tiered(tier) => tier.tick_spacing() as u16,
+            PoolFee::Static { tick_spacing, .. } => tick_spacing,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,12 +108,12 @@ pub type PoolMetadataResult = Result<PoolMetadata, PoolMetadataFailure>;
 pub enum TrustedPoolLogs {
     Unknown,
     PendingValidation,
-    Resolved(HashSet<PoolAddress>),
+    Resolved(HashSet<PoolRef>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustedPoolRegistry {
-    verified: HashMap<PoolAddress, PoolMetadata>,
+    verified: HashMap<PoolRef, PoolMetadata>,
     rejected: HashSet<PoolCandidateAddress>,
 }
 
@@ -105,7 +133,7 @@ impl TrustedPoolRegistry {
         let mut registry = self;
 
         for (candidate, result) in results {
-            let pool = PoolAddress(candidate.0, chain);
+            let pool = PoolRef::uniswap_v3(candidate.0, chain);
 
             match result {
                 Ok(metadata) => {
@@ -122,7 +150,7 @@ impl TrustedPoolRegistry {
         registry
     }
 
-    pub fn verified_metadata(&self, pool: PoolAddress) -> Option<&PoolMetadata> {
+    pub fn verified_metadata(&self, pool: PoolRef) -> Option<&PoolMetadata> {
         self.verified.get(&pool)
     }
 
@@ -138,8 +166,8 @@ impl TrustedPoolRegistry {
     pub fn verified_addresses(&self, chain: ChainKey) -> HashSet<Address> {
         self.verified
             .keys()
-            .filter(|PoolAddress(_, pool_chain)| *pool_chain == chain)
-            .map(|PoolAddress(address, _)| *address)
+            .filter(|pool| pool.chain == chain)
+            .filter_map(|pool| pool.uniswap_v3_address())
             .collect()
     }
 
@@ -147,8 +175,8 @@ impl TrustedPoolRegistry {
         &self,
         chain: ChainKey,
         candidate: PoolCandidateAddress,
-    ) -> Option<PoolAddress> {
-        let pool = PoolAddress(candidate.0, chain);
+    ) -> Option<PoolRef> {
+        let pool = PoolRef::uniswap_v3(candidate.0, chain);
         self.verified.contains_key(&pool).then_some(pool)
     }
 
@@ -192,7 +220,7 @@ impl TrustedPoolRegistry {
 
 #[cfg(test)]
 impl TrustedPoolRegistry {
-    pub(crate) fn verified_pools_for_test(&self) -> HashSet<PoolAddress> {
+    pub(crate) fn verified_pools_for_test(&self) -> HashSet<PoolRef> {
         self.verified.keys().copied().collect()
     }
 }
@@ -211,7 +239,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::PoolAddress;
+    use crate::PoolRef;
 
     #[test]
     fn fee_tiers_derive_tick_spacing_without_storing_it_in_metadata() {
@@ -235,6 +263,23 @@ mod tests {
     }
 
     #[test]
+    fn pool_fee_tiered_delegates_to_the_tier() {
+        let fee = PoolFee::Tiered(UniswapV3Fee::Fee3000);
+        assert_eq!(fee.pips(), 3000);
+        assert_eq!(fee.tick_spacing(), 60);
+    }
+
+    #[test]
+    fn pool_fee_static_returns_its_stored_pips_and_tick_spacing() {
+        let fee = PoolFee::Static {
+            pips: 450,
+            tick_spacing: 7,
+        };
+        assert_eq!(fee.pips(), 450);
+        assert_eq!(fee.tick_spacing(), 7);
+    }
+
+    #[test]
     fn registry_verifies_by_pool_address_and_keeps_metadata_address_free() {
         let candidate = candidate(3);
         let metadata = pool_metadata(1, 2, UniswapV3Fee::Fee500);
@@ -245,12 +290,12 @@ mod tests {
         );
 
         assert_eq!(
-            registry.verified_metadata(PoolAddress(candidate.0, ChainKey::Ethereum)),
+            registry.verified_metadata(PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum)),
             Some(&metadata)
         );
         assert_eq!(
             registry.verified_pool(ChainKey::Ethereum, candidate),
-            Some(PoolAddress(candidate.0, ChainKey::Ethereum))
+            Some(PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -272,7 +317,7 @@ mod tests {
 
         assert_eq!(
             registry.verified_pool(ChainKey::Ethereum, candidate),
-            Some(PoolAddress(candidate.0, ChainKey::Ethereum))
+            Some(PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -313,7 +358,7 @@ mod tests {
 
         assert_eq!(
             registry.verified_pool(ChainKey::Ethereum, candidate),
-            Some(PoolAddress(candidate.0, ChainKey::Ethereum))
+            Some(PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum))
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -366,7 +411,7 @@ mod tests {
         );
         assert_eq!(
             registry.trusted_pool_logs(ChainKey::Ethereum, &HashSet::from([verified, rejected])),
-            TrustedPoolLogs::Resolved(HashSet::from([PoolAddress(verified.0, ChainKey::Ethereum)]))
+            TrustedPoolLogs::Resolved(HashSet::from([PoolRef::uniswap_v3(verified.0, ChainKey::Ethereum)]))
         );
     }
 
@@ -391,7 +436,8 @@ mod tests {
             let registry = TrustedPoolRegistry::new().with_metadata_results(ChainKey::Ethereum, results);
 
             for pool in registry.verified_pools_for_test() {
-                prop_assert!(!registry.is_rejected(PoolCandidateAddress(pool.0)));
+                let address = pool.uniswap_v3_address().expect("v3 pool");
+                prop_assert!(!registry.is_rejected(PoolCandidateAddress(address)));
             }
         }
 
@@ -493,7 +539,7 @@ mod tests {
         PoolMetadata {
             token0: Address::with_last_byte(token0),
             token1: Address::with_last_byte(token1),
-            fee,
+            fee: PoolFee::Tiered(fee),
         }
     }
 }

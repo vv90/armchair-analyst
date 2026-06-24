@@ -6,9 +6,54 @@ use thiserror::Error;
 
 use crate::ChainKey;
 use crate::tick_math::{self, TickMathError};
+use crate::uniswap_v4::PoolId;
 
+/// The protocol-specific on-chain identity of a pool. Uniswap v3 pools are their own contract, so
+/// their identity is an [`Address`]; Uniswap v4 pools all live in the singleton `PoolManager` and
+/// are identified by a [`PoolId`] instead. The split keeps an address from ever being mistaken for a
+/// PoolId, or vice versa.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub struct PoolAddress(pub Address, pub ChainKey);
+pub enum ProtocolPoolKey {
+    UniswapV3(Address),
+    UniswapV4(PoolId),
+}
+
+/// A pool's full identity: its protocol-specific key plus the chain it lives on. Used as the key for
+/// every pool-indexed map, effect payload, and reserve projection.
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct PoolRef {
+    pub key: ProtocolPoolKey,
+    pub chain: ChainKey,
+}
+
+impl PoolRef {
+    pub fn uniswap_v3(address: Address, chain: ChainKey) -> PoolRef {
+        PoolRef {
+            key: ProtocolPoolKey::UniswapV3(address),
+            chain,
+        }
+    }
+
+    pub fn uniswap_v4(pool_id: PoolId, chain: ChainKey) -> PoolRef {
+        PoolRef {
+            key: ProtocolPoolKey::UniswapV4(pool_id),
+            chain,
+        }
+    }
+
+    pub fn chain(&self) -> ChainKey {
+        self.chain
+    }
+
+    /// The pool's own contract address for Uniswap v3 pools; `None` for v4 pools, which have no
+    /// per-pool address (they live in the singleton `PoolManager`).
+    pub fn uniswap_v3_address(&self) -> Option<Address> {
+        match self.key {
+            ProtocolPoolKey::UniswapV3(address) => Some(address),
+            ProtocolPoolKey::UniswapV4(_) => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolState {
@@ -169,9 +214,9 @@ mod tests {
 
     #[test]
     fn pool_address_order_matches_inner_address_order() {
-        let first = PoolAddress(Address::with_last_byte(1), ChainKey::Ethereum);
-        let second = PoolAddress(Address::with_last_byte(2), ChainKey::Ethereum);
-        let third = PoolAddress(Address::with_last_byte(3), ChainKey::Ethereum);
+        let first = PoolRef::uniswap_v3(Address::with_last_byte(1), ChainKey::Ethereum);
+        let second = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
+        let third = PoolRef::uniswap_v3(Address::with_last_byte(3), ChainKey::Ethereum);
         let mut pools = vec![third, first, second];
 
         pools.sort();
@@ -184,8 +229,8 @@ mod tests {
         use std::collections::HashSet;
 
         let address = Address::with_last_byte(7);
-        let ethereum = PoolAddress(address, ChainKey::Ethereum);
-        let arbitrum = PoolAddress(address, ChainKey::Arbitrum);
+        let ethereum = PoolRef::uniswap_v3(address, ChainKey::Ethereum);
+        let arbitrum = PoolRef::uniswap_v3(address, ChainKey::Arbitrum);
 
         // The widened identity makes a contract deployed at the same address on two chains two
         // distinct keys, so cross-chain merges never collapse or collide them.

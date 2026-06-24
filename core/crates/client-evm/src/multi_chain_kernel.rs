@@ -8,8 +8,8 @@ use optimization::{Invertible, OptimizationStepResult, PoolReserves, VirtualRese
 use thiserror::Error;
 
 use crate::{
-    PoolAddress, PoolLog, PoolMetadata, PoolState, PoolStateError, TokenAddress,
-    TokenAmountConversionError, TokenDecimals, UniswapV3Fee, bootstrap, chain::ChainKey, kernel,
+    PoolFee, PoolRef, PoolLog, PoolMetadata, PoolState, PoolStateError, TokenAddress,
+    TokenAmountConversionError, TokenDecimals, bootstrap, chain::ChainKey, kernel,
     u256_token_amount_to_f32,
 };
 
@@ -86,16 +86,16 @@ const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChainPoolReserves {
     pub block_hash: BlockHash,
-    pub reserves: Vec<PoolReserves<PoolAddress, TokenAddress>>,
+    pub reserves: Vec<PoolReserves<PoolRef, TokenAddress>>,
 }
 
 /// The merged optimizer input spanning every active chain. Reserves stay a flat `Vec` because chain
-/// identity already rides inside every `PoolAddress`/`TokenAddress`; `block_hashes` records the block
+/// identity already rides inside every `PoolRef`/`TokenAddress`; `block_hashes` records the block
 /// each contributing chain was projected at (one entry per chain in the merge).
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptimizationPoolReserves {
     pub block_hashes: BTreeMap<ChainKey, BlockHash>,
-    pub reserves: Vec<PoolReserves<PoolAddress, TokenAddress>>,
+    pub reserves: Vec<PoolReserves<PoolRef, TokenAddress>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,28 +110,22 @@ pub enum PoolReserveValueKind {
 pub enum PoolReserveProjectionError {
     #[error("failed to calculate max swap 0 for pool {pool:?}: {source}")]
     SwapLimit0 {
-        pool: PoolAddress,
+        pool: PoolRef,
         source: PoolStateError,
     },
 
     #[error("failed to calculate max swap 1 for pool {pool:?}: {source}")]
     SwapLimit1 {
-        pool: PoolAddress,
+        pool: PoolRef,
         source: PoolStateError,
     },
 
     #[error("failed to convert {value:?} for pool {pool:?} token {token:?}: {source}")]
     AmountConversion {
-        pool: PoolAddress,
+        pool: PoolRef,
         token: TokenAddress,
         value: PoolReserveValueKind,
         source: TokenAmountConversionError,
-    },
-
-    #[error("invalid tick spacing for pool {pool:?}: {tick_spacing}")]
-    InvalidTickSpacing {
-        pool: PoolAddress,
-        tick_spacing: i32,
     },
 }
 
@@ -298,9 +292,9 @@ fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
 /// Merges finalized snapshots with update snapshots and returns pools in deterministic order.
 /// Added so projections include the latest known state per pool while keeping output stable for model layout and tests.
 fn sorted_pool_states_for_projection<'a>(
-    finalized_pool_states: &'a HashMap<PoolAddress, PoolState>,
-    update_pool_states: HashMap<PoolAddress, &'a PoolState>,
-) -> Vec<(PoolAddress, &'a PoolState)> {
+    finalized_pool_states: &'a HashMap<PoolRef, PoolState>,
+    update_pool_states: HashMap<PoolRef, &'a PoolState>,
+) -> Vec<(PoolRef, &'a PoolState)> {
     let mut pool_states = finalized_pool_states
         .iter()
         .map(|(pool, pool_state)| (*pool, pool_state))
@@ -318,11 +312,11 @@ fn sorted_pool_states_for_projection<'a>(
 fn projection_metadata(
     chain_state: &kernel::State,
     chain: ChainKey,
-    pool: PoolAddress,
+    pool: PoolRef,
 ) -> Option<(
     TokenAddress,
     TokenAddress,
-    UniswapV3Fee,
+    PoolFee,
     TokenDecimals,
     TokenDecimals,
 )> {
@@ -342,9 +336,9 @@ fn projection_metadata(
 /// Converts one pool state into scaled virtual reserves, fee multiplier, and swap caps.
 /// Added to keep Uniswap math, token scaling, and projection error context in one isolated pure step.
 fn pool_reserve_values(
-    pool: PoolAddress,
+    pool: PoolRef,
     pool_state: &PoolState,
-    fee: UniswapV3Fee,
+    fee: PoolFee,
     token0: TokenAddress,
     token1: TokenAddress,
     token0_decimals: TokenDecimals,
@@ -364,7 +358,7 @@ fn pool_reserve_values(
         pool_state.virtual_reserve_y(),
         token1_decimals,
     )?;
-    let tick_spacing = tick_spacing_for_pool(pool, fee)?;
+    let tick_spacing = fee.tick_spacing();
     let max_swap_0 = pool_state
         .swap_limit_x(tick_spacing)
         .map_err(|source| PoolReserveProjectionError::SwapLimit0 { pool, source })
@@ -399,22 +393,10 @@ fn pool_reserve_values(
     })
 }
 
-/// Derives a projection-ready tick spacing from the verified fee tier.
-/// Added to keep the fee-tier boundary typed before calling pool-state swap-limit math.
-fn tick_spacing_for_pool(
-    pool: PoolAddress,
-    fee: UniswapV3Fee,
-) -> Result<u16, PoolReserveProjectionError> {
-    let tick_spacing = fee.tick_spacing();
-
-    u16::try_from(tick_spacing)
-        .map_err(|_| PoolReserveProjectionError::InvalidTickSpacing { pool, tick_spacing })
-}
-
 /// Scales a raw on-chain token amount into the optimizer's `f32` reserve representation.
 /// Added so conversion failures carry the pool, token, and reserve field being projected.
 fn convert_pool_amount(
-    pool: PoolAddress,
+    pool: PoolRef,
     token: TokenAddress,
     value: PoolReserveValueKind,
     amount: U256,
@@ -984,7 +966,7 @@ mod tests {
     use super::*;
     use crate::kernel;
     use crate::{
-        PoolAddress, PoolMetadata, PoolState, TokenAddress, TokenAmountConversionError,
+        PoolFee, PoolRef, PoolMetadata, PoolState, TokenAddress, TokenAmountConversionError,
         TokenDecimals, TokenMetadata, TrustedPoolRegistry, UniswapV3Fee, u256_token_amount_to_f32,
     };
 
@@ -2113,7 +2095,7 @@ mod tests {
         BlockHash::with_last_byte(value)
     }
 
-    fn pool(value: u8) -> PoolAddress {
+    fn pool(value: u8) -> PoolRef {
         pool_on(ChainKey::Ethereum, value)
     }
 
@@ -2121,8 +2103,8 @@ mod tests {
         token_on(ChainKey::Ethereum, value)
     }
 
-    fn pool_on(chain: ChainKey, value: u8) -> PoolAddress {
-        PoolAddress(Address::with_last_byte(value), chain)
+    fn pool_on(chain: ChainKey, value: u8) -> PoolRef {
+        PoolRef::uniswap_v3(Address::with_last_byte(value), chain)
     }
 
     fn token_on(chain: ChainKey, value: u8) -> TokenAddress {
@@ -2137,7 +2119,7 @@ mod tests {
         PoolMetadata {
             token0: token0.0,
             token1: token1.0,
-            fee,
+            fee: PoolFee::Tiered(fee),
         }
     }
 
@@ -2162,8 +2144,8 @@ mod tests {
     fn projection_state(
         chain: ChainKey,
         finalized_hash: BlockHash,
-        finalized_snapshots: HashMap<PoolAddress, PoolState>,
-        pool_metadata: HashMap<PoolAddress, PoolMetadata>,
+        finalized_snapshots: HashMap<PoolRef, PoolState>,
+        pool_metadata: HashMap<PoolRef, PoolMetadata>,
         token_metadata: HashMap<TokenAddress, TokenMetadata>,
     ) -> State {
         let finalized_state = kernel::FinalizedState::with_pool_snapshots_for_test(
@@ -2174,7 +2156,10 @@ mod tests {
             chain,
             pool_metadata
                 .into_iter()
-                .map(|(pool, metadata)| (crate::PoolCandidateAddress(pool.0), Ok(metadata)))
+                .map(|(pool, metadata)| {
+                    let address = pool.uniswap_v3_address().expect("v3 pool");
+                    (crate::PoolCandidateAddress(address), Ok(metadata))
+                })
                 .collect(),
         );
         let token_registry = crate::TokenRegistry::new().with_metadata_results(
@@ -2202,7 +2187,7 @@ mod tests {
         chain: ChainKey,
         state: State,
         block_hash: BlockHash,
-        overlay_pool_states: HashMap<PoolAddress, PoolState>,
+        overlay_pool_states: HashMap<PoolRef, PoolState>,
     ) -> (State, kernel::CompletePoolStateUpdate) {
         let pool_snapshot_blocks = overlay_pool_states
             .keys()
@@ -2243,8 +2228,8 @@ mod tests {
     }
 
     fn assert_directional_pair(
-        reserves: &[optimization::PoolReserves<PoolAddress, TokenAddress>],
-        pool: PoolAddress,
+        reserves: &[optimization::PoolReserves<PoolRef, TokenAddress>],
+        pool: PoolRef,
         token0: TokenAddress,
         token1: TokenAddress,
         pool_state: &PoolState,

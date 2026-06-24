@@ -2,7 +2,7 @@ use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
     ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, MetadataCache,
-    PoolAddress, PoolCandidateAddress, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
+    PoolRef, PoolCandidateAddress, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
     RpcConfig, TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, kernel,
@@ -654,8 +654,8 @@ where
     FetchBlockLogs: FnOnce(BlockHash) -> Result<Vec<PoolLog>, ClientEvmError>,
     FetchPoolData: FnOnce(
         BlockHash,
-        HashSet<PoolAddress>,
-    ) -> Result<HashMap<PoolAddress, PoolDataResult>, ClientEvmError>,
+        HashSet<PoolRef>,
+    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
     FetchPoolMetadata:
         FnOnce(
             BlockHash,
@@ -801,9 +801,9 @@ where
 mod tests {
     use client_evm::{
         Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
-        GetTokenMetadata, IssuedRequest, PoolAddress, PoolCandidateAddress, PoolDataResult,
-        PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult,
-        UniswapV3Fee,
+        GetTokenMetadata, IssuedRequest, PoolRef, PoolCandidateAddress, PoolDataResult,
+        PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
+        TokenMetadataResult, UniswapV3Fee,
     };
     use serde_json::json;
     use std::{sync::mpsc, time::Duration};
@@ -1804,8 +1804,8 @@ mod tests {
 
     fn unexpected_pool_data_fetch(
         _at: BlockHash,
-        _pools: HashSet<PoolAddress>,
-    ) -> Result<HashMap<PoolAddress, PoolDataResult>, ClientEvmError> {
+        _pools: HashSet<PoolRef>,
+    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError> {
         panic!("pool data fetch must not be called")
     }
 
@@ -1835,7 +1835,7 @@ mod tests {
         PoolMetadata {
             token0: pool_candidate_address(last_byte).0,
             token1: pool_candidate_address(last_byte.wrapping_add(1)).0,
-            fee: UniswapV3Fee::Fee3000,
+            fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
         }
     }
 
@@ -1893,7 +1893,7 @@ mod tests {
         }
     }
 
-    fn optimization_pool_reserves() -> optimization::PoolReserves<PoolAddress, TokenAddress> {
+    fn optimization_pool_reserves() -> optimization::PoolReserves<PoolRef, TokenAddress> {
         optimization::PoolReserves {
             pool_id: pool_address(1),
             token0: token_address(1),
@@ -1908,12 +1908,12 @@ mod tests {
         }
     }
 
-    fn pool_address(last_byte: u8) -> PoolAddress {
+    fn pool_address(last_byte: u8) -> PoolRef {
         let address = format!("0x{}", format!("{last_byte:040x}"))
             .parse()
             .expect("test address must parse");
 
-        PoolAddress(address, ChainKey::Ethereum)
+        PoolRef::uniswap_v3(address, ChainKey::Ethereum)
     }
 
     fn zero_logs_bloom() -> String {

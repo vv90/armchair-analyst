@@ -8,7 +8,7 @@ use alloy::primitives::BlockHash;
 use super::{pool_registry::PoolCandidateAddress, token_registry::TokenAddress};
 pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
 use crate::{
-    pool_state::PoolAddress,
+    pool_state::PoolRef,
     request_tracking::{
         RequestCollection, RequestIdSequence, RequestIssuer, RequestStore, expired_request_ids,
         issue_request, retry_request, take_request,
@@ -29,7 +29,7 @@ pub struct GetBlockHeader {
 #[derive(Clone)]
 pub struct GetPoolData {
     pub at: BlockHash,
-    pub pools: HashSet<PoolAddress>,
+    pub pools: HashSet<PoolRef>,
 }
 
 #[derive(Clone)]
@@ -190,7 +190,7 @@ impl PendingRequests {
 
     pub(crate) fn pending_pool_data_pools_by_block(
         &self,
-    ) -> HashMap<BlockHash, HashSet<PoolAddress>> {
+    ) -> HashMap<BlockHash, HashSet<PoolRef>> {
         self.pool_data
             .values()
             .fold(HashMap::new(), |mut pools_by_block, request| {

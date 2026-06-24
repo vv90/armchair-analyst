@@ -1,6 +1,6 @@
 use std::sync::mpsc::Sender;
 
-use client_evm::{PoolAddress, TokenAddress, multi_chain_kernel::OptimizationPoolReserves};
+use client_evm::{PoolRef, TokenAddress, multi_chain_kernel::OptimizationPoolReserves};
 use optimization::{
     OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
     OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
@@ -35,7 +35,7 @@ pub fn run_optimization<T>(
         let snapshot = receiver
             .wait_take()
             .map_err(RunOptimizationError::Receive)?;
-        match OptimizationRunner::<PoolAddress, TokenAddress, OPTIMIZATION_LAYERS>::init(
+        match OptimizationRunner::<PoolRef, TokenAddress, OPTIMIZATION_LAYERS>::init(
             backend,
             snapshot.reserves,
             session_config.clone(),
@@ -75,7 +75,7 @@ mod tests {
         sync::mpsc,
     };
 
-    use client_evm::{BlockHash, ChainKey, PoolAddress, TokenAddress};
+    use client_evm::{BlockHash, ChainKey, PoolRef, TokenAddress};
     use optimization::{OptimizationStepStatus, PoolReserves, VirtualReserveValues};
 
     use super::*;
@@ -202,7 +202,7 @@ mod tests {
                 BlockHash::with_last_byte(last_byte),
             )]),
             reserves: vec![PoolReserves {
-                pool_id: PoolAddress(Default::default(), ChainKey::Arbitrum),
+                pool_id: PoolRef::uniswap_v3(Default::default(), ChainKey::Arbitrum),
                 token0: other,
                 token1: other,
                 value: VirtualReserveValues {
@@ -230,7 +230,7 @@ mod tests {
         }
     }
 
-    fn base_reserves() -> Vec<PoolReserves<PoolAddress, TokenAddress>> {
+    fn base_reserves() -> Vec<PoolReserves<PoolRef, TokenAddress>> {
         vec![PoolReserves {
             pool_id: pool(),
             token0: token(),
@@ -245,8 +245,8 @@ mod tests {
         }]
     }
 
-    fn pool() -> PoolAddress {
-        PoolAddress(Default::default(), ChainKey::Ethereum)
+    fn pool() -> PoolRef {
+        PoolRef::uniswap_v3(Default::default(), ChainKey::Ethereum)
     }
 
     fn token() -> TokenAddress {

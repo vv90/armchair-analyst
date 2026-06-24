@@ -18,6 +18,7 @@ mod tick;
 mod tick_math;
 mod tokens;
 pub mod uniswap_v3;
+pub mod uniswap_v4;
 mod utils;
 
 pub use chain::{ACTIVE_CHAINS, ChainKey, chain_key_for_network_path, drpc_network_path};
@@ -37,8 +38,8 @@ pub use kernel::pending_requests::{
     GetTokenMetadata, IssuedRequest, RequestId,
 };
 pub use kernel::pool_registry::{
-    PoolCandidateAddress, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
-    TrustedPoolLogs, TrustedPoolRegistry, UniswapV3Fee,
+    PoolCandidateAddress, PoolFee, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
+    PoolMetadataResult, TrustedPoolLogs, TrustedPoolRegistry, UniswapV3Fee,
 };
 pub use kernel::token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
@@ -46,7 +47,8 @@ pub use kernel::token_registry::{
 };
 pub use pool_log::{PoolLog, PoolLogEvent, decode_pool_log, derive_pool_state};
 pub use pool_state::{
-    PoolAddress, PoolDataCall, PoolDataFailure, PoolDataResult, PoolState, PoolStateError,
+    PoolDataCall, PoolDataFailure, PoolDataResult, PoolRef, PoolState, PoolStateError,
+    ProtocolPoolKey,
 };
 pub use tick_math::TickMathError;
 pub use tokens::{ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS};

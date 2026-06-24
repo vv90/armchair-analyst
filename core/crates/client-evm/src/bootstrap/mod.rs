@@ -11,7 +11,7 @@ use alloy::primitives::{BlockHash, keccak256};
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
 use crate::{
-    ChainKey, PoolAddress, PoolCandidateAddress, PoolMetadataResult, PoolState, RangeLogBlock,
+    ChainKey, PoolRef, PoolCandidateAddress, PoolMetadataResult, PoolState, RangeLogBlock,
     TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry, tick::Tick,
 };
 pub use crate::{GetPoolMetadata, GetTokenMetadata};
@@ -174,7 +174,7 @@ impl VerifiedPools {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapOutcome {
     pub anchor: FinalizedAnchor,
-    pub pool_snapshots: HashMap<PoolAddress, PoolState>,
+    pub pool_snapshots: HashMap<PoolRef, PoolState>,
     pub pool_registry: TrustedPoolRegistry,
     pub token_registry: TokenRegistry,
     pub seed_blocks: Vec<SeedBlock>,
@@ -523,7 +523,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        PoolMetadata, PoolMetadataCall, PoolMetadataFailure, TokenDecimals, TokenMetadata,
+        PoolFee, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, TokenDecimals, TokenMetadata,
         TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
     };
 
@@ -833,8 +833,8 @@ mod tests {
         }
     }
 
-    fn pool(byte: u8) -> PoolAddress {
-        PoolAddress(Address::with_last_byte(byte), ChainKey::Ethereum)
+    fn pool(byte: u8) -> PoolRef {
+        PoolRef::uniswap_v3(Address::with_last_byte(byte), ChainKey::Ethereum)
     }
 
     fn token(byte: u8) -> TokenAddress {
@@ -845,7 +845,7 @@ mod tests {
         PoolMetadata {
             token0: Address::with_last_byte(1),
             token1: Address::with_last_byte(2),
-            fee: UniswapV3Fee::Fee3000,
+            fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
         }
     }
 
@@ -853,7 +853,7 @@ mod tests {
         PoolMetadata {
             token0: Address::with_last_byte(token0),
             token1: Address::with_last_byte(token1),
-            fee: UniswapV3Fee::Fee3000,
+            fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
         }
     }
 
@@ -1332,7 +1332,8 @@ mod tests {
             );
 
             for pool in outcome.pool_registry.verified_pools_for_test() {
-                prop_assert!(!outcome.pool_registry.is_rejected(PoolCandidateAddress(pool.0)));
+                let address = pool.uniswap_v3_address().expect("v3 pool");
+                prop_assert!(!outcome.pool_registry.is_rejected(PoolCandidateAddress(address)));
             }
         }
 
