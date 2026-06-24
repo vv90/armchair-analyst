@@ -332,6 +332,11 @@ where
     TPool: Copy + PartialEq + Eq + Hash,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
+    let reserves = crate::routing_filter::routable_reserves(
+        reserves,
+        session_config.init_asset,
+        &session_config.bridges,
+    );
     initialize_optimization_session_with_status(
         reserves,
         session_config,
@@ -382,6 +387,11 @@ where
     TPool: Copy + PartialEq + Eq + Hash,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
+    let reserves = crate::routing_filter::routable_reserves(
+        reserves,
+        session.session_config.init_asset,
+        &session.session_config.bridges,
+    );
     let incoming_keys = validate_reserve_snapshot(&reserves, &session.session_config, step_config)?;
     let OptimizationSession {
         model,
@@ -989,5 +999,86 @@ mod tests {
                 max_swap_1: amount * 0.75,
             },
         }
+    }
+
+    /// A USDC/WETH/WBTC triangle (all tokens degree 2): a genuine 2-core that
+    /// survives routing-filter pruning.
+    fn triangle_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let wbtc = tokens::WBTC.address;
+        let edges = [
+            reserve(1, usdc, weth, 1_000.0),
+            reserve(2, weth, wbtc, 1_000.0),
+            reserve(3, wbtc, usdc, 1_000.0),
+        ];
+        edges
+            .into_iter()
+            .flat_map(|edge| [edge, edge.inverse()])
+            .collect()
+    }
+
+    /// The triangle plus an unroutable leaf pool (USDC/UNI, UNI is degree 1).
+    fn triangle_with_leaf_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let leaf = reserve(4, tokens::USDC.address, tokens::UNI.address, 500.0);
+        let mut reserves = triangle_reserves();
+        reserves.extend([leaf, leaf.inverse()]);
+        reserves
+    }
+
+    fn scaled(
+        reserves: Vec<PoolReserves<i32, TokenAddress>>,
+        scale: f32,
+    ) -> Vec<PoolReserves<i32, TokenAddress>> {
+        reserves
+            .into_iter()
+            .map(|mut reserve| {
+                reserve.value.token_0 *= scale;
+                reserve.value.token_1 *= scale;
+                reserve.value.max_swap_0 *= scale;
+                reserve.value.max_swap_1 *= scale;
+                reserve
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unroutable_leaf_pools_are_pruned_before_optimization() {
+        let (_session, result) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                triangle_with_leaf_reserves(),
+                session_config(),
+                &step_config(0),
+            )
+            .unwrap();
+
+        // 8 directional reserves in, the 2 leaf reserves pruned, 6 kept.
+        assert_eq!(result.reserves_count, 6);
+    }
+
+    #[test]
+    fn stable_topology_with_unroutable_pools_keeps_updating() {
+        let (session, init_result) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                triangle_with_leaf_reserves(),
+                session_config(),
+                &step_config(0),
+            )
+            .unwrap();
+        assert_eq!(init_result.status, OptimizationStepStatus::Initialized);
+        assert_eq!(init_result.reserves_count, 6);
+
+        // The next snapshot carries the same (leaf-padded) topology with only value
+        // changes. Pruning is deterministic, so the surviving keys match and the
+        // session updates in place instead of reinitializing.
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves(scaled(triangle_with_leaf_reserves(), 1.01)),
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
+        assert_eq!(result.reserves_count, 6);
     }
 }
