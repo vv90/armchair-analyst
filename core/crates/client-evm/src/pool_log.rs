@@ -1,32 +1,39 @@
-//! Decoded Uniswap v3 pool-state log events.
+//! Decoded Uniswap v3 / v4 pool-state log events.
 //!
 //! A [`PoolLog`] is the minimal projection of an on-chain log that the kernel can fold into a
-//! [`crate::PoolState`]: the emitting pool address, the intra-block ordering key, and the
-//! state-relevant event payload. Logs that do not affect pool state (Collect, Flash, cardinality,
-//! fee-protocol) decode to `None` and are dropped at this boundary.
+//! [`crate::PoolState`]: the emitting pool's protocol-tagged identity, the intra-block ordering key,
+//! and the state-relevant event payload. Logs that do not affect pool state (v3 Collect/Flash/
+//! cardinality/fee-protocol, or any unrecognized event) decode to `None` and are dropped at this
+//! boundary.
 
 use alloy::{
-    primitives::{Address, U160, aliases::I24},
+    primitives::{U160, aliases::I24},
     rpc::types::Log,
     sol_types::SolEvent,
 };
 
 use crate::PoolState;
+use crate::pool_state::ProtocolPoolKey;
 use crate::uniswap_v3::{Burn, Initialize, Mint, Swap};
+use crate::uniswap_v4::{self, PoolId};
 
-/// A state-relevant Uniswap v3 log, projected to exactly the fields pool-state derivation needs.
+/// A state-relevant Uniswap v3 or v4 log, projected to exactly the fields pool-state derivation
+/// needs. The pool's protocol-tagged identity is its own contract address (v3) or its
+/// [`PoolId`](crate::uniswap_v4::PoolId) (v4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolLog {
-    pub address: Address,
+    pub pool: ProtocolPoolKey,
     pub log_index: u64,
     pub event: PoolLogEvent,
 }
 
-/// The state-relevant payload of a Uniswap v3 pool log.
+/// The state-relevant payload of a Uniswap v3 or v4 pool log.
 ///
 /// `Swap` and `Initialize` carry an absolute post-event snapshot; `Mint` and `Burn` carry a
 /// liquidity delta that applies only when the pool's current tick is inside `[tick_lower,
-/// tick_upper)`. All other pool events are state-irrelevant and never produce a `PoolLogEvent`.
+/// tick_upper)`. v4's single `ModifyLiquidity` event maps onto `Mint`/`Burn` by the sign of its
+/// signed `liquidityDelta`. All other pool events are state-irrelevant and never produce a
+/// `PoolLogEvent`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PoolLogEvent {
     Initialize {
@@ -51,46 +58,99 @@ pub enum PoolLogEvent {
 }
 
 /// Decodes a raw log into a [`PoolLog`], or `None` when the log is not a state-relevant pool event
-/// or lacks an intra-block ordering index. Pure: dispatches on `topic0` against the v3 event
-/// signature hashes and decodes the matching `SolEvent`.
+/// or lacks an intra-block ordering index. Pure: dispatches on `topic0` against the v3 and v4 event
+/// signature hashes (which are disjoint) and decodes the matching `SolEvent`. A v3 log is keyed by
+/// its emitting address; a v4 log is keyed by the `PoolId` carried in its indexed `id` topic.
 pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
     let log_index = log.log_index?;
     let data = &log.inner.data;
     let topic0 = *log.topic0()?;
 
-    let event = if topic0 == Swap::SIGNATURE_HASH {
+    let (pool, event) = if topic0 == Swap::SIGNATURE_HASH {
         let swap = Swap::decode_log_data(data).ok()?;
-        PoolLogEvent::Swap {
-            sqrt_price_x96: swap.sqrtPriceX96,
-            tick: swap.tick,
-            liquidity: swap.liquidity,
-        }
+        (
+            ProtocolPoolKey::UniswapV3(log.address()),
+            PoolLogEvent::Swap {
+                sqrt_price_x96: swap.sqrtPriceX96,
+                tick: swap.tick,
+                liquidity: swap.liquidity,
+            },
+        )
     } else if topic0 == Initialize::SIGNATURE_HASH {
         let initialize = Initialize::decode_log_data(data).ok()?;
-        PoolLogEvent::Initialize {
-            sqrt_price_x96: initialize.sqrtPriceX96,
-            tick: initialize.tick,
-        }
+        (
+            ProtocolPoolKey::UniswapV3(log.address()),
+            PoolLogEvent::Initialize {
+                sqrt_price_x96: initialize.sqrtPriceX96,
+                tick: initialize.tick,
+            },
+        )
     } else if topic0 == Mint::SIGNATURE_HASH {
         let mint = Mint::decode_log_data(data).ok()?;
-        PoolLogEvent::Mint {
-            tick_lower: mint.tickLower,
-            tick_upper: mint.tickUpper,
-            amount: mint.amount,
-        }
+        (
+            ProtocolPoolKey::UniswapV3(log.address()),
+            PoolLogEvent::Mint {
+                tick_lower: mint.tickLower,
+                tick_upper: mint.tickUpper,
+                amount: mint.amount,
+            },
+        )
     } else if topic0 == Burn::SIGNATURE_HASH {
         let burn = Burn::decode_log_data(data).ok()?;
-        PoolLogEvent::Burn {
-            tick_lower: burn.tickLower,
-            tick_upper: burn.tickUpper,
-            amount: burn.amount,
-        }
+        (
+            ProtocolPoolKey::UniswapV3(log.address()),
+            PoolLogEvent::Burn {
+                tick_lower: burn.tickLower,
+                tick_upper: burn.tickUpper,
+                amount: burn.amount,
+            },
+        )
+    } else if topic0 == uniswap_v4::Swap::SIGNATURE_HASH {
+        let swap = uniswap_v4::Swap::decode_log_data(data).ok()?;
+        (
+            ProtocolPoolKey::UniswapV4(PoolId(swap.id)),
+            PoolLogEvent::Swap {
+                sqrt_price_x96: swap.sqrtPriceX96,
+                tick: swap.tick,
+                liquidity: swap.liquidity,
+            },
+        )
+    } else if topic0 == uniswap_v4::Initialize::SIGNATURE_HASH {
+        let initialize = uniswap_v4::Initialize::decode_log_data(data).ok()?;
+        (
+            ProtocolPoolKey::UniswapV4(PoolId(initialize.id)),
+            PoolLogEvent::Initialize {
+                sqrt_price_x96: initialize.sqrtPriceX96,
+                tick: initialize.tick,
+            },
+        )
+    } else if topic0 == uniswap_v4::ModifyLiquidity::SIGNATURE_HASH {
+        let modify = uniswap_v4::ModifyLiquidity::decode_log_data(data).ok()?;
+        // v4 collapses v3's Mint/Burn into one signed delta: a non-negative delta adds liquidity
+        // (Mint), a negative delta removes it (Burn). The magnitude is bounded by the pool's
+        // `uint128` liquidity; a value that does not fit drops the log to the GetPoolData fallback
+        // rather than panicking.
+        let amount = u128::try_from(modify.liquidityDelta.unsigned_abs()).ok()?;
+        let event = if modify.liquidityDelta.is_negative() {
+            PoolLogEvent::Burn {
+                tick_lower: modify.tickLower,
+                tick_upper: modify.tickUpper,
+                amount,
+            }
+        } else {
+            PoolLogEvent::Mint {
+                tick_lower: modify.tickLower,
+                tick_upper: modify.tickUpper,
+                amount,
+            }
+        };
+        (ProtocolPoolKey::UniswapV4(PoolId(modify.id)), event)
     } else {
         return None;
     };
 
     Some(PoolLog {
-        address: log.address(),
+        pool,
         log_index,
         event,
     })
@@ -193,13 +253,21 @@ fn apply_liquidity_delta(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{I256, U256};
+    use alloy::primitives::{
+        Address, B256, I256, U256,
+        aliases::U24,
+        b256,
+    };
     use proptest::prelude::*;
 
     use super::*;
 
     fn tick(value: i32) -> I24 {
         I24::try_from(value).expect("tick fixture in range")
+    }
+
+    fn v3(address: Address) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV3(address)
     }
 
     fn log_with(address: Address, log_index: u64, event: impl SolEvent) -> Log {
@@ -233,7 +301,7 @@ mod tests {
         assert_eq!(
             decode_pool_log(&log),
             Some(PoolLog {
-                address,
+                pool: v3(address),
                 log_index: 7,
                 event: PoolLogEvent::Swap {
                     sqrt_price_x96: U160::from(123456789u128),
@@ -259,7 +327,7 @@ mod tests {
         assert_eq!(
             decode_pool_log(&log),
             Some(PoolLog {
-                address,
+                pool: v3(address),
                 log_index: 0,
                 event: PoolLogEvent::Initialize {
                     sqrt_price_x96: U160::from(999u128),
@@ -289,7 +357,7 @@ mod tests {
         assert_eq!(
             decode_pool_log(&log),
             Some(PoolLog {
-                address,
+                pool: v3(address),
                 log_index: 3,
                 event: PoolLogEvent::Mint {
                     tick_lower: tick(-600),
@@ -319,7 +387,7 @@ mod tests {
         assert_eq!(
             decode_pool_log(&log),
             Some(PoolLog {
-                address,
+                pool: v3(address),
                 log_index: 9,
                 event: PoolLogEvent::Burn {
                     tick_lower: tick(120),
@@ -367,6 +435,154 @@ mod tests {
             },
         );
         log.log_index = None;
+
+        assert_eq!(decode_pool_log(&log), None);
+    }
+
+    // An arbitrary but fixed v4 pool id; the decode must surface it as the log's identity.
+    const V4_POOL_ID: B256 =
+        b256!("21c67e77068de97969ba93d4aab21826d33ca12bb9f565d8496e8fda8a82ca27");
+
+    fn v4_manager() -> Address {
+        uniswap_v4::ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS
+    }
+
+    #[test]
+    fn decodes_v4_swap_to_absolute_snapshot_keyed_by_pool_id() {
+        // The emitting address is the singleton PoolManager; identity comes from the indexed id.
+        let log = log_with(
+            v4_manager(),
+            4,
+            uniswap_v4::Swap {
+                id: V4_POOL_ID,
+                sender: Address::with_last_byte(1),
+                amount0: -12345i128,
+                amount1: 6789i128,
+                sqrtPriceX96: U160::from(123456789u128),
+                liquidity: 555_000u128,
+                tick: tick(85176),
+                fee: U24::from(500u32),
+            },
+        );
+
+        assert_eq!(
+            decode_pool_log(&log),
+            Some(PoolLog {
+                pool: ProtocolPoolKey::UniswapV4(PoolId(V4_POOL_ID)),
+                log_index: 4,
+                event: PoolLogEvent::Swap {
+                    sqrt_price_x96: U160::from(123456789u128),
+                    tick: tick(85176),
+                    liquidity: 555_000u128,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_v4_initialize_to_absolute_snapshot_keyed_by_pool_id() {
+        let log = log_with(
+            v4_manager(),
+            0,
+            uniswap_v4::Initialize {
+                id: V4_POOL_ID,
+                currency0: Address::ZERO,
+                currency1: Address::with_last_byte(2),
+                fee: U24::from(500u32),
+                tickSpacing: tick(10),
+                hooks: Address::ZERO,
+                sqrtPriceX96: U160::from(999u128),
+                tick: tick(-42),
+            },
+        );
+
+        assert_eq!(
+            decode_pool_log(&log),
+            Some(PoolLog {
+                pool: ProtocolPoolKey::UniswapV4(PoolId(V4_POOL_ID)),
+                log_index: 0,
+                event: PoolLogEvent::Initialize {
+                    sqrt_price_x96: U160::from(999u128),
+                    tick: tick(-42),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_v4_modify_liquidity_positive_delta_to_mint() {
+        let log = log_with(
+            v4_manager(),
+            3,
+            uniswap_v4::ModifyLiquidity {
+                id: V4_POOL_ID,
+                sender: Address::with_last_byte(1),
+                tickLower: tick(-600),
+                tickUpper: tick(600),
+                liquidityDelta: I256::try_from(42).expect("fits int256"),
+                salt: B256::ZERO,
+            },
+        );
+
+        assert_eq!(
+            decode_pool_log(&log),
+            Some(PoolLog {
+                pool: ProtocolPoolKey::UniswapV4(PoolId(V4_POOL_ID)),
+                log_index: 3,
+                event: PoolLogEvent::Mint {
+                    tick_lower: tick(-600),
+                    tick_upper: tick(600),
+                    amount: 42u128,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_v4_modify_liquidity_negative_delta_to_burn() {
+        let log = log_with(
+            v4_manager(),
+            9,
+            uniswap_v4::ModifyLiquidity {
+                id: V4_POOL_ID,
+                sender: Address::with_last_byte(1),
+                tickLower: tick(120),
+                tickUpper: tick(240),
+                liquidityDelta: I256::try_from(-7).expect("fits int256"),
+                salt: B256::ZERO,
+            },
+        );
+
+        assert_eq!(
+            decode_pool_log(&log),
+            Some(PoolLog {
+                pool: ProtocolPoolKey::UniswapV4(PoolId(V4_POOL_ID)),
+                log_index: 9,
+                event: PoolLogEvent::Burn {
+                    tick_lower: tick(120),
+                    tick_upper: tick(240),
+                    amount: 7u128,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn v4_modify_liquidity_delta_exceeding_u128_is_dropped() {
+        // A magnitude past u128::MAX cannot be a real v4 liquidity delta; it must not panic.
+        let too_big = I256::try_from(U256::from(u128::MAX)).expect("fits int256") + I256::ONE;
+        let log = log_with(
+            v4_manager(),
+            1,
+            uniswap_v4::ModifyLiquidity {
+                id: V4_POOL_ID,
+                sender: Address::with_last_byte(1),
+                tickLower: tick(-1),
+                tickUpper: tick(1),
+                liquidityDelta: too_big,
+                salt: B256::ZERO,
+            },
+        );
 
         assert_eq!(decode_pool_log(&log), None);
     }

@@ -5,10 +5,10 @@ use std::{
 
 use alloy::primitives::BlockHash;
 
-use super::{pool_registry::PoolCandidateAddress, token_registry::TokenAddress};
+use super::token_registry::TokenAddress;
 pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
 use crate::{
-    pool_state::PoolRef,
+    pool_state::{PoolRef, ProtocolPoolKey},
     request_tracking::{
         RequestCollection, RequestIdSequence, RequestIssuer, RequestStore, expired_request_ids,
         issue_request, retry_request, take_request,
@@ -35,7 +35,7 @@ pub struct GetPoolData {
 #[derive(Clone)]
 pub struct GetPoolMetadata {
     pub at: BlockHash,
-    pub candidates: HashSet<PoolCandidateAddress>,
+    pub candidates: HashSet<ProtocolPoolKey>,
 }
 
 #[derive(Clone)]
@@ -174,7 +174,7 @@ impl PendingRequests {
             .any(|request| request.payload.block_hash == block_hash)
     }
 
-    pub(crate) fn pending_pool_metadata_candidates(&self) -> HashSet<PoolCandidateAddress> {
+    pub(crate) fn pending_pool_metadata_candidates(&self) -> HashSet<ProtocolPoolKey> {
         self.pool_metadata
             .values()
             .flat_map(|request| request.payload.candidates.iter().copied())

@@ -38,8 +38,8 @@ pub use kernel::pending_requests::{
     GetTokenMetadata, IssuedRequest, RequestId,
 };
 pub use kernel::pool_registry::{
-    PoolCandidateAddress, PoolFee, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
-    PoolMetadataResult, TrustedPoolLogs, TrustedPoolRegistry, UniswapV3Fee,
+    PoolFee, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,
+    TrustedPoolLogs, TrustedPoolRegistry, UniswapV3Fee,
 };
 pub use kernel::token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,

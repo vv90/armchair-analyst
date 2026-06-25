@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use alloy::{primitives::BlockHash, rpc::types::Header, serde::WithOtherFields};
 
-use crate::{PoolCandidateAddress, PoolLog};
+use crate::{ProtocolPoolKey, PoolLog};
 
 pub type ClientHead = WithOtherFields<Header>;
 
@@ -13,7 +13,7 @@ pub type ClientHead = WithOtherFields<Header>;
 pub struct RangeLogBlock {
     pub number: u64,
     pub hash: BlockHash,
-    pub candidates: HashSet<PoolCandidateAddress>,
+    pub candidates: HashSet<ProtocolPoolKey>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

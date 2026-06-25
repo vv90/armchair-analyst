@@ -1942,6 +1942,38 @@ mod tests {
     }
 
     #[test]
+    fn pool_reserves_projection_resolves_native_currency_decimals_without_fetching() {
+        let pool = pool(10);
+        let native = TokenAddress(Address::ZERO, ChainKey::Ethereum);
+        let token1 = token(2);
+        let pool_state = balanced_pool_state(1_000_000);
+        // Only token1's decimals are seeded. The native currency (token0 = address(0)) is never
+        // fetched — it is not an ERC20 — yet the projection must still resolve it (intrinsically 18
+        // decimals) and produce reserves instead of pausing on missing token metadata.
+        let state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::from([(pool, pool_state.clone())]),
+            HashMap::from([(pool, pool_metadata(native, token1, UniswapV3Fee::Fee3000))]),
+            HashMap::from([(token1, token_metadata(6))]),
+        );
+        let (state, update) = projection_update(
+            ChainKey::Ethereum,
+            state,
+            hash(2),
+            HashMap::from([(pool, pool_state.clone())]),
+        );
+
+        let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
+            .unwrap()
+            .unwrap();
+
+        // `assert_directional_pair` expects token0 at 18 decimals — matching the intrinsic native
+        // value — and token1 at 6.
+        assert_directional_pair(&reserves.reserves, pool, native, token1, &pool_state);
+    }
+
+    #[test]
     fn pool_reserves_projection_returns_typed_error_when_amount_conversion_fails() {
         let pool = pool(10);
         let token0 = token(1);
@@ -2158,7 +2190,7 @@ mod tests {
                 .into_iter()
                 .map(|(pool, metadata)| {
                     let address = pool.uniswap_v3_address().expect("v3 pool");
-                    (crate::PoolCandidateAddress(address), Ok(metadata))
+                    (crate::ProtocolPoolKey::UniswapV3(address), Ok(metadata))
                 })
                 .collect(),
         );

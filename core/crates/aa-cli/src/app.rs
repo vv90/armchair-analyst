@@ -2,7 +2,7 @@ use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
     ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, MetadataCache,
-    PoolRef, PoolCandidateAddress, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
+    PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
     RpcConfig, TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, kernel,
@@ -76,8 +76,8 @@ impl ClientEvmRuntime {
         &self,
         chain: ChainKey,
         at: BlockHash,
-        candidates: HashSet<PoolCandidateAddress>,
-    ) -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError> {
+        candidates: HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError> {
         let cached = match self.metadata_cache.load_pool_metadata(chain, &candidates) {
             Ok(cached) => cached,
             Err(error) => {
@@ -495,7 +495,7 @@ impl ClientEvmRuntime {
                 // resolve as hits in `cached_pool_metadata` (no RPC); only genuinely new pools are
                 // fetched. A cache fault degrades to the scan-only set rather than failing bootstrap.
                 // This is bootstrap-only — the live closures stay scoped to their specific candidate.
-                match self.metadata_cache.load_pool_addresses(chain) {
+                match self.metadata_cache.load_pool_candidates(chain) {
                     Ok(known) => candidates.extend(known),
                     Err(error) => self.logger.log(&format!(
                         "error chain={chain:?} metadata_cache_load_failed kind=pool_addresses error={error}"
@@ -659,9 +659,9 @@ where
     FetchPoolMetadata:
         FnOnce(
             BlockHash,
-            HashSet<PoolCandidateAddress>,
+            HashSet<ProtocolPoolKey>,
         )
-            -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError>,
+            -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>,
     FetchTokenMetadata:
         FnOnce(
             BlockHash,
@@ -801,7 +801,7 @@ where
 mod tests {
     use client_evm::{
         Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
-        GetTokenMetadata, IssuedRequest, PoolRef, PoolCandidateAddress, PoolDataResult,
+        GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey, PoolDataResult,
         PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
         TokenMetadataResult, UniswapV3Fee,
     };
@@ -1766,7 +1766,7 @@ mod tests {
 
     fn pool_metadata_request_effect(
         at: BlockHash,
-        candidates: HashSet<PoolCandidateAddress>,
+        candidates: HashSet<ProtocolPoolKey>,
     ) -> (kernel::Effect, RequestId<GetPoolMetadata>) {
         let request_id = RequestId::from_raw_for_test(9);
         (
@@ -1811,8 +1811,8 @@ mod tests {
 
     fn unexpected_pool_metadata_fetch(
         _at: BlockHash,
-        _candidates: HashSet<PoolCandidateAddress>,
-    ) -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError> {
+        _candidates: HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError> {
         panic!("pool metadata fetch must not be called")
     }
 
@@ -1823,18 +1823,22 @@ mod tests {
         panic!("token metadata fetch must not be called")
     }
 
-    fn pool_candidate_address(last_byte: u8) -> PoolCandidateAddress {
+    fn pool_candidate_address(last_byte: u8) -> ProtocolPoolKey {
         let address = format!("0x{}", format!("{last_byte:040x}"))
             .parse()
             .expect("test address must parse");
 
-        PoolCandidateAddress(address)
+        ProtocolPoolKey::UniswapV3(address)
     }
 
     fn pool_metadata(last_byte: u8) -> PoolMetadata {
         PoolMetadata {
-            token0: pool_candidate_address(last_byte).0,
-            token1: pool_candidate_address(last_byte.wrapping_add(1)).0,
+            token0: pool_candidate_address(last_byte)
+                .uniswap_v3_address()
+                .expect("v3 pool"),
+            token1: pool_candidate_address(last_byte.wrapping_add(1))
+                .uniswap_v3_address()
+                .expect("v3 pool"),
             fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
         }
     }

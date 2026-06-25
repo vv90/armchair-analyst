@@ -13,16 +13,16 @@ enum PoolLogsStatus {
     Unknown,
     /// Logs observed via the best-effort subscription: candidates are real but the set is not
     /// guaranteed complete, so it is provisional and never gates the optimizer or finalization.
-    Partial(HashSet<PoolCandidateAddress>),
+    Partial(HashSet<ProtocolPoolKey>),
     /// Logs from an authoritative `GetBlockLogs`: the candidate set is complete.
-    Resolved(HashSet<PoolCandidateAddress>),
+    Resolved(HashSet<ProtocolPoolKey>),
 }
 
 impl PoolLogsStatus {
     /// The observed candidate set for `Partial`/`Resolved`, or `None` while `Unknown`. Lets
     /// consumers that treat any observation alike (candidate discovery, dirty tracking, metadata
     /// validation) avoid distinguishing provisional from authoritative.
-    fn candidates(&self) -> Option<&HashSet<PoolCandidateAddress>> {
+    fn candidates(&self) -> Option<&HashSet<ProtocolPoolKey>> {
         match self {
             PoolLogsStatus::Unknown => None,
             PoolLogsStatus::Partial(candidates) | PoolLogsStatus::Resolved(candidates) => {
@@ -430,8 +430,8 @@ impl BlocksGraph {
         tip_hash: BlockHash,
         finalized_hash: BlockHash,
         registry: &TrustedPoolRegistry,
-        pending_candidates: &HashSet<PoolCandidateAddress>,
-    ) -> Vec<(BlockHash, HashSet<PoolCandidateAddress>)> {
+        pending_candidates: &HashSet<ProtocolPoolKey>,
+    ) -> Vec<(BlockHash, HashSet<ProtocolPoolKey>)> {
         let mut current_hash = tip_hash;
         let mut requests = Vec::new();
         let mut visited = HashSet::new();
@@ -602,7 +602,7 @@ impl State {
         finalized_pool_snapshots: HashMap<PoolRef, PoolState>,
         pool_registry: TrustedPoolRegistry,
         token_registry: TokenRegistry,
-        seed_blocks: Vec<(BlockHash, BlockHash, HashSet<PoolCandidateAddress>)>,
+        seed_blocks: Vec<(BlockHash, BlockHash, HashSet<ProtocolPoolKey>)>,
     ) -> (State, Vec<Effect>) {
         let blocks = seed_blocks
             .into_iter()
@@ -901,9 +901,11 @@ impl State {
             return self;
         }
 
+        // The registry is still keyed by v3 contract address; v4 logs (keyed by PoolId) have no
+        // candidate yet and are skipped until v4 discovery wires them in.
         let observed = logs
             .iter()
-            .map(|log| PoolCandidateAddress(log.address))
+            .filter_map(|log| log.pool.uniswap_v3_address().map(ProtocolPoolKey::UniswapV3))
             .collect::<HashSet<_>>();
         let status = if complete {
             PoolLogsStatus::Resolved(observed)
@@ -918,9 +920,12 @@ impl State {
         // order via `log_index`.
         let mut events_by_pool: HashMap<PoolRef, Vec<(u64, &PoolLogEvent)>> = HashMap::new();
         for log in &logs {
+            let Some(address) = log.pool.uniswap_v3_address() else {
+                continue;
+            };
             if let Some(pool) = self
                 .pool_registry
-                .verified_pool(chain, PoolCandidateAddress(log.address))
+                .verified_pool(chain, ProtocolPoolKey::UniswapV3(address))
             {
                 events_by_pool
                     .entry(pool)
@@ -1151,7 +1156,7 @@ pub enum Event {
     },
     PoolMetadataReceived {
         request_id: RequestId<GetPoolMetadata>,
-        metadata: HashMap<PoolCandidateAddress, PoolMetadataResult>,
+        metadata: HashMap<ProtocolPoolKey, PoolMetadataResult>,
     },
     TokenMetadataReceived {
         request_id: RequestId<GetTokenMetadata>,
@@ -2940,7 +2945,7 @@ mod tests {
         state: &State,
         hash: BlockHash,
         parent_hash: BlockHash,
-        expected_logs: &HashSet<PoolCandidateAddress>,
+        expected_logs: &HashSet<ProtocolPoolKey>,
     ) {
         let block = state
             .blocks
@@ -2966,7 +2971,7 @@ mod tests {
         state: &State,
         hash: BlockHash,
         parent_hash: BlockHash,
-        expected_logs: &HashSet<PoolCandidateAddress>,
+        expected_logs: &HashSet<ProtocolPoolKey>,
     ) {
         let block = state
             .blocks
@@ -3115,7 +3120,7 @@ mod tests {
     fn assert_single_pool_metadata_request_effect(
         effects: &[Effect],
         at: BlockHash,
-        candidates: &HashSet<PoolCandidateAddress>,
+        candidates: &HashSet<ProtocolPoolKey>,
     ) -> RequestId<GetPoolMetadata> {
         let request_ids = effects
             .iter()
@@ -3205,19 +3210,19 @@ mod tests {
 
     /// Builds a deterministic candidate address fixture.
     /// This preserves the identity relationship between a log emitter and its potential pool.
-    fn pool_candidate_address(last_byte: u8) -> PoolCandidateAddress {
-        PoolCandidateAddress(Address::with_last_byte(last_byte))
+    fn pool_candidate_address(last_byte: u8) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV3(Address::with_last_byte(last_byte))
     }
 
     /// Builds the `BlockLogsReceived` payload that names exactly `candidates`. Each log is a
     /// liquidity delta with no base, so it derives to no snapshot: candidate-only tests keep their
     /// existing semantics (the block resolves and the pools are dirtied, nothing is derived).
-    fn pool_logs(candidates: &HashSet<PoolCandidateAddress>) -> Vec<PoolLog> {
+    fn pool_logs(candidates: &HashSet<ProtocolPoolKey>) -> Vec<PoolLog> {
         candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| PoolLog {
-                address: candidate.0,
+                pool: *candidate,
                 log_index: index as u64,
                 event: PoolLogEvent::Mint {
                     tick_lower: I24::try_from(-1).expect("test tick fits int24"),
@@ -3230,12 +3235,12 @@ mod tests {
 
     /// Builds a single `Swap` log whose absolute snapshot equals `pool_state`.
     fn swap_log(
-        candidate: PoolCandidateAddress,
+        candidate: ProtocolPoolKey,
         log_index: u64,
         pool_state: &PoolState,
     ) -> PoolLog {
         PoolLog {
-            address: candidate.0,
+            pool: candidate,
             log_index,
             event: PoolLogEvent::Swap {
                 sqrt_price_x96: pool_state.sqrt_price_x96,
@@ -3247,14 +3252,14 @@ mod tests {
 
     /// Builds a single `Mint` log carrying a liquidity delta over `[tick_lower, tick_upper)`.
     fn mint_log(
-        candidate: PoolCandidateAddress,
+        candidate: ProtocolPoolKey,
         log_index: u64,
         tick_lower: i32,
         tick_upper: i32,
         amount: u128,
     ) -> PoolLog {
         PoolLog {
-            address: candidate.0,
+            pool: candidate,
             log_index,
             event: PoolLogEvent::Mint {
                 tick_lower: I24::try_from(tick_lower).expect("test tick fits int24"),
@@ -3322,7 +3327,7 @@ mod tests {
     /// Latest-complete-query tests use it to shape path readiness directly.
     fn resolved_block_with_snapshots(
         parent_hash: BlockHash,
-        candidates: HashSet<PoolCandidateAddress>,
+        candidates: HashSet<ProtocolPoolKey>,
         pool_snapshots: HashMap<PoolRef, PoolState>,
     ) -> BlockNode {
         BlockNode {
@@ -3745,7 +3750,7 @@ mod tests {
         assert_eq!(
             next_state
                 .pool_registry
-                .verified_metadata(PoolRef::uniswap_v3(verified_candidate.0, ChainKey::Ethereum)),
+                .verified_metadata(PoolRef { key: verified_candidate, chain: ChainKey::Ethereum }),
             Some(&metadata)
         );
         assert!(next_state.pool_registry.is_rejected(rejected_candidate));
@@ -4068,7 +4073,7 @@ mod tests {
     }
 
     /// The single pool-event candidate a block at `number` contributes to its range-logs entry.
-    fn candidate_for_number(number: u64) -> PoolCandidateAddress {
+    fn candidate_for_number(number: u64) -> ProtocolPoolKey {
         pool_candidate_address(number as u8)
     }
 
@@ -4123,7 +4128,7 @@ mod tests {
                     .candidates
                     .iter()
                     .map(|candidate| {
-                        let byte = address_last_byte(&candidate.0);
+                        let byte = address_last_byte(&candidate.uniswap_v3_address().expect("v3 pool"));
                         let result = if metadata_fails.contains(&byte) {
                             Err(PoolMetadataFailure::FactoryReturnedZero)
                         } else {
@@ -5182,7 +5187,7 @@ mod tests {
         assert_trusted_pool_logs_resolved(
             &next_state,
             block_hash,
-            HashSet::from([PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum)]),
+            HashSet::from([PoolRef { key: candidate, chain: ChainKey::Ethereum }]),
         );
         assert_state_invariants(&next_state);
     }
@@ -5239,7 +5244,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -5320,7 +5325,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = registry_verifying(candidate);
@@ -5359,7 +5364,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let base = PoolState {
             sqrt_price_x96: U160::from(123u128),
             tick: I24::try_from(5).unwrap(),
@@ -5409,7 +5414,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = registry_verifying(candidate);
@@ -5450,7 +5455,7 @@ mod tests {
         let ancestor_hash = BlockHash::with_last_byte(2);
         let block_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = registry_verifying(candidate);
@@ -5494,7 +5499,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = registry_verifying(candidate);
@@ -5531,7 +5536,7 @@ mod tests {
 
     fn partial(
         parent_hash: BlockHash,
-        candidates: HashSet<PoolCandidateAddress>,
+        candidates: HashSet<ProtocolPoolKey>,
         pool_snapshots: HashMap<PoolRef, PoolState>,
     ) -> BlockNode {
         BlockNode {
@@ -5731,7 +5736,7 @@ mod tests {
         let block_hash = BlockHash::with_last_byte(2);
         let verified = pool_candidate_address(3);
         let rejected = pool_candidate_address(4);
-        let verified_pool = PoolRef::uniswap_v3(verified.0, ChainKey::Ethereum);
+        let verified_pool = PoolRef { key: verified, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -5877,7 +5882,7 @@ mod tests {
             next_state
                 .pool_registry
                 .verified_pool(ChainKey::Ethereum, first_candidate),
-            Some(PoolRef::uniswap_v3(first_candidate.0, ChainKey::Ethereum))
+            Some(PoolRef { key: first_candidate, chain: ChainKey::Ethereum })
         );
         assert_eq!(
             next_state
@@ -5946,13 +5951,13 @@ mod tests {
         assert_eq!(
             next_state
                 .pool_registry
-                .verified_metadata(PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum)),
+                .verified_metadata(PoolRef { key: candidate, chain: ChainKey::Ethereum }),
             Some(&pool_metadata(1, 2, UniswapV3Fee::Fee500))
         );
         assert_trusted_pool_logs_resolved(
             &next_state,
             block_hash,
-            HashSet::from([PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum)]),
+            HashSet::from([PoolRef { key: candidate, chain: ChainKey::Ethereum }]),
         );
         assert_state_invariants(&next_state);
     }
@@ -5964,7 +5969,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.token_registry = TokenRegistry::new().with_metadata_results(HashMap::from([
@@ -6014,7 +6019,7 @@ mod tests {
     // Coverage tests use it to place a failure marker on a specific block.
     fn resolved_block_with_failures(
         parent_hash: BlockHash,
-        candidates: HashSet<PoolCandidateAddress>,
+        candidates: HashSet<ProtocolPoolKey>,
         pool_data_failures: HashMap<PoolRef, PoolDataFailure>,
     ) -> BlockNode {
         BlockNode {
@@ -6027,7 +6032,7 @@ mod tests {
     }
 
     // Verifies a single candidate so its resolved logs project to a trusted pool.
-    fn registry_verifying(candidate: PoolCandidateAddress) -> TrustedPoolRegistry {
+    fn registry_verifying(candidate: ProtocolPoolKey) -> TrustedPoolRegistry {
         TrustedPoolRegistry::new().with_metadata_results(
             ChainKey::Ethereum,
             HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)))]),
@@ -6356,7 +6361,7 @@ mod tests {
         assert_eq!(
             next_state
                 .pool_registry
-                .verified_metadata(PoolRef::uniswap_v3(unrequested.0, ChainKey::Ethereum)),
+                .verified_metadata(PoolRef { key: unrequested, chain: ChainKey::Ethereum }),
             None
         );
         assert_eq!(
@@ -6420,7 +6425,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let logs = HashSet::from([candidate]);
         let mut state = empty_state_at(finalized_hash);
 
@@ -6472,8 +6477,8 @@ mod tests {
         let head_hash = BlockHash::with_last_byte(3);
         let first_candidate = pool_candidate_address(4);
         let second_candidate = pool_candidate_address(5);
-        let first_pool = PoolRef::uniswap_v3(first_candidate.0, ChainKey::Ethereum);
-        let second_pool = PoolRef::uniswap_v3(second_candidate.0, ChainKey::Ethereum);
+        let first_pool = PoolRef { key: first_candidate, chain: ChainKey::Ethereum };
+        let second_pool = PoolRef { key: second_candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -6538,8 +6543,8 @@ mod tests {
         let block_hash = BlockHash::with_last_byte(2);
         let first_candidate = pool_candidate_address(3);
         let second_candidate = pool_candidate_address(4);
-        let first_pool = PoolRef::uniswap_v3(first_candidate.0, ChainKey::Ethereum);
-        let second_pool = PoolRef::uniswap_v3(second_candidate.0, ChainKey::Ethereum);
+        let first_pool = PoolRef { key: first_candidate, chain: ChainKey::Ethereum };
+        let second_pool = PoolRef { key: second_candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -6618,7 +6623,7 @@ mod tests {
                 pool_data_failures: HashMap::new(),
             },
         );
-        (state, candidate.0)
+        (state, candidate.uniswap_v3_address().expect("v3 pool"))
     }
 
     // A block whose bloom contains none of the trusted pool addresses is promoted to `Resolved`
@@ -6693,7 +6698,7 @@ mod tests {
         let (state, _pool) = state_with_one_verified_pool_and_block(
             finalized_hash,
             block_hash,
-            Some(bloom_containing(&[undiscovered.0])),
+            Some(bloom_containing(&[undiscovered.uniswap_v3_address().expect("v3 pool")])),
             PoolLogsStatus::Partial(HashSet::from([undiscovered])),
         );
 
@@ -6771,7 +6776,7 @@ mod tests {
         let parent_hash = BlockHash::with_last_byte(2);
         let head_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -6827,7 +6832,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -6949,7 +6954,7 @@ mod tests {
         assert_trusted_pool_logs_resolved(
             &state,
             block_hash,
-            HashSet::from([PoolRef::uniswap_v3(verified.0, ChainKey::Ethereum)]),
+            HashSet::from([PoolRef { key: verified, chain: ChainKey::Ethereum }]),
         );
         assert_state_invariants(&state);
     }
@@ -7316,7 +7321,7 @@ mod tests {
         let complete_hash = BlockHash::with_last_byte(2);
         let unknown_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let snapshot = pool_state(5);
         let mut state = empty_state_at(finalized_hash);
 
@@ -7355,7 +7360,7 @@ mod tests {
         let pending_hash = BlockHash::with_last_byte(3);
         let verified = pool_candidate_address(4);
         let pending = pool_candidate_address(5);
-        let pool = PoolRef::uniswap_v3(verified.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: verified, chain: ChainKey::Ethereum };
         let snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
@@ -7420,7 +7425,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let snapshot = pool_state(4);
         let mut state = empty_state_at(finalized_hash);
 
@@ -7454,7 +7459,7 @@ mod tests {
         let affected_hash = BlockHash::with_last_byte(2);
         let later_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let snapshot = pool_state(5);
         let mut state = empty_state_at(finalized_hash);
 
@@ -7493,7 +7498,7 @@ mod tests {
         let second_hash = BlockHash::with_last_byte(3);
         let third_hash = BlockHash::with_last_byte(4);
         let candidate = pool_candidate_address(5);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let first_snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
@@ -7536,7 +7541,7 @@ mod tests {
         let second_hash = BlockHash::with_last_byte(3);
         let third_hash = BlockHash::with_last_byte(4);
         let candidate = pool_candidate_address(5);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let first_snapshot = pool_state(6);
         let third_snapshot = pool_state(7);
         let mut state = empty_state_at(finalized_hash);
@@ -7582,7 +7587,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
@@ -7616,7 +7621,7 @@ mod tests {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
-        let affected_pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let affected_pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let unaffected_pool = pool_address(4);
         let affected_snapshot = pool_state(5);
         let unaffected_snapshot = pool_state(6);
@@ -7655,7 +7660,7 @@ mod tests {
         let first_hash = BlockHash::with_last_byte(2);
         let second_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let first_snapshot = pool_state(5);
         let second_snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
@@ -7698,7 +7703,7 @@ mod tests {
         let target_hash = BlockHash::with_last_byte(2);
         let tip_hash = BlockHash::with_last_byte(3);
         let candidate = pool_candidate_address(4);
-        let affected_pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let affected_pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let unaffected_pool = pool_address(5);
         let old_affected_snapshot = pool_state(6);
         let new_affected_snapshot = pool_state(7);
@@ -7759,7 +7764,7 @@ mod tests {
         let incomplete_hash = BlockHash::with_last_byte(3);
         let target_hash = BlockHash::with_last_byte(4);
         let candidate = pool_candidate_address(5);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let snapshot = pool_state(6);
         let mut state = empty_state_at(finalized_hash);
 
@@ -7911,7 +7916,7 @@ mod tests {
         let side_hash = BlockHash::with_last_byte(4);
         let retained_token = token_address(5);
         let candidate = pool_candidate_address(6);
-        let pool = PoolRef::uniswap_v3(candidate.0, ChainKey::Ethereum);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
         let mut state = empty_state_at(finalized_hash);
 
         state.canonical_tip = retained_hash;
@@ -8083,7 +8088,7 @@ mod tests {
         let block_hash = BlockHash::with_last_byte(2);
         let logged_pool = pool_address(3);
         let logged_candidate =
-            PoolCandidateAddress(logged_pool.uniswap_v3_address().expect("v3 pool"));
+            ProtocolPoolKey::UniswapV3(logged_pool.uniswap_v3_address().expect("v3 pool"));
         let requested_pool = pool_address(4);
         let requested_state = pool_state(5);
         let mut state = empty_state_at(finalized_hash);
@@ -10017,7 +10022,7 @@ mod tests {
                     .iter()
                     .copied()
                     .map(|candidate| {
-                        let result = if candidate.0.as_slice()[19] % 2 == 0 {
+                        let result = if candidate.uniswap_v3_address().expect("v3 pool").as_slice()[19] % 2 == 0 {
                             Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000))
                         } else {
                             Err(PoolMetadataFailure::FactoryReturnedZero)
@@ -10315,7 +10320,7 @@ mod tests {
                     .collect::<HashSet<_>>();
 
                 for candidate in &candidates {
-                    let byte = candidate.0.as_slice()[19];
+                    let byte = candidate.uniswap_v3_address().expect("v3 pool").as_slice()[19];
                     pool_metadata_results.insert(
                         *candidate,
                         Ok(pool_metadata(

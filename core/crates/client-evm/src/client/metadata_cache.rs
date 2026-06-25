@@ -1,26 +1,33 @@
-//! Persistent, address-keyed cache of immutable pool/token metadata, backed by redb.
+//! Persistent cache of immutable pool/token metadata, backed by redb.
 //!
 //! Pool metadata (`token0`/`token1`/`fee`) and token decimals never change once validated, so they
 //! are stored once and reused across runs to avoid re-validating them via RPC on every bootstrap.
 //! Pool *state* (reserves) is intentionally **not** cached — it is per-block and always fetched fresh.
 //!
-//! Address uniqueness is a property of the store, not of application logic: each row is keyed by
-//! `(chain, raw-address)`, so there is exactly one entry per address per chain. `alloy::Address` is
-//! already canonical 20-byte data (checksum casing is a display concern only), so the raw bytes are
-//! the canonical key with no normalization step.
+//! Identity uniqueness is a property of the store, not of application logic. Tokens are keyed by
+//! `(chain, raw-address)`. Pools are keyed by `(chain, protocol, identity)` — a v3 pool's identity
+//! is its 20-byte address, a v4 pool's is its 32-byte `PoolId`; the explicit protocol tag keeps the
+//! two from ever colliding even when their bytes overlap.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use alloy::primitives::{Address, B256};
 use redb::{Database, TableDefinition, backends::InMemoryBackend};
 
+use crate::uniswap_v4::PoolId;
 use crate::{
-    ChainKey, PoolCandidateAddress, PoolMetadata, PoolMetadataResult, TokenAddress, TokenMetadata,
+    ChainKey, PoolMetadata, PoolMetadataResult, ProtocolPoolKey, TokenAddress, TokenMetadata,
     TokenMetadataResult,
 };
 
-/// Composite key length: one chain tag byte followed by the 20-byte address.
+/// Token composite key length: one chain tag byte followed by the 20-byte address.
 const KEY_LEN: usize = 21;
+
+/// Stable, explicit protocol discriminant for pool keys — like `chain_tag`, not derived from enum
+/// ordering, so the on-disk format is decoupled from `ProtocolPoolKey`'s declaration order.
+const PROTO_TAG_V3: u8 = 0;
+const PROTO_TAG_V4: u8 = 1;
 
 const POOLS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pool_metadata");
 const TOKENS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("token_metadata");
@@ -71,14 +78,14 @@ impl MetadataCache {
     pub fn load_pool_metadata(
         &self,
         chain: ChainKey,
-        candidates: &HashSet<PoolCandidateAddress>,
-    ) -> Result<HashMap<PoolCandidateAddress, PoolMetadata>, MetadataCacheError> {
+        candidates: &HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadata>, MetadataCacheError> {
         let read = self.database.begin_read().map_err(database_error)?;
         let table = read.open_table(POOLS_TABLE).map_err(database_error)?;
 
         let mut hits = HashMap::new();
         for candidate in candidates {
-            let key = composite_key(chain, candidate.0);
+            let key = pool_key(chain, *candidate);
             if let Some(value) = table.get(key.as_slice()).map_err(database_error)? {
                 hits.insert(*candidate, serde_json::from_slice(value.value())?);
             }
@@ -91,7 +98,7 @@ impl MetadataCache {
     pub fn store_pool_metadata(
         &self,
         chain: ChainKey,
-        results: &HashMap<PoolCandidateAddress, PoolMetadataResult>,
+        results: &HashMap<ProtocolPoolKey, PoolMetadataResult>,
     ) -> Result<(), MetadataCacheError> {
         let entries = results
             .iter()
@@ -107,7 +114,7 @@ impl MetadataCache {
         {
             let mut table = write.open_table(POOLS_TABLE).map_err(database_error)?;
             for (candidate, metadata) in entries {
-                let key = composite_key(chain, candidate.0);
+                let key = pool_key(chain, *candidate);
                 let value = serde_json::to_vec(metadata)?;
                 table
                     .insert(key.as_slice(), value.as_slice())
@@ -119,40 +126,38 @@ impl MetadataCache {
         Ok(())
     }
 
-    /// Returns every pool address stored for `chain` via a prefix range scan over the chain tag.
+    /// Returns every pool candidate stored for `chain` (both protocols) via a prefix range scan over
+    /// the chain tag.
     ///
     /// Bootstrap uses this to widen its candidate set with the full known pool set, so a narrowed
     /// `finalized..tip` scan still re-activates every previously-validated pool (those resolve as
     /// cache hits; only genuinely new pools hit RPC).
-    pub fn load_pool_addresses(
+    pub fn load_pool_candidates(
         &self,
         chain: ChainKey,
-    ) -> Result<HashSet<PoolCandidateAddress>, MetadataCacheError> {
+    ) -> Result<HashSet<ProtocolPoolKey>, MetadataCacheError> {
         let read = self.database.begin_read().map_err(database_error)?;
         let table = read.open_table(POOLS_TABLE).map_err(database_error)?;
 
-        // The composite key sorts by chain tag first, so a chain's rows are one contiguous range
-        // `[tag, 0x00..] ..= [tag, 0xFF..]` — no tag arithmetic, no risk of spanning another chain.
+        // Pool keys sort by chain tag first, so a chain's rows (of either protocol and any length)
+        // are exactly the half-open range `[tag] .. [tag + 1]`. The chain tag is 0 or 1, so the
+        // `tag + 1` upper bound never overflows.
         let tag = chain_tag(chain);
-        let mut lower = [0u8; KEY_LEN];
-        lower[0] = tag;
-        let mut upper = [0xFFu8; KEY_LEN];
-        upper[0] = tag;
+        let lower = [tag];
+        let upper = [tag + 1];
         let range = table
-            .range::<&[u8]>(lower.as_slice()..=upper.as_slice())
+            .range::<&[u8]>(lower.as_slice()..upper.as_slice())
             .map_err(database_error)?;
 
-        let mut addresses = HashSet::new();
+        let mut candidates = HashSet::new();
         for entry in range {
             let (key, _value) = entry.map_err(database_error)?;
-            if let Some(address_bytes) = key.value().get(1..) {
-                if let Ok(address) = alloy::primitives::Address::try_from(address_bytes) {
-                    addresses.insert(PoolCandidateAddress(address));
-                }
+            if let Some(candidate) = key.value().get(1..).and_then(decode_pool_candidate) {
+                candidates.insert(candidate);
             }
         }
 
-        Ok(addresses)
+        Ok(candidates)
     }
 
     /// Returns the cached metadata for whichever requested tokens are already known.
@@ -204,12 +209,44 @@ impl MetadataCache {
     }
 }
 
-/// One chain tag byte followed by the address bytes — unique per `(chain, address)`.
+/// One chain tag byte followed by the token address bytes — unique per `(chain, address)`.
 fn composite_key(chain: ChainKey, address: alloy::primitives::Address) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     key[0] = chain_tag(chain);
     key[1..].copy_from_slice(address.as_slice());
     key
+}
+
+/// Pool key: chain tag, protocol tag, then the protocol identity bytes (20 for a v3 address, 32 for
+/// a v4 `PoolId`). The protocol tag prevents a v3 address and a v4 `PoolId` from colliding.
+fn pool_key(chain: ChainKey, candidate: ProtocolPoolKey) -> Vec<u8> {
+    let mut key = vec![chain_tag(chain)];
+    match candidate {
+        ProtocolPoolKey::UniswapV3(address) => {
+            key.push(PROTO_TAG_V3);
+            key.extend_from_slice(address.as_slice());
+        }
+        ProtocolPoolKey::UniswapV4(pool_id) => {
+            key.push(PROTO_TAG_V4);
+            key.extend_from_slice(pool_id.0.as_slice());
+        }
+    }
+    key
+}
+
+/// Decodes a pool key's identity portion (the bytes after the chain tag) back into a
+/// `ProtocolPoolKey`. Returns `None` for an unknown protocol tag or an identity of the wrong length.
+fn decode_pool_candidate(identity: &[u8]) -> Option<ProtocolPoolKey> {
+    let (proto_tag, id_bytes) = identity.split_first()?;
+    match *proto_tag {
+        PROTO_TAG_V3 => Address::try_from(id_bytes)
+            .ok()
+            .map(ProtocolPoolKey::UniswapV3),
+        PROTO_TAG_V4 => B256::try_from(id_bytes)
+            .ok()
+            .map(|bytes| ProtocolPoolKey::UniswapV4(PoolId(bytes))),
+        _ => None,
+    }
 }
 
 /// Stable, explicit chain discriminant for the key — not derived from enum ordering, so reordering
@@ -223,13 +260,17 @@ fn chain_tag(chain: ChainKey) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, B256, U256};
 
     use super::*;
     use crate::{PoolFee, PoolMetadataCall, PoolMetadataFailure, TokenDecimals, UniswapV3Fee};
 
-    fn pool_candidate(byte: u8) -> PoolCandidateAddress {
-        PoolCandidateAddress(Address::with_last_byte(byte))
+    fn pool_candidate(byte: u8) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV3(Address::with_last_byte(byte))
+    }
+
+    fn v4_pool_candidate(byte: u8) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV4(PoolId(B256::with_last_byte(byte)))
     }
 
     fn pool_metadata(byte: u8) -> PoolMetadata {
@@ -237,6 +278,17 @@ mod tests {
             token0: Address::with_last_byte(byte),
             token1: Address::with_last_byte(byte.wrapping_add(1)),
             fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
+        }
+    }
+
+    fn v4_pool_metadata(byte: u8) -> PoolMetadata {
+        PoolMetadata {
+            token0: Address::with_last_byte(byte),
+            token1: Address::with_last_byte(byte.wrapping_add(1)),
+            fee: PoolFee::Static {
+                pips: 500,
+                tick_spacing: 10,
+            },
         }
     }
 
@@ -362,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn load_pool_addresses_enumerates_only_the_requested_chain() {
+    fn load_pool_candidates_enumerates_only_the_requested_chain() {
         let cache = MetadataCache::in_memory().unwrap();
         let ethereum_a = pool_candidate(1);
         let ethereum_b = pool_candidate(2);
@@ -384,17 +436,77 @@ mod tests {
             )
             .unwrap();
 
-        let ethereum = cache.load_pool_addresses(ChainKey::Ethereum).unwrap();
+        let ethereum = cache.load_pool_candidates(ChainKey::Ethereum).unwrap();
 
         // Same last byte exists on Arbitrum, but the chain-tagged prefix scan must not include it.
         assert_eq!(ethereum, HashSet::from([ethereum_a, ethereum_b]));
     }
 
     #[test]
-    fn load_pool_addresses_is_empty_on_a_cold_table() {
+    fn load_pool_candidates_returns_both_protocols_for_a_chain() {
+        let cache = MetadataCache::in_memory().unwrap();
+        let v3 = pool_candidate(1);
+        let v4 = v4_pool_candidate(2);
+
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(v3, Ok(pool_metadata(1))), (v4, Ok(v4_pool_metadata(2)))]),
+            )
+            .unwrap();
+
+        let loaded = cache.load_pool_candidates(ChainKey::Ethereum).unwrap();
+
+        assert_eq!(loaded, HashSet::from([v3, v4]));
+    }
+
+    #[test]
+    fn v4_pool_metadata_round_trips_through_the_cache() {
+        let cache = MetadataCache::in_memory().unwrap();
+        let candidate = v4_pool_candidate(9);
+        let metadata = v4_pool_metadata(9);
+
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(candidate, Ok(metadata.clone()))]),
+            )
+            .unwrap();
+
+        let loaded = cache
+            .load_pool_metadata(ChainKey::Ethereum, &HashSet::from([candidate]))
+            .unwrap();
+
+        assert_eq!(loaded, HashMap::from([(candidate, metadata)]));
+    }
+
+    #[test]
+    fn v3_address_and_v4_pool_id_with_shared_bytes_do_not_collide() {
+        let cache = MetadataCache::in_memory().unwrap();
+        // Both identities share the last byte; the protocol tag must keep their keys distinct.
+        let v3 = ProtocolPoolKey::UniswapV3(Address::with_last_byte(0xAB));
+        let v4 = ProtocolPoolKey::UniswapV4(PoolId(B256::with_last_byte(0xAB)));
+
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(v3, Ok(pool_metadata(1))), (v4, Ok(v4_pool_metadata(2)))]),
+            )
+            .unwrap();
+
+        let loaded = cache
+            .load_pool_metadata(ChainKey::Ethereum, &HashSet::from([v3, v4]))
+            .unwrap();
+
+        assert_eq!(loaded.get(&v3), Some(&pool_metadata(1)));
+        assert_eq!(loaded.get(&v4), Some(&v4_pool_metadata(2)));
+    }
+
+    #[test]
+    fn load_pool_candidates_is_empty_on_a_cold_table() {
         let cache = MetadataCache::in_memory().unwrap();
 
-        let loaded = cache.load_pool_addresses(ChainKey::Ethereum).unwrap();
+        let loaded = cache.load_pool_candidates(ChainKey::Ethereum).unwrap();
 
         assert!(loaded.is_empty());
     }

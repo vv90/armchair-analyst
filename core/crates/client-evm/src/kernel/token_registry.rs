@@ -69,6 +69,14 @@ pub enum TokenMetadataFailure {
 
 pub type TokenMetadataResult = Result<TokenMetadata, TokenMetadataFailure>;
 
+// The native currency (`Address::ZERO`) is not an ERC20, so its `decimals()` cannot be fetched; it is
+// a fixed protocol fact. Every chain currently in scope (Ethereum, Arbitrum) uses 18-decimal native
+// ETH, including v4 native-ETH pools that store `token0 = address(0)`. Treating the native currency as
+// intrinsically known keeps it out of the RPC token-metadata path while still resolving its decimals.
+static NATIVE_TOKEN_METADATA: TokenMetadata = TokenMetadata {
+    decimals: TokenDecimals(18),
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRegistry {
     verified: HashMap<TokenAddress, TokenMetadata>,
@@ -106,6 +114,9 @@ impl TokenRegistry {
     }
 
     pub fn verified_metadata(&self, token: TokenAddress) -> Option<&TokenMetadata> {
+        if token.0 == Address::ZERO {
+            return Some(&NATIVE_TOKEN_METADATA);
+        }
         self.verified.get(&token)
     }
 
@@ -118,7 +129,9 @@ impl TokenRegistry {
     }
 
     pub fn is_known(&self, token: TokenAddress) -> bool {
-        self.verified.contains_key(&token) || self.is_unsupported(token)
+        // `verified_metadata` resolves the native currency intrinsically, so this also reports the
+        // native token as known — keeping `address(0)` out of `unknown_tokens` and the RPC path.
+        self.verified_metadata(token).is_some() || self.is_unsupported(token)
     }
 
     pub fn unknown_tokens(&self, tokens: &HashSet<TokenAddress>) -> HashSet<TokenAddress> {
@@ -291,6 +304,47 @@ mod tests {
             for token in registry.verified_tokens_for_test() {
                 prop_assert!(!registry.is_unsupported(token));
             }
+        }
+    }
+
+    #[test]
+    fn native_currency_is_intrinsically_known_with_eighteen_decimals() {
+        let native = TokenAddress(Address::ZERO, ChainKey::Ethereum);
+        // A fresh registry has fetched nothing, yet native ETH resolves: it is a fixed protocol fact,
+        // not an RPC-fetched value (the zero address is not an ERC20).
+        let registry = TokenRegistry::new();
+
+        assert_eq!(registry.verified_metadata(native).unwrap().decimals.value(), 18);
+        assert!(registry.is_known(native));
+        assert!(!registry.is_unsupported(native));
+    }
+
+    #[test]
+    fn unknown_tokens_excludes_the_native_currency() {
+        let native = TokenAddress(Address::ZERO, ChainKey::Ethereum);
+        let erc20 = token(1);
+        let registry = TokenRegistry::new();
+
+        // The native currency must never be requested over RPC, so it is never an unknown token.
+        assert_eq!(
+            registry.unknown_tokens(&HashSet::from([native, erc20])),
+            HashSet::from([erc20])
+        );
+    }
+
+    #[test]
+    fn native_currency_is_known_on_every_chain() {
+        // Native ETH on any supported chain is 18 decimals; the intrinsic lookup is chain-agnostic.
+        for chain in [ChainKey::Ethereum, ChainKey::Arbitrum] {
+            let native = TokenAddress(Address::ZERO, chain);
+            assert_eq!(
+                TokenRegistry::new()
+                    .verified_metadata(native)
+                    .unwrap()
+                    .decimals
+                    .value(),
+                18
+            );
         }
     }
 

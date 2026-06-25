@@ -11,7 +11,7 @@ use alloy::primitives::{BlockHash, keccak256};
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
 use crate::{
-    ChainKey, PoolRef, PoolCandidateAddress, PoolMetadataResult, PoolState, RangeLogBlock,
+    ChainKey, PoolRef, ProtocolPoolKey, PoolMetadataResult, PoolState, RangeLogBlock,
     TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry, tick::Tick,
 };
 pub use crate::{GetPoolMetadata, GetTokenMetadata};
@@ -45,7 +45,7 @@ pub struct FinalizedAnchor {
 pub struct SeedBlock {
     pub hash: BlockHash,
     pub parent_hash: BlockHash,
-    pub candidates: HashSet<PoolCandidateAddress>,
+    pub candidates: HashSet<ProtocolPoolKey>,
 }
 
 /// Inferred block-graph seed for the `finalized..tip` window (parents by number adjacency).
@@ -148,7 +148,7 @@ impl GraphSeed {
 /// and the trusted-pool registry handed to the kernel — none of which are stored redundantly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedPools {
-    metadata: HashMap<PoolCandidateAddress, PoolMetadataResult>,
+    metadata: HashMap<ProtocolPoolKey, PoolMetadataResult>,
 }
 
 impl VerifiedPools {
@@ -227,7 +227,7 @@ pub enum Event {
     },
     PoolMetadataReceived {
         request_id: RequestId<GetPoolMetadata>,
-        metadata: HashMap<PoolCandidateAddress, PoolMetadataResult>,
+        metadata: HashMap<ProtocolPoolKey, PoolMetadataResult>,
     },
     TokenMetadataReceived {
         request_id: RequestId<GetTokenMetadata>,
@@ -531,8 +531,8 @@ mod tests {
         BlockHash::with_last_byte(byte)
     }
 
-    fn candidate(byte: u8) -> PoolCandidateAddress {
-        PoolCandidateAddress(Address::with_last_byte(byte))
+    fn candidate(byte: u8) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV3(Address::with_last_byte(byte))
     }
 
     fn anchor(number: u64, hash_byte: u8) -> FinalizedAnchor {
@@ -1137,7 +1137,7 @@ mod tests {
     /// kernel property tests build a populated state, but ends at the `BootstrapOutcome` so the
     /// same invariants can be asserted against the bootstrap's *output*.
     fn drive_to_ready(
-        pool_metadata: HashMap<PoolCandidateAddress, PoolMetadataResult>,
+        pool_metadata: HashMap<ProtocolPoolKey, PoolMetadataResult>,
         token_response: impl Fn(&TokenAddress) -> TokenMetadataResult,
     ) -> BootstrapOutcome {
         let (state, effects) = init(test_policy());
@@ -1333,7 +1333,7 @@ mod tests {
 
             for pool in outcome.pool_registry.verified_pools_for_test() {
                 let address = pool.uniswap_v3_address().expect("v3 pool");
-                prop_assert!(!outcome.pool_registry.is_rejected(PoolCandidateAddress(address)));
+                prop_assert!(!outcome.pool_registry.is_rejected(ProtocolPoolKey::UniswapV3(address)));
             }
         }
 

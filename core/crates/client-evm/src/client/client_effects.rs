@@ -16,7 +16,7 @@ use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 use crate::{
-    ChainKey, ClientEvmError, PoolFee, PoolRef, PoolCandidateAddress, PoolDataCall, PoolDataFailure,
+    ChainKey, ClientEvmError, PoolFee, PoolRef, ProtocolPoolKey, PoolDataCall, PoolDataFailure,
     PoolDataResult, PoolLog, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
     PoolMetadataResult, PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals,
     TokenMetadata, TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
@@ -240,11 +240,12 @@ pub fn fetch_pool_data(
     }
 
     let endpoint_pool = endpoints.pool(chain)?;
-    let targets = sorted_v3_pool_data_targets(pools);
-    let calls = pool_data_multicall_calls(&targets);
+    let state_view = crate::uniswap_v4::state_view_address(chain);
+    let plans = sorted_pool_data_call_plans(pools, state_view);
+    let calls = pool_data_multicall_calls(&plans);
     let results = aggregate3_batched(agent, endpoint_pool, MulticallBlock::Hash(at), &calls)?;
 
-    Ok(decode_pool_data_results(&targets, &results))
+    Ok(decode_pool_data_results(&plans, &results))
 }
 
 pub fn fetch_pool_metadata(
@@ -255,8 +256,8 @@ pub fn fetch_pool_metadata(
     // than the anchor block: this avoids historical-state execution that pruned free-tier upstreams
     // reject outright. The anchor `_at` is retained for request plumbing/symmetry with pool data.
     _at: BlockHash,
-    candidates: HashSet<PoolCandidateAddress>,
-) -> Result<HashMap<PoolCandidateAddress, PoolMetadataResult>, ClientEvmError> {
+    candidates: HashSet<ProtocolPoolKey>,
+) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError> {
     if candidates.is_empty() {
         return Ok(HashMap::new());
     }
@@ -306,11 +307,24 @@ pub fn fetch_token_metadata(
 }
 
 fn sorted_pool_candidate_addresses(
-    candidates: HashSet<PoolCandidateAddress>,
-) -> Vec<PoolCandidateAddress> {
-    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates: HashSet<ProtocolPoolKey>,
+) -> Vec<ProtocolPoolKey> {
+    // This RPC path validates pools via the v3 factory and per-pool `token0`/`token1`/`fee` reads,
+    // so it applies only to v3 candidates; v4 metadata is event-sourced. Drop any non-v3 candidate
+    // defensively (none reach here today).
+    let mut candidates = candidates
+        .into_iter()
+        .filter(|candidate| candidate.uniswap_v3_address().is_some())
+        .collect::<Vec<_>>();
+    candidates.sort();
     candidates
+}
+
+/// The v3 pool contract address a candidate's metadata calls target. `sorted_pool_candidate_addresses`
+/// has already dropped non-v3 candidates, so the zero-address fallback is unreachable; it keeps this
+/// panic-free regardless.
+fn candidate_target(candidate: ProtocolPoolKey) -> Address {
+    candidate.uniswap_v3_address().unwrap_or(Address::ZERO)
 }
 
 fn sorted_token_addresses(tokens: HashSet<TokenAddress>) -> Vec<TokenAddress> {
@@ -369,22 +383,23 @@ fn decode_token_metadata_multicall_result<T>(
 }
 
 fn pool_metadata_candidate_multicall_calls(
-    candidates: &[PoolCandidateAddress],
+    candidates: &[ProtocolPoolKey],
 ) -> Vec<MulticallCall> {
     candidates
         .iter()
         .flat_map(|candidate| {
+            let target = candidate_target(*candidate);
             [
                 MulticallCall {
-                    target: candidate.0,
+                    target,
                     call_data: Bytes::from(crate::uniswap_v3::token0Call {}.abi_encode()),
                 },
                 MulticallCall {
-                    target: candidate.0,
+                    target,
                     call_data: Bytes::from(crate::uniswap_v3::token1Call {}.abi_encode()),
                 },
                 MulticallCall {
-                    target: candidate.0,
+                    target,
                     call_data: Bytes::from(crate::uniswap_v3::feeCall {}.abi_encode()),
                 },
             ]
@@ -393,7 +408,7 @@ fn pool_metadata_candidate_multicall_calls(
 }
 
 fn pool_metadata_factory_multicall_calls(
-    metadata: &[(PoolCandidateAddress, PoolMetadata)],
+    metadata: &[(ProtocolPoolKey, PoolMetadata)],
 ) -> Vec<MulticallCall> {
     metadata
         .iter()
@@ -412,11 +427,11 @@ fn pool_metadata_factory_multicall_calls(
 }
 
 fn decode_pool_metadata_candidate_results(
-    candidates: &[PoolCandidateAddress],
+    candidates: &[ProtocolPoolKey],
     results: &[MulticallCallResult],
 ) -> (
-    HashMap<PoolCandidateAddress, PoolMetadataResult>,
-    Vec<(PoolCandidateAddress, PoolMetadata)>,
+    HashMap<ProtocolPoolKey, PoolMetadataResult>,
+    Vec<(ProtocolPoolKey, PoolMetadata)>,
 ) {
     let mut result_chunks = results.chunks(3);
     let mut metadata_results = HashMap::new();
@@ -459,9 +474,9 @@ fn decode_pool_metadata_candidate_result(
 }
 
 fn decode_pool_metadata_factory_results(
-    metadata: &[(PoolCandidateAddress, PoolMetadata)],
+    metadata: &[(ProtocolPoolKey, PoolMetadata)],
     results: &[MulticallCallResult],
-) -> HashMap<PoolCandidateAddress, PoolMetadataResult> {
+) -> HashMap<ProtocolPoolKey, PoolMetadataResult> {
     metadata
         .iter()
         .enumerate()
@@ -475,7 +490,7 @@ fn decode_pool_metadata_factory_results(
 }
 
 fn decode_pool_metadata_factory_result(
-    candidate: PoolCandidateAddress,
+    candidate: ProtocolPoolKey,
     metadata: &PoolMetadata,
     result: Option<&MulticallCallResult>,
 ) -> PoolMetadataResult {
@@ -483,7 +498,7 @@ fn decode_pool_metadata_factory_result(
 
     if returned == Address::ZERO {
         Err(PoolMetadataFailure::FactoryReturnedZero)
-    } else if returned != candidate.0 {
+    } else if returned != candidate_target(candidate) {
         Err(PoolMetadataFailure::FactoryMismatch { returned })
     } else {
         Ok(metadata.clone())
@@ -536,51 +551,82 @@ fn decode_pool_metadata_multicall_result<T>(
     }
 }
 
-/// The v3 pools to query, each paired with the contract address its `slot0`/`liquidity` calls
-/// target, sorted by address for deterministic multicall ordering. v4 pools have no per-pool address
-/// (they live in the singleton `PoolManager`) and are read through a separate StateView path, so
-/// they are skipped here rather than producing an address-less call.
-fn sorted_v3_pool_data_targets(pools: HashSet<PoolRef>) -> Vec<(PoolRef, Address)> {
-    let mut targets = pools
+/// Each pool paired with the two multicall calls (state + liquidity) that read its live state,
+/// sorted by `PoolRef` for deterministic multicall ordering. v3 pools read `slot0()`/`liquidity()`
+/// from their own contract; v4 pools read `getSlot0(id)`/`getLiquidity(id)` from the chain's
+/// `StateView`. `PoolRef`'s `Ord` keeps all v3 pools (ordered by address) ahead of v4, so v3 ordering
+/// is unchanged. A v4 pool on a chain with no known `StateView` produces no plan and is skipped — it
+/// has no contract to target; this cannot happen today since v4 is Ethereum-only.
+fn sorted_pool_data_call_plans(
+    pools: HashSet<PoolRef>,
+    state_view: Option<Address>,
+) -> Vec<(PoolRef, [MulticallCall; 2])> {
+    let mut plans = pools
         .into_iter()
-        .filter_map(|pool| pool.uniswap_v3_address().map(|address| (pool, address)))
+        .filter_map(|pool| pool_data_call_plan(pool, state_view).map(|calls| (pool, calls)))
         .collect::<Vec<_>>();
-    targets.sort_by(|left, right| left.1.cmp(&right.1));
-    targets
+    plans.sort_by(|left, right| left.0.cmp(&right.0));
+    plans
 }
 
-fn pool_data_multicall_calls(targets: &[(PoolRef, Address)]) -> Vec<MulticallCall> {
-    targets
-        .iter()
-        .flat_map(|(_, address)| {
+/// The state + liquidity calls for one pool, or `None` for a v4 pool whose chain has no `StateView`.
+fn pool_data_call_plan(pool: PoolRef, state_view: Option<Address>) -> Option<[MulticallCall; 2]> {
+    match pool.key {
+        ProtocolPoolKey::UniswapV3(address) => Some([
+            MulticallCall {
+                target: address,
+                call_data: Bytes::from(crate::uniswap_v3::slot0Call {}.abi_encode()),
+            },
+            MulticallCall {
+                target: address,
+                call_data: Bytes::from(crate::uniswap_v3::liquidityCall {}.abi_encode()),
+            },
+        ]),
+        ProtocolPoolKey::UniswapV4(pool_id) => state_view.map(|target| {
             [
                 MulticallCall {
-                    target: *address,
-                    call_data: Bytes::from(crate::uniswap_v3::slot0Call {}.abi_encode()),
+                    target,
+                    call_data: Bytes::from(
+                        crate::uniswap_v4::getSlot0Call { poolId: pool_id.0 }.abi_encode(),
+                    ),
                 },
                 MulticallCall {
-                    target: *address,
-                    call_data: Bytes::from(crate::uniswap_v3::liquidityCall {}.abi_encode()),
+                    target,
+                    call_data: Bytes::from(
+                        crate::uniswap_v4::getLiquidityCall { poolId: pool_id.0 }.abi_encode(),
+                    ),
                 },
             ]
-        })
+        }),
+    }
+}
+
+fn pool_data_multicall_calls(plans: &[(PoolRef, [MulticallCall; 2])]) -> Vec<MulticallCall> {
+    plans
+        .iter()
+        .flat_map(|(_, calls)| calls.clone())
         .collect()
 }
 
 fn decode_pool_data_results(
-    targets: &[(PoolRef, Address)],
+    plans: &[(PoolRef, [MulticallCall; 2])],
     results: &[MulticallCallResult],
 ) -> HashMap<PoolRef, PoolDataResult> {
     let mut result_chunks = results.chunks(2);
 
-    targets
+    plans
         .iter()
         .map(|(pool, _)| {
             let result_chunk = result_chunks.next().unwrap_or(&[]);
-            (
-                *pool,
-                decode_pool_data_result(result_chunk.first(), result_chunk.get(1)),
-            )
+            let state = result_chunk.first();
+            let liquidity = result_chunk.get(1);
+            // Both protocols yield the same `PoolState`; only the ABI of the state read differs, so
+            // dispatch the decode on the pool's protocol.
+            let pool_data = match pool.key {
+                ProtocolPoolKey::UniswapV3(_) => decode_pool_data_result(state, liquidity),
+                ProtocolPoolKey::UniswapV4(_) => decode_v4_pool_data_result(state, liquidity),
+            };
+            (*pool, pool_data)
         })
         .collect()
 }
@@ -596,6 +642,34 @@ fn decode_pool_data_result(
         sqrt_price_x96: slot0.sqrtPriceX96,
         tick: slot0.tick,
         liquidity,
+    })
+}
+
+fn decode_v4_pool_data_result(
+    slot0: Option<&MulticallCallResult>,
+    liquidity: Option<&MulticallCallResult>,
+) -> PoolDataResult {
+    let slot0 = decode_v4_slot0(slot0)?;
+    let liquidity = decode_v4_liquidity(liquidity)?;
+
+    Ok(PoolState {
+        sqrt_price_x96: slot0.sqrtPriceX96,
+        tick: slot0.tick,
+        liquidity,
+    })
+}
+
+fn decode_v4_slot0(
+    result: Option<&MulticallCallResult>,
+) -> Result<crate::uniswap_v4::getSlot0Return, PoolDataFailure> {
+    decode_multicall_result(result, PoolDataCall::Slot0, |return_data| {
+        crate::uniswap_v4::getSlot0Call::abi_decode_returns(return_data)
+    })
+}
+
+fn decode_v4_liquidity(result: Option<&MulticallCallResult>) -> Result<u128, PoolDataFailure> {
+    decode_multicall_result(result, PoolDataCall::Liquidity, |return_data| {
+        crate::uniswap_v4::getLiquidityCall::abi_decode_returns(return_data)
     })
 }
 
@@ -878,7 +952,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        PoolRef, PoolCandidateAddress, PoolDataCall, PoolDataFailure, PoolMetadataCall,
+        PoolRef, ProtocolPoolKey, PoolDataCall, PoolDataFailure, PoolMetadataCall,
         PoolMetadataFailure, PoolState, TokenAddress, TokenDecimals, TokenMetadata,
         TokenMetadataCall, TokenMetadataFailure, UniswapV3Fee,
         client::multicall3::{
@@ -991,14 +1065,14 @@ mod tests {
         let candidates = fetch_block_logs(&agent, &endpoints, ChainKey::Ethereum, block_hash)
             .expect("logs fetch")
             .iter()
-            .map(|log| PoolCandidateAddress(log.address))
+            .map(|log| ProtocolPoolKey::UniswapV3(log.pool.uniswap_v3_address().expect("v3 pool")))
             .collect::<HashSet<_>>();
 
         assert_eq!(
             candidates,
             HashSet::from([
-                PoolCandidateAddress(first_pool),
-                PoolCandidateAddress(second_pool),
+                ProtocolPoolKey::UniswapV3(first_pool),
+                ProtocolPoolKey::UniswapV3(second_pool),
             ])
         );
 
@@ -1198,6 +1272,151 @@ mod tests {
     }
 
     #[test]
+    fn fetch_pool_data_reads_a_v4_pool_via_the_state_view() {
+        let at = B256::with_last_byte(1);
+        let pool_id = crate::uniswap_v4::PoolId(B256::with_last_byte(7));
+        let pool = PoolRef::uniswap_v4(pool_id, ChainKey::Ethereum);
+        let state = pool_state(31, -32, 33);
+        let response = multicall3_response([
+            successful_multicall_result(v4_get_slot0_return_data(&state)),
+            successful_multicall_result(v4_get_liquidity_return_data(state.liquidity)),
+        ]);
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(
+            &agent,
+            &endpoints,
+            ChainKey::Ethereum,
+            at,
+            HashSet::from([pool]),
+        );
+
+        let pools = result.expect("pool data fetch must succeed");
+        assert_eq!(pools.get(&pool), Some(&Ok(state)));
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        assert_multicall_request_at(&request.body, at);
+        // v4 pools have no per-pool address; their state is read from the singleton StateView.
+        let state_view = crate::uniswap_v4::ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS;
+        let calls = multicall_calls_from_request(&request.body);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| (call.target, call.call_data.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (state_view, v4_get_slot0_call_data(pool_id)),
+                (state_view, v4_get_liquidity_call_data(pool_id)),
+            ]
+        );
+
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_data_decodes_mixed_v3_and_v4_pools_with_v3_ordered_first() {
+        let at = B256::with_last_byte(1);
+        let v3_pool = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
+        let v4_id = crate::uniswap_v4::PoolId(B256::with_last_byte(9));
+        let v4_pool = PoolRef::uniswap_v4(v4_id, ChainKey::Ethereum);
+        let v3_state = pool_state(11, -12, 13);
+        let v4_state = pool_state(21, 22, 23);
+        // `PoolRef`'s `Ord` places every v3 pool ahead of v4, so the multicall is ordered v3 then v4.
+        let response = multicall3_response([
+            successful_multicall_result(slot0_return_data(&v3_state)),
+            successful_multicall_result(liquidity_return_data(v3_state.liquidity)),
+            successful_multicall_result(v4_get_slot0_return_data(&v4_state)),
+            successful_multicall_result(v4_get_liquidity_return_data(v4_state.liquidity)),
+        ]);
+        let (http_url, received_request, server) = spawn_json_rpc_server(response);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(
+            &agent,
+            &endpoints,
+            ChainKey::Ethereum,
+            at,
+            HashSet::from([v4_pool, v3_pool]),
+        );
+
+        let pools = result.expect("pool data fetch must succeed");
+        assert_eq!(pools.get(&v3_pool), Some(&Ok(v3_state)));
+        assert_eq!(pools.get(&v4_pool), Some(&Ok(v4_state)));
+
+        let request = received_request
+            .recv()
+            .expect("server must report received request");
+        let v3_target = v3_pool.uniswap_v3_address().expect("v3 pool");
+        let state_view = crate::uniswap_v4::ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS;
+        let calls = multicall_calls_from_request(&request.body);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| (call.target, call.call_data.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (v3_target, slot0_call_data()),
+                (v3_target, liquidity_call_data()),
+                (state_view, v4_get_slot0_call_data(v4_id)),
+                (state_view, v4_get_liquidity_call_data(v4_id)),
+            ]
+        );
+
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_data_returns_per_pool_failure_for_failed_v4_inner_call() {
+        let at = B256::with_last_byte(1);
+        let pool =
+            PoolRef::uniswap_v4(crate::uniswap_v4::PoolId(B256::with_last_byte(7)), ChainKey::Ethereum);
+        let state = pool_state(31, -32, 33);
+        let response = multicall3_response([
+            successful_multicall_result(v4_get_slot0_return_data(&state)),
+            failed_multicall_result(),
+        ]);
+        let (http_url, _received_request, server) = spawn_json_rpc_server(response);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let result = fetch_pool_data(
+            &agent,
+            &endpoints,
+            ChainKey::Ethereum,
+            at,
+            HashSet::from([pool]),
+        );
+
+        let pools = result.expect("outer multicall must succeed");
+        assert_eq!(
+            pools.get(&pool),
+            Some(&Err(PoolDataFailure::CallFailed(PoolDataCall::Liquidity)))
+        );
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn pool_data_call_plans_skip_v4_pools_when_the_chain_has_no_state_view() {
+        let v3_pool = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
+        let v4_pool =
+            PoolRef::uniswap_v4(crate::uniswap_v4::PoolId(B256::with_last_byte(7)), ChainKey::Arbitrum);
+
+        // With no StateView for the chain the v4 pool has no contract to target and is dropped, while
+        // the v3 pool still produces its (address-targeted) plan.
+        let plans = sorted_pool_data_call_plans(HashSet::from([v3_pool, v4_pool]), None);
+
+        assert_eq!(
+            plans.iter().map(|(pool, _)| *pool).collect::<Vec<_>>(),
+            vec![v3_pool]
+        );
+    }
+
+    #[test]
     fn fetch_pool_metadata_with_empty_candidate_set_returns_empty_results_without_http() {
         let endpoints = endpoints_for("http://127.0.0.1:9");
         let agent = ureq::Agent::new_with_defaults();
@@ -1216,8 +1435,8 @@ mod tests {
     #[test]
     fn fetch_pool_metadata_posts_candidate_and_factory_multicalls_and_verifies_metadata() {
         let at = B256::with_last_byte(1);
-        let first_candidate = PoolCandidateAddress(Address::with_last_byte(2));
-        let second_candidate = PoolCandidateAddress(Address::with_last_byte(3));
+        let first_candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(2));
+        let second_candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(3));
         let first_token0 = Address::with_last_byte(4);
         let first_token1 = Address::with_last_byte(5);
         let second_token0 = Address::with_last_byte(6);
@@ -1234,7 +1453,9 @@ mod tests {
             successful_multicall_result(fee_return_data(second_fee.pips())),
         ]);
         let second_response = multicall3_response([
-            successful_multicall_result(get_pool_return_data(first_candidate.0)),
+            successful_multicall_result(get_pool_return_data(
+                first_candidate.uniswap_v3_address().expect("v3 pool"),
+            )),
             successful_multicall_result(get_pool_return_data(returned_mismatch)),
         ]);
         let (http_url, received_request, server) =
@@ -1272,18 +1493,20 @@ mod tests {
         assert_eq!(first_request.path, "/ethereum/api-key");
         assert_multicall_request_at_latest(&first_request.body);
         let first_calls = multicall_calls_from_request(&first_request.body);
+        let first_target = first_candidate.uniswap_v3_address().expect("v3 pool");
+        let second_target = second_candidate.uniswap_v3_address().expect("v3 pool");
         assert_eq!(
             first_calls
                 .iter()
                 .map(|call| (call.target, call.call_data.clone()))
                 .collect::<Vec<_>>(),
             vec![
-                (first_candidate.0, token0_call_data()),
-                (first_candidate.0, token1_call_data()),
-                (first_candidate.0, fee_call_data()),
-                (second_candidate.0, token0_call_data()),
-                (second_candidate.0, token1_call_data()),
-                (second_candidate.0, fee_call_data()),
+                (first_target, token0_call_data()),
+                (first_target, token1_call_data()),
+                (first_target, fee_call_data()),
+                (second_target, token0_call_data()),
+                (second_target, token1_call_data()),
+                (second_target, fee_call_data()),
             ]
         );
 
@@ -1314,7 +1537,7 @@ mod tests {
     #[test]
     fn fetch_pool_metadata_rejects_unsupported_fee_without_factory_lookup() {
         let at = B256::with_last_byte(1);
-        let candidate = PoolCandidateAddress(Address::with_last_byte(2));
+        let candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(2));
         let response = multicall3_response([
             successful_multicall_result(address_return_data_for_token0(Address::with_last_byte(3))),
             successful_multicall_result(address_return_data_for_token1(Address::with_last_byte(4))),
@@ -1345,8 +1568,8 @@ mod tests {
     #[test]
     fn fetch_pool_metadata_rejects_round_one_call_and_decode_failures() {
         let at = B256::with_last_byte(1);
-        let failed_candidate = PoolCandidateAddress(Address::with_last_byte(2));
-        let malformed_candidate = PoolCandidateAddress(Address::with_last_byte(3));
+        let failed_candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(2));
+        let malformed_candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(3));
         let response = multicall3_response([
             failed_multicall_result(),
             successful_multicall_result(address_return_data_for_token1(Address::with_last_byte(4))),
@@ -1386,7 +1609,7 @@ mod tests {
     #[test]
     fn fetch_pool_metadata_rejects_zero_factory_result() {
         let at = B256::with_last_byte(1);
-        let candidate = PoolCandidateAddress(Address::with_last_byte(2));
+        let candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(2));
         let token0 = Address::with_last_byte(3);
         let token1 = Address::with_last_byte(4);
         let response = multicall3_response([
@@ -1421,8 +1644,8 @@ mod tests {
     #[test]
     fn fetch_pool_metadata_rejects_factory_call_and_decode_failures() {
         let at = B256::with_last_byte(1);
-        let failed_candidate = PoolCandidateAddress(Address::with_last_byte(2));
-        let malformed_candidate = PoolCandidateAddress(Address::with_last_byte(3));
+        let failed_candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(2));
+        let malformed_candidate = ProtocolPoolKey::UniswapV3(Address::with_last_byte(3));
         let failed_token0 = Address::with_last_byte(4);
         let failed_token1 = Address::with_last_byte(5);
         let malformed_token0 = Address::with_last_byte(6);
@@ -1933,6 +2156,31 @@ mod tests {
 
     fn liquidity_return_data(liquidity: u128) -> Bytes {
         Bytes::from(crate::uniswap_v3::liquidityCall::abi_encode_returns(
+            &liquidity,
+        ))
+    }
+
+    fn v4_get_slot0_call_data(pool_id: crate::uniswap_v4::PoolId) -> Bytes {
+        Bytes::from(crate::uniswap_v4::getSlot0Call { poolId: pool_id.0 }.abi_encode())
+    }
+
+    fn v4_get_liquidity_call_data(pool_id: crate::uniswap_v4::PoolId) -> Bytes {
+        Bytes::from(crate::uniswap_v4::getLiquidityCall { poolId: pool_id.0 }.abi_encode())
+    }
+
+    fn v4_get_slot0_return_data(pool_state: &PoolState) -> Bytes {
+        Bytes::from(crate::uniswap_v4::getSlot0Call::abi_encode_returns(
+            &crate::uniswap_v4::getSlot0Return {
+                sqrtPriceX96: pool_state.sqrt_price_x96,
+                tick: pool_state.tick,
+                protocolFee: alloy::primitives::Uint::<24, 1>::ZERO,
+                lpFee: alloy::primitives::Uint::<24, 1>::ZERO,
+            },
+        ))
+    }
+
+    fn v4_get_liquidity_return_data(liquidity: u128) -> Bytes {
+        Bytes::from(crate::uniswap_v4::getLiquidityCall::abi_encode_returns(
             &liquidity,
         ))
     }

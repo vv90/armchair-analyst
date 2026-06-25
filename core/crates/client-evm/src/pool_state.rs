@@ -18,6 +18,17 @@ pub enum ProtocolPoolKey {
     UniswapV4(PoolId),
 }
 
+impl ProtocolPoolKey {
+    /// The pool's own contract address for Uniswap v3 pools; `None` for v4 pools, which have no
+    /// per-pool address (they live in the singleton `PoolManager`).
+    pub fn uniswap_v3_address(&self) -> Option<Address> {
+        match self {
+            ProtocolPoolKey::UniswapV3(address) => Some(*address),
+            ProtocolPoolKey::UniswapV4(_) => None,
+        }
+    }
+}
+
 /// A pool's full identity: its protocol-specific key plus the chain it lives on. Used as the key for
 /// every pool-indexed map, effect payload, and reserve projection.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -48,10 +59,7 @@ impl PoolRef {
     /// The pool's own contract address for Uniswap v3 pools; `None` for v4 pools, which have no
     /// per-pool address (they live in the singleton `PoolManager`).
     pub fn uniswap_v3_address(&self) -> Option<Address> {
-        match self.key {
-            ProtocolPoolKey::UniswapV3(address) => Some(address),
-            ProtocolPoolKey::UniswapV4(_) => None,
-        }
+        self.key.uniswap_v3_address()
     }
 }
 

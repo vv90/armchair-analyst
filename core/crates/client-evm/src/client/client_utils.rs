@@ -4,7 +4,7 @@ use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
 use crate::{
-    ClientEvmError, ClientHead, PoolCandidateAddress, PoolLog, RangeLogBlock, decode_pool_log,
+    ClientEvmError, ClientHead, ProtocolPoolKey, PoolLog, RangeLogBlock, decode_pool_log,
     uniswap_v3::pool_event_signature_hashes,
 };
 
@@ -316,7 +316,7 @@ pub(crate) fn parse_pool_logs_range_response(
 /// Logs missing block number or hash cannot be attributed to a block and are dropped at this
 /// boundary; the result is deterministic so downstream graph inference stays reproducible.
 fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
-    let mut candidates_by_block: HashMap<(u64, BlockHash), HashSet<PoolCandidateAddress>> =
+    let mut candidates_by_block: HashMap<(u64, BlockHash), HashSet<ProtocolPoolKey>> =
         HashMap::new();
 
     for log in logs {
@@ -327,7 +327,7 @@ fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
         candidates_by_block
             .entry((number, hash))
             .or_default()
-            .insert(PoolCandidateAddress(log.address()));
+            .insert(ProtocolPoolKey::UniswapV3(log.address()));
     }
 
     let mut blocks = candidates_by_block
@@ -356,7 +356,7 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
-    use crate::PoolCandidateAddress;
+    use crate::ProtocolPoolKey;
 
     use super::*;
 
@@ -445,14 +445,14 @@ mod tests {
         let candidates = parse_block_logs_response(&response, 9, block_hash)
             .expect("logs parse")
             .iter()
-            .map(|log| PoolCandidateAddress(log.address))
+            .map(|log| ProtocolPoolKey::UniswapV3(log.pool.uniswap_v3_address().expect("v3 pool")))
             .collect::<HashSet<_>>();
 
         assert_eq!(
             candidates,
             HashSet::from([
-                PoolCandidateAddress(first_pool),
-                PoolCandidateAddress(second_pool),
+                ProtocolPoolKey::UniswapV3(first_pool),
+                ProtocolPoolKey::UniswapV3(second_pool),
             ])
         );
     }
@@ -651,14 +651,14 @@ mod tests {
                     number: 4,
                     hash: first_hash,
                     candidates: HashSet::from([
-                        PoolCandidateAddress(first_pool),
-                        PoolCandidateAddress(second_pool),
+                        ProtocolPoolKey::UniswapV3(first_pool),
+                        ProtocolPoolKey::UniswapV3(second_pool),
                     ]),
                 },
                 RangeLogBlock {
                     number: 5,
                     hash: second_hash,
-                    candidates: HashSet::from([PoolCandidateAddress(first_pool)]),
+                    candidates: HashSet::from([ProtocolPoolKey::UniswapV3(first_pool)]),
                 },
             ]
         );
@@ -683,7 +683,7 @@ mod tests {
             vec![RangeLogBlock {
                 number: 4,
                 hash: block_hash,
-                candidates: HashSet::from([PoolCandidateAddress(pool)]),
+                candidates: HashSet::from([ProtocolPoolKey::UniswapV3(pool)]),
             }]
         );
     }
