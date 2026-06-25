@@ -1,11 +1,13 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
-    ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, GraphEndpoints,
-    MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
-    RpcConfig, TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
-    fetch_pool_metadata, fetch_token_metadata, kernel,
+    ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_NATIVE_TOKEN_ADDRESS,
+    ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS, GraphEndpoints,
+    MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadata,
+    PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult, bootstrap,
+    fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
+    fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
+    fetch_v4_pool_metadata, kernel,
     multi_chain_kernel::{
         Effect, Event, OptimizationPoolReserves, State, Subscription, SubscriptionData, transition,
     },
@@ -16,6 +18,7 @@ use optimization::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::{OnceLock, mpsc::Sender},
     thread::{self, JoinHandle},
     time,
@@ -34,9 +37,8 @@ pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     rpc_config: RpcConfig,
     endpoints: ChainEndpoints,
-    // Consumed in Increment 4 (the v4 metadata resolver); plumbed now so the config/endpoint wiring
-    // lands in one reviewable change. Empty when The Graph is unconfigured.
-    #[allow(dead_code)]
+    // Per-chain Uniswap v4 subgraph pools used by the v4 metadata resolver. Empty when The Graph is
+    // unconfigured, in which case v4 metadata resolution is skipped.
     graph_endpoints: GraphEndpoints,
     metadata_cache: MetadataCache,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
@@ -75,52 +77,33 @@ impl ClientEvmRuntime {
         &self.endpoints
     }
 
-    /// Per-chain Uniswap v4 subgraph pools (empty when unconfigured). Consumed by the v4 metadata
-    /// resolver in Increment 4; exposed here for the constructor smoke test until then.
-    #[cfg(test)]
+    /// Per-chain Uniswap v4 subgraph pools (empty when unconfigured), used by the v4 metadata resolver.
     fn graph_endpoints(&self) -> &GraphEndpoints {
         &self.graph_endpoints
     }
 
-    /// Resolves pool metadata through the persistent cache: known pools are served from disk, only
-    /// the misses hit RPC, and freshly validated metadata is written back. A cache fault degrades to
-    /// a plain RPC fetch, so the cache can never make a request fail that would otherwise succeed.
+    /// Resolves pool metadata through the persistent cache: known pools are served from disk, only the
+    /// misses are fetched, and freshly validated metadata is written back. Misses are split by protocol
+    /// — v3 pools go to RPC, v4 pools to the subgraph aggregator (a `PoolId` is a one-way hash, so v4
+    /// metadata cannot be read from chain) — and merged. A cache fault degrades to a plain fetch, so the
+    /// cache can never make a request fail that would otherwise succeed.
     fn cached_pool_metadata(
         &self,
         chain: ChainKey,
         at: BlockHash,
         candidates: HashSet<ProtocolPoolKey>,
     ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError> {
-        let cached = match self.metadata_cache.load_pool_metadata(chain, &candidates) {
-            Ok(cached) => cached,
-            Err(error) => {
-                self.logger.log(&format!(
-                    "error chain={chain:?} metadata_cache_load_failed kind=pool error={error}"
-                ));
-                HashMap::new()
-            }
-        };
-
-        let misses = candidates
-            .into_iter()
-            .filter(|candidate| !cached.contains_key(candidate))
-            .collect::<HashSet<_>>();
-
-        let mut metadata = fetch_pool_metadata(&self.agent, self.endpoints(), chain, at, misses)?;
-
-        if let Err(error) = self.metadata_cache.store_pool_metadata(chain, &metadata) {
-            self.logger.log(&format!(
-                "error chain={chain:?} metadata_cache_store_failed kind=pool error={error}"
-            ));
-        }
-
-        metadata.extend(
-            cached
-                .into_iter()
-                .map(|(candidate, value)| (candidate, Ok(value))),
-        );
-
-        Ok(metadata)
+        resolve_pool_metadata_with(
+            chain,
+            candidates,
+            &self.logger,
+            |candidates| self.metadata_cache.load_pool_metadata(chain, candidates),
+            |metadata| self.metadata_cache.store_pool_metadata(chain, metadata),
+            |v3_misses| fetch_pool_metadata(&self.agent, self.endpoints(), chain, at, v3_misses),
+            |v4_misses| {
+                fetch_v4_pool_metadata(&self.agent, self.graph_endpoints(), chain, v4_misses)
+            },
+        )
     }
 
     /// Token-metadata counterpart of [`ClientEvmRuntime::cached_pool_metadata`].
@@ -629,14 +612,20 @@ fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddre
     }
 }
 
-/// Synthetic 1:1 connection between each chain's USDC, treating them as fungible so the single
-/// `init_asset` (Ethereum USDC) can traverse Arbitrum pools and close cross-chain cycles. Bridges are
-/// directional in the optimizer, so both orderings are registered; the optimizer ignores a bridge
-/// whose endpoints aren't yet present, so an Arbitrum entry is harmless before Arbitrum has reported.
+/// Synthetic 1:1 connections the optimizer treats as fungible passthroughs. Bridges are directional,
+/// so both orderings of each pair are registered; the optimizer ignores a bridge whose endpoints
+/// aren't yet present, so an entry is harmless before its tokens have reported.
+///
+/// * Cross-chain USDC: lets the single `init_asset` (Ethereum USDC) traverse Arbitrum pools and close
+///   cross-chain cycles back to it.
+/// * Native ETH ↔ WETH: wrapping is 1:1, so this unifies v4 native-ETH pools (`token0 = address(0)`)
+///   with v3 WETH liquidity; without it, native-ETH pools would be an isolated island in the graph.
 fn default_optimization_bridges() -> HashSet<(TokenAddress, TokenAddress)> {
     HashSet::from([
         (ETHEREUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS),
         (ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        (ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        (ETHEREUM_WETH_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS),
     ])
 }
 
@@ -645,6 +634,69 @@ fn default_optimization_step_config() -> OptimizationStepConfig {
         input_amount: 1000.0,
         iterations: 10,
     }
+}
+
+/// Resolves pool metadata from cache + fetch, with every effectful dependency injected so the
+/// cache-degradation, protocol routing, and merge logic are unit-testable without IO. Cache hits are
+/// served as `Ok`; the remaining misses are partitioned (v4 by [`ProtocolPoolKey::uniswap_v4_pool_id`])
+/// and routed to `fetch_v3` / `fetch_v4`; the merged results are written back (a store fault is logged,
+/// not fatal) and unioned with the hits. A cache *load* fault degrades to "no hits" so the fetch still
+/// runs.
+fn resolve_pool_metadata_with<Load, Store, FetchV3, FetchV4, LoadErr, StoreErr>(
+    chain: ChainKey,
+    candidates: HashSet<ProtocolPoolKey>,
+    logger: &Logger,
+    load_cache: Load,
+    store_cache: Store,
+    fetch_v3: FetchV3,
+    fetch_v4: FetchV4,
+) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>
+where
+    Load: FnOnce(
+        &HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadata>, LoadErr>,
+    Store: FnOnce(&HashMap<ProtocolPoolKey, PoolMetadataResult>) -> Result<(), StoreErr>,
+    FetchV3: FnOnce(
+        HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>,
+    FetchV4: FnOnce(
+        HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>,
+    LoadErr: fmt::Display,
+    StoreErr: fmt::Display,
+{
+    let cached = match load_cache(&candidates) {
+        Ok(cached) => cached,
+        Err(error) => {
+            logger.log(&format!(
+                "error chain={chain:?} metadata_cache_load_failed kind=pool error={error}"
+            ));
+            HashMap::new()
+        }
+    };
+
+    // Partition the misses: v4 pools resolve from the subgraph aggregator, v3 from RPC.
+    let (v4_misses, v3_misses): (HashSet<_>, HashSet<_>) = candidates
+        .into_iter()
+        .filter(|candidate| !cached.contains_key(candidate))
+        .partition(|candidate| candidate.uniswap_v4_pool_id().is_some());
+
+    let mut metadata = fetch_v3(v3_misses)?;
+    metadata.extend(fetch_v4(v4_misses)?);
+
+    if let Err(error) = store_cache(&metadata) {
+        logger.log(&format!(
+            "error chain={chain:?} metadata_cache_store_failed kind=pool error={error}"
+        ));
+    }
+
+    metadata.extend(
+        cached
+            .into_iter()
+            .map(|(candidate, value)| (candidate, Ok(value))),
+    );
+
+    Ok(metadata)
 }
 
 fn execute_chain_effect_with<
@@ -1171,6 +1223,113 @@ mod tests {
     }
 
     #[test]
+    fn resolve_pool_metadata_routes_v3_to_rpc_and_v4_to_aggregator_and_merges() {
+        let v3 = pool_candidate_address(2);
+        let v4 = v4_pool_candidate(3);
+
+        let result = resolve_pool_metadata_with(
+            ChainKey::Ethereum,
+            HashSet::from([v3, v4]),
+            &Logger::sink(),
+            |_candidates| Ok::<_, &str>(HashMap::new()),
+            |_metadata| Ok::<(), &str>(()),
+            |v3_misses| {
+                assert_eq!(v3_misses, HashSet::from([v3]), "only v3 misses go to RPC");
+                Ok(HashMap::from([(v3, Ok(pool_metadata(2)))]))
+            },
+            |v4_misses| {
+                assert_eq!(
+                    v4_misses,
+                    HashSet::from([v4]),
+                    "only v4 misses go to the aggregator"
+                );
+                Ok(HashMap::from([(v4, Ok(pool_metadata(3)))]))
+            },
+        )
+        .expect("resolve succeeds");
+
+        assert_eq!(result.get(&v3), Some(&Ok(pool_metadata(2))));
+        assert_eq!(result.get(&v4), Some(&Ok(pool_metadata(3))));
+    }
+
+    #[test]
+    fn resolve_pool_metadata_serves_cache_hits_without_fetching() {
+        let v4 = v4_pool_candidate(3);
+
+        let result = resolve_pool_metadata_with(
+            ChainKey::Ethereum,
+            HashSet::from([v4]),
+            &Logger::sink(),
+            |_candidates| Ok::<_, &str>(HashMap::from([(v4, pool_metadata(3))])),
+            |_metadata| Ok::<(), &str>(()),
+            |v3_misses| {
+                assert!(v3_misses.is_empty());
+                Ok(HashMap::new())
+            },
+            |v4_misses| {
+                assert!(v4_misses.is_empty(), "a cached pool must not be re-fetched");
+                Ok(HashMap::new())
+            },
+        )
+        .expect("resolve succeeds");
+
+        assert_eq!(result.get(&v4), Some(&Ok(pool_metadata(3))));
+    }
+
+    #[test]
+    fn resolve_pool_metadata_writes_fetched_results_to_cache() {
+        let v4 = v4_pool_candidate(3);
+        let stored = std::cell::RefCell::new(None);
+
+        let _ = resolve_pool_metadata_with(
+            ChainKey::Ethereum,
+            HashSet::from([v4]),
+            &Logger::sink(),
+            |_candidates| Ok::<_, &str>(HashMap::new()),
+            |metadata| {
+                *stored.borrow_mut() = Some(metadata.clone());
+                Ok::<(), &str>(())
+            },
+            |_v3_misses| Ok(HashMap::new()),
+            |_v4_misses| Ok(HashMap::from([(v4, Ok(pool_metadata(3)))])),
+        )
+        .expect("resolve succeeds");
+
+        let stored = stored.borrow();
+        let stored = stored.as_ref().expect("store must be called with the fetched results");
+        assert_eq!(stored.get(&v4), Some(&Ok(pool_metadata(3))));
+    }
+
+    #[test]
+    fn cached_pool_metadata_serves_a_cached_v4_pool_without_network() {
+        let cache = in_memory_metadata_cache();
+        let v4 = v4_pool_candidate(7);
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(v4, Ok(pool_metadata(7)))]),
+            )
+            .expect("store cached v4 pool");
+
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            test_endpoints(),
+            GraphEndpoints::empty(),
+            cache,
+            Logger::sink(),
+            View::sink(),
+        );
+
+        // The pool is a cache hit, so neither RPC (which points nowhere) nor the aggregator (the graph
+        // is unconfigured) is contacted — proving v4 metadata round-trips through the persistent cache.
+        let result = runtime
+            .cached_pool_metadata(ChainKey::Ethereum, hash(1), HashSet::from([v4]))
+            .expect("resolve succeeds");
+
+        assert_eq!(result.get(&v4), Some(&Ok(pool_metadata(7))));
+    }
+
+    #[test]
     fn run_optimization_effect_returns_no_events() {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
@@ -1203,6 +1362,24 @@ mod tests {
             config
                 .bridges
                 .contains(&(ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS))
+        );
+    }
+
+    #[test]
+    fn default_session_config_bridges_native_eth_and_weth_both_ways() {
+        let config = default_optimization_session_config();
+
+        // Wrapping is 1:1, so native ETH (v4 `token0 = address(0)`) and WETH (v3) must be a
+        // two-sided bridge; otherwise v4 native-ETH pools are isolated from WETH liquidity.
+        assert!(
+            config
+                .bridges
+                .contains(&(ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS))
+        );
+        assert!(
+            config
+                .bridges
+                .contains(&(ETHEREUM_WETH_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS))
         );
     }
 
@@ -1867,6 +2044,10 @@ mod tests {
             .expect("test address must parse");
 
         ProtocolPoolKey::UniswapV3(address)
+    }
+
+    fn v4_pool_candidate(last_byte: u8) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV4(client_evm::uniswap_v4::PoolId(hash(last_byte)))
     }
 
     fn pool_metadata(last_byte: u8) -> PoolMetadata {

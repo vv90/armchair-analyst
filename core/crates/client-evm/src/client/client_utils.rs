@@ -4,13 +4,17 @@ use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
 use crate::{
-    ClientEvmError, ClientHead, ProtocolPoolKey, PoolLog, RangeLogBlock, decode_pool_log,
-    uniswap_v3::pool_event_signature_hashes,
+    ClientEvmError, ClientHead, ProtocolPoolKey, PoolLog, RangeLogBlock, decode_pool_log, uniswap_v3,
+    uniswap_v4,
 };
 
+/// The `topic0` filter for every pool-log request (subscribe / block-logs / range), unioning the
+/// state-relevant v3 and v4 event signatures so both protocols are discovered. `decode_pool_log`
+/// then drops any matched-but-irrelevant or spoofed log downstream.
 fn pool_event_topic_filter() -> Vec<String> {
-    pool_event_signature_hashes()
+    uniswap_v3::pool_event_signature_hashes()
         .into_iter()
+        .chain(uniswap_v4::pool_event_signature_hashes())
         .map(|topic| topic.to_string())
         .collect::<Vec<_>>()
 }
@@ -324,10 +328,16 @@ fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
             continue;
         };
 
+        // Decode to the protocol-tagged pool identity (v3 address / v4 PoolId) exactly like the live
+        // block-logs path; logs that are not state-relevant pool events are dropped here.
+        let Some(pool_log) = decode_pool_log(&log) else {
+            continue;
+        };
+
         candidates_by_block
             .entry((number, hash))
             .or_default()
-            .insert(ProtocolPoolKey::UniswapV3(log.address()));
+            .insert(pool_log.pool);
     }
 
     let mut blocks = candidates_by_block
@@ -396,10 +406,7 @@ mod tests {
     fn block_logs_request_uses_block_hash_and_pool_event_topics() {
         let block_hash = B256::with_last_byte(7);
         let request = build_block_logs_request(9, block_hash);
-        let expected_topics = pool_event_signature_hashes()
-            .into_iter()
-            .map(|topic| topic.to_string())
-            .collect::<Vec<_>>();
+        let expected_topics = expected_pool_event_topics();
 
         assert_eq!(
             request,
@@ -593,10 +600,7 @@ mod tests {
     #[test]
     fn pool_logs_range_request_uses_from_block_latest_and_pool_event_topics() {
         let request = build_pool_logs_range_request(9, 4);
-        let expected_topics = pool_event_signature_hashes()
-            .into_iter()
-            .map(|topic| topic.to_string())
-            .collect::<Vec<_>>();
+        let expected_topics = expected_pool_event_topics();
 
         assert_eq!(
             request,
@@ -661,6 +665,35 @@ mod tests {
                     candidates: HashSet::from([ProtocolPoolKey::UniswapV3(first_pool)]),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn pool_logs_range_response_decodes_mixed_v3_and_v4_candidates_in_one_block() {
+        let block_hash = B256::with_last_byte(7);
+        let v3_pool = Address::with_last_byte(1);
+        let v4_pool_id = B256::with_last_byte(0x99);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [
+                range_log_result(v3_pool, block_hash, 4),
+                v4_range_log_result(v4_pool_id, block_hash, 4)
+            ]
+        });
+
+        let blocks = parse_pool_logs_range_response(&response, 9).unwrap();
+
+        assert_eq!(
+            blocks,
+            vec![RangeLogBlock {
+                number: 4,
+                hash: block_hash,
+                candidates: HashSet::from([
+                    ProtocolPoolKey::UniswapV3(v3_pool),
+                    ProtocolPoolKey::UniswapV4(crate::uniswap_v4::PoolId(v4_pool_id)),
+                ]),
+            }]
         );
     }
 
@@ -978,10 +1011,7 @@ mod tests {
     #[test]
     fn subscribe_request_uses_topic_only_pool_event_filter() {
         let request = build_pool_events_subscribe_request(7);
-        let expected_topics = pool_event_signature_hashes()
-            .into_iter()
-            .map(|topic| topic.to_string())
-            .collect::<Vec<_>>();
+        let expected_topics = expected_pool_event_topics();
 
         assert_eq!(request.get("jsonrpc"), Some(&json!("2.0")));
         assert_eq!(request.get("id"), Some(&json!(7)));
@@ -1022,7 +1052,8 @@ mod tests {
             .and_then(Value::as_array)
             .map(|topics| topics.iter().collect::<HashSet<_>>().len());
 
-        assert_eq!(unique_topic_count, Some(9));
+        // 9 state-relevant v3 signatures + 3 v4 signatures.
+        assert_eq!(unique_topic_count, Some(12));
     }
 
     #[test]
@@ -1236,10 +1267,7 @@ mod tests {
         #[test]
         fn subscribe_request_always_uses_topic_only_pool_event_filter(request_id in any::<u64>()) {
             let request = build_pool_events_subscribe_request(request_id);
-            let expected_topics = pool_event_signature_hashes()
-                .into_iter()
-                .map(|topic| topic.to_string())
-                .collect::<Vec<_>>();
+            let expected_topics = expected_pool_event_topics();
 
             prop_assert_eq!(request.get("method"), Some(&json!("eth_subscribe")));
             prop_assert_eq!(
@@ -1275,6 +1303,16 @@ mod tests {
 
     }
 
+    /// The expected `topic0` filter: the union of v3 and v4 state-relevant signatures, mirroring the
+    /// production `pool_event_topic_filter`.
+    fn expected_pool_event_topics() -> Vec<String> {
+        uniswap_v3::pool_event_signature_hashes()
+            .into_iter()
+            .chain(uniswap_v4::pool_event_signature_hashes())
+            .map(|topic| topic.to_string())
+            .collect::<Vec<_>>()
+    }
+
     fn log_result(address: Address, block_hash: B256) -> Value {
         use alloy::primitives::{I256, U160, aliases::I24};
         use alloy::sol_types::SolEvent;
@@ -1307,19 +1345,65 @@ mod tests {
     }
 
     fn range_log_result(address: Address, block_hash: B256, block_number: u64) -> Value {
-        json!({
-            "address": address,
-            "topics": [
-                pool_event_signature_hashes()[0]
-            ],
-            "data": "0x",
-            "blockHash": block_hash,
-            "blockNumber": format!("0x{block_number:x}"),
-            "transactionHash": B256::with_last_byte(5),
-            "transactionIndex": "0x6",
-            "logIndex": "0x7",
-            "removed": false
-        })
+        use alloy::primitives::{I256, U160, aliases::I24};
+        use alloy::sol_types::SolEvent;
+
+        use crate::uniswap_v3::Swap;
+
+        // A real, decodable v3 Swap log: `group_range_logs_by_block` now decodes events, so range
+        // fixtures must carry valid topics and data rather than an empty placeholder.
+        let event = Swap {
+            sender: Address::with_last_byte(9),
+            recipient: Address::with_last_byte(10),
+            amount0: I256::ZERO,
+            amount1: I256::ZERO,
+            sqrtPriceX96: U160::from(1u128),
+            liquidity: 1,
+            tick: I24::ZERO,
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address,
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(block_number),
+            log_index: Some(7),
+            ..Default::default()
+        };
+
+        serde_json::to_value(&log).expect("log serializes to json")
+    }
+
+    /// A real, decodable v4 Swap log emitted by the singleton PoolManager and identified by `pool_id`.
+    fn v4_range_log_result(pool_id: B256, block_hash: B256, block_number: u64) -> Value {
+        use alloy::primitives::{U160, aliases::U24};
+        use alloy::sol_types::SolEvent;
+
+        use crate::uniswap_v4::{self, Swap};
+
+        let event = Swap {
+            id: pool_id,
+            sender: Address::with_last_byte(9),
+            amount0: 0,
+            amount1: 0,
+            sqrtPriceX96: U160::from(1u128),
+            liquidity: 1,
+            tick: alloy::primitives::aliases::I24::ZERO,
+            fee: U24::from(500u32),
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address: uniswap_v4::ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(block_number),
+            log_index: Some(8),
+            ..Default::default()
+        };
+
+        serde_json::to_value(&log).expect("log serializes to json")
     }
 
     fn block_header_result(block_hash: B256) -> Value {

@@ -66,6 +66,11 @@ pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
     let data = &log.inner.data;
     let topic0 = *log.topic0()?;
 
+    // v4 events are all emitted by the singleton `PoolManager`; a matching `topic0` from any other
+    // emitter is a spoof and must not seed a bogus `PoolId` candidate. v3 events are keyed by their
+    // own emitting address and need no such guard.
+    let from_v4_manager = uniswap_v4::is_v4_pool_manager(log.address());
+
     let (pool, event) = if topic0 == Swap::SIGNATURE_HASH {
         let swap = Swap::decode_log_data(data).ok()?;
         (
@@ -105,7 +110,7 @@ pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
                 amount: burn.amount,
             },
         )
-    } else if topic0 == uniswap_v4::Swap::SIGNATURE_HASH {
+    } else if topic0 == uniswap_v4::Swap::SIGNATURE_HASH && from_v4_manager {
         let swap = uniswap_v4::Swap::decode_log_data(data).ok()?;
         (
             ProtocolPoolKey::UniswapV4(PoolId(swap.id)),
@@ -115,7 +120,7 @@ pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
                 liquidity: swap.liquidity,
             },
         )
-    } else if topic0 == uniswap_v4::Initialize::SIGNATURE_HASH {
+    } else if topic0 == uniswap_v4::Initialize::SIGNATURE_HASH && from_v4_manager {
         let initialize = uniswap_v4::Initialize::decode_log_data(data).ok()?;
         (
             ProtocolPoolKey::UniswapV4(PoolId(initialize.id)),
@@ -124,7 +129,7 @@ pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
                 tick: initialize.tick,
             },
         )
-    } else if topic0 == uniswap_v4::ModifyLiquidity::SIGNATURE_HASH {
+    } else if topic0 == uniswap_v4::ModifyLiquidity::SIGNATURE_HASH && from_v4_manager {
         let modify = uniswap_v4::ModifyLiquidity::decode_log_data(data).ok()?;
         // v4 collapses v3's Mint/Burn into one signed delta: a non-negative delta adds liquidity
         // (Mint), a negative delta removes it (Burn). The magnitude is bounded by the pool's
@@ -565,6 +570,31 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn v4_event_from_non_pool_manager_is_rejected_as_spoof() {
+        // The same valid v4 Swap, but emitted by an arbitrary contract rather than the PoolManager.
+        // It must not seed a bogus PoolId candidate.
+        let spoofer = Address::with_last_byte(0x42);
+        assert!(!uniswap_v4::is_v4_pool_manager(spoofer));
+
+        let log = log_with(
+            spoofer,
+            4,
+            uniswap_v4::Swap {
+                id: V4_POOL_ID,
+                sender: Address::with_last_byte(1),
+                amount0: -12345i128,
+                amount1: 6789i128,
+                sqrtPriceX96: U160::from(123456789u128),
+                liquidity: 555_000u128,
+                tick: tick(85176),
+                fee: U24::from(500u32),
+            },
+        );
+
+        assert_eq!(decode_pool_log(&log), None);
     }
 
     #[test]

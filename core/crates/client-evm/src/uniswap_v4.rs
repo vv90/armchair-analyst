@@ -158,6 +158,23 @@ pub fn state_view_address(chain: ChainKey) -> Option<Address> {
     }
 }
 
+/// The `PoolManager` singleton for a chain, the address every v4 pool event is emitted from. `None`
+/// for chains where v4 is not deployed/known. Used as the live-discovery bloom anchor so a block
+/// carrying only v4 activity is never bloom-skipped.
+pub fn pool_manager_address(chain: ChainKey) -> Option<Address> {
+    match chain {
+        ChainKey::Ethereum => Some(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS),
+        _ => None,
+    }
+}
+
+/// Whether `address` is a known v4 `PoolManager`. Chain-agnostic (the manager address is globally
+/// unique and [`decode_pool_log`](crate::decode_pool_log) carries no chain), so v4 log decoding can
+/// reject events spoofed from a non-manager contract that merely reuses the matching `topic0`.
+pub fn is_v4_pool_manager(address: Address) -> bool {
+    address == ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS
+}
+
 /// The `topic0` signature hashes of the state-relevant v4 pool events, mirroring v3's
 /// `pool_event_signature_hashes`.
 pub fn pool_event_signature_hashes() -> [B256; 3] {
@@ -213,6 +230,24 @@ mod tests {
             Some(ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS)
         );
         assert_eq!(state_view_address(ChainKey::Arbitrum), None);
+    }
+
+    #[test]
+    fn pool_manager_address_is_known_for_ethereum_only() {
+        assert_eq!(
+            pool_manager_address(ChainKey::Ethereum),
+            Some(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS)
+        );
+        assert_eq!(pool_manager_address(ChainKey::Arbitrum), None);
+    }
+
+    #[test]
+    fn is_v4_pool_manager_recognizes_only_the_known_manager() {
+        assert!(is_v4_pool_manager(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
+        assert!(!is_v4_pool_manager(Address::ZERO));
+        assert!(!is_v4_pool_manager(address!(
+            "00000000000000000000000000000000deadbeef"
+        )));
     }
 
     #[test]

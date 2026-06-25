@@ -1090,6 +1090,7 @@ mod tests {
                     "blockHash": block_hash,
                     "topics": [crate::uniswap_v3::pool_event_signature_hashes()
                         .into_iter()
+                        .chain(crate::uniswap_v4::pool_event_signature_hashes())
                         .map(|topic| topic.to_string())
                         .collect::<Vec<_>>()]
                 }]

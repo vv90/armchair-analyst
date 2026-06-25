@@ -7,7 +7,7 @@ pub(crate) mod pool_registry;
 pub(crate) mod token_registry;
 
 use self::{pending_requests::*, pool_registry::*, token_registry::*};
-use crate::{ChainKey, PoolLog, PoolLogEvent, derive_pool_state, pool_state::*, tick::Tick};
+use crate::{ChainKey, PoolLog, PoolLogEvent, derive_pool_state, pool_state::*, tick::Tick, uniswap_v4};
 
 enum PoolLogsStatus {
     Unknown,
@@ -901,12 +901,9 @@ impl State {
             return self;
         }
 
-        // The registry is still keyed by v3 contract address; v4 logs (keyed by PoolId) have no
-        // candidate yet and are skipped until v4 discovery wires them in.
-        let observed = logs
-            .iter()
-            .filter_map(|log| log.pool.uniswap_v3_address().map(ProtocolPoolKey::UniswapV3))
-            .collect::<HashSet<_>>();
+        // `log.pool` is the protocol-tagged identity (v3 contract address or v4 PoolId); both
+        // protocols become candidates here.
+        let observed = logs.iter().map(|log| log.pool).collect::<HashSet<_>>();
         let status = if complete {
             PoolLogsStatus::Resolved(observed)
         } else if let PoolLogsStatus::Partial(existing) = &block.pool_logs {
@@ -920,13 +917,7 @@ impl State {
         // order via `log_index`.
         let mut events_by_pool: HashMap<PoolRef, Vec<(u64, &PoolLogEvent)>> = HashMap::new();
         for log in &logs {
-            let Some(address) = log.pool.uniswap_v3_address() else {
-                continue;
-            };
-            if let Some(pool) = self
-                .pool_registry
-                .verified_pool(chain, ProtocolPoolKey::UniswapV3(address))
-            {
+            if let Some(pool) = self.pool_registry.verified_pool(chain, log.pool) {
                 events_by_pool
                     .entry(pool)
                     .or_default()
@@ -1241,7 +1232,17 @@ fn schedule_unknown_canonical_log_requests(
         finalized_state.block_hash,
         &pending_log_hashes,
     );
-    let trusted_addresses = pool_registry.verified_addresses(chain);
+    // The bloom gate only fires once there is a verified pool whose log completeness to protect; with
+    // none, the per-block fetch is still the discovery channel and every bloom-bearing block is
+    // fetched. Capture that "gate active" decision from the verified set *before* adding the v4
+    // PoolManager discovery anchor, so warmup behavior is unchanged.
+    let mut trusted_addresses = pool_registry.verified_addresses(chain);
+    let gate_active = !trusted_addresses.is_empty();
+    if let Some(manager) = uniswap_v4::pool_manager_address(chain) {
+        // Anchor on the singleton PoolManager so a block carrying only v4 activity is never
+        // bloom-skipped; otherwise, once any v3 pool is verified, new v4 pools would never be found.
+        trusted_addresses.insert(manager);
+    }
     let mut pending_requests = pending_requests;
 
     for block_hash in block_hashes {
@@ -1251,9 +1252,8 @@ fn schedule_unknown_canonical_log_requests(
         // trusted pools yet, the per-block fetch is still the discovery channel, so we fetch.
         let resolve_empty_candidates = blocks.get(&block_hash).and_then(|block| {
             let bloom = block.logs_bloom.as_ref()?;
-            (!trusted_addresses.is_empty()
-                && !block_may_touch_trusted_pool(bloom, &trusted_addresses))
-            .then(|| block.pool_logs.candidates().cloned().unwrap_or_default())
+            (gate_active && !block_may_touch_trusted_pool(bloom, &trusted_addresses))
+                .then(|| block.pool_logs.candidates().cloned().unwrap_or_default())
         });
 
         match resolve_empty_candidates {
@@ -6716,6 +6716,34 @@ mod tests {
             block_hash,
             &HashSet::from([undiscovered]),
         );
+        assert_effects_are_well_formed(&next_state, &effects);
+        assert_state_invariants(&next_state);
+    }
+
+    // A block whose bloom carries only the v4 PoolManager (no trusted v3 pool) still gets the
+    // authoritative fetch: the PoolManager is the v4 discovery anchor, so v4-only blocks are never
+    // bloom-skipped once the gate is active (a verified v3 pool is present here).
+    #[test]
+    fn bloom_with_v4_pool_manager_requests_logs() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let (state, _pool) = state_with_one_verified_pool_and_block(
+            finalized_hash,
+            block_hash,
+            Some(bloom_containing(&[
+                uniswap_v4::ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            ])),
+            PoolLogsStatus::Unknown,
+        );
+
+        let (next_state, effects) =
+            schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
+
+        let _ = assert_single_block_log_request_effect(&effects, block_hash);
+        assert!(matches!(
+            next_state.blocks.get(&block_hash).map(|block| &block.pool_logs),
+            Some(PoolLogsStatus::Unknown)
+        ));
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
     }
