@@ -1,10 +1,11 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
-    ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
-    ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_NATIVE_TOKEN_ADDRESS,
-    ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS, GraphEndpoints,
-    MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadata,
-    PoolMetadataResult, RequestId, RpcConfig, TokenAddress, TokenMetadataResult, bootstrap,
+    ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS,
+    AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
+    ChainKey, ChainSubscriptions, ClientEvent, ClientEvmError, ClientHead,
+    ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
+    GraphEndpoints, MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadata,
+    PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult, bootstrap,
     fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
     fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
     fetch_v4_pool_metadata, kernel,
@@ -35,7 +36,7 @@ pub(crate) struct ClientEvmApp {}
 
 pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
-    rpc_config: RpcConfig,
+    subscriptions: ChainSubscriptions,
     endpoints: ChainEndpoints,
     // Per-chain Uniswap v4 subgraph pools used by the v4 metadata resolver. Empty when The Graph is
     // unconfigured, in which case v4 metadata resolution is skipped.
@@ -48,7 +49,7 @@ pub(crate) struct ClientEvmRuntime {
 
 impl ClientEvmRuntime {
     pub(crate) fn new(
-        rpc_config: RpcConfig,
+        subscriptions: ChainSubscriptions,
         endpoints: ChainEndpoints,
         graph_endpoints: GraphEndpoints,
         metadata_cache: MetadataCache,
@@ -57,7 +58,7 @@ impl ClientEvmRuntime {
     ) -> ClientEvmRuntime {
         ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
-            rpc_config,
+            subscriptions,
             endpoints,
             graph_endpoints,
             metadata_cache,
@@ -67,9 +68,10 @@ impl ClientEvmRuntime {
         }
     }
 
-    /// dRPC/websocket config used by the subscription channel (still single-provider).
-    fn rpc_config(&self) -> &RpcConfig {
-        &self.rpc_config
+    /// Per-chain WebSocket endpoints used by the new-heads / pool-events subscription channel (single
+    /// connection per chain).
+    fn subscriptions(&self) -> &ChainSubscriptions {
+        &self.subscriptions
     }
 
     /// Per-chain HTTP endpoint pools used by every RPC fetch (multi-provider, with failover).
@@ -219,14 +221,18 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                     map_client_subscription_data(client_event)
                         .map(|data| Event::SubscriptionData { chain, data })
                 };
-                let _ = subscribe_new_heads(self.rpc_config(), chain, sender, map_client_event);
+                if let Ok(ws_url) = self.subscriptions().ws(chain) {
+                    let _ = subscribe_new_heads(ws_url, sender, map_client_event);
+                }
             }
             Subscription::PoolEventsSubscription(chain) => {
                 let map_client_event = |client_event: ClientEvent| {
                     map_client_subscription_data(client_event)
                         .map(|data| Event::SubscriptionData { chain, data })
                 };
-                let _ = subscribe_pool_events(self.rpc_config(), chain, sender, map_client_event);
+                if let Ok(ws_url) = self.subscriptions().ws(chain) {
+                    let _ = subscribe_pool_events(ws_url, sender, map_client_event);
+                }
             }
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
@@ -287,7 +293,7 @@ impl ClientEvmRuntime {
 }
 
 pub(crate) fn start_runtime(
-    config: RpcConfig,
+    subscriptions: ChainSubscriptions,
     endpoints: ChainEndpoints,
     graph_endpoints: GraphEndpoints,
     metadata_cache: MetadataCache,
@@ -295,7 +301,14 @@ pub(crate) fn start_runtime(
     view: View,
 ) -> JoinHandle<()> {
     let (_sender, handle) = <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(
-        ClientEvmRuntime::new(config, endpoints, graph_endpoints, metadata_cache, logger, view),
+        ClientEvmRuntime::new(
+            subscriptions,
+            endpoints,
+            graph_endpoints,
+            metadata_cache,
+            logger,
+            view,
+        ),
     );
 
     handle
@@ -620,12 +633,17 @@ fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddre
 ///   cross-chain cycles back to it.
 /// * Native ETH ↔ WETH: wrapping is 1:1, so this unifies v4 native-ETH pools (`token0 = address(0)`)
 ///   with v3 WETH liquidity; without it, native-ETH pools would be an isolated island in the graph.
+///   Registered per chain (Ethereum and Arbitrum) — native ETH and WETH are distinct `(Address,
+///   ChainKey)` tokens on each chain, and there is intentionally no cross-chain ETH bridge (only USDC
+///   connects the chains).
 fn default_optimization_bridges() -> HashSet<(TokenAddress, TokenAddress)> {
     HashSet::from([
         (ETHEREUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS),
         (ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
         (ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
         (ETHEREUM_WETH_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS),
+        (ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS),
+        (ARBITRUM_WETH_TOKEN_ADDRESS, ARBITRUM_NATIVE_TOKEN_ADDRESS),
     ])
 }
 
@@ -877,10 +895,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_constructor_stores_rpc_config() {
-        let config = rpc_config();
+    fn runtime_constructor_stores_subscriptions() {
         let runtime = ClientEvmRuntime::new(
-            config.clone(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -888,13 +905,16 @@ mod tests {
             View::sink(),
         );
 
-        assert_eq!(runtime.rpc_config(), &config);
+        assert_eq!(
+            runtime.subscriptions().ws(ChainKey::Ethereum).expect("ethereum ws"),
+            "wss://example.invalid/ws"
+        );
     }
 
     #[test]
     fn runtime_constructor_stores_graph_endpoints() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::single(ChainKey::Ethereum, "thegraph", "http://graph.invalid"),
             in_memory_metadata_cache(),
@@ -973,7 +993,7 @@ mod tests {
     #[test]
     fn runtime_starts_with_uninitialized_optimization_sender() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -1188,7 +1208,7 @@ mod tests {
             .expect("store cached pool");
 
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             cache,
@@ -1197,7 +1217,7 @@ mod tests {
         );
 
         // The scan yielded no candidates; the union must still surface the cached pool, resolved as
-        // a hit. `rpc_config()` points nowhere, so any RPC (a cache miss) would error/panic instead.
+        // a hit. `test_endpoints()` points nowhere, so any RPC (a cache miss) would error instead.
         let request = bootstrap::AnyIssuedRequest::PoolMetadata(IssuedRequest {
             request_id: RequestId::from_raw_for_test(1),
             request_payload: GetPoolMetadata {
@@ -1312,7 +1332,7 @@ mod tests {
             .expect("store cached v4 pool");
 
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             cache,
@@ -1332,7 +1352,7 @@ mod tests {
     #[test]
     fn run_optimization_effect_returns_no_events() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -1370,23 +1390,28 @@ mod tests {
         let config = default_optimization_session_config();
 
         // Wrapping is 1:1, so native ETH (v4 `token0 = address(0)`) and WETH (v3) must be a
-        // two-sided bridge; otherwise v4 native-ETH pools are isolated from WETH liquidity.
+        // two-sided bridge on every chain; otherwise v4 native-ETH pools are isolated from WETH
+        // liquidity. There is intentionally no cross-chain ETH bridge (only USDC connects chains).
+        for (native, weth) in [
+            (ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+            (ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS),
+        ] {
+            assert!(config.bridges.contains(&(native, weth)));
+            assert!(config.bridges.contains(&(weth, native)));
+        }
+
+        // No cross-chain ETH/WETH conduit.
         assert!(
-            config
+            !config
                 .bridges
-                .contains(&(ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS))
-        );
-        assert!(
-            config
-                .bridges
-                .contains(&(ETHEREUM_WETH_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS))
+                .contains(&(ETHEREUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_NATIVE_TOKEN_ADDRESS))
         );
     }
 
     #[test]
     fn empty_optimization_snapshot_is_dropped() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -1407,7 +1432,7 @@ mod tests {
     #[test]
     fn non_empty_optimization_snapshot_is_forwarded_when_sender_is_initialized() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -1429,7 +1454,7 @@ mod tests {
     #[test]
     fn non_empty_optimization_snapshot_is_dropped_when_sender_is_uninitialized() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -1448,7 +1473,7 @@ mod tests {
     #[test]
     fn optimization_subscription_initializes_sender() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -1465,7 +1490,7 @@ mod tests {
     #[test]
     fn optimization_subscription_starts_only_once() {
         let runtime = ClientEvmRuntime::new(
-            rpc_config(),
+            test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
@@ -2143,23 +2168,29 @@ mod tests {
         format!("0x{}", "00".repeat(256))
     }
 
-    fn rpc_config() -> RpcConfig {
-        RpcConfig {
-            http_url: "https://example.invalid/http".to_owned(),
-            ws_url: "wss://example.invalid/ws".to_owned(),
-            api_key: "api-key".to_owned(),
+    fn test_subscriptions() -> ChainSubscriptions {
+        let mut ws = std::collections::BTreeMap::new();
+        for &chain in client_evm::ACTIVE_CHAINS {
+            ws.insert(chain, "wss://example.invalid/ws".to_owned());
         }
+        ChainSubscriptions::new(ws).expect("test subscriptions")
     }
 
-    // Endpoint pools pointing at the (unreachable) test dRPC URL, public fallbacks disabled — so any
-    // RPC a test triggers errors instead of escaping to a real provider.
+    // Endpoint pools pointing at an (unreachable) test URL — so any RPC a test triggers errors instead
+    // of escaping to a real provider.
     fn test_endpoints() -> ChainEndpoints {
-        client_evm::assemble_chain_endpoints(
-            &rpc_config(),
-            &std::collections::BTreeMap::new(),
-            false,
-        )
-        .expect("test endpoint assembly")
+        let mut specs = std::collections::BTreeMap::new();
+        for &chain in client_evm::ACTIVE_CHAINS {
+            specs.insert(
+                chain,
+                vec![client_evm::EndpointSpec::new(
+                    "test",
+                    "https://example.invalid/http",
+                    1,
+                )],
+            );
+        }
+        client_evm::assemble_chain_endpoints(&specs).expect("test endpoint assembly")
     }
 
     fn in_memory_metadata_cache() -> MetadataCache {

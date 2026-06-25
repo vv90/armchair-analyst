@@ -13,9 +13,9 @@ use alloy::{
 
 use crate::{ChainKey, PoolFee, PoolMetadata, PoolMetadataFailure, PoolMetadataResult};
 
-/// Ethereum mainnet `PoolManager` singleton. All v4 pools live here and emit their events from this
-/// address, so v4 discovery filters on this target plus the per-pool `PoolId` topic rather than on a
-/// per-pool address the way v3 does.
+/// Ethereum mainnet `PoolManager` singleton. Each chain's v4 pools all live in that chain's
+/// `PoolManager` and emit their events from it, so v4 discovery filters on this target plus the per-pool
+/// `PoolId` topic rather than on a per-pool address the way v3 does.
 pub const ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
     address!("000000000004444c5dc75cB358380D2e3dE08A90");
 
@@ -23,6 +23,15 @@ pub const ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
 /// `liquidity()`; their state is read here via `getSlot0(id)`/`getLiquidity(id)`.
 pub const ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
     address!("7fFE42C4a5DEeA5b0feC41C94C136Cf115597227");
+
+/// Arbitrum One `PoolManager` singleton (counterpart to [`ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS`]).
+pub const ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
+    address!("360e68faccca8ca495c1b759fd9eee466db9fb32");
+
+/// Arbitrum One `StateView` periphery contract (counterpart to
+/// [`ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS`]).
+pub const ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
+    address!("76fd297e2d437cd7f76d50f01afe6160f86e9990");
 
 /// The high bit of a `uint24` fee marks a pool whose fee is set dynamically by its hook rather than
 /// being a fixed value. Such pools fall outside the constant-fee swap math, so the fixed-fee path
@@ -148,31 +157,56 @@ pub fn pool_metadata_from_pool_key(id: PoolId, key: &PoolKey) -> PoolMetadataRes
     })
 }
 
+/// The on-chain footprint of a Uniswap v4 deployment on one chain: the `PoolManager` singleton (every
+/// pool event's emitter) and the `StateView` periphery (where pool state is read). A chain has *either*
+/// both — a complete deployment — or neither; pairing them in one value (resolved by [`v4_deployment`])
+/// makes "half a v4 deployment" unrepresentable, so the `pool_manager`/`state_view` accessors can never
+/// disagree about whether v4 is enabled on a chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct V4Deployment {
+    pub pool_manager: Address,
+    pub state_view: Address,
+}
+
+/// The Uniswap v4 deployment for a chain — the single source of truth for "v4 is enabled here". `None`
+/// for chains where v4 is not deployed/known. Add a chain's deployment here and every v4 path
+/// (discovery, state reads, subgraph assembly) picks it up.
+pub fn v4_deployment(chain: ChainKey) -> Option<V4Deployment> {
+    match chain {
+        ChainKey::Ethereum => Some(V4Deployment {
+            pool_manager: ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
+        ChainKey::Arbitrum => Some(V4Deployment {
+            pool_manager: ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
+    }
+}
+
 /// The `StateView` periphery contract for a chain, through which v4 pool state is read
 /// (`getSlot0`/`getLiquidity` keyed by [`PoolId`]). `None` for chains where v4 is not deployed/known;
 /// callers skip v4 state reads for such chains rather than targeting a missing contract.
 pub fn state_view_address(chain: ChainKey) -> Option<Address> {
-    match chain {
-        ChainKey::Ethereum => Some(ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS),
-        _ => None,
-    }
+    v4_deployment(chain).map(|deployment| deployment.state_view)
 }
 
 /// The `PoolManager` singleton for a chain, the address every v4 pool event is emitted from. `None`
 /// for chains where v4 is not deployed/known. Used as the live-discovery bloom anchor so a block
 /// carrying only v4 activity is never bloom-skipped.
 pub fn pool_manager_address(chain: ChainKey) -> Option<Address> {
-    match chain {
-        ChainKey::Ethereum => Some(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS),
-        _ => None,
-    }
+    v4_deployment(chain).map(|deployment| deployment.pool_manager)
 }
 
-/// Whether `address` is a known v4 `PoolManager`. Chain-agnostic (the manager address is globally
-/// unique and [`decode_pool_log`](crate::decode_pool_log) carries no chain), so v4 log decoding can
-/// reject events spoofed from a non-manager contract that merely reuses the matching `topic0`.
+/// Whether `address` is a known v4 `PoolManager` on any active chain. Chain-agnostic (the manager
+/// address is globally unique and [`decode_pool_log`](crate::decode_pool_log) carries no chain), so v4
+/// log decoding can reject events spoofed from a non-manager contract that merely reuses the matching
+/// `topic0`.
 pub fn is_v4_pool_manager(address: Address) -> bool {
-    address == ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS
+    crate::ACTIVE_CHAINS
+        .iter()
+        .filter_map(|&chain| pool_manager_address(chain))
+        .any(|manager| manager == address)
 }
 
 /// The `topic0` signature hashes of the state-relevant v4 pool events, mirroring v3's
@@ -224,26 +258,55 @@ mod tests {
     }
 
     #[test]
-    fn state_view_address_is_known_for_ethereum_only() {
+    fn v4_deployment_is_known_for_active_chains_and_accessors_agree() {
+        for (chain, pool_manager, state_view) in [
+            (
+                ChainKey::Ethereum,
+                ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+            (
+                ChainKey::Arbitrum,
+                ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+        ] {
+            let deployment = v4_deployment(chain).expect("chain has a v4 deployment");
+            assert_eq!(deployment.pool_manager, pool_manager);
+            assert_eq!(deployment.state_view, state_view);
+            assert_eq!(pool_manager_address(chain), Some(pool_manager));
+            assert_eq!(state_view_address(chain), Some(state_view));
+        }
+    }
+
+    #[test]
+    fn state_view_address_is_known_for_each_active_chain() {
         assert_eq!(
             state_view_address(ChainKey::Ethereum),
             Some(ETHEREUM_UNISWAP_V4_STATE_VIEW_ADDRESS)
         );
-        assert_eq!(state_view_address(ChainKey::Arbitrum), None);
+        assert_eq!(
+            state_view_address(ChainKey::Arbitrum),
+            Some(ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS)
+        );
     }
 
     #[test]
-    fn pool_manager_address_is_known_for_ethereum_only() {
+    fn pool_manager_address_is_known_for_each_active_chain() {
         assert_eq!(
             pool_manager_address(ChainKey::Ethereum),
             Some(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS)
         );
-        assert_eq!(pool_manager_address(ChainKey::Arbitrum), None);
+        assert_eq!(
+            pool_manager_address(ChainKey::Arbitrum),
+            Some(ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS)
+        );
     }
 
     #[test]
-    fn is_v4_pool_manager_recognizes_only_the_known_manager() {
+    fn is_v4_pool_manager_recognizes_only_known_managers() {
         assert!(is_v4_pool_manager(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
+        assert!(is_v4_pool_manager(ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
         assert!(!is_v4_pool_manager(Address::ZERO));
         assert!(!is_v4_pool_manager(address!(
             "00000000000000000000000000000000deadbeef"

@@ -24,6 +24,17 @@ pub const ARBITRUM_USDC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
     ChainKey::Arbitrum,
 );
 
+/// Native ETH on Arbitrum One (the chain's gas token), denoted by the zero address. v4 native-currency
+/// pools store this as their `token0`; the token registry resolves it intrinsically to 18 decimals.
+pub const ARBITRUM_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Arbitrum);
+
+/// Canonical Wrapped Ether (WETH) on Arbitrum One. Wrapping is 1:1 with native ETH, so the optimizer
+/// bridges this to [`ARBITRUM_NATIVE_TOKEN_ADDRESS`] to unify v4 native-ETH liquidity with v3 WETH.
+pub const ARBITRUM_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1"),
+    ChainKey::Arbitrum,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +75,25 @@ mod tests {
             ARBITRUM_USDC_TOKEN_ADDRESS,
             TokenAddress(
                 address!("af88d065e77c8cC2239327C5EDb3A432268e5831"),
+                ChainKey::Arbitrum
+            )
+        );
+    }
+
+    #[test]
+    fn arbitrum_native_token_address_is_the_zero_address() {
+        assert_eq!(
+            ARBITRUM_NATIVE_TOKEN_ADDRESS,
+            TokenAddress(Address::ZERO, ChainKey::Arbitrum)
+        );
+    }
+
+    #[test]
+    fn arbitrum_weth_token_address_is_exported() {
+        assert_eq!(
+            ARBITRUM_WETH_TOKEN_ADDRESS,
+            TokenAddress(
+                address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1"),
                 ChainKey::Arbitrum
             )
         );

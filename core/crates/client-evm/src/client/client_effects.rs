@@ -18,9 +18,8 @@ use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 use crate::{
     ChainKey, ClientEvmError, PoolFee, PoolRef, ProtocolPoolKey, PoolDataCall, PoolDataFailure,
     PoolDataResult, PoolLog, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
-    PoolMetadataResult, PoolState, RangeLogBlock, RpcConfig, TokenAddress, TokenDecimals,
+    PoolMetadataResult, PoolState, RangeLogBlock, TokenAddress, TokenDecimals,
     TokenMetadata, TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
-    config::compose_ws_endpoint,
     decode_pool_log,
     endpoints::{ChainEndpoints, EndpointPool},
 };
@@ -273,7 +272,7 @@ pub fn fetch_pool_metadata(
         return Ok(metadata_results);
     }
 
-    let factory_calls = pool_metadata_factory_multicall_calls(&factory_inputs);
+    let factory_calls = pool_metadata_factory_multicall_calls(chain, &factory_inputs);
     let factory_results =
         aggregate3_batched(agent, endpoint_pool, MulticallBlock::Latest, &factory_calls)?;
 
@@ -408,12 +407,14 @@ fn pool_metadata_candidate_multicall_calls(
 }
 
 fn pool_metadata_factory_multicall_calls(
+    chain: ChainKey,
     metadata: &[(ProtocolPoolKey, PoolMetadata)],
 ) -> Vec<MulticallCall> {
+    let factory = crate::uniswap_v3::v3_factory_address(chain);
     metadata
         .iter()
         .map(|(_, metadata)| MulticallCall {
-            target: crate::uniswap_v3::ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS,
+            target: factory,
             call_data: Bytes::from(
                 crate::uniswap_v3::getPoolCall {
                     tokenA: metadata.token0,
@@ -715,17 +716,15 @@ pub fn fetch_finalized_block_header(
 }
 
 pub fn subscribe_new_heads<T, F>(
-    config: &RpcConfig,
-    chain: ChainKey,
+    ws_url: &str,
     sender: &Sender<T>,
     map_event: F,
 ) -> Result<(), ClientEvmError>
 where
     F: Fn(ClientEvent) -> Option<T>,
 {
-    let endpoint = compose_ws_endpoint(config, chain)?;
     let (mut socket, _) =
-        connect(endpoint.as_str()).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
+        connect(ws_url).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
 
     let subscribe_request = build_new_heads_subscribe_request(SUBSCRIBE_REQUEST_ID);
     socket
@@ -807,17 +806,15 @@ where
 /// Subscribes to the live `logs` stream for pool events, mirroring [`subscribe_new_heads`]. Each
 /// state-relevant log is decoded and forwarded as a [`ClientEvent::PoolLogObserved`] for its block.
 pub fn subscribe_pool_events<T, F>(
-    config: &RpcConfig,
-    chain: ChainKey,
+    ws_url: &str,
     sender: &Sender<T>,
     map_event: F,
 ) -> Result<(), ClientEvmError>
 where
     F: Fn(ClientEvent) -> Option<T>,
 {
-    let endpoint = compose_ws_endpoint(config, chain)?;
     let (mut socket, _) =
-        connect(endpoint.as_str()).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
+        connect(ws_url).map_err(|ws_error| ClientEvmError::WebSocketError(ws_error))?;
 
     let subscribe_request = build_pool_events_subscribe_request(SUBSCRIBE_REQUEST_ID);
     socket

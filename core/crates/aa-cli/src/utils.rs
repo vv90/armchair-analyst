@@ -1,31 +1,23 @@
 use std::{collections::BTreeMap, error, fmt, io, path::PathBuf};
 
-use client_evm::{ChainKey, EndpointSpec, RpcConfig, TheGraphConfig, chain_key_for_network_path};
+use client_evm::{ChainKey, EndpointSpec, chain_key_for_network_path};
 use serde::Deserialize;
 
-pub(crate) const RPC_HTTP_URL_ENV: &str = "AA_RPC_HTTP_URL";
-pub(crate) const RPC_WS_URL_ENV: &str = "AA_RPC_WS_URL";
-pub(crate) const RPC_API_KEY_ENV: &str = "AA_RPC_API_KEY";
-pub(crate) const RPC_ENDPOINTS_FILE_ENV: &str = "AA_RPC_ENDPOINTS_FILE";
-pub(crate) const RPC_PUBLIC_FALLBACKS_ENV: &str = "AA_RPC_PUBLIC_FALLBACKS";
+/// Path to the unified TOML config file holding every mutable endpoint setting (RPC providers, their
+/// WebSocket URLs, and Uniswap v4 subgraphs). Required — the runtime has no built-in endpoint defaults.
+pub(crate) const CONFIG_FILE_ENV: &str = "AA_CONFIG_FILE";
 pub(crate) const METADATA_CACHE_PATH_ENV: &str = "AA_METADATA_CACHE_PATH";
-pub(crate) const GRAPH_URL_ENV: &str = "AA_GRAPH_URL";
-pub(crate) const GRAPH_API_KEY_ENV: &str = "AA_GRAPH_API_KEY";
-pub(crate) const GRAPH_ENDPOINTS_FILE_ENV: &str = "AA_GRAPH_ENDPOINTS_FILE";
 
-/// Prefix for the per-provider derived key env var on the RPC endpoints file (`AA_RPC_KEY_<NAME>`).
+/// Prefix for a provider's derived key env var on `[[rpc]]` entries (`AA_RPC_KEY_<NAME>`).
 const RPC_KEY_PREFIX: &str = "AA_RPC_KEY_";
-/// Prefix for the per-provider derived key env var on the graph mirrors file (`AA_GRAPH_KEY_<NAME>`).
+/// Prefix for a provider's derived key env var on `[[subgraph]]` entries (`AA_GRAPH_KEY_<NAME>`).
 const GRAPH_KEY_PREFIX: &str = "AA_GRAPH_KEY_";
 
 const DEFAULT_METADATA_CACHE_PATH: &str = "metadata-cache.redb";
 
 /// Token substituted with a provider's resolved API key wherever it appears in that provider's URLs.
+/// The only secret-bearing piece of any URL: keys live in the environment, never in the config file.
 const KEY_PLACEHOLDER: &str = "{key}";
-
-const RPC_HTTP_URL_PROMPT: &str = "RPC HTTP URL:";
-pub(crate) const RPC_WS_URL_PROMPT: &str = "RPC WebSocket URL:";
-pub(crate) const RPC_API_KEY_PROMPT: &str = "RPC API key:";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CliError {
@@ -33,7 +25,7 @@ pub(crate) enum CliError {
         env_name: &'static str,
     },
     PromptFailed {
-        prompt: &'static str,
+        prompt: String,
         message: String,
     },
     RuntimeFailed {
@@ -69,7 +61,7 @@ impl fmt::Display for CliError {
                 write!(formatter, "failed to open metadata cache: {message}")
             }
             Self::EndpointConfigFailed { message } => {
-                write!(formatter, "failed to load rpc endpoints config: {message}")
+                write!(formatter, "failed to load endpoints config: {message}")
             }
         }
     }
@@ -89,17 +81,43 @@ where
         .unwrap_or_else(|| PathBuf::from(DEFAULT_METADATA_CACHE_PATH))
 }
 
-/// One `[[provider]]` entry in the endpoints file: a friendly `name`, an optional `weight` (defaulting
-/// to 1), an optional `key_env` naming the environment variable holding this provider's API key, and
-/// one URL per chain keyed by its network slug (e.g. `ethereum = "https://…/{key}"`). URLs may embed
-/// the [`KEY_PLACEHOLDER`]; the key is resolved from `key_env` (or a derived default) and substituted in.
+/// The per-chain HTTP/WS URLs for one `[[rpc]]` provider on one chain. `http` feeds the failover pool;
+/// the optional `ws` feeds the (single-connection) subscription channel.
 #[derive(Debug, Deserialize)]
-struct ProviderEntry {
+struct RpcChainUrls {
+    http: String,
+    ws: Option<String>,
+}
+
+/// One `[[rpc]]` provider: a friendly `name`, an optional `weight` (defaulting to 1), an optional
+/// `key_env` naming the env var holding this provider's API key, and one `{ http, ws }` table per chain
+/// keyed by its network slug. URLs may embed [`KEY_PLACEHOLDER`], substituted from the resolved key.
+#[derive(Debug, Deserialize)]
+struct RpcProviderEntry {
+    name: String,
+    weight: Option<u32>,
+    key_env: Option<String>,
+    #[serde(flatten)]
+    chains: BTreeMap<String, RpcChainUrls>,
+}
+
+/// One `[[subgraph]]` provider: same shape as an RPC provider but with a single query URL per chain
+/// (subgraphs have no WebSocket side). Used to resolve Uniswap v4 pool metadata by id.
+#[derive(Debug, Deserialize)]
+struct SubgraphProviderEntry {
     name: String,
     weight: Option<u32>,
     key_env: Option<String>,
     #[serde(flatten)]
     chains: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    rpc: Vec<RpcProviderEntry>,
+    #[serde(default)]
+    subgraph: Vec<SubgraphProviderEntry>,
 }
 
 /// Outcome of resolving a provider's API key: the provider needs no key, a key was resolved, or the key
@@ -110,132 +128,122 @@ enum KeyResolution {
     Skipped,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct EndpointsFile {
-    #[serde(default)]
-    provider: Vec<ProviderEntry>,
+/// Every endpoint setting resolved from the config file, with keys substituted: per-chain HTTP specs for
+/// the failover pools, a single WS URL per chain for the subscription channel, and per-chain subgraph
+/// specs for v4 metadata resolution. The caller assembles these into the client-evm endpoint types.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResolvedEndpoints {
+    pub rpc_http: BTreeMap<ChainKey, Vec<EndpointSpec>>,
+    pub rpc_ws: BTreeMap<ChainKey, String>,
+    pub subgraph: BTreeMap<ChainKey, Vec<EndpointSpec>>,
 }
 
-/// Whether the built-in keyless public endpoint fallbacks are enabled. Defaults to on; any of
-/// `0/false/no/off` (case-insensitive) turns them off, keeping all traffic on configured providers.
-pub(crate) fn public_fallbacks_enabled_with<Env>(mut read_env: Env) -> bool
-where
-    Env: FnMut(&'static str) -> Option<String>,
-{
-    match read_env(RPC_PUBLIC_FALLBACKS_ENV).and_then(normalize_config_value) {
-        Some(value) => !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        None => true,
-    }
-}
-
-/// Loads the optional RPC endpoints file named by [`RPC_ENDPOINTS_FILE_ENV`] into per-chain endpoint
-/// specs. Thin wrapper over [`load_endpoints_file_with`] with the RPC file env and key prefix.
-pub(crate) fn load_custom_endpoints_with<Env, ReadFile, Prompt>(
-    read_env: Env,
-    read_file: ReadFile,
-    prompt: Prompt,
-) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
-where
-    Env: FnMut(&str) -> Option<String>,
-    ReadFile: FnOnce(&str) -> io::Result<String>,
-    Prompt: FnMut(&str) -> Result<String, CliError>,
-{
-    load_endpoints_file_with(
-        RPC_ENDPOINTS_FILE_ENV,
-        RPC_KEY_PREFIX,
-        read_env,
-        read_file,
-        prompt,
-    )
-}
-
-/// Loads the optional Uniswap v4 subgraph mirrors file named by [`GRAPH_ENDPOINTS_FILE_ENV`] into
-/// per-chain endpoint specs — same-schema mirrors of the canonical subgraph that fail over alongside the
-/// gateway primary. Thin wrapper over [`load_endpoints_file_with`] with the graph file env and key prefix.
-pub(crate) fn load_graph_endpoints_with<Env, ReadFile, Prompt>(
-    read_env: Env,
-    read_file: ReadFile,
-    prompt: Prompt,
-) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
-where
-    Env: FnMut(&str) -> Option<String>,
-    ReadFile: FnOnce(&str) -> io::Result<String>,
-    Prompt: FnMut(&str) -> Result<String, CliError>,
-{
-    load_endpoints_file_with(
-        GRAPH_ENDPOINTS_FILE_ENV,
-        GRAPH_KEY_PREFIX,
-        read_env,
-        read_file,
-        prompt,
-    )
-}
-
-/// Loads an optional endpoints file named by `file_env` into per-chain endpoint specs, resolving each
-/// provider's API key (env first under `key_prefix`, then prompt) and substituting it into the URLs.
-/// Absent env var → no custom providers (empty map). A read or parse failure is a hard error; a skipped
-/// key drops that provider. Shared by the RPC and graph endpoint loaders.
-fn load_endpoints_file_with<Env, ReadFile, Prompt>(
-    file_env: &str,
-    key_prefix: &str,
+/// Loads and resolves the unified config file named by [`CONFIG_FILE_ENV`]. The file is **required** (an
+/// absent/blank env var is an error); each provider's API key is resolved from the environment (under
+/// `key_env` or a derived `<prefix><NAME>`), then prompted for if missing — a blank answer drops that
+/// provider. RPC keys are effectively required (dropping a provider may leave a chain with no endpoint,
+/// caught downstream); subgraph keys are optional (dropping the subgraph just skips v4 resolution).
+pub(crate) fn load_config_with<Env, ReadFile, Prompt>(
     mut read_env: Env,
     read_file: ReadFile,
     mut prompt: Prompt,
-) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
+) -> Result<ResolvedEndpoints, CliError>
 where
     Env: FnMut(&str) -> Option<String>,
     ReadFile: FnOnce(&str) -> io::Result<String>,
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
-    let Some(path) = read_env(file_env).and_then(normalize_config_value) else {
-        return Ok(BTreeMap::new());
-    };
+    let path = read_env(CONFIG_FILE_ENV)
+        .and_then(normalize_config_value)
+        .ok_or(CliError::MissingRequiredConfig {
+            env_name: CONFIG_FILE_ENV,
+        })?;
 
     let content = read_file(&path).map_err(|error| CliError::EndpointConfigFailed {
         message: format!("failed to read {path}: {error}"),
     })?;
 
-    let file = parse_endpoints_toml(&content)?;
-    resolve_endpoints(file, key_prefix, &mut read_env, &mut prompt)
-}
-
-/// Loads the optional Uniswap v4 subgraph config (gateway URL + API key). Env-only — unlike the required
-/// RPC config it never prompts, so an unconfigured aggregator simply yields `None` (v4 metadata
-/// resolution is then skipped) rather than blocking startup. Both values must be present and non-empty.
-pub(crate) fn load_graph_config_with<Env>(mut read_env: Env) -> Option<TheGraphConfig>
-where
-    Env: FnMut(&'static str) -> Option<String>,
-{
-    let url = read_env(GRAPH_URL_ENV).and_then(normalize_config_value)?;
-    let api_key = read_env(GRAPH_API_KEY_ENV).and_then(normalize_config_value)?;
-
-    Some(TheGraphConfig { url, api_key })
-}
-
-fn parse_endpoints_toml(content: &str) -> Result<EndpointsFile, CliError> {
-    toml::from_str(content).map_err(|error| CliError::EndpointConfigFailed {
+    let file: ConfigFile = toml::from_str(&content).map_err(|error| CliError::EndpointConfigFailed {
         message: error.to_string(),
-    })
+    })?;
+
+    resolve_config(file, &mut read_env, &mut prompt)
 }
 
-fn resolve_endpoints<Env, Prompt>(
-    file: EndpointsFile,
-    key_prefix: &str,
+fn resolve_config<Env, Prompt>(
+    file: ConfigFile,
     read_env: &mut Env,
     prompt: &mut Prompt,
-) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
+) -> Result<ResolvedEndpoints, CliError>
 where
     Env: FnMut(&str) -> Option<String>,
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
-    let mut endpoints: BTreeMap<ChainKey, Vec<EndpointSpec>> = BTreeMap::new();
+    let mut resolved = ResolvedEndpoints::default();
+    // The highest-weight provider that declares a WS URL wins each chain's single subscription slot.
+    let mut best_ws: BTreeMap<ChainKey, (u32, String)> = BTreeMap::new();
 
-    for provider in file.provider {
-        let key = match resolve_provider_key(&provider, key_prefix, read_env, prompt)? {
-            // A skipped key drops the whole provider: none of its endpoints enter the pool.
+    for provider in file.rpc {
+        let needs_key = provider.chains.values().any(|urls| {
+            urls.http.contains(KEY_PLACEHOLDER)
+                || urls
+                    .ws
+                    .as_deref()
+                    .is_some_and(|ws| ws.contains(KEY_PLACEHOLDER))
+        });
+        let key = match resolve_provider_key(
+            &provider.name,
+            provider.key_env.as_deref(),
+            needs_key,
+            RPC_KEY_PREFIX,
+            read_env,
+            prompt,
+        )? {
+            KeyResolution::Skipped => continue,
+            KeyResolution::NotNeeded => None,
+            KeyResolution::Resolved(key) => Some(key),
+        };
+
+        let weight = provider.weight.unwrap_or(1);
+        for (network, urls) in &provider.chains {
+            let chain = chain_for_network(network, &provider.name)?;
+            let http = substitute_key(&urls.http, key.as_deref());
+            resolved
+                .rpc_http
+                .entry(chain)
+                .or_default()
+                .push(EndpointSpec::new(provider.name.clone(), http, weight));
+
+            if let Some(ws) = &urls.ws {
+                let ws = substitute_key(ws, key.as_deref());
+                let replace = best_ws
+                    .get(&chain)
+                    .is_none_or(|(best_weight, _)| weight > *best_weight);
+                if replace {
+                    best_ws.insert(chain, (weight, ws));
+                }
+            }
+        }
+    }
+
+    resolved.rpc_ws = best_ws
+        .into_iter()
+        .map(|(chain, (_, url))| (chain, url))
+        .collect();
+
+    for provider in file.subgraph {
+        let needs_key = provider
+            .chains
+            .values()
+            .any(|url| url.contains(KEY_PLACEHOLDER));
+        let key = match resolve_provider_key(
+            &provider.name,
+            provider.key_env.as_deref(),
+            needs_key,
+            GRAPH_KEY_PREFIX,
+            read_env,
+            prompt,
+        )? {
             KeyResolution::Skipped => continue,
             KeyResolution::NotNeeded => None,
             KeyResolution::Resolved(key) => Some(key),
@@ -243,34 +251,39 @@ where
 
         let weight = provider.weight.unwrap_or(1);
         for (network, url) in &provider.chains {
-            let chain = chain_key_for_network_path(network).ok_or_else(|| {
-                CliError::EndpointConfigFailed {
-                    message: format!(
-                        "provider '{}' references unknown chain '{network}'",
-                        provider.name
-                    ),
-                }
-            })?;
-            let url = match &key {
-                Some(key) => url.replace(KEY_PLACEHOLDER, key),
-                None => url.clone(),
-            };
-            endpoints.entry(chain).or_default().push(EndpointSpec::new(
-                provider.name.clone(),
-                url,
-                weight,
-            ));
+            let chain = chain_for_network(network, &provider.name)?;
+            let url = substitute_key(url, key.as_deref());
+            resolved
+                .subgraph
+                .entry(chain)
+                .or_default()
+                .push(EndpointSpec::new(provider.name.clone(), url, weight));
         }
     }
 
-    Ok(endpoints)
+    Ok(resolved)
 }
 
-/// Resolves a provider's API key when any of its URLs embed [`KEY_PLACEHOLDER`]: the environment
-/// (`key_env`, or the derived `<key_prefix><NAME>`) is consulted first, then the user is prompted; a
-/// blank prompt (or EOF on a non-interactive run) skips the provider.
+fn chain_for_network(network: &str, provider: &str) -> Result<ChainKey, CliError> {
+    chain_key_for_network_path(network).ok_or_else(|| CliError::EndpointConfigFailed {
+        message: format!("provider '{provider}' references unknown chain '{network}'"),
+    })
+}
+
+fn substitute_key(url: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) => url.replace(KEY_PLACEHOLDER, key),
+        None => url.to_owned(),
+    }
+}
+
+/// Resolves a provider's API key when `needs_key` (any of its URLs embed [`KEY_PLACEHOLDER`]): the
+/// environment (`key_env`, or the derived `<key_prefix><NAME>`) is consulted first, then the user is
+/// prompted; a blank prompt (or EOF on a non-interactive run) skips the provider.
 fn resolve_provider_key<Env, Prompt>(
-    provider: &ProviderEntry,
+    name: &str,
+    key_env: Option<&str>,
+    needs_key: bool,
     key_prefix: &str,
     read_env: &mut Env,
     prompt: &mut Prompt,
@@ -279,23 +292,18 @@ where
     Env: FnMut(&str) -> Option<String>,
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
-    let needs_key = provider
-        .chains
-        .values()
-        .any(|url| url.contains(KEY_PLACEHOLDER));
     if !needs_key {
         return Ok(KeyResolution::NotNeeded);
     }
 
-    let env_name = provider
-        .key_env
-        .clone()
-        .unwrap_or_else(|| derived_key_env(key_prefix, &provider.name));
+    let env_name = key_env
+        .map(str::to_owned)
+        .unwrap_or_else(|| derived_key_env(key_prefix, name));
     if let Some(key) = read_env(&env_name).and_then(normalize_config_value) {
         return Ok(KeyResolution::Resolved(key));
     }
 
-    let answer = prompt(&format!("{} API key (leave blank to skip):", provider.name))?;
+    let answer = prompt(&format!("{name} API key (leave blank to skip):"))?;
     Ok(match normalize_config_value(answer) {
         Some(key) => KeyResolution::Resolved(key),
         None => KeyResolution::Skipped,
@@ -319,54 +327,6 @@ fn derived_key_env(key_prefix: &str, name: &str) -> String {
     format!("{key_prefix}{sanitized}")
 }
 
-pub(crate) fn load_rpc_config_with<Env, Prompt>(
-    mut read_env: Env,
-    mut prompt: Prompt,
-) -> Result<RpcConfig, CliError>
-where
-    Env: FnMut(&'static str) -> Option<String>,
-    Prompt: FnMut(&'static str) -> Result<String, CliError>,
-{
-    Ok(RpcConfig {
-        http_url: required_value(
-            RPC_HTTP_URL_ENV,
-            RPC_HTTP_URL_PROMPT,
-            &mut read_env,
-            &mut prompt,
-        )?,
-        ws_url: required_value(
-            RPC_WS_URL_ENV,
-            RPC_WS_URL_PROMPT,
-            &mut read_env,
-            &mut prompt,
-        )?,
-        api_key: required_value(
-            RPC_API_KEY_ENV,
-            RPC_API_KEY_PROMPT,
-            &mut read_env,
-            &mut prompt,
-        )?,
-    })
-}
-
-fn required_value<Env, Prompt>(
-    env_name: &'static str,
-    prompt_text: &'static str,
-    read_env: &mut Env,
-    prompt: &mut Prompt,
-) -> Result<String, CliError>
-where
-    Env: FnMut(&'static str) -> Option<String>,
-    Prompt: FnMut(&'static str) -> Result<String, CliError>,
-{
-    if let Some(value) = read_env(env_name).and_then(normalize_config_value) {
-        return Ok(value);
-    }
-
-    let value = prompt(prompt_text)?;
-    normalize_config_value(value).ok_or(CliError::MissingRequiredConfig { env_name })
-}
-
 fn normalize_config_value(value: String) -> Option<String> {
     let trimmed = value.trim();
 
@@ -381,198 +341,44 @@ fn normalize_config_value(value: String) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn all_env_values_present_returns_config_without_prompting() {
-        let mut prompt_calls = 0;
-        let result = load_rpc_config_with(
-            env_from([
-                (RPC_HTTP_URL_ENV, " https://example.invalid/http "),
-                (RPC_WS_URL_ENV, " wss://example.invalid/ws "),
-                (RPC_API_KEY_ENV, " key-from-env "),
-            ]),
-            |_| {
-                prompt_calls += 1;
-                Ok("unused".to_owned())
-            },
-        );
+    const CONFIG: &str = r#"
+        [[rpc]]
+        name = "drpc"
+        weight = 3
+        ethereum = { http = "https://lb.drpc.org/ethereum/{key}", ws = "wss://lb.drpc.org/ethereum/{key}" }
+        arbitrum = { http = "https://lb.drpc.org/arbitrum/{key}", ws = "wss://lb.drpc.org/arbitrum/{key}" }
 
-        assert_eq!(
-            result,
-            Ok(RpcConfig {
-                http_url: "https://example.invalid/http".to_owned(),
-                ws_url: "wss://example.invalid/ws".to_owned(),
-                api_key: "key-from-env".to_owned(),
-            })
-        );
-        assert_eq!(prompt_calls, 0);
-    }
+        [[rpc]]
+        name = "publicnode"
+        ethereum = { http = "https://ethereum-rpc.publicnode.com" }
+        arbitrum = { http = "https://arbitrum-one-rpc.publicnode.com" }
+
+        [[subgraph]]
+        name = "thegraph"
+        key_env = "AA_GRAPH_API_KEY"
+        ethereum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/v4"
+    "#;
 
     #[test]
-    fn missing_values_are_prompted_for() {
-        let mut answers = vec![
-            (RPC_WS_URL_PROMPT, "wss://prompted.example/ws"),
-            (RPC_API_KEY_PROMPT, "prompted-key"),
-        ]
-        .into_iter();
-        let mut prompts = Vec::new();
-
-        let result = load_rpc_config_with(
-            env_from([(RPC_HTTP_URL_ENV, "https://env.example/http")]),
-            |prompt| match answers.next() {
-                Some((expected_prompt, answer)) => {
-                    prompts.push(prompt);
-                    assert_eq!(prompt, expected_prompt);
-                    Ok(answer.to_owned())
-                }
-                None => Err(CliError::PromptFailed {
-                    prompt,
-                    message: "no test answer available".to_owned(),
-                }),
-            },
-        );
-
-        assert_eq!(
-            result,
-            Ok(RpcConfig {
-                http_url: "https://env.example/http".to_owned(),
-                ws_url: "wss://prompted.example/ws".to_owned(),
-                api_key: "prompted-key".to_owned(),
-            })
-        );
-        assert_eq!(prompts, vec![RPC_WS_URL_PROMPT, RPC_API_KEY_PROMPT]);
-    }
-
-    #[test]
-    fn empty_env_values_are_prompted_for() {
-        let result = load_rpc_config_with(
-            env_from([
-                (RPC_HTTP_URL_ENV, " "),
-                (RPC_WS_URL_ENV, "\t"),
-                (RPC_API_KEY_ENV, "\n"),
-            ]),
-            prompt_from([
-                (RPC_HTTP_URL_PROMPT, "https://prompted.example/http"),
-                (RPC_WS_URL_PROMPT, "wss://prompted.example/ws"),
-                (RPC_API_KEY_PROMPT, "prompted-key"),
-            ]),
-        );
-
-        assert_eq!(
-            result,
-            Ok(RpcConfig {
-                http_url: "https://prompted.example/http".to_owned(),
-                ws_url: "wss://prompted.example/ws".to_owned(),
-                api_key: "prompted-key".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn empty_prompt_value_is_rejected() {
-        let result = load_rpc_config_with(
-            env_from([
-                (RPC_HTTP_URL_ENV, "https://env.example/http"),
-                (RPC_WS_URL_ENV, "wss://env.example/ws"),
-            ]),
-            prompt_from([(RPC_API_KEY_PROMPT, " ")]),
-        );
-
-        assert_eq!(
-            result,
-            Err(CliError::MissingRequiredConfig {
-                env_name: RPC_API_KEY_ENV
-            })
-        );
-    }
-
-    #[test]
-    fn public_fallbacks_enabled_defaults_on_and_respects_disable_values() {
-        assert!(public_fallbacks_enabled_with(env_from([])));
-        for disable in ["0", "false", "NO", "Off"] {
-            assert!(
-                !public_fallbacks_enabled_with(env_from([(RPC_PUBLIC_FALLBACKS_ENV, disable)])),
-                "{disable} should disable public fallbacks"
-            );
-        }
-        assert!(public_fallbacks_enabled_with(env_from([(
-            RPC_PUBLIC_FALLBACKS_ENV,
-            "1"
-        )])));
-    }
-
-    #[test]
-    fn no_endpoints_file_yields_no_custom_providers() {
-        let result = load_custom_endpoints_with(
+    fn missing_config_file_env_is_an_error() {
+        let result = load_config_with(
             env_from([]),
             |_| panic!("file must not be read"),
             never_prompt(),
         );
 
-        assert_eq!(result, Ok(BTreeMap::new()));
-    }
-
-    #[test]
-    fn endpoints_file_parses_into_per_chain_specs() {
-        let toml = r#"
-            [[provider]]
-            name = "alchemy"
-            weight = 3
-            ethereum = "https://eth.example/v2/key"
-            arbitrum = "https://arb.example/v2/key"
-
-            [[provider]]
-            name = "publicnode"
-            ethereum = "https://eth.public.example"
-        "#;
-
-        let result = load_custom_endpoints_with(
-            env_from([(RPC_ENDPOINTS_FILE_ENV, "endpoints.toml")]),
-            |path| {
-                assert_eq!(path, "endpoints.toml");
-                Ok(toml.to_owned())
-            },
-            never_prompt(),
-        )
-        .expect("parse succeeds");
-
-        let ethereum = result.get(&ChainKey::Ethereum).expect("ethereum entries");
-        assert_eq!(ethereum.len(), 2);
         assert_eq!(
-            ethereum[0],
-            EndpointSpec::new("alchemy", "https://eth.example/v2/key", 3)
+            result,
+            Err(CliError::MissingRequiredConfig {
+                env_name: CONFIG_FILE_ENV
+            })
         );
-        // Missing weight defaults to 1.
-        assert_eq!(
-            ethereum[1],
-            EndpointSpec::new("publicnode", "https://eth.public.example", 1)
-        );
-
-        let arbitrum = result.get(&ChainKey::Arbitrum).expect("arbitrum entries");
-        assert_eq!(arbitrum.len(), 1);
-        assert_eq!(arbitrum[0].weight, 3);
     }
 
     #[test]
-    fn endpoints_file_with_unknown_chain_is_rejected() {
-        let toml = r#"
-            [[provider]]
-            name = "mystery"
-            solana = "https://nope.example"
-        "#;
-
-        let result = load_custom_endpoints_with(
-            env_from([(RPC_ENDPOINTS_FILE_ENV, "endpoints.toml")]),
-            |_| Ok(toml.to_owned()),
-            never_prompt(),
-        );
-
-        assert!(matches!(result, Err(CliError::EndpointConfigFailed { .. })));
-    }
-
-    #[test]
-    fn unreadable_endpoints_file_is_an_error() {
-        let result = load_custom_endpoints_with(
-            env_from([(RPC_ENDPOINTS_FILE_ENV, "missing.toml")]),
+    fn unreadable_config_file_is_an_error() {
+        let result = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "missing.toml")]),
             |_| Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
             never_prompt(),
         );
@@ -581,65 +387,108 @@ mod tests {
     }
 
     #[test]
-    fn provider_key_is_substituted_from_explicit_env() {
+    fn unknown_chain_is_rejected() {
         let toml = r#"
-            [[provider]]
-            name = "alchemy"
-            key_env = "MY_ALCHEMY_KEY"
-            ethereum = "https://eth.example/v2/{key}"
+            [[rpc]]
+            name = "mystery"
+            solana = { http = "https://nope.example" }
         "#;
-
-        let result = load_custom_endpoints_with(
-            env_from([
-                (RPC_ENDPOINTS_FILE_ENV, "endpoints.toml"),
-                ("MY_ALCHEMY_KEY", "secret-key"),
-            ]),
+        let result = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "config.toml")]),
             |_| Ok(toml.to_owned()),
+            never_prompt(),
+        );
+
+        assert!(matches!(result, Err(CliError::EndpointConfigFailed { .. })));
+    }
+
+    #[test]
+    fn resolves_rpc_http_ws_and_subgraph_with_keys_substituted() {
+        let resolved = load_config_with(
+            env_from([
+                (CONFIG_FILE_ENV, "config.toml"),
+                ("AA_RPC_KEY_DRPC", "rpc-secret"),
+                ("AA_GRAPH_API_KEY", "graph-secret"),
+            ]),
+            |path| {
+                assert_eq!(path, "config.toml");
+                Ok(CONFIG.to_owned())
+            },
             never_prompt(),
         )
         .expect("resolution succeeds");
 
-        let ethereum = result.get(&ChainKey::Ethereum).expect("ethereum entries");
+        // Two HTTP providers on Ethereum, dRPC first with key substituted and weight 3.
+        let eth_http = resolved.rpc_http.get(&ChainKey::Ethereum).expect("eth http");
+        assert_eq!(eth_http.len(), 2);
         assert_eq!(
-            ethereum[0],
-            EndpointSpec::new("alchemy", "https://eth.example/v2/secret-key", 1)
+            eth_http[0],
+            EndpointSpec::new("drpc", "https://lb.drpc.org/ethereum/rpc-secret", 3)
+        );
+        assert_eq!(
+            eth_http[1],
+            EndpointSpec::new("publicnode", "https://ethereum-rpc.publicnode.com", 1)
+        );
+
+        // Single WS per chain (the weight-3 dRPC wins; publicnode declares no ws).
+        assert_eq!(
+            resolved.rpc_ws.get(&ChainKey::Ethereum).map(String::as_str),
+            Some("wss://lb.drpc.org/ethereum/rpc-secret")
+        );
+        assert_eq!(
+            resolved.rpc_ws.get(&ChainKey::Arbitrum).map(String::as_str),
+            Some("wss://lb.drpc.org/arbitrum/rpc-secret")
+        );
+
+        // Subgraph on Ethereum with the graph key substituted.
+        let eth_graph = resolved.subgraph.get(&ChainKey::Ethereum).expect("eth graph");
+        assert_eq!(
+            eth_graph[0],
+            EndpointSpec::new(
+                "thegraph",
+                "https://gateway.thegraph.com/api/graph-secret/subgraphs/id/v4",
+                1
+            )
         );
     }
 
     #[test]
-    fn provider_key_uses_derived_env_name() {
+    fn highest_weight_provider_wins_the_ws_slot() {
         let toml = r#"
-            [[provider]]
-            name = "my-node"
-            ethereum = "https://eth.example/{key}"
-        "#;
+            [[rpc]]
+            name = "low"
+            weight = 1
+            ethereum = { http = "https://low/http", ws = "wss://low/ws" }
 
-        let result = load_custom_endpoints_with(
-            env_from([
-                (RPC_ENDPOINTS_FILE_ENV, "endpoints.toml"),
-                ("AA_RPC_KEY_MY_NODE", "derived-key"),
-            ]),
+            [[rpc]]
+            name = "high"
+            weight = 5
+            ethereum = { http = "https://high/http", ws = "wss://high/ws" }
+        "#;
+        let resolved = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "config.toml")]),
             |_| Ok(toml.to_owned()),
             never_prompt(),
         )
         .expect("resolution succeeds");
 
-        let ethereum = result.get(&ChainKey::Ethereum).expect("ethereum entries");
-        assert_eq!(ethereum[0].url, "https://eth.example/derived-key");
+        assert_eq!(
+            resolved.rpc_ws.get(&ChainKey::Ethereum).map(String::as_str),
+            Some("wss://high/ws")
+        );
     }
 
     #[test]
     fn provider_key_is_prompted_when_env_missing() {
         let toml = r#"
-            [[provider]]
+            [[rpc]]
             name = "alchemy"
-            ethereum = "https://eth.example/{key}"
-            arbitrum = "https://arb.example/{key}"
+            ethereum = { http = "https://eth.example/{key}" }
+            arbitrum = { http = "https://arb.example/{key}" }
         "#;
-
         let mut prompt_calls = 0;
-        let result = load_custom_endpoints_with(
-            env_from([(RPC_ENDPOINTS_FILE_ENV, "endpoints.toml")]),
+        let resolved = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "config.toml")]),
             |_| Ok(toml.to_owned()),
             |prompt: &str| {
                 prompt_calls += 1;
@@ -649,62 +498,82 @@ mod tests {
         )
         .expect("resolution succeeds");
 
-        // Prompted once for the provider, then reused across both of its chains.
+        // Prompted once for the provider, reused across both of its chains.
         assert_eq!(prompt_calls, 1);
         assert_eq!(
-            result.get(&ChainKey::Ethereum).expect("ethereum")[0].url,
+            resolved.rpc_http.get(&ChainKey::Ethereum).expect("eth")[0].url,
             "https://eth.example/prompted-key"
         );
         assert_eq!(
-            result.get(&ChainKey::Arbitrum).expect("arbitrum")[0].url,
+            resolved.rpc_http.get(&ChainKey::Arbitrum).expect("arb")[0].url,
             "https://arb.example/prompted-key"
         );
     }
 
     #[test]
-    fn skipped_provider_key_drops_the_provider() {
+    fn skipped_subgraph_key_drops_the_subgraph() {
         let toml = r#"
-            [[provider]]
-            name = "alchemy"
-            ethereum = "https://eth.example/{key}"
+            [[rpc]]
+            name = "drpc"
+            ethereum = { http = "https://eth/http", ws = "wss://eth/ws" }
 
-            [[provider]]
-            name = "publicnode"
-            ethereum = "https://eth.public.example"
+            [[subgraph]]
+            name = "thegraph"
+            ethereum = "https://gateway/{key}/v4"
         "#;
-
-        let result = load_custom_endpoints_with(
-            env_from([(RPC_ENDPOINTS_FILE_ENV, "endpoints.toml")]),
+        let resolved = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "config.toml")]),
             |_| Ok(toml.to_owned()),
-            // Blank answer skips the keyed provider; EOF on a non-interactive run behaves the same.
+            // Blank answer skips the keyed subgraph; EOF on a non-interactive run behaves the same.
             |_: &str| Ok("   ".to_owned()),
         )
         .expect("resolution succeeds");
 
-        let ethereum = result.get(&ChainKey::Ethereum).expect("ethereum entries");
-        assert_eq!(ethereum.len(), 1);
-        assert_eq!(ethereum[0].label, "publicnode");
+        assert!(resolved.subgraph.is_empty());
+        // The keyless RPC provider is unaffected.
+        assert!(resolved.rpc_http.contains_key(&ChainKey::Ethereum));
     }
 
     #[test]
     fn provider_without_placeholder_is_not_prompted() {
         let toml = r#"
-            [[provider]]
-            name = "alchemy"
-            key_env = "MY_ALCHEMY_KEY"
-            ethereum = "https://eth.example/no-placeholder"
+            [[rpc]]
+            name = "publicnode"
+            ethereum = { http = "https://eth.public.example" }
         "#;
-
-        let result = load_custom_endpoints_with(
-            env_from([(RPC_ENDPOINTS_FILE_ENV, "endpoints.toml")]),
+        let resolved = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "config.toml")]),
             |_| Ok(toml.to_owned()),
             never_prompt(),
         )
         .expect("resolution succeeds");
 
         assert_eq!(
-            result.get(&ChainKey::Ethereum).expect("ethereum")[0].url,
-            "https://eth.example/no-placeholder"
+            resolved.rpc_http.get(&ChainKey::Ethereum).expect("eth")[0].url,
+            "https://eth.public.example"
+        );
+    }
+
+    #[test]
+    fn provider_key_uses_derived_env_name() {
+        let toml = r#"
+            [[rpc]]
+            name = "my-node"
+            ethereum = { http = "https://eth.example/{key}" }
+        "#;
+        let resolved = load_config_with(
+            env_from([
+                (CONFIG_FILE_ENV, "config.toml"),
+                ("AA_RPC_KEY_MY_NODE", "derived-key"),
+            ]),
+            |_| Ok(toml.to_owned()),
+            never_prompt(),
+        )
+        .expect("resolution succeeds");
+
+        assert_eq!(
+            resolved.rpc_http.get(&ChainKey::Ethereum).expect("eth")[0].url,
+            "https://eth.example/derived-key"
         );
     }
 
@@ -725,71 +594,15 @@ mod tests {
     }
 
     #[test]
-    fn graph_config_present_when_both_url_and_key_set() {
-        let config = load_graph_config_with(env_from([
-            (GRAPH_URL_ENV, " https://gateway.thegraph.com/api/{key}/subgraphs/id/v4 "),
-            (GRAPH_API_KEY_ENV, " graph-key "),
-        ]));
-
+    fn metadata_cache_path_defaults_when_unset_and_reads_env() {
         assert_eq!(
-            config,
-            Some(TheGraphConfig {
-                url: "https://gateway.thegraph.com/api/{key}/subgraphs/id/v4".to_owned(),
-                api_key: "graph-key".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn graph_config_absent_when_url_or_key_missing() {
-        assert_eq!(load_graph_config_with(env_from([])), None);
-        assert_eq!(
-            load_graph_config_with(env_from([(GRAPH_URL_ENV, "https://gateway.example")])),
-            None
+            metadata_cache_path_with(static_env_from([])),
+            PathBuf::from(DEFAULT_METADATA_CACHE_PATH)
         );
         assert_eq!(
-            load_graph_config_with(env_from([(GRAPH_API_KEY_ENV, "graph-key")])),
-            None
+            metadata_cache_path_with(static_env_from([(METADATA_CACHE_PATH_ENV, " /tmp/cache.redb ")])),
+            PathBuf::from("/tmp/cache.redb")
         );
-    }
-
-    #[test]
-    fn graph_mirrors_file_parses_with_graph_key_prefix() {
-        let toml = r#"
-            [[provider]]
-            name = "goldsky"
-            ethereum = "https://api.goldsky.com/subgraphs/v4/{key}"
-        "#;
-
-        let result = load_graph_endpoints_with(
-            env_from([
-                (GRAPH_ENDPOINTS_FILE_ENV, "graph-endpoints.toml"),
-                ("AA_GRAPH_KEY_GOLDSKY", "mirror-key"),
-            ]),
-            |path| {
-                assert_eq!(path, "graph-endpoints.toml");
-                Ok(toml.to_owned())
-            },
-            never_prompt(),
-        )
-        .expect("resolution succeeds");
-
-        let ethereum = result.get(&ChainKey::Ethereum).expect("ethereum entries");
-        assert_eq!(
-            ethereum[0],
-            EndpointSpec::new("goldsky", "https://api.goldsky.com/subgraphs/v4/mirror-key", 1)
-        );
-    }
-
-    #[test]
-    fn no_graph_endpoints_file_yields_no_mirrors() {
-        let result = load_graph_endpoints_with(
-            env_from([]),
-            |_| panic!("file must not be read"),
-            never_prompt(),
-        );
-
-        assert_eq!(result, Ok(BTreeMap::new()));
     }
 
     #[test]
@@ -809,10 +622,10 @@ mod tests {
     fn missing_required_config_display_is_stable() {
         assert_eq!(
             CliError::MissingRequiredConfig {
-                env_name: RPC_API_KEY_ENV
+                env_name: CONFIG_FILE_ENV
             }
             .to_string(),
-            "missing required configuration value AA_RPC_API_KEY"
+            "missing required configuration value AA_CONFIG_FILE"
         );
     }
 
@@ -820,11 +633,11 @@ mod tests {
     fn prompt_failed_display_is_stable() {
         assert_eq!(
             CliError::PromptFailed {
-                prompt: RPC_API_KEY_PROMPT,
+                prompt: "drpc API key (leave blank to skip):".to_owned(),
                 message: "permission denied".to_owned(),
             }
             .to_string(),
-            "failed to read RPC API key: permission denied"
+            "failed to read drpc API key (leave blank to skip): permission denied"
         );
     }
 
@@ -861,24 +674,18 @@ mod tests {
         }
     }
 
-    fn never_prompt() -> impl FnMut(&str) -> Result<String, CliError> {
-        |_prompt: &str| panic!("prompt must not be called")
+    fn static_env_from<const N: usize>(
+        values: [(&'static str, &'static str); N],
+    ) -> impl FnMut(&'static str) -> Option<String> {
+        move |name| {
+            values
+                .iter()
+                .find(|(env_name, _)| *env_name == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
     }
 
-    fn prompt_from<const N: usize>(
-        values: [(&'static str, &'static str); N],
-    ) -> impl FnMut(&'static str) -> Result<String, CliError> {
-        let mut answers = values.into_iter();
-
-        move |prompt| match answers.next() {
-            Some((expected_prompt, value)) => {
-                assert_eq!(prompt, expected_prompt);
-                Ok(value.to_owned())
-            }
-            None => Err(CliError::PromptFailed {
-                prompt,
-                message: "no test answer available".to_owned(),
-            }),
-        }
+    fn never_prompt() -> impl FnMut(&str) -> Result<String, CliError> {
+        |_prompt: &str| panic!("prompt must not be called")
     }
 }

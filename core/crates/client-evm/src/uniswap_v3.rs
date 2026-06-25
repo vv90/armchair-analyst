@@ -6,8 +6,23 @@ use alloy::{
     sol_types::SolEvent,
 };
 
+use crate::ChainKey;
+
+/// The Uniswap v3 factory, deployed deterministically at the same address on Ethereum and Arbitrum (and
+/// most other chains, but *not* universally — e.g. Base uses a different one). Resolve it through
+/// [`v3_factory_address`] rather than referencing this directly, so adding a chain with a different
+/// factory cannot silently authenticate pools against the wrong contract.
 pub const ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS: Address =
     address!("1F98431c8aD98523631AE4a59f267346ea31F984");
+
+/// The Uniswap v3 factory address for a chain — the single chain-keyed source of truth used to validate
+/// discovered v3 pools. Both currently active chains share the canonical deterministic deployment; a
+/// future chain with a different factory is added here, not by reusing a per-chain constant elsewhere.
+pub fn v3_factory_address(chain: ChainKey) -> Address {
+    match chain {
+        ChainKey::Ethereum | ChainKey::Arbitrum => ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS,
+    }
+}
 
 sol! {
     function token0() external view returns (address);
@@ -139,5 +154,12 @@ mod tests {
         let unique_hashes = hashes.into_iter().collect::<HashSet<_>>();
 
         assert_eq!(unique_hashes.len(), hashes.len());
+    }
+
+    #[test]
+    fn v3_factory_address_is_known_for_every_active_chain() {
+        for &chain in crate::ACTIVE_CHAINS {
+            assert_eq!(v3_factory_address(chain), ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS);
+        }
     }
 }

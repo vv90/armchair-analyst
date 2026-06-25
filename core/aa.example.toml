@@ -1,0 +1,92 @@
+# Unified runtime configuration for aa-cli — copy this file, edit, and point the runtime at it:
+#   export AA_CONFIG_FILE=aa.toml
+#
+# This file holds every MUTABLE endpoint setting. It is REQUIRED: there are no built-in endpoint
+# defaults. The only things NOT in this file are:
+#   - secrets (API keys): kept in the environment, substituted into the `{key}` placeholder below;
+#   - immutable chain data (contract/token addresses): hardcoded in the binary.
+#
+# Two kinds of entry:
+#   [[rpc]]      one weighted HTTP endpoint per chain (failover pool) + an optional WebSocket URL.
+#   [[subgraph]] one Uniswap v4 subgraph query URL per chain (used to resolve v4 pool metadata by id).
+#
+# Per chain, the HTTP endpoints form a weighted pool (smooth weighted round-robin) that fails over to
+# another endpoint on a retryable error; a failing endpoint is benched on an exponential cooldown. The
+# WebSocket subscription channel uses a SINGLE connection per chain — the highest-weight [[rpc]] entry
+# that declares a `ws` wins that chain's subscription slot.
+#
+# Every active chain (ethereum, arbitrum) MUST end up with at least one HTTP endpoint and one WS URL,
+# or startup fails.
+#
+# API keys: a `{key}` placeholder in any URL is filled from the provider's key — resolved from the env
+# var named by `key_env` (or the derived `AA_RPC_KEY_<NAME>` / `AA_GRAPH_KEY_<NAME>`), and if that is
+# unset you are prompted once at startup. A blank answer SKIPS that whole provider. So export the keys
+# you have and press Enter past the rest:
+#   export AA_RPC_KEY_DRPC=...
+#   export AA_RPC_KEY_ALCHEMY=...
+#   export AA_RPC_KEY_INFURA=...
+#   export AA_RPC_KEY_CHAINSTACK=...
+#   export AA_GRAPH_API_KEY=...          # optional — omit to disable v4 metadata resolution
+#
+# Other env (not endpoints):
+#   AA_METADATA_CACHE_PATH  on-disk metadata cache path (default: metadata-cache.redb)
+
+# ---------------------------------------------------------------------------------------------------
+# RPC providers
+# ---------------------------------------------------------------------------------------------------
+
+# dRPC — both chains, HTTP + WebSocket. Highest weight, so it also serves the WS subscription channel.
+# The per-chain URL is `{base}/{network}/{key}`.
+[[rpc]]
+name = "drpc"
+weight = 3
+key_env = "AA_RPC_KEY_DRPC"
+ethereum = { http = "https://lb.drpc.org/ethereum/{key}", ws = "wss://lb.drpc.org/ethereum/{key}" }
+arbitrum = { http = "https://lb.drpc.org/arbitrum/{key}", ws = "wss://lb.drpc.org/arbitrum/{key}" }
+
+# Alchemy — both chains, HTTP only. Two-chain backbone (30M CU/mo ≈ 1.15M eth_calls, shared).
+[[rpc]]
+name = "alchemy"
+weight = 4
+key_env = "AA_RPC_KEY_ALCHEMY"
+ethereum = { http = "https://eth-mainnet.g.alchemy.com/v2/{key}" }
+arbitrum = { http = "https://arb-mainnet.g.alchemy.com/v2/{key}" }
+
+# Infura — both chains, HTTP only. Lowest effective free capacity here, so the lowest weight.
+[[rpc]]
+name = "infura"
+weight = 2
+key_env = "AA_RPC_KEY_INFURA"
+ethereum = { http = "https://mainnet.infura.io/v3/{key}" }
+arbitrum = { http = "https://arbitrum-mainnet.infura.io/v3/{key}" }
+
+# Chainstack — Arbitrum ONLY (free Developer plan = one node), pointed at the bottleneck chain. The HOST
+# is node-specific: paste your node's host from the Chainstack console.
+[[rpc]]
+name = "chainstack"
+weight = 8
+key_env = "AA_RPC_KEY_CHAINSTACK"
+arbitrum = { http = "https://arbitrum-mainnet.core.chainstack.com/{key}" }
+
+# Keyless public nodes — HTTP only, weight 1, no key needed. Low-weight resilience fallbacks.
+[[rpc]]
+name = "publicnode"
+weight = 1
+ethereum = { http = "https://ethereum-rpc.publicnode.com" }
+arbitrum = { http = "https://arbitrum-one-rpc.publicnode.com" }
+
+# ---------------------------------------------------------------------------------------------------
+# Uniswap v4 subgraphs (optional — omit, or skip the key, to disable v4 metadata resolution)
+# ---------------------------------------------------------------------------------------------------
+
+# The Graph decentralized-network gateway. v4 is supported on Ethereum and Arbitrum; give a per-chain
+# subgraph whose schema matches the query/parser (id, token0{id}, token1{id}, feeTier, tickSpacing,
+# hooks). Replace each <…-deployment-id> with the subgraph you target for that chain. The gateway carries
+# its key in the path, so `{key}` is filled from AA_GRAPH_API_KEY. Add same-schema mirrors (Goldsky,
+# Alchemy Subgraphs, …) as extra [[subgraph]] entries with their own key_env to fail over alongside it.
+[[subgraph]]
+name = "thegraph"
+weight = 3
+key_env = "AA_GRAPH_API_KEY"
+ethereum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/<ethereum-deployment-id>"
+arbitrum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/<arbitrum-deployment-id>"

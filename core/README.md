@@ -17,65 +17,83 @@ The `aa-cli` binary in this workspace is the entry point.
 
 All commands below are run from this `core/` directory.
 
-## Required configuration
+## Configuration model
 
-The runtime needs one **dRPC** account for its primary HTTP endpoint and its WebSocket subscriptions.
-Provide these via environment variables; any that are missing are **prompted for interactively** at
-startup:
+Configuration is split by what each value *is*:
 
-| Variable | Meaning | Example |
-|---|---|---|
-| `AA_RPC_HTTP_URL` | dRPC HTTP base URL | `https://lb.drpc.org` |
-| `AA_RPC_WS_URL` | dRPC WebSocket base URL | `wss://lb.drpc.org` |
-| `AA_RPC_API_KEY` | dRPC API key | `<your-dkey>` |
+- **Immutable chain data** (contract & token addresses, network slugs) — hardcoded in the binary.
+- **Mutable endpoint settings** (provider URLs, weights, WebSocket URLs, subgraph URLs) — a single
+  **required** TOML config file.
+- **Secrets** (API keys) — loaded **only** from the environment, and prompted for at startup if missing.
+  Optional keys may be left blank.
 
-The per-chain endpoint is composed as `{base}/{network}/{key}` (e.g.
-`https://lb.drpc.org/ethereum/<key>`), with `network` being `ethereum` or `arbitrum`.
+### The config file (`AA_CONFIG_FILE`)
+
+Point the runtime at one TOML file holding every endpoint setting. A ready-to-edit
+[`aa.example.toml`](./aa.example.toml) ships in this directory — copy it and edit:
 
 ```bash
-export AA_RPC_HTTP_URL="https://lb.drpc.org"
-export AA_RPC_WS_URL="wss://lb.drpc.org"
-export AA_RPC_API_KEY="your-dkey"
+cp aa.example.toml aa.toml
+export AA_CONFIG_FILE=aa.toml
 ```
 
-## Optional configuration
+The file has two kinds of entry:
+
+- `[[rpc]]` — one weighted **HTTP** endpoint per chain (these form the failover pool) plus an optional
+  **WebSocket** URL. Per chain, the highest-weight `[[rpc]]` entry that declares a `ws` serves that
+  chain's subscription channel (a single connection — HTTP failover is multi-provider, WS is not).
+- `[[subgraph]]` — one Uniswap v4 subgraph query URL per chain, used to resolve v4 pool metadata by id.
+  Optional: omit it (or skip its key) to disable v4 metadata resolution.
+
+Each chain's HTTP requests are distributed by weight (smooth weighted round-robin) and, on a retryable
+error, retried on the next healthy endpoint; a failing endpoint is benched on an exponential cooldown.
+Every active chain (`ethereum`, `arbitrum`) must end up with at least one HTTP endpoint and one WS URL,
+or startup fails — there are no built-in endpoint defaults.
+
+### Secrets (environment)
+
+API keys use a `{key}` placeholder in the config URLs, resolved per provider from:
+
+1. the environment variable named by the provider's `key_env` (or the derived `AA_RPC_KEY_<NAME>` /
+   `AA_GRAPH_KEY_<NAME>`), then
+2. an interactive prompt at startup if that variable is unset.
+
+A **blank** answer skips that whole provider — so you can keep providers you haven't configured and just
+press Enter past them. For RPC this may leave a chain short an endpoint (a hard error); for the optional
+subgraph it simply disables v4 resolution.
+
+```bash
+export AA_RPC_KEY_DRPC=...
+export AA_RPC_KEY_ALCHEMY=...
+export AA_GRAPH_API_KEY=...      # optional
+```
+
+See the comments in `aa.example.toml` for the recommended free-tier setup (dRPC for HTTP+WS, Alchemy +
+Infura as the two-chain backbone, Chainstack on Arbitrum) and how its weights are derived.
+
+### Other environment variables
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AA_RPC_ENDPOINTS_FILE` | unset | Path to a multi-provider endpoints file (see below). Absent → only dRPC + built-in public nodes. |
-| `AA_RPC_PUBLIC_FALLBACKS` | on | Set to `0`/`false`/`no`/`off` to drop the bundled keyless public endpoints from every pool. |
+| `AA_CONFIG_FILE` | — (required) | Path to the unified TOML config file above. |
 | `AA_METADATA_CACHE_PATH` | `metadata-cache.redb` | On-disk cache of immutable pool/token metadata. |
-| `AA_RPC_KEY_<NAME>` | — | API key for a provider named in the endpoints file (see below). |
+| `AA_RPC_KEY_<NAME>` / `AA_GRAPH_KEY_<NAME>` | — | API key for a provider named in the config file. |
 
-### Multi-provider RPC (`endpoints.toml`)
+### Checking your environment
 
-Beyond the dRPC primary, you can spread HTTP load across additional providers and fail requests over to
-an alternative when one errors. Point `AA_RPC_ENDPOINTS_FILE` at a TOML file (a ready-to-edit
-[`endpoints.toml`](./endpoints.toml) ships in this directory):
-
-```bash
-export AA_RPC_ENDPOINTS_FILE=endpoints.toml
-```
-
-Each chain's pool combines: the **dRPC primary** (weight 3) + your **file providers** + the **built-in
-public nodes** (weight 1, unless disabled). Requests are distributed by weight (smooth weighted
-round-robin) and, on a retryable error, retried on the next healthy endpoint; a failing endpoint is
-benched on an exponential cooldown.
-
-Provider API keys use a `{key}` placeholder in the URL, resolved per provider from:
-1. the environment variable named by the provider's `key_env` (or the derived `AA_RPC_KEY_<NAME>`), then
-2. an interactive prompt at startup if that variable is unset.
-
-Leaving a key prompt **blank skips that whole provider** — so you can keep providers you haven't
-configured in the file and just press Enter past them. See the comments in `endpoints.toml` for the
-recommended free-tier setup (Alchemy + Infura as the two-chain backbone, Chainstack on Arbitrum) and
-how its weights are derived.
+To see which of the variables the binary uses are set (reports set/unset only — never prints values),
+run from this directory. The list is derived from the `key_env`s declared in `aa.toml`, so it stays
+correct as you add or remove providers:
 
 ```bash
-export AA_RPC_KEY_ALCHEMY=...
-export AA_RPC_KEY_INFURA=...
-export AA_RPC_KEY_CHAINSTACK=...
+for v in AA_CONFIG_FILE AA_METADATA_CACHE_PATH \
+  $(grep -oP 'key_env\s*=\s*"\K[^"]+' aa.toml | sort -u); do
+  if [ -n "${!v}" ]; then echo "✓ set    $v"; else echo "✗ unset  $v"; fi
+done
 ```
+
+An unset key is not fatal: you'll be prompted at startup, and a blank answer skips that provider
+(`publicnode` is keyless, so it never appears here).
 
 ## Running
 
@@ -85,14 +103,13 @@ cargo run -p aa-cli --release  # recommended for real runs
 ```
 
 On startup the binary:
-1. Loads the dRPC config (prompting for any missing required value).
-2. Loads `AA_RPC_ENDPOINTS_FILE` if set and resolves each provider's key (env → prompt → skip).
+1. Reads `AA_CONFIG_FILE` and resolves each provider's key (env → prompt → skip).
+2. Assembles the per-chain HTTP pools, WebSocket subscriptions, and v4 subgraph pools.
 3. Opens the metadata cache.
 4. Starts the runtime: subscribes to both chains, bootstraps pools, and begins streaming + optimizing.
 
-Because missing keys are prompted for, a first run with no env vars is fully interactive. For
-unattended/CI runs, export every variable you need (and press nothing) — a missing optional provider key
-read as EOF is treated as "skip".
+Because missing keys are prompted for, a first run can be interactive. For unattended/CI runs, export
+every key you need (and press nothing) — a missing optional key read as EOF is treated as "skip".
 
 ## Output
 
@@ -102,8 +119,9 @@ read as EOF is treated as "skip".
 
 ## Notes
 
-- Only `/target/` is git-ignored. `endpoints.toml` contains no secrets when you use `{key}` + env vars
-  (keys stay in the environment), but it does hold your account-specific Chainstack/QuickNode host —
-  consider keeping a customized copy untracked if that matters to you. Never commit raw API keys.
-- The set of tracked chains (Ethereum, Arbitrum) is fixed in code (`ACTIVE_CHAINS`); the WebSocket
-  subscription channel uses the dRPC config only (HTTP failover is multi-provider, WS is not).
+- Your `aa.toml` contains no secrets when you use `{key}` + env vars (keys stay in the environment), but
+  it may hold account-specific hosts (e.g. Chainstack) — keep your customized copy untracked if that
+  matters to you. Never commit raw API keys.
+- The set of tracked chains (Ethereum, Arbitrum) is fixed in code (`ACTIVE_CHAINS`). The WebSocket
+  subscription channel uses a single endpoint per chain (the highest-weight `[[rpc]]` entry with a `ws`);
+  HTTP failover is multi-provider, WS is not.

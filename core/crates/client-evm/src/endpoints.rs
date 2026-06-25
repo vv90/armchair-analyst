@@ -19,9 +19,8 @@ use std::{
 use crate::{
     ClientEvmError,
     chain::{ACTIVE_CHAINS, ChainKey},
-    config::{RpcConfig, TheGraphConfig, compose_graph_endpoint, compose_http_endpoint},
     error::ConfigScope,
-    uniswap_v4::state_view_address,
+    uniswap_v4::v4_deployment,
 };
 
 /// Base cooldown applied after one failure; doubles per consecutive failure up to [`COOLDOWN_CAP`].
@@ -30,8 +29,6 @@ const COOLDOWN_BASE: Duration = Duration::from_secs(2);
 const COOLDOWN_CAP: Duration = Duration::from_secs(60);
 /// Largest backoff doubling exponent (`COOLDOWN_BASE << 5` = 64s, clamped to [`COOLDOWN_CAP`]).
 const MAX_BACKOFF_SHIFT: u32 = 5;
-/// Weight given to the configured dRPC primary relative to keyless public fallbacks (weight 1).
-const DRPC_PRIMARY_WEIGHT: u32 = 3;
 
 /// A description of one endpoint before it is installed into a pool. `url` is the fully-formed POST
 /// target (network path and any key already baked in); `label` identifies the provider in logs.
@@ -234,36 +231,71 @@ impl ChainEndpoints {
     }
 }
 
-/// Assembles each active chain's pool from, in priority order: the configured dRPC primary (weight
-/// [`DRPC_PRIMARY_WEIGHT`]), any custom providers from the endpoints file, and — unless disabled — the
-/// built-in keyless public fallbacks (weight 1). A chain that ends up with no endpoint is a hard error.
+/// Assembles each active chain's HTTP pool from the fully-resolved `specs` (provider URLs with keys
+/// already substituted, weights set). Every [`ACTIVE_CHAINS`] chain must have at least one spec — a
+/// chain with none is a hard configuration error, since the runtime has no endpoint to reach it.
 pub fn assemble_chain_endpoints(
-    config: &RpcConfig,
-    custom: &BTreeMap<ChainKey, Vec<EndpointSpec>>,
-    include_public_fallbacks: bool,
+    specs: &BTreeMap<ChainKey, Vec<EndpointSpec>>,
 ) -> Result<ChainEndpoints, ClientEvmError> {
     let mut pools = BTreeMap::new();
 
     for &chain in ACTIVE_CHAINS {
-        let mut specs = Vec::new();
-        specs.push(EndpointSpec::new(
-            "drpc",
-            compose_http_endpoint(config, chain)?,
-            DRPC_PRIMARY_WEIGHT,
-        ));
-
-        if let Some(extra) = custom.get(&chain) {
-            specs.extend(extra.iter().cloned());
+        let chain_specs = specs.get(&chain).cloned().unwrap_or_default();
+        if chain_specs.is_empty() {
+            return Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Http,
+                reason: format!("no rpc endpoints configured for chain {chain:?}"),
+            });
         }
 
-        if include_public_fallbacks {
-            specs.extend(default_public_endpoints(chain));
-        }
-
-        pools.insert(chain, EndpointPool::new(specs)?);
+        pools.insert(chain, EndpointPool::new(chain_specs)?);
     }
 
     Ok(ChainEndpoints { pools })
+}
+
+/// The WebSocket subscription endpoint for each active chain. Unlike the HTTP [`ChainEndpoints`] pool,
+/// the live new-heads / pool-events streams use a single connection per chain (no failover), so this
+/// holds exactly one fully-resolved `wss://` URL per chain.
+#[derive(Debug)]
+pub struct ChainSubscriptions {
+    ws: BTreeMap<ChainKey, String>,
+}
+
+impl ChainSubscriptions {
+    /// Builds the subscription set, requiring a WS URL for every [`ACTIVE_CHAINS`] chain — a chain with
+    /// none is a hard error, since the runtime seeds a new-heads subscription per active chain.
+    pub fn new(ws: BTreeMap<ChainKey, String>) -> Result<ChainSubscriptions, ClientEvmError> {
+        for &chain in ACTIVE_CHAINS {
+            if !ws.get(&chain).is_some_and(|url| !url.trim().is_empty()) {
+                return Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Subscription,
+                    reason: format!("no websocket endpoint configured for chain {chain:?}"),
+                });
+            }
+        }
+
+        Ok(ChainSubscriptions { ws })
+    }
+
+    /// The WebSocket URL for a chain. `new` guarantees one exists for every active chain, but the lookup
+    /// still returns a `Result` so a stray non-active chain surfaces a clear error rather than panicking.
+    pub fn ws(&self, chain: ChainKey) -> Result<&str, ClientEvmError> {
+        self.ws
+            .get(&chain)
+            .map(String::as_str)
+            .ok_or_else(|| ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Subscription,
+                reason: format!("no websocket endpoint configured for chain {chain:?}"),
+            })
+    }
+
+    /// Builds a single-chain subscription set. Convenience for tests and minimal setups.
+    pub fn single(chain: ChainKey, url: impl Into<String>) -> ChainSubscriptions {
+        let mut ws = BTreeMap::new();
+        ws.insert(chain, url.into());
+        ChainSubscriptions { ws }
+    }
 }
 
 /// Per-chain Uniswap v4 subgraph endpoint pools. Unlike [`ChainEndpoints`], coverage is **partial and
@@ -302,58 +334,30 @@ impl GraphEndpoints {
     }
 }
 
-/// Assembles each v4-enabled chain's subgraph pool from the configured gateway primary plus any
-/// same-schema `custom` mirrors. A chain is v4-enabled iff [`state_view_address`] knows it — the single
-/// source of truth for "v4 is deployed here" — so non-v4 chains get no pool (and v4 metadata is skipped
-/// for them). Cross-provider failover only works for mirrors serving the canonical Uniswap v4 subgraph
-/// schema, which the query/parser assume.
+/// Assembles each v4-enabled chain's subgraph pool from the fully-resolved `specs` (gateway URL with the
+/// key already substituted, plus any same-schema mirrors). A chain is v4-enabled iff [`v4_deployment`]
+/// knows it — the single source of truth for "v4 is deployed here" — so specs for non-v4 chains are
+/// ignored and v4 metadata is skipped for them. A v4-enabled chain with no specs simply gets no pool
+/// (v4 resolution is optional), matching the unconfigured case. Cross-provider failover only works for
+/// mirrors serving the canonical Uniswap v4 subgraph schema, which the query/parser assume.
 pub fn assemble_graph_endpoints(
-    config: &TheGraphConfig,
-    custom: &BTreeMap<ChainKey, Vec<EndpointSpec>>,
+    specs: &BTreeMap<ChainKey, Vec<EndpointSpec>>,
 ) -> Result<GraphEndpoints, ClientEvmError> {
     let mut pools = BTreeMap::new();
 
     for &chain in ACTIVE_CHAINS {
-        if state_view_address(chain).is_none() {
+        if v4_deployment(chain).is_none() {
             continue;
         }
 
-        let mut specs = vec![EndpointSpec::new(
-            "thegraph",
-            compose_graph_endpoint(config)?,
-            DRPC_PRIMARY_WEIGHT,
-        )];
+        let Some(chain_specs) = specs.get(&chain).filter(|specs| !specs.is_empty()) else {
+            continue;
+        };
 
-        if let Some(extra) = custom.get(&chain) {
-            specs.extend(extra.iter().cloned());
-        }
-
-        pools.insert(chain, EndpointPool::new(specs)?);
+        pools.insert(chain, EndpointPool::new(chain_specs.clone())?);
     }
 
     Ok(GraphEndpoints { pools })
-}
-
-/// Keyless public RPC endpoints bundled per chain (no signup required), used as low-weight fallbacks so
-/// multi-provider resilience works out of the box.
-pub fn default_public_endpoints(chain: ChainKey) -> Vec<EndpointSpec> {
-    let entries: &[(&str, &str)] = match chain {
-        ChainKey::Ethereum => &[
-            ("publicnode", "https://ethereum-rpc.publicnode.com"),
-            ("ankr", "https://rpc.ankr.com/eth"),
-            ("1rpc", "https://1rpc.io/eth"),
-        ],
-        ChainKey::Arbitrum => &[
-            ("publicnode", "https://arbitrum-one-rpc.publicnode.com"),
-            ("ankr", "https://rpc.ankr.com/arbitrum"),
-            ("1rpc", "https://1rpc.io/arb"),
-        ],
-    };
-
-    entries
-        .iter()
-        .map(|(label, url)| EndpointSpec::new(*label, *url, 1))
-        .collect()
 }
 
 /// Whether an error warrants failing the request over to another endpoint. Transport faults, retryable
@@ -708,95 +712,136 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn default_public_endpoints_cover_active_chains() {
-        assert!(!default_public_endpoints(ChainKey::Ethereum).is_empty());
-        assert!(!default_public_endpoints(ChainKey::Arbitrum).is_empty());
+    fn rpc_specs() -> BTreeMap<ChainKey, Vec<EndpointSpec>> {
+        let mut specs = BTreeMap::new();
+        for &chain in ACTIVE_CHAINS {
+            specs.insert(
+                chain,
+                vec![EndpointSpec::new("drpc", "https://lb.drpc.org/x/key", 3)],
+            );
+        }
+        specs
     }
 
     #[test]
-    fn assemble_includes_primary_and_publics_and_omits_publics_when_disabled() {
-        let config = RpcConfig {
-            http_url: "https://lb.drpc.org".to_owned(),
-            ws_url: "wss://lb.drpc.org".to_owned(),
-            api_key: "key".to_owned(),
-        };
+    fn assemble_chain_builds_a_pool_per_active_chain_from_specs() {
+        let mut specs = rpc_specs();
+        specs.entry(ChainKey::Ethereum).or_default().push(
+            EndpointSpec::new("publicnode", "https://ethereum-rpc.publicnode.com", 1),
+        );
 
-        let with_publics =
-            assemble_chain_endpoints(&config, &BTreeMap::new(), true).expect("assembly succeeds");
-        let eth = with_publics
-            .pool(ChainKey::Ethereum)
-            .expect("ethereum pool");
-        let expected = 1 + default_public_endpoints(ChainKey::Ethereum).len();
-        assert_eq!(eth.endpoints.len(), expected);
-
-        let without_publics =
-            assemble_chain_endpoints(&config, &BTreeMap::new(), false).expect("assembly succeeds");
-        let eth = without_publics
-            .pool(ChainKey::Ethereum)
-            .expect("ethereum pool");
-        assert_eq!(eth.endpoints.len(), 1);
+        let endpoints = assemble_chain_endpoints(&specs).expect("assembly succeeds");
+        assert_eq!(
+            endpoints.pool(ChainKey::Ethereum).expect("ethereum pool").endpoints.len(),
+            2
+        );
+        assert_eq!(
+            endpoints.pool(ChainKey::Arbitrum).expect("arbitrum pool").endpoints.len(),
+            1
+        );
     }
 
     #[test]
-    fn assemble_appends_custom_providers() {
-        let config = RpcConfig {
-            http_url: "https://lb.drpc.org".to_owned(),
-            ws_url: "wss://lb.drpc.org".to_owned(),
-            api_key: "key".to_owned(),
-        };
-        let mut custom = BTreeMap::new();
-        custom.insert(
-            ChainKey::Arbitrum,
+    fn assemble_chain_errors_when_an_active_chain_has_no_specs() {
+        let mut specs = rpc_specs();
+        specs.remove(&ChainKey::Arbitrum);
+
+        assert!(matches!(
+            assemble_chain_endpoints(&specs),
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Http,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn chain_subscriptions_require_every_active_chain() {
+        let mut ws = BTreeMap::new();
+        for &chain in ACTIVE_CHAINS {
+            ws.insert(chain, "wss://lb.drpc.org/x/key".to_owned());
+        }
+        let subscriptions = ChainSubscriptions::new(ws.clone()).expect("complete set");
+        assert_eq!(
+            subscriptions.ws(ChainKey::Ethereum).expect("ethereum ws"),
+            "wss://lb.drpc.org/x/key"
+        );
+
+        ws.remove(&ChainKey::Arbitrum);
+        assert!(matches!(
+            ChainSubscriptions::new(ws),
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Subscription,
+                ..
+            })
+        ));
+    }
+
+    fn graph_specs() -> BTreeMap<ChainKey, Vec<EndpointSpec>> {
+        let mut specs = BTreeMap::new();
+        specs.insert(
+            ChainKey::Ethereum,
             vec![EndpointSpec::new(
-                "alchemy",
-                "https://arb.example/v2/key",
+                "thegraph",
+                "https://gateway.thegraph.com/api/key/subgraphs/id/v4",
                 3,
             )],
         );
-
-        let endpoints =
-            assemble_chain_endpoints(&config, &custom, false).expect("assembly succeeds");
-        let arb = endpoints.pool(ChainKey::Arbitrum).expect("arbitrum pool");
-        // primary + one custom.
-        assert_eq!(arb.endpoints.len(), 2);
-    }
-
-    fn graph_config() -> TheGraphConfig {
-        TheGraphConfig {
-            url: "https://gateway.thegraph.com/api/{key}/subgraphs/id/v4".to_owned(),
-            api_key: "graph-key".to_owned(),
-        }
+        specs
     }
 
     #[test]
-    fn assemble_graph_builds_a_pool_only_for_v4_enabled_chains() {
-        let endpoints =
-            assemble_graph_endpoints(&graph_config(), &BTreeMap::new()).expect("assembly succeeds");
-
-        // Ethereum has a v4 deployment (StateView known); Arbitrum does not, so it gets no pool.
-        let eth = endpoints.pool(ChainKey::Ethereum).expect("ethereum pool");
-        assert_eq!(eth.endpoints.len(), 1);
-        assert!(endpoints.pool(ChainKey::Arbitrum).is_none());
-    }
-
-    #[test]
-    fn assemble_graph_appends_same_schema_mirrors() {
-        let mut custom = BTreeMap::new();
-        custom.insert(
-            ChainKey::Ethereum,
+    fn assemble_graph_builds_a_pool_for_each_v4_enabled_chain_with_specs() {
+        // Both Ethereum and Arbitrum are v4-enabled, so specs for each yield a pool.
+        let mut specs = graph_specs();
+        specs.insert(
+            ChainKey::Arbitrum,
             vec![EndpointSpec::new(
-                "goldsky",
-                "https://api.goldsky.com/subgraphs/v4",
+                "thegraph",
+                "https://gateway.thegraph.com/api/key/subgraphs/id/arb-v4",
                 1,
             )],
         );
 
-        let endpoints =
-            assemble_graph_endpoints(&graph_config(), &custom).expect("assembly succeeds");
+        let endpoints = assemble_graph_endpoints(&specs).expect("assembly succeeds");
+        assert_eq!(
+            endpoints.pool(ChainKey::Ethereum).expect("ethereum pool").endpoints.len(),
+            1
+        );
+        assert_eq!(
+            endpoints.pool(ChainKey::Arbitrum).expect("arbitrum pool").endpoints.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn assemble_graph_omits_a_v4_chain_with_no_specs() {
+        // Ethereum has specs, Arbitrum has none — only Ethereum gets a pool even though both are
+        // v4-enabled.
+        let endpoints = assemble_graph_endpoints(&graph_specs()).expect("assembly succeeds");
+        assert!(endpoints.pool(ChainKey::Ethereum).is_some());
+        assert!(endpoints.pool(ChainKey::Arbitrum).is_none());
+    }
+
+    #[test]
+    fn assemble_graph_includes_all_specs_for_a_chain() {
+        let mut specs = graph_specs();
+        specs.entry(ChainKey::Ethereum).or_default().push(
+            EndpointSpec::new("goldsky", "https://api.goldsky.com/subgraphs/v4", 1),
+        );
+
+        let endpoints = assemble_graph_endpoints(&specs).expect("assembly succeeds");
         let eth = endpoints.pool(ChainKey::Ethereum).expect("ethereum pool");
-        // gateway primary + one mirror.
         assert_eq!(eth.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn assemble_graph_with_no_specs_yields_no_pools() {
+        let endpoints =
+            assemble_graph_endpoints(&BTreeMap::new()).expect("assembly succeeds");
+
+        assert!(endpoints.pool(ChainKey::Ethereum).is_none());
+        assert!(endpoints.pool(ChainKey::Arbitrum).is_none());
     }
 
     #[test]
