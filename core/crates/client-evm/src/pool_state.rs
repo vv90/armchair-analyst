@@ -27,6 +27,14 @@ impl ProtocolPoolKey {
             ProtocolPoolKey::UniswapV4(_) => None,
         }
     }
+
+    /// The pool's [`PoolId`] for Uniswap v4 pools; `None` for v3 pools, which are keyed by address.
+    pub fn uniswap_v4_pool_id(&self) -> Option<PoolId> {
+        match self {
+            ProtocolPoolKey::UniswapV4(pool_id) => Some(*pool_id),
+            ProtocolPoolKey::UniswapV3(_) => None,
+        }
+    }
 }
 
 /// A pool's full identity: its protocol-specific key plus the chain it lives on. Used as the key for

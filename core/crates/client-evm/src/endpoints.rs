@@ -19,8 +19,9 @@ use std::{
 use crate::{
     ClientEvmError,
     chain::{ACTIVE_CHAINS, ChainKey},
-    config::{RpcConfig, compose_http_endpoint},
+    config::{RpcConfig, TheGraphConfig, compose_graph_endpoint, compose_http_endpoint},
     error::ConfigScope,
+    uniswap_v4::state_view_address,
 };
 
 /// Base cooldown applied after one failure; doubles per consecutive failure up to [`COOLDOWN_CAP`].
@@ -263,6 +264,74 @@ pub fn assemble_chain_endpoints(
     }
 
     Ok(ChainEndpoints { pools })
+}
+
+/// Per-chain Uniswap v4 subgraph endpoint pools. Unlike [`ChainEndpoints`], coverage is **partial and
+/// optional**: only chains with a v4 deployment carry a pool, and an unconfigured runtime holds none at
+/// all (`empty()`), in which case v4 metadata resolution is simply skipped. Reuses [`EndpointPool`]
+/// verbatim — the gateway primary plus any same-schema mirrors fail over through [`EndpointPool::with_failover`].
+#[derive(Debug)]
+pub struct GraphEndpoints {
+    pools: BTreeMap<ChainKey, EndpointPool>,
+}
+
+impl GraphEndpoints {
+    /// The subgraph pool for a chain, or `None` when no v4 subgraph is configured for it. `None` is a
+    /// normal "skip v4 here" signal, not a fault — so this returns `Option`, not a `Result` like
+    /// [`ChainEndpoints::pool`].
+    pub fn pool(&self, chain: ChainKey) -> Option<&EndpointPool> {
+        self.pools.get(&chain)
+    }
+
+    /// An unconfigured set with no subgraph pools — the runtime default when The Graph is not set up.
+    pub fn empty() -> GraphEndpoints {
+        GraphEndpoints {
+            pools: BTreeMap::new(),
+        }
+    }
+
+    /// Builds a single-endpoint, single-chain `GraphEndpoints`. Convenience for tests and minimal setups.
+    pub fn single(
+        chain: ChainKey,
+        label: impl Into<String>,
+        url: impl Into<String>,
+    ) -> GraphEndpoints {
+        let mut pools = BTreeMap::new();
+        pools.insert(chain, EndpointPool::single(label, url));
+        GraphEndpoints { pools }
+    }
+}
+
+/// Assembles each v4-enabled chain's subgraph pool from the configured gateway primary plus any
+/// same-schema `custom` mirrors. A chain is v4-enabled iff [`state_view_address`] knows it — the single
+/// source of truth for "v4 is deployed here" — so non-v4 chains get no pool (and v4 metadata is skipped
+/// for them). Cross-provider failover only works for mirrors serving the canonical Uniswap v4 subgraph
+/// schema, which the query/parser assume.
+pub fn assemble_graph_endpoints(
+    config: &TheGraphConfig,
+    custom: &BTreeMap<ChainKey, Vec<EndpointSpec>>,
+) -> Result<GraphEndpoints, ClientEvmError> {
+    let mut pools = BTreeMap::new();
+
+    for &chain in ACTIVE_CHAINS {
+        if state_view_address(chain).is_none() {
+            continue;
+        }
+
+        let mut specs = vec![EndpointSpec::new(
+            "thegraph",
+            compose_graph_endpoint(config)?,
+            DRPC_PRIMARY_WEIGHT,
+        )];
+
+        if let Some(extra) = custom.get(&chain) {
+            specs.extend(extra.iter().cloned());
+        }
+
+        pools.insert(chain, EndpointPool::new(specs)?);
+    }
+
+    Ok(GraphEndpoints { pools })
 }
 
 /// Keyless public RPC endpoints bundled per chain (no signup required), used as low-weight fallbacks so
@@ -691,5 +760,50 @@ mod tests {
         let arb = endpoints.pool(ChainKey::Arbitrum).expect("arbitrum pool");
         // primary + one custom.
         assert_eq!(arb.endpoints.len(), 2);
+    }
+
+    fn graph_config() -> TheGraphConfig {
+        TheGraphConfig {
+            url: "https://gateway.thegraph.com/api/{key}/subgraphs/id/v4".to_owned(),
+            api_key: "graph-key".to_owned(),
+        }
+    }
+
+    #[test]
+    fn assemble_graph_builds_a_pool_only_for_v4_enabled_chains() {
+        let endpoints =
+            assemble_graph_endpoints(&graph_config(), &BTreeMap::new()).expect("assembly succeeds");
+
+        // Ethereum has a v4 deployment (StateView known); Arbitrum does not, so it gets no pool.
+        let eth = endpoints.pool(ChainKey::Ethereum).expect("ethereum pool");
+        assert_eq!(eth.endpoints.len(), 1);
+        assert!(endpoints.pool(ChainKey::Arbitrum).is_none());
+    }
+
+    #[test]
+    fn assemble_graph_appends_same_schema_mirrors() {
+        let mut custom = BTreeMap::new();
+        custom.insert(
+            ChainKey::Ethereum,
+            vec![EndpointSpec::new(
+                "goldsky",
+                "https://api.goldsky.com/subgraphs/v4",
+                1,
+            )],
+        );
+
+        let endpoints =
+            assemble_graph_endpoints(&graph_config(), &custom).expect("assembly succeeds");
+        let eth = endpoints.pool(ChainKey::Ethereum).expect("ethereum pool");
+        // gateway primary + one mirror.
+        assert_eq!(eth.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn empty_graph_endpoints_expose_no_pools() {
+        let endpoints = GraphEndpoints::empty();
+
+        assert!(endpoints.pool(ChainKey::Ethereum).is_none());
+        assert!(endpoints.pool(ChainKey::Arbitrum).is_none());
     }
 }

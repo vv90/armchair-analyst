@@ -10,6 +10,45 @@ pub struct RpcConfig {
     pub api_key: String,
 }
 
+/// Token substituted with the resolved API key wherever it appears in a graph endpoint URL. The Graph
+/// gateway carries its key in the path (`…/api/{key}/subgraphs/id/<id>`), so the URL template embeds
+/// this placeholder rather than appending the key like the dRPC RPC endpoints do.
+const GRAPH_KEY_PLACEHOLDER: &str = "{key}";
+
+/// Connection details for a Uniswap v4 subgraph (The Graph gateway or a same-schema mirror). `url` is
+/// the full query URL and may embed [`GRAPH_KEY_PLACEHOLDER`]; `api_key` is substituted into it. v4
+/// metadata is resolved by id from this indexer rather than from chain (a `PoolId` is a one-way hash of
+/// its `PoolKey`, so the chain reveals the key only once, in the `Initialize` event).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TheGraphConfig {
+    pub url: String,
+    pub api_key: String,
+}
+
+/// Composes a subgraph's query URL, substituting the API key into the [`GRAPH_KEY_PLACEHOLDER`]. A URL
+/// without the placeholder is used verbatim (keyless self-hosted indexers); the key must still be
+/// present so a misconfiguration is caught at startup rather than on the first query. Mirrors
+/// [`compose_http_endpoint`] but for the GraphQL side channel.
+pub(crate) fn compose_graph_endpoint(config: &TheGraphConfig) -> Result<String, ClientEvmError> {
+    let url = config.url.trim();
+    if url.is_empty() {
+        return Err(ClientEvmError::InvalidConfig {
+            scope: ConfigScope::Graph,
+            reason: "graph url is required".to_owned(),
+        });
+    }
+
+    let api_key = config.api_key.trim();
+    if api_key.is_empty() {
+        return Err(ClientEvmError::InvalidConfig {
+            scope: ConfigScope::Graph,
+            reason: "graph api key is required".to_owned(),
+        });
+    }
+
+    Ok(url.replace(GRAPH_KEY_PLACEHOLDER, api_key))
+}
+
 pub(crate) fn compose_ws_endpoint(
     config: &RpcConfig,
     chain: ChainKey,
@@ -246,6 +285,64 @@ mod tests {
 
             prop_assert_eq!(compose_http_endpoint(&config, ChainKey::Ethereum)?, expected);
         }
+    }
+
+    #[test]
+    fn compose_graph_endpoint_substitutes_the_api_key() {
+        let config = TheGraphConfig {
+            url: " https://gateway.thegraph.com/api/{key}/subgraphs/id/v4 ".to_owned(),
+            api_key: " graph-key ".to_owned(),
+        };
+
+        assert!(matches!(
+            compose_graph_endpoint(&config).as_deref(),
+            Ok("https://gateway.thegraph.com/api/graph-key/subgraphs/id/v4")
+        ));
+    }
+
+    #[test]
+    fn compose_graph_endpoint_uses_a_placeholderless_url_verbatim() {
+        let config = TheGraphConfig {
+            url: "https://self-hosted.example/subgraphs/name/v4".to_owned(),
+            api_key: "unused".to_owned(),
+        };
+
+        assert!(matches!(
+            compose_graph_endpoint(&config).as_deref(),
+            Ok("https://self-hosted.example/subgraphs/name/v4")
+        ));
+    }
+
+    #[test]
+    fn compose_graph_endpoint_rejects_empty_url() {
+        let config = TheGraphConfig {
+            url: " ".to_owned(),
+            api_key: "graph-key".to_owned(),
+        };
+
+        assert!(matches!(
+            compose_graph_endpoint(&config),
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Graph,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compose_graph_endpoint_rejects_empty_api_key() {
+        let config = TheGraphConfig {
+            url: "https://gateway.thegraph.com/api/{key}/subgraphs/id/v4".to_owned(),
+            api_key: "\t".to_owned(),
+        };
+
+        assert!(matches!(
+            compose_graph_endpoint(&config),
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Graph,
+                ..
+            })
+        ));
     }
 
     fn rpc_config(ws_url: &str, api_key: &str) -> RpcConfig {

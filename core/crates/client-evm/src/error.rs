@@ -8,6 +8,7 @@ use thiserror::Error;
 pub enum ConfigScope {
     Subscription,
     Http,
+    Graph,
 }
 
 impl fmt::Display for ConfigScope {
@@ -15,6 +16,7 @@ impl fmt::Display for ConfigScope {
         let label = match self {
             ConfigScope::Subscription => "subscription",
             ConfigScope::Http => "http",
+            ConfigScope::Graph => "graph",
         };
         formatter.write_str(label)
     }

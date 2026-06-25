@@ -1,8 +1,8 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_USDC_TOKEN_ADDRESS, AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
-    ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, MetadataCache,
-    PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
+    ChainKey, ClientEvent, ClientEvmError, ClientHead, ETHEREUM_USDC_TOKEN_ADDRESS, GraphEndpoints,
+    MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadataResult, RequestId,
     RpcConfig, TokenAddress, TokenMetadataResult, bootstrap, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
     fetch_pool_metadata, fetch_token_metadata, kernel,
@@ -34,6 +34,10 @@ pub(crate) struct ClientEvmRuntime {
     agent: ureq::Agent,
     rpc_config: RpcConfig,
     endpoints: ChainEndpoints,
+    // Consumed in Increment 4 (the v4 metadata resolver); plumbed now so the config/endpoint wiring
+    // lands in one reviewable change. Empty when The Graph is unconfigured.
+    #[allow(dead_code)]
+    graph_endpoints: GraphEndpoints,
     metadata_cache: MetadataCache,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
     view: View,
@@ -44,6 +48,7 @@ impl ClientEvmRuntime {
     pub(crate) fn new(
         rpc_config: RpcConfig,
         endpoints: ChainEndpoints,
+        graph_endpoints: GraphEndpoints,
         metadata_cache: MetadataCache,
         logger: Logger,
         view: View,
@@ -52,6 +57,7 @@ impl ClientEvmRuntime {
             agent: ureq::Agent::new_with_defaults(),
             rpc_config,
             endpoints,
+            graph_endpoints,
             metadata_cache,
             optimization_sender: OnceLock::new(),
             view,
@@ -67,6 +73,13 @@ impl ClientEvmRuntime {
     /// Per-chain HTTP endpoint pools used by every RPC fetch (multi-provider, with failover).
     fn endpoints(&self) -> &ChainEndpoints {
         &self.endpoints
+    }
+
+    /// Per-chain Uniswap v4 subgraph pools (empty when unconfigured). Consumed by the v4 metadata
+    /// resolver in Increment 4; exposed here for the constructor smoke test until then.
+    #[cfg(test)]
+    fn graph_endpoints(&self) -> &GraphEndpoints {
+        &self.graph_endpoints
     }
 
     /// Resolves pool metadata through the persistent cache: known pools are served from disk, only
@@ -293,12 +306,13 @@ impl ClientEvmRuntime {
 pub(crate) fn start_runtime(
     config: RpcConfig,
     endpoints: ChainEndpoints,
+    graph_endpoints: GraphEndpoints,
     metadata_cache: MetadataCache,
     logger: Logger,
     view: View,
 ) -> JoinHandle<()> {
     let (_sender, handle) = <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(
-        ClientEvmRuntime::new(config, endpoints, metadata_cache, logger, view),
+        ClientEvmRuntime::new(config, endpoints, graph_endpoints, metadata_cache, logger, view),
     );
 
     handle
@@ -816,12 +830,28 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             config.clone(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
         );
 
         assert_eq!(runtime.rpc_config(), &config);
+    }
+
+    #[test]
+    fn runtime_constructor_stores_graph_endpoints() {
+        let runtime = ClientEvmRuntime::new(
+            rpc_config(),
+            test_endpoints(),
+            GraphEndpoints::single(ChainKey::Ethereum, "thegraph", "http://graph.invalid"),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
+
+        assert!(runtime.graph_endpoints().pool(ChainKey::Ethereum).is_some());
+        assert!(runtime.graph_endpoints().pool(ChainKey::Arbitrum).is_none());
     }
 
     #[test]
@@ -893,6 +923,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1107,6 +1138,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             cache,
             Logger::sink(),
             View::sink(),
@@ -1143,6 +1175,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1178,6 +1211,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1198,6 +1232,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1219,6 +1254,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1237,6 +1273,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),
@@ -1253,6 +1290,7 @@ mod tests {
         let runtime = ClientEvmRuntime::new(
             rpc_config(),
             test_endpoints(),
+            GraphEndpoints::empty(),
             in_memory_metadata_cache(),
             Logger::sink(),
             View::sink(),

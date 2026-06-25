@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, error, fmt, io, path::PathBuf};
 
-use client_evm::{ChainKey, EndpointSpec, RpcConfig, chain_key_for_network_path};
+use client_evm::{ChainKey, EndpointSpec, RpcConfig, TheGraphConfig, chain_key_for_network_path};
 use serde::Deserialize;
 
 pub(crate) const RPC_HTTP_URL_ENV: &str = "AA_RPC_HTTP_URL";
@@ -9,6 +9,14 @@ pub(crate) const RPC_API_KEY_ENV: &str = "AA_RPC_API_KEY";
 pub(crate) const RPC_ENDPOINTS_FILE_ENV: &str = "AA_RPC_ENDPOINTS_FILE";
 pub(crate) const RPC_PUBLIC_FALLBACKS_ENV: &str = "AA_RPC_PUBLIC_FALLBACKS";
 pub(crate) const METADATA_CACHE_PATH_ENV: &str = "AA_METADATA_CACHE_PATH";
+pub(crate) const GRAPH_URL_ENV: &str = "AA_GRAPH_URL";
+pub(crate) const GRAPH_API_KEY_ENV: &str = "AA_GRAPH_API_KEY";
+pub(crate) const GRAPH_ENDPOINTS_FILE_ENV: &str = "AA_GRAPH_ENDPOINTS_FILE";
+
+/// Prefix for the per-provider derived key env var on the RPC endpoints file (`AA_RPC_KEY_<NAME>`).
+const RPC_KEY_PREFIX: &str = "AA_RPC_KEY_";
+/// Prefix for the per-provider derived key env var on the graph mirrors file (`AA_GRAPH_KEY_<NAME>`).
+const GRAPH_KEY_PREFIX: &str = "AA_GRAPH_KEY_";
 
 const DEFAULT_METADATA_CACHE_PATH: &str = "metadata-cache.redb";
 
@@ -123,11 +131,56 @@ where
     }
 }
 
-/// Loads the optional endpoints file named by [`RPC_ENDPOINTS_FILE_ENV`] into per-chain endpoint specs,
-/// resolving each provider's API key (env first, then prompt) and substituting it into the URLs. Absent
-/// env var → no custom providers (empty map). A read or parse failure is a hard error; a skipped key
-/// drops that provider.
+/// Loads the optional RPC endpoints file named by [`RPC_ENDPOINTS_FILE_ENV`] into per-chain endpoint
+/// specs. Thin wrapper over [`load_endpoints_file_with`] with the RPC file env and key prefix.
 pub(crate) fn load_custom_endpoints_with<Env, ReadFile, Prompt>(
+    read_env: Env,
+    read_file: ReadFile,
+    prompt: Prompt,
+) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
+where
+    Env: FnMut(&str) -> Option<String>,
+    ReadFile: FnOnce(&str) -> io::Result<String>,
+    Prompt: FnMut(&str) -> Result<String, CliError>,
+{
+    load_endpoints_file_with(
+        RPC_ENDPOINTS_FILE_ENV,
+        RPC_KEY_PREFIX,
+        read_env,
+        read_file,
+        prompt,
+    )
+}
+
+/// Loads the optional Uniswap v4 subgraph mirrors file named by [`GRAPH_ENDPOINTS_FILE_ENV`] into
+/// per-chain endpoint specs — same-schema mirrors of the canonical subgraph that fail over alongside the
+/// gateway primary. Thin wrapper over [`load_endpoints_file_with`] with the graph file env and key prefix.
+pub(crate) fn load_graph_endpoints_with<Env, ReadFile, Prompt>(
+    read_env: Env,
+    read_file: ReadFile,
+    prompt: Prompt,
+) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
+where
+    Env: FnMut(&str) -> Option<String>,
+    ReadFile: FnOnce(&str) -> io::Result<String>,
+    Prompt: FnMut(&str) -> Result<String, CliError>,
+{
+    load_endpoints_file_with(
+        GRAPH_ENDPOINTS_FILE_ENV,
+        GRAPH_KEY_PREFIX,
+        read_env,
+        read_file,
+        prompt,
+    )
+}
+
+/// Loads an optional endpoints file named by `file_env` into per-chain endpoint specs, resolving each
+/// provider's API key (env first under `key_prefix`, then prompt) and substituting it into the URLs.
+/// Absent env var → no custom providers (empty map). A read or parse failure is a hard error; a skipped
+/// key drops that provider. Shared by the RPC and graph endpoint loaders.
+fn load_endpoints_file_with<Env, ReadFile, Prompt>(
+    file_env: &str,
+    key_prefix: &str,
     mut read_env: Env,
     read_file: ReadFile,
     mut prompt: Prompt,
@@ -137,7 +190,7 @@ where
     ReadFile: FnOnce(&str) -> io::Result<String>,
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
-    let Some(path) = read_env(RPC_ENDPOINTS_FILE_ENV).and_then(normalize_config_value) else {
+    let Some(path) = read_env(file_env).and_then(normalize_config_value) else {
         return Ok(BTreeMap::new());
     };
 
@@ -146,7 +199,20 @@ where
     })?;
 
     let file = parse_endpoints_toml(&content)?;
-    resolve_endpoints(file, &mut read_env, &mut prompt)
+    resolve_endpoints(file, key_prefix, &mut read_env, &mut prompt)
+}
+
+/// Loads the optional Uniswap v4 subgraph config (gateway URL + API key). Env-only — unlike the required
+/// RPC config it never prompts, so an unconfigured aggregator simply yields `None` (v4 metadata
+/// resolution is then skipped) rather than blocking startup. Both values must be present and non-empty.
+pub(crate) fn load_graph_config_with<Env>(mut read_env: Env) -> Option<TheGraphConfig>
+where
+    Env: FnMut(&'static str) -> Option<String>,
+{
+    let url = read_env(GRAPH_URL_ENV).and_then(normalize_config_value)?;
+    let api_key = read_env(GRAPH_API_KEY_ENV).and_then(normalize_config_value)?;
+
+    Some(TheGraphConfig { url, api_key })
 }
 
 fn parse_endpoints_toml(content: &str) -> Result<EndpointsFile, CliError> {
@@ -157,6 +223,7 @@ fn parse_endpoints_toml(content: &str) -> Result<EndpointsFile, CliError> {
 
 fn resolve_endpoints<Env, Prompt>(
     file: EndpointsFile,
+    key_prefix: &str,
     read_env: &mut Env,
     prompt: &mut Prompt,
 ) -> Result<BTreeMap<ChainKey, Vec<EndpointSpec>>, CliError>
@@ -167,7 +234,7 @@ where
     let mut endpoints: BTreeMap<ChainKey, Vec<EndpointSpec>> = BTreeMap::new();
 
     for provider in file.provider {
-        let key = match resolve_provider_key(&provider, read_env, prompt)? {
+        let key = match resolve_provider_key(&provider, key_prefix, read_env, prompt)? {
             // A skipped key drops the whole provider: none of its endpoints enter the pool.
             KeyResolution::Skipped => continue,
             KeyResolution::NotNeeded => None,
@@ -200,10 +267,11 @@ where
 }
 
 /// Resolves a provider's API key when any of its URLs embed [`KEY_PLACEHOLDER`]: the environment
-/// (`key_env`, or the derived `AA_RPC_KEY_<NAME>`) is consulted first, then the user is prompted; a
+/// (`key_env`, or the derived `<key_prefix><NAME>`) is consulted first, then the user is prompted; a
 /// blank prompt (or EOF on a non-interactive run) skips the provider.
 fn resolve_provider_key<Env, Prompt>(
     provider: &ProviderEntry,
+    key_prefix: &str,
     read_env: &mut Env,
     prompt: &mut Prompt,
 ) -> Result<KeyResolution, CliError>
@@ -222,7 +290,7 @@ where
     let env_name = provider
         .key_env
         .clone()
-        .unwrap_or_else(|| derived_key_env(&provider.name));
+        .unwrap_or_else(|| derived_key_env(key_prefix, &provider.name));
     if let Some(key) = read_env(&env_name).and_then(normalize_config_value) {
         return Ok(KeyResolution::Resolved(key));
     }
@@ -234,9 +302,10 @@ where
     })
 }
 
-/// Default environment variable name for a provider's key: `AA_RPC_KEY_<NAME>`, with the name upcased
-/// and any non-alphanumeric character replaced by `_` (e.g. `my-node` → `AA_RPC_KEY_MY_NODE`).
-fn derived_key_env(name: &str) -> String {
+/// Default environment variable name for a provider's key: `<key_prefix><NAME>`, with the name upcased
+/// and any non-alphanumeric character replaced by `_` (e.g. prefix `AA_RPC_KEY_` + `my-node` →
+/// `AA_RPC_KEY_MY_NODE`).
+fn derived_key_env(key_prefix: &str, name: &str) -> String {
     let sanitized: String = name
         .chars()
         .map(|character| {
@@ -247,7 +316,7 @@ fn derived_key_env(name: &str) -> String {
             }
         })
         .collect();
-    format!("AA_RPC_KEY_{sanitized}")
+    format!("{key_prefix}{sanitized}")
 }
 
 pub(crate) fn load_rpc_config_with<Env, Prompt>(
@@ -641,8 +710,86 @@ mod tests {
 
     #[test]
     fn derived_key_env_sanitizes_provider_name() {
-        assert_eq!(derived_key_env("alchemy"), "AA_RPC_KEY_ALCHEMY");
-        assert_eq!(derived_key_env("my-node.io"), "AA_RPC_KEY_MY_NODE_IO");
+        assert_eq!(
+            derived_key_env(RPC_KEY_PREFIX, "alchemy"),
+            "AA_RPC_KEY_ALCHEMY"
+        );
+        assert_eq!(
+            derived_key_env(RPC_KEY_PREFIX, "my-node.io"),
+            "AA_RPC_KEY_MY_NODE_IO"
+        );
+        assert_eq!(
+            derived_key_env(GRAPH_KEY_PREFIX, "goldsky"),
+            "AA_GRAPH_KEY_GOLDSKY"
+        );
+    }
+
+    #[test]
+    fn graph_config_present_when_both_url_and_key_set() {
+        let config = load_graph_config_with(env_from([
+            (GRAPH_URL_ENV, " https://gateway.thegraph.com/api/{key}/subgraphs/id/v4 "),
+            (GRAPH_API_KEY_ENV, " graph-key "),
+        ]));
+
+        assert_eq!(
+            config,
+            Some(TheGraphConfig {
+                url: "https://gateway.thegraph.com/api/{key}/subgraphs/id/v4".to_owned(),
+                api_key: "graph-key".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn graph_config_absent_when_url_or_key_missing() {
+        assert_eq!(load_graph_config_with(env_from([])), None);
+        assert_eq!(
+            load_graph_config_with(env_from([(GRAPH_URL_ENV, "https://gateway.example")])),
+            None
+        );
+        assert_eq!(
+            load_graph_config_with(env_from([(GRAPH_API_KEY_ENV, "graph-key")])),
+            None
+        );
+    }
+
+    #[test]
+    fn graph_mirrors_file_parses_with_graph_key_prefix() {
+        let toml = r#"
+            [[provider]]
+            name = "goldsky"
+            ethereum = "https://api.goldsky.com/subgraphs/v4/{key}"
+        "#;
+
+        let result = load_graph_endpoints_with(
+            env_from([
+                (GRAPH_ENDPOINTS_FILE_ENV, "graph-endpoints.toml"),
+                ("AA_GRAPH_KEY_GOLDSKY", "mirror-key"),
+            ]),
+            |path| {
+                assert_eq!(path, "graph-endpoints.toml");
+                Ok(toml.to_owned())
+            },
+            never_prompt(),
+        )
+        .expect("resolution succeeds");
+
+        let ethereum = result.get(&ChainKey::Ethereum).expect("ethereum entries");
+        assert_eq!(
+            ethereum[0],
+            EndpointSpec::new("goldsky", "https://api.goldsky.com/subgraphs/v4/mirror-key", 1)
+        );
+    }
+
+    #[test]
+    fn no_graph_endpoints_file_yields_no_mirrors() {
+        let result = load_graph_endpoints_with(
+            env_from([]),
+            |_| panic!("file must not be read"),
+            never_prompt(),
+        );
+
+        assert_eq!(result, Ok(BTreeMap::new()));
     }
 
     #[test]

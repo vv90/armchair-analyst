@@ -19,6 +19,7 @@ mod tick_math;
 mod tokens;
 pub mod uniswap_v3;
 pub mod uniswap_v4;
+pub mod uniswap_v4_subgraph;
 mod utils;
 
 pub use chain::{ACTIVE_CHAINS, ChainKey, chain_key_for_network_path, drpc_network_path};
@@ -28,9 +29,10 @@ pub use client::{
     fetch_pool_data, fetch_pool_metadata, fetch_token_metadata, subscribe_new_heads,
     subscribe_pool_events,
 };
-pub use config::RpcConfig;
+pub use config::{RpcConfig, TheGraphConfig};
 pub use endpoints::{
-    ChainEndpoints, EndpointPool, EndpointSpec, assemble_chain_endpoints, default_public_endpoints,
+    ChainEndpoints, EndpointPool, EndpointSpec, GraphEndpoints, assemble_chain_endpoints,
+    assemble_graph_endpoints, default_public_endpoints,
 };
 pub use error::{ClientEvmError, ConfigScope};
 pub use kernel::pending_requests::{
@@ -51,5 +53,6 @@ pub use pool_state::{
     ProtocolPoolKey,
 };
 pub use tick_math::TickMathError;
+pub use uniswap_v4_subgraph::fetch_v4_pool_metadata;
 pub use tokens::{ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS};
 pub use utils::{TokenAmountConversionError, u256_token_amount_to_f32};

@@ -1,13 +1,15 @@
 use std::{env, io, io::Write, process::ExitCode, thread};
 
-use client_evm::{MetadataCache, RpcConfig, assemble_chain_endpoints};
+use client_evm::{
+    GraphEndpoints, MetadataCache, RpcConfig, assemble_chain_endpoints, assemble_graph_endpoints,
+};
 
 use crate::{
     app::start_runtime,
     logger::Logger,
     utils::{
-        CliError, load_custom_endpoints_with, load_rpc_config_with, metadata_cache_path_with,
-        public_fallbacks_enabled_with,
+        CliError, load_custom_endpoints_with, load_graph_config_with, load_graph_endpoints_with,
+        load_rpc_config_with, metadata_cache_path_with, public_fallbacks_enabled_with,
     },
     view::View,
 };
@@ -34,12 +36,20 @@ fn run() -> Result<(), CliError> {
         .map_err(|error| CliError::EndpointConfigFailed {
             message: error.to_string(),
         })?;
+    let graph_endpoints = load_graph_endpoints()?;
     let metadata_cache = open_metadata_cache()?;
     let logger = Logger::create_for_run().map_err(|error| CliError::LogInitFailed {
         message: error.to_string(),
     })?;
     let view = View::for_run();
-    let handle = start_runtime(config, endpoints, metadata_cache, logger, view.clone());
+    let handle = start_runtime(
+        config,
+        endpoints,
+        graph_endpoints,
+        metadata_cache,
+        logger,
+        view.clone(),
+    );
 
     let result = finish_runtime(handle.join());
     view.finish();
@@ -49,6 +59,24 @@ fn run() -> Result<(), CliError> {
 
 fn load_rpc_config() -> Result<RpcConfig, CliError> {
     load_rpc_config_with(|name| env::var(name).ok(), prompt_for_value)
+}
+
+/// Builds the Uniswap v4 subgraph endpoint pools from the environment. Unconfigured (no gateway URL/key)
+/// → an empty set, so v4 metadata resolution is simply skipped; the RPC path is unaffected either way.
+fn load_graph_endpoints() -> Result<GraphEndpoints, CliError> {
+    let Some(config) = load_graph_config_with(|name| env::var(name).ok()) else {
+        return Ok(GraphEndpoints::empty());
+    };
+
+    let mirrors = load_graph_endpoints_with(
+        |name| env::var(name).ok(),
+        |path| std::fs::read_to_string(path),
+        |prompt| prompt_for_key(prompt),
+    )?;
+
+    assemble_graph_endpoints(&config, &mirrors).map_err(|error| CliError::EndpointConfigFailed {
+        message: error.to_string(),
+    })
 }
 
 fn open_metadata_cache() -> Result<MetadataCache, CliError> {
