@@ -4,7 +4,7 @@ use client_evm::{PoolRef, TokenAddress, multi_chain_kernel::OptimizationPoolRese
 use optimization::{
     OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
     OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
-    OptimizationStepResult, OptimizationStepUpdate,
+    OptimizationStepResult, OptimizationStepUpdate, reserves_reach_init_asset,
 };
 
 use crate::latest_slot::{LatestReceiveError, LatestReceiver};
@@ -55,6 +55,13 @@ pub fn run_optimization<T>(
 
     loop {
         let update = match receiver.try_take().map_err(RunOptimizationError::Receive)? {
+            // Same transient guard as init: a merged cross-chain snapshot can momentarily fail to
+            // reach the init asset (a chain bootstrapping, a refresh gap). Feeding it to the session
+            // would abort the worker with `InitAssetOutputNotFound`, permanently closing the
+            // optimization channel. Skip the snapshot and keep stepping the live session instead.
+            Some(snapshot) if !reserves_reach_init_asset(&snapshot.reserves, &session_config) => {
+                OptimizationStepUpdate::Continue
+            }
             Some(snapshot) => OptimizationStepUpdate::NewReserves(snapshot.reserves),
             None => OptimizationStepUpdate::Continue,
         };

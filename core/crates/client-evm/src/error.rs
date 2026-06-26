@@ -54,6 +54,14 @@ pub enum ClientEvmError {
     #[error("malformed {context} response: {detail}")]
     MalformedResponse { context: String, detail: String },
 
+    /// Every endpoint in a chain's pool failed the same request, or a non-retryable error
+    /// short-circuited the failover before the rest of the pool was tried. `detail` lists each
+    /// endpoint tried, in order, with the error it returned — so a failed request shows which
+    /// providers were actually reached and why each failed (and whether failover stopped early),
+    /// instead of only the last error. Produced solely by [`crate::EndpointPool::with_failover`].
+    #[error("{detail}")]
+    FailoverExhausted { detail: String },
+
     #[error("event receiver dropped")]
     EventReceiverDropped,
 }

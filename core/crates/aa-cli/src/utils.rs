@@ -136,6 +136,10 @@ pub(crate) struct ResolvedEndpoints {
     pub rpc_http: BTreeMap<ChainKey, Vec<EndpointSpec>>,
     pub rpc_ws: BTreeMap<ChainKey, String>,
     pub subgraph: BTreeMap<ChainKey, Vec<EndpointSpec>>,
+    /// Names of `[[rpc]]` providers dropped because their key was skipped (blank prompt / unset env).
+    /// A dropped provider is absent from every pool above; recorded so startup can surface it, since a
+    /// silent drop otherwise looks identical to a provider that was never configured.
+    pub skipped_rpc_providers: Vec<String>,
 }
 
 /// Loads and resolves the unified config file named by [`CONFIG_FILE_ENV`]. The file is **required** (an
@@ -199,7 +203,10 @@ where
             read_env,
             prompt,
         )? {
-            KeyResolution::Skipped => continue,
+            KeyResolution::Skipped => {
+                resolved.skipped_rpc_providers.push(provider.name.clone());
+                continue;
+            }
             KeyResolution::NotNeeded => None,
             KeyResolution::Resolved(key) => Some(key),
         };
@@ -262,6 +269,39 @@ where
     }
 
     Ok(resolved)
+}
+
+/// Human-readable startup lines describing the resolved RPC pools, so the live provider composition is
+/// visible in the run log. One `endpoints chain=…` line per chain lists each pool entry's provider and
+/// weight plus whether the chain has a WS subscription; a trailing line names any providers dropped for
+/// a skipped key. This makes a silently-dropped provider, or a chain down to a single endpoint, obvious
+/// at a glance — the per-request failover only ever logs its last endpoint's error, so the pool's true
+/// membership is otherwise invisible.
+pub(crate) fn summarize_endpoints(resolved: &ResolvedEndpoints) -> Vec<String> {
+    let mut lines: Vec<String> = resolved
+        .rpc_http
+        .iter()
+        .map(|(chain, specs)| {
+            let providers = specs
+                .iter()
+                .map(|spec| format!("{}:{}", spec.label, spec.weight))
+                .collect::<Vec<_>>()
+                .join(",");
+            let ws = if resolved.rpc_ws.contains_key(chain) {
+                "present"
+            } else {
+                "absent"
+            };
+            format!("endpoints chain={chain:?} http={providers} ws={ws}")
+        })
+        .collect();
+
+    lines.push(format!(
+        "endpoints skipped_rpc_providers={}",
+        resolved.skipped_rpc_providers.join(",")
+    ));
+
+    lines
 }
 
 fn chain_for_network(network: &str, provider: &str) -> Result<ChainKey, CliError> {
@@ -532,6 +572,59 @@ mod tests {
         assert!(resolved.subgraph.is_empty());
         // The keyless RPC provider is unaffected.
         assert!(resolved.rpc_http.contains_key(&ChainKey::Ethereum));
+    }
+
+    #[test]
+    fn skipped_rpc_key_is_recorded_and_drops_the_provider() {
+        let toml = r#"
+            [[rpc]]
+            name = "infura"
+            ethereum = { http = "https://eth.infura/{key}" }
+
+            [[rpc]]
+            name = "publicnode"
+            ethereum = { http = "https://eth.public.example", ws = "wss://eth/ws" }
+        "#;
+        let resolved = load_config_with(
+            env_from([(CONFIG_FILE_ENV, "config.toml")]),
+            |_| Ok(toml.to_owned()),
+            // Blank answer skips the keyed infura provider; the keyless publicnode is never prompted.
+            |_: &str| Ok(String::new()),
+        )
+        .expect("resolution succeeds");
+
+        assert_eq!(resolved.skipped_rpc_providers, vec!["infura".to_owned()]);
+        // The dropped provider is absent from the pool; only the surviving one remains.
+        let eth = resolved.rpc_http.get(&ChainKey::Ethereum).expect("eth");
+        assert_eq!(eth.len(), 1);
+        assert_eq!(eth[0].label, "publicnode");
+    }
+
+    #[test]
+    fn summarize_endpoints_lists_providers_ws_presence_and_skips() {
+        let mut resolved = ResolvedEndpoints::default();
+        resolved.rpc_http.insert(
+            ChainKey::Ethereum,
+            vec![
+                EndpointSpec::new("drpc", "https://d", 3),
+                EndpointSpec::new("alchemy", "https://a", 4),
+            ],
+        );
+        resolved
+            .rpc_http
+            .insert(ChainKey::Arbitrum, vec![EndpointSpec::new("publicnode", "https://p", 1)]);
+        // Only Ethereum has a WS endpoint, so Arbitrum must read as `ws=absent`.
+        resolved.rpc_ws.insert(ChainKey::Ethereum, "wss://d".to_owned());
+        resolved.skipped_rpc_providers.push("infura".to_owned());
+
+        assert_eq!(
+            summarize_endpoints(&resolved),
+            vec![
+                "endpoints chain=Ethereum http=drpc:3,alchemy:4 ws=present".to_owned(),
+                "endpoints chain=Arbitrum http=publicnode:1 ws=absent".to_owned(),
+                "endpoints skipped_rpc_providers=infura".to_owned(),
+            ]
+        );
     }
 
     #[test]

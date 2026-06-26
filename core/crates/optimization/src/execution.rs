@@ -521,6 +521,31 @@ where
     ))
 }
 
+/// Whether `reserves` can reach the session's init asset — i.e. whether feeding them to a step would
+/// avoid the transient [`OptimizationStepError::InitAssetOutputNotFound`].
+///
+/// With cross-chain merging a merged snapshot can momentarily fail to reach the init asset (the chain
+/// that owns the quote token reported late, a brief bootstrap/refresh gap, etc.). Initialization
+/// already treats that as "not ready yet" and skips the snapshot; a running session must do the same,
+/// because applying such a snapshot aborts the whole optimization worker. This mirrors the routing +
+/// init-asset reachability check performed inside [`validate_reserve_snapshot`].
+pub fn reserves_reach_init_asset<TPool, TToken>(
+    reserves: &[PoolReserves<TPool, TToken>],
+    session_config: &OptimizationSessionConfig<TToken>,
+) -> bool
+where
+    TPool: Copy + Eq + Hash,
+    TToken: Copy + Eq + Hash,
+{
+    crate::routing_filter::routable_reserves(
+        reserves.to_vec(),
+        session_config.init_asset,
+        &session_config.bridges,
+    )
+    .iter()
+    .any(|reserve| reserve.token1 == session_config.init_asset)
+}
+
 fn validate_reserve_snapshot<TPool, TToken>(
     reserves: &[PoolReserves<TPool, TToken>],
     session_config: &OptimizationSessionConfig<TToken>,
@@ -885,6 +910,28 @@ mod tests {
         ));
 
         assert_eq!(error, OptimizationStepError::InitAssetOutputNotFound);
+    }
+
+    #[test]
+    fn reserves_reach_init_asset_is_true_when_a_pool_outputs_the_init_asset() {
+        assert!(reserves_reach_init_asset(&base_reserves(), &session_config()));
+    }
+
+    #[test]
+    fn reserves_reach_init_asset_is_false_when_no_pool_outputs_the_init_asset() {
+        // Same snapshot that drives `missing_init_asset_output_returns_typed_error`: a step fed this
+        // would abort with `InitAssetOutputNotFound`, so the predicate must flag it as not-yet-ready.
+        let reserves = vec![reserve(1, tokens::USDC.address, tokens::WETH.address, 1_000.0)];
+
+        assert!(!reserves_reach_init_asset(&reserves, &session_config()));
+    }
+
+    #[test]
+    fn reserves_reach_init_asset_is_false_for_an_empty_snapshot() {
+        assert!(!reserves_reach_init_asset(
+            &Vec::<PoolReserves<i32, TokenAddress>>::new(),
+            &session_config(),
+        ));
     }
 
     fn initialized_session() -> (

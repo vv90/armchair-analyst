@@ -81,6 +81,44 @@ const ARBITRUM_BOOTSTRAP_TIP_TRIM: usize = 8;
 /// Ticks after which bootstrap activates best-effort (or abandons before the anchor is known).
 const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
+// PROVISIONAL — tune before relying on finalized pruning. Base/Optimism are OP-stack rollups (~2s
+// blocks): the unsafe sequencer head can reorg shallowly while true finality follows L1, so the
+// block-denominated window is moderate. Values anchored to block time × an Ethereum-comparable reorg
+// depth; revisit against observed reorg depth.
+const BASE_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
+const BASE_FINALIZED_RETENTION_MARGIN: usize = 32;
+const BASE_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const BASE_BOOTSTRAP_TIP_TRIM: usize = 8;
+const BASE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
+
+const OPTIMISM_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
+const OPTIMISM_FINALIZED_RETENTION_MARGIN: usize = 32;
+const OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const OPTIMISM_BOOTSTRAP_TIP_TRIM: usize = 8;
+const OPTIMISM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
+
+// PROVISIONAL — Polygon PoS (~2s blocks) has historically the deepest probabilistic reorgs of this
+// set, so its retention/look-back windows are the largest.
+const POLYGON_APPROX_FINALIZED_BLOCK_AGE: usize = 400;
+const POLYGON_FINALIZED_RETENTION_MARGIN: usize = 64;
+const POLYGON_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
+const POLYGON_BOOTSTRAP_TIP_TRIM: usize = 16;
+const POLYGON_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
+
+// PROVISIONAL — BNB Chain (~3s blocks) has fast finality with occasional short reorgs.
+const BNB_APPROX_FINALIZED_BLOCK_AGE: usize = 150;
+const BNB_FINALIZED_RETENTION_MARGIN: usize = 32;
+const BNB_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const BNB_BOOTSTRAP_TIP_TRIM: usize = 12;
+const BNB_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
+
+// PROVISIONAL — Avalanche C-Chain (~2s blocks) has near-instant finality, so the smallest window.
+const AVALANCHE_APPROX_FINALIZED_BLOCK_AGE: usize = 80;
+const AVALANCHE_FINALIZED_RETENTION_MARGIN: usize = 16;
+const AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+const AVALANCHE_BOOTSTRAP_TIP_TRIM: usize = 6;
+const AVALANCHE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
+
 /// One chain's projected reserves at the block they were derived from. The per-chain piece that
 /// `pool_reserves_for_optimization` yields; the merge concatenates these into one optimizer envelope.
 #[derive(Clone, Debug, PartialEq)]
@@ -937,6 +975,26 @@ fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
             target_len: ARBITRUM_APPROX_FINALIZED_BLOCK_AGE + ARBITRUM_FINALIZED_RETENTION_MARGIN,
             retry_stride: ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE,
         },
+        ChainKey::Base => FinalizedRefreshPolicy {
+            target_len: BASE_APPROX_FINALIZED_BLOCK_AGE + BASE_FINALIZED_RETENTION_MARGIN,
+            retry_stride: BASE_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
+        ChainKey::Optimism => FinalizedRefreshPolicy {
+            target_len: OPTIMISM_APPROX_FINALIZED_BLOCK_AGE + OPTIMISM_FINALIZED_RETENTION_MARGIN,
+            retry_stride: OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
+        ChainKey::Polygon => FinalizedRefreshPolicy {
+            target_len: POLYGON_APPROX_FINALIZED_BLOCK_AGE + POLYGON_FINALIZED_RETENTION_MARGIN,
+            retry_stride: POLYGON_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
+        ChainKey::Bnb => FinalizedRefreshPolicy {
+            target_len: BNB_APPROX_FINALIZED_BLOCK_AGE + BNB_FINALIZED_RETENTION_MARGIN,
+            retry_stride: BNB_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
+        ChainKey::Avalanche => FinalizedRefreshPolicy {
+            target_len: AVALANCHE_APPROX_FINALIZED_BLOCK_AGE + AVALANCHE_FINALIZED_RETENTION_MARGIN,
+            retry_stride: AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE,
+        },
     }
 }
 
@@ -949,6 +1007,26 @@ fn bootstrap_policy(chain: ChainKey) -> bootstrap::BootstrapPolicy {
         ChainKey::Arbitrum => bootstrap::BootstrapPolicy {
             tip_trim: ARBITRUM_BOOTSTRAP_TIP_TRIM,
             deadline_ticks: ARBITRUM_BOOTSTRAP_DEADLINE_TICKS,
+        },
+        ChainKey::Base => bootstrap::BootstrapPolicy {
+            tip_trim: BASE_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: BASE_BOOTSTRAP_DEADLINE_TICKS,
+        },
+        ChainKey::Optimism => bootstrap::BootstrapPolicy {
+            tip_trim: OPTIMISM_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: OPTIMISM_BOOTSTRAP_DEADLINE_TICKS,
+        },
+        ChainKey::Polygon => bootstrap::BootstrapPolicy {
+            tip_trim: POLYGON_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: POLYGON_BOOTSTRAP_DEADLINE_TICKS,
+        },
+        ChainKey::Bnb => bootstrap::BootstrapPolicy {
+            tip_trim: BNB_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: BNB_BOOTSTRAP_DEADLINE_TICKS,
+        },
+        ChainKey::Avalanche => bootstrap::BootstrapPolicy {
+            tip_trim: AVALANCHE_BOOTSTRAP_TIP_TRIM,
+            deadline_ticks: AVALANCHE_BOOTSTRAP_DEADLINE_TICKS,
         },
     }
 }

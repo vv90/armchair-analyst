@@ -12,6 +12,7 @@ pub use execution::{
     OptimizationBackendSelection, OptimizationBackendUsed, OptimizationInitError,
     OptimizationRunner, OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
     OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate,
+    reserves_reach_init_asset,
 };
 pub use model::ModelUpdateError;
 pub use pool_reserves::{PoolReserves, VirtualReserveValues};

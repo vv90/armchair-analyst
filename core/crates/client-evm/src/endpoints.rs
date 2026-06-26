@@ -52,8 +52,24 @@ impl EndpointSpec {
 #[derive(Debug)]
 struct Endpoint {
     url: String,
-    #[allow(dead_code)]
     label: String,
+}
+
+/// One endpoint's outcome within a single [`EndpointPool::with_failover`] sequence: the provider
+/// label and the error it returned, rendered. Collected so a failed request can report the whole
+/// pool's behaviour rather than only the last error.
+struct FailoverAttempt {
+    label: String,
+    error: String,
+}
+
+impl FailoverAttempt {
+    fn record(label: &str, error: &ClientEvmError) -> FailoverAttempt {
+        FailoverAttempt {
+            label: label.to_owned(),
+            error: error.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,11 +142,16 @@ impl EndpointPool {
         &self,
         attempt: impl Fn(&str) -> Result<T, ClientEvmError>,
     ) -> Result<T, ClientEvmError> {
-        let attempts = self.endpoints.len();
-        let mut tried: Vec<usize> = Vec::with_capacity(attempts);
+        let pool_size = self.endpoints.len();
+        // A single-endpoint pool has no failover to report, so its lone error is returned verbatim
+        // (no `FailoverExhausted` wrapper). Multi-endpoint pools collect a per-endpoint trace so a
+        // failure shows which providers were reached and why each failed — not just the last error.
+        let wrap = pool_size > 1;
+        let mut tried: Vec<usize> = Vec::with_capacity(pool_size);
+        let mut trace: Vec<FailoverAttempt> = Vec::with_capacity(pool_size);
         let mut last_error: Option<ClientEvmError> = None;
 
-        for _ in 0..attempts {
+        for _ in 0..pool_size {
             let now = Instant::now();
             let idx = self.pick_excluding(&tried, now);
 
@@ -141,16 +162,31 @@ impl EndpointPool {
                 }
                 Err(error) if is_retryable(&error) => {
                     self.report_failure(idx, now);
+                    if wrap {
+                        trace.push(FailoverAttempt::record(&self.endpoints[idx].label, &error));
+                    }
                     tried.push(idx);
                     last_error = Some(error);
                 }
-                // A non-retryable error (config fault, or a request-shaped HTTP 400/404/405) is the
-                // same on every endpoint; surface it without burning the rest of the pool.
-                Err(error) => return Err(error),
+                // A non-retryable error (config fault, or a request-shaped HTTP 400/404/405) is
+                // assumed identical on every endpoint, so the rest of the pool is not tried. For a
+                // pool, record it and mark the trace short-circuited so the log shows failover
+                // stopped early — the signal that distinguishes this from an exhausted failover.
+                Err(error) => {
+                    if !wrap {
+                        return Err(error);
+                    }
+                    trace.push(FailoverAttempt::record(&self.endpoints[idx].label, &error));
+                    return Err(failover_exhausted(&trace, pool_size, true));
+                }
             }
         }
 
-        Err(last_error.expect("with_failover runs at least one attempt"))
+        if wrap {
+            Err(failover_exhausted(&trace, pool_size, false))
+        } else {
+            Err(last_error.expect("with_failover runs at least one attempt"))
+        }
     }
 
     /// Selects the next endpoint, preferring one that is both untried (this request) and not cooling
@@ -364,6 +400,43 @@ pub fn assemble_graph_endpoints(
 /// HTTP statuses, malformed responses, and any JSON-RPC error (here always gateway/node-level — pruned
 /// state, "temporary internal error", rate limits, unsupported method) are all worth trying elsewhere;
 /// only a configuration fault is identical on every endpoint and so is not retried.
+/// Wraps a finished failover sequence into a [`ClientEvmError::FailoverExhausted`] whose message is
+/// the rendered per-endpoint trace.
+fn failover_exhausted(
+    trace: &[FailoverAttempt],
+    pool_size: usize,
+    short_circuited: bool,
+) -> ClientEvmError {
+    ClientEvmError::FailoverExhausted {
+        detail: render_failover_trace(trace, pool_size, short_circuited),
+    }
+}
+
+/// Renders a failover sequence into one log-friendly line: how many of the pool's endpoints were
+/// tried, whether failover stopped early on a non-retryable error, and each tried endpoint's label
+/// with the error it returned.
+fn render_failover_trace(
+    trace: &[FailoverAttempt],
+    pool_size: usize,
+    short_circuited: bool,
+) -> String {
+    let stopped = if short_circuited {
+        " — stopped on non-retryable error"
+    } else {
+        ""
+    };
+    let outcomes = trace
+        .iter()
+        .map(|attempt| format!("{}=[{}]", attempt.label, attempt.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "failover failed: tried {} of {} endpoint(s){stopped}: {outcomes}",
+        trace.len(),
+        pool_size,
+    )
+}
+
 pub(crate) fn is_retryable(error: &ClientEvmError) -> bool {
     match error {
         ClientEvmError::HttpTransport(_) => true,
@@ -380,8 +453,10 @@ pub(crate) fn is_retryable(error: &ClientEvmError) -> bool {
         }
         ClientEvmError::JsonRpcError { .. } => true,
         ClientEvmError::MalformedResponse { .. } => true,
+        // Already the terminal result of a failover sequence; never re-failed-over.
         ClientEvmError::InvalidConfig { .. }
         | ClientEvmError::WebSocketError(_)
+        | ClientEvmError::FailoverExhausted { .. }
         | ClientEvmError::EventReceiverDropped => false,
     }
 }
@@ -525,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn failover_returns_last_error_when_all_attempts_fail() {
+    fn failover_exhausted_reports_every_tried_endpoint() {
         let pool = pool(&[1, 1]);
 
         let result: Result<(), _> = pool.with_failover(|_| {
@@ -535,10 +610,14 @@ mod tests {
             })
         });
 
-        assert!(matches!(
-            result,
-            Err(ClientEvmError::HttpStatus { status: 503, .. })
-        ));
+        let Err(ClientEvmError::FailoverExhausted { detail }) = result else {
+            panic!("all-retryable failures must surface as FailoverExhausted, got {result:?}");
+        };
+        // Both endpoints were tried (not short-circuited), and each appears with its error.
+        assert!(detail.contains("tried 2 of 2 endpoint(s):"), "detail: {detail}");
+        assert!(!detail.contains("stopped on non-retryable"), "detail: {detail}");
+        assert!(detail.contains("ep0=[http status 503: down]"), "detail: {detail}");
+        assert!(detail.contains("ep1=[http status 503: down]"), "detail: {detail}");
     }
 
     #[test]
@@ -548,14 +627,24 @@ mod tests {
 
         let result: Result<(), _> = pool.with_failover(|_| {
             calls.set(calls.get() + 1);
-            Err(ClientEvmError::InvalidConfig {
-                scope: ConfigScope::Http,
-                reason: "bad".to_owned(),
+            Err(ClientEvmError::HttpStatus {
+                status: 400,
+                body: "10 block range".to_owned(),
             })
         });
 
-        assert!(matches!(result, Err(ClientEvmError::InvalidConfig { .. })));
+        // The other endpoint is not tried, and the trace says so explicitly — the visibility that
+        // distinguishes a short-circuit from an exhausted multi-endpoint failover.
+        let Err(ClientEvmError::FailoverExhausted { detail }) = result else {
+            panic!("a non-retryable error must surface as FailoverExhausted, got {result:?}");
+        };
         assert_eq!(calls.get(), 1);
+        assert!(
+            detail.contains("tried 1 of 2 endpoint(s) — stopped on non-retryable error"),
+            "detail: {detail}"
+        );
+        // Whichever endpoint the cursor picked first carries the recorded 400.
+        assert!(detail.contains("=[http status 400: 10 block range]"), "detail: {detail}");
     }
 
     #[test]

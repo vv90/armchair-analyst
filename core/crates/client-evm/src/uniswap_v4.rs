@@ -33,6 +33,41 @@ pub const ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
 pub const ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
     address!("76fd297e2d437cd7f76d50f01afe6160f86e9990");
 
+/// Base `PoolManager` singleton.
+pub const BASE_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
+    address!("498581ff718922c3f8e6a244956af099b2652b2b");
+/// Base `StateView` periphery contract.
+pub const BASE_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
+    address!("a3c0c9b65bad0b08107aa264b0f3db444b867a71");
+
+/// Optimism `PoolManager` singleton.
+pub const OPTIMISM_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
+    address!("9a13f98cb987694c9f086b1f5eb990eea8264ec3");
+/// Optimism `StateView` periphery contract.
+pub const OPTIMISM_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
+    address!("c18a3169788f4f75a170290584eca6395c75ecdb");
+
+/// Polygon `PoolManager` singleton.
+pub const POLYGON_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
+    address!("67366782805870060151383f4bbff9dab53e5cd6");
+/// Polygon `StateView` periphery contract.
+pub const POLYGON_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
+    address!("5ea1bd7974c8a611cbab0bdcafcb1d9cc9b3ba5a");
+
+/// BNB Chain `PoolManager` singleton.
+pub const BNB_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
+    address!("28e2ea090877bf75740558f6bfb36a5ffee9e9df");
+/// BNB Chain `StateView` periphery contract.
+pub const BNB_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
+    address!("d13dd3d6e93f276fafc9db9e6bb47c1180aee0c4");
+
+/// Avalanche `PoolManager` singleton.
+pub const AVALANCHE_UNISWAP_V4_POOL_MANAGER_ADDRESS: Address =
+    address!("06380c0e0912312b5150364b9dc4542ba0dbbc85");
+/// Avalanche `StateView` periphery contract.
+pub const AVALANCHE_UNISWAP_V4_STATE_VIEW_ADDRESS: Address =
+    address!("c3c9e198c735a4b97e3e683f391ccbdd60b69286");
+
 /// The high bit of a `uint24` fee marks a pool whose fee is set dynamically by its hook rather than
 /// being a fixed value. Such pools fall outside the constant-fee swap math, so the fixed-fee path
 /// must reject them.
@@ -181,6 +216,26 @@ pub fn v4_deployment(chain: ChainKey) -> Option<V4Deployment> {
             pool_manager: ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
             state_view: ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS,
         }),
+        ChainKey::Base => Some(V4Deployment {
+            pool_manager: BASE_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: BASE_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
+        ChainKey::Optimism => Some(V4Deployment {
+            pool_manager: OPTIMISM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: OPTIMISM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
+        ChainKey::Polygon => Some(V4Deployment {
+            pool_manager: POLYGON_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: POLYGON_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
+        ChainKey::Bnb => Some(V4Deployment {
+            pool_manager: BNB_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: BNB_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
+        ChainKey::Avalanche => Some(V4Deployment {
+            pool_manager: AVALANCHE_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            state_view: AVALANCHE_UNISWAP_V4_STATE_VIEW_ADDRESS,
+        }),
     }
 }
 
@@ -269,6 +324,31 @@ mod tests {
                 ChainKey::Arbitrum,
                 ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
                 ARBITRUM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+            (
+                ChainKey::Base,
+                BASE_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                BASE_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+            (
+                ChainKey::Optimism,
+                OPTIMISM_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                OPTIMISM_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+            (
+                ChainKey::Polygon,
+                POLYGON_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                POLYGON_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+            (
+                ChainKey::Bnb,
+                BNB_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                BNB_UNISWAP_V4_STATE_VIEW_ADDRESS,
+            ),
+            (
+                ChainKey::Avalanche,
+                AVALANCHE_UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                AVALANCHE_UNISWAP_V4_STATE_VIEW_ADDRESS,
             ),
         ] {
             let deployment = v4_deployment(chain).expect("chain has a v4 deployment");

@@ -8,7 +8,7 @@ use client_evm::{
 use crate::{
     app::start_runtime,
     logger::Logger,
-    utils::{CliError, load_config_with, metadata_cache_path_with},
+    utils::{CliError, load_config_with, metadata_cache_path_with, summarize_endpoints},
     view::View,
 };
 
@@ -29,6 +29,10 @@ fn run() -> Result<(), CliError> {
         |prompt| prompt_for_key(prompt),
     )?;
 
+    // Captured before `resolved.rpc_ws` is moved into the subscription channel below, then logged once
+    // the run logger exists so the live provider composition lands alongside the bootstrap events.
+    let startup_summary = summarize_endpoints(&resolved);
+
     let endpoints = assemble_chain_endpoints(&resolved.rpc_http).map_err(endpoint_config_error)?;
     let subscriptions = ChainSubscriptions::new(resolved.rpc_ws).map_err(endpoint_config_error)?;
     // Empty when no subgraph is configured (or its key was skipped), in which case v4 metadata
@@ -39,6 +43,9 @@ fn run() -> Result<(), CliError> {
     let logger = Logger::create_for_run().map_err(|error| CliError::LogInitFailed {
         message: error.to_string(),
     })?;
+    for line in &startup_summary {
+        logger.log(line);
+    }
     let view = View::for_run();
     let handle = start_runtime(
         subscriptions,

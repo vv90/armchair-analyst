@@ -1,9 +1,13 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
     ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS,
-    AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints,
+    AVALANCHE_USDC_TOKEN_ADDRESS,
+    AnyIssuedRequest, AnyRequestId, BlockHash, BASE_NATIVE_TOKEN_ADDRESS, BASE_USDC_TOKEN_ADDRESS,
+    BASE_WETH_TOKEN_ADDRESS, BNB_USDC_TOKEN_ADDRESS, ChainEndpoints,
     ChainKey, ChainSubscriptions, ClientEvent, ClientEvmError, ClientHead,
     ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
+    OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
+    POLYGON_USDC_TOKEN_ADDRESS,
     GraphEndpoints, MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadata,
     PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult, bootstrap,
     fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
@@ -629,21 +633,41 @@ fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddre
 /// so both orderings of each pair are registered; the optimizer ignores a bridge whose endpoints
 /// aren't yet present, so an entry is harmless before its tokens have reported.
 ///
-/// * Cross-chain USDC: lets the single `init_asset` (Ethereum USDC) traverse Arbitrum pools and close
-///   cross-chain cycles back to it.
+/// * Cross-chain USDC: lets the single `init_asset` (Ethereum USDC) traverse every other chain's pools
+///   and close cross-chain cycles back to it. Ethereum USDC is the hub; each chain's native USDC bridges
+///   to and from it, so all chains' USDC are mutually reachable.
 /// * Native ETH ↔ WETH: wrapping is 1:1, so this unifies v4 native-ETH pools (`token0 = address(0)`)
 ///   with v3 WETH liquidity; without it, native-ETH pools would be an isolated island in the graph.
-///   Registered per chain (Ethereum and Arbitrum) — native ETH and WETH are distinct `(Address,
-///   ChainKey)` tokens on each chain, and there is intentionally no cross-chain ETH bridge (only USDC
-///   connects the chains).
+///   Registered per chain (native ETH and WETH are distinct `(Address, ChainKey)` tokens on each chain),
+///   and there is intentionally no cross-chain ETH bridge (only USDC connects the chains). This bridge
+///   is registered ONLY for chains whose native gas token is ETH (Ethereum, Arbitrum, Base, Optimism).
+///   Polygon (POL), BNB (BNB) and Avalanche (AVAX) have a non-ETH native token, so their `WETH` is an
+///   ordinary bridged ERC20 that is NOT 1:1 with the native token — bridging it to native would be wrong,
+///   so it is omitted and that liquidity connects through pools instead.
 fn default_optimization_bridges() -> HashSet<(TokenAddress, TokenAddress)> {
     HashSet::from([
+        // Cross-chain USDC hub (Ethereum USDC ⇄ each chain).
         (ETHEREUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS),
         (ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        (ETHEREUM_USDC_TOKEN_ADDRESS, BASE_USDC_TOKEN_ADDRESS),
+        (BASE_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        (ETHEREUM_USDC_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS),
+        (OPTIMISM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        (ETHEREUM_USDC_TOKEN_ADDRESS, POLYGON_USDC_TOKEN_ADDRESS),
+        (POLYGON_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        (ETHEREUM_USDC_TOKEN_ADDRESS, BNB_USDC_TOKEN_ADDRESS),
+        (BNB_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        (ETHEREUM_USDC_TOKEN_ADDRESS, AVALANCHE_USDC_TOKEN_ADDRESS),
+        (AVALANCHE_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        // Native ETH ↔ WETH, only on ETH-native chains.
         (ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
         (ETHEREUM_WETH_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS),
         (ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS),
         (ARBITRUM_WETH_TOKEN_ADDRESS, ARBITRUM_NATIVE_TOKEN_ADDRESS),
+        (BASE_NATIVE_TOKEN_ADDRESS, BASE_WETH_TOKEN_ADDRESS),
+        (BASE_WETH_TOKEN_ADDRESS, BASE_NATIVE_TOKEN_ADDRESS),
+        (OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS),
+        (OPTIMISM_WETH_TOKEN_ADDRESS, OPTIMISM_NATIVE_TOKEN_ADDRESS),
     ])
 }
 

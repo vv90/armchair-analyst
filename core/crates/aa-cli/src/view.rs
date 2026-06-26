@@ -145,6 +145,11 @@ fn format_chain(chain: ChainKey) -> &'static str {
     match chain {
         ChainKey::Ethereum => "Ethereum",
         ChainKey::Arbitrum => "Arbitrum",
+        ChainKey::Base => "Base",
+        ChainKey::Optimism => "Optimism",
+        ChainKey::Polygon => "Polygon",
+        ChainKey::Bnb => "BNB Chain",
+        ChainKey::Avalanche => "Avalanche",
     }
 }
 

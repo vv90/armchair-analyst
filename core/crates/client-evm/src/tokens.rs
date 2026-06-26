@@ -35,6 +35,86 @@ pub const ARBITRUM_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
     ChainKey::Arbitrum,
 );
 
+// --- Base ---------------------------------------------------------------------------------------
+
+/// Circle native USDC on Base.
+pub const BASE_USDC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+    ChainKey::Base,
+);
+/// Native ETH on Base (the chain's gas token), denoted by the zero address; 18 decimals intrinsically.
+pub const BASE_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Base);
+/// Canonical Wrapped Ether (WETH) on Base, bridged 1:1 to [`BASE_NATIVE_TOKEN_ADDRESS`].
+pub const BASE_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("4200000000000000000000000000000000000006"),
+    ChainKey::Base,
+);
+
+// --- Optimism -----------------------------------------------------------------------------------
+
+/// Circle native USDC on Optimism (not the bridged USDC.e).
+pub const OPTIMISM_USDC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("0b2C639c533813f4Aa9D7837CAf62653d097Ff85"),
+    ChainKey::Optimism,
+);
+/// Native ETH on Optimism, denoted by the zero address; 18 decimals intrinsically.
+pub const OPTIMISM_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Optimism);
+/// Canonical Wrapped Ether (WETH) on Optimism, bridged 1:1 to [`OPTIMISM_NATIVE_TOKEN_ADDRESS`].
+pub const OPTIMISM_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("4200000000000000000000000000000000000006"),
+    ChainKey::Optimism,
+);
+
+// --- Polygon ------------------------------------------------------------------------------------
+
+/// Circle native USDC on Polygon (not the bridged USDC.e at 0x2791…).
+pub const POLYGON_USDC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+    ChainKey::Polygon,
+);
+/// Polygon's native gas token is POL (zero address, 18 decimals) — *not* ETH. WETH below is a bridged
+/// ERC20, so unlike the rollups it is not 1:1 with the native token; it is the wrapped-ETH anchor only.
+pub const POLYGON_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Polygon);
+/// Bridged Wrapped Ether (WETH) on Polygon.
+pub const POLYGON_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"),
+    ChainKey::Polygon,
+);
+
+// --- BNB Chain ----------------------------------------------------------------------------------
+
+/// USDC on BNB Chain. Note: 18 decimals here (not 6) — decimals are resolved via on-chain metadata,
+/// so this address constant carries no decimals assumption.
+pub const BNB_USDC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"),
+    ChainKey::Bnb,
+);
+/// BNB Chain's native gas token is BNB (zero address, 18 decimals) — *not* ETH. WETH below is a bridged
+/// ERC20 (Binance-Peg ETH), so it is not 1:1 with the native token.
+pub const BNB_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Bnb);
+/// Bridged Wrapped Ether (Binance-Peg ETH) on BNB Chain.
+pub const BNB_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("2170Ed0880ac9A755fd29B2688956BD959F933F8"),
+    ChainKey::Bnb,
+);
+
+// --- Avalanche ----------------------------------------------------------------------------------
+
+/// Circle native USDC on Avalanche C-Chain.
+pub const AVALANCHE_USDC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("B97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"),
+    ChainKey::Avalanche,
+);
+/// Avalanche's native gas token is AVAX (zero address, 18 decimals) — *not* ETH. WETH.e below is a
+/// bridged ERC20, so it is not 1:1 with the native token.
+pub const AVALANCHE_NATIVE_TOKEN_ADDRESS: TokenAddress =
+    TokenAddress(Address::ZERO, ChainKey::Avalanche);
+/// Bridged Wrapped Ether (WETH.e) on Avalanche C-Chain.
+pub const AVALANCHE_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
+    address!("49D5c2BdFfac6CE2BFdB6640F4F80f226bc10bAB"),
+    ChainKey::Avalanche,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +177,47 @@ mod tests {
                 ChainKey::Arbitrum
             )
         );
+    }
+
+    #[test]
+    fn added_chain_token_anchors_are_tagged_to_their_chain() {
+        for (usdc, native, weth, chain) in [
+            (
+                BASE_USDC_TOKEN_ADDRESS,
+                BASE_NATIVE_TOKEN_ADDRESS,
+                BASE_WETH_TOKEN_ADDRESS,
+                ChainKey::Base,
+            ),
+            (
+                OPTIMISM_USDC_TOKEN_ADDRESS,
+                OPTIMISM_NATIVE_TOKEN_ADDRESS,
+                OPTIMISM_WETH_TOKEN_ADDRESS,
+                ChainKey::Optimism,
+            ),
+            (
+                POLYGON_USDC_TOKEN_ADDRESS,
+                POLYGON_NATIVE_TOKEN_ADDRESS,
+                POLYGON_WETH_TOKEN_ADDRESS,
+                ChainKey::Polygon,
+            ),
+            (
+                BNB_USDC_TOKEN_ADDRESS,
+                BNB_NATIVE_TOKEN_ADDRESS,
+                BNB_WETH_TOKEN_ADDRESS,
+                ChainKey::Bnb,
+            ),
+            (
+                AVALANCHE_USDC_TOKEN_ADDRESS,
+                AVALANCHE_NATIVE_TOKEN_ADDRESS,
+                AVALANCHE_WETH_TOKEN_ADDRESS,
+                ChainKey::Avalanche,
+            ),
+        ] {
+            assert_eq!(usdc.1, chain);
+            assert_eq!(weth.1, chain);
+            assert_eq!(native, TokenAddress(Address::ZERO, chain));
+            assert_ne!(usdc.0, Address::ZERO);
+            assert_ne!(weth.0, Address::ZERO);
+        }
     }
 }

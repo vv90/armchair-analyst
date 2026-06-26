@@ -15,12 +15,31 @@ use crate::ChainKey;
 pub const ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS: Address =
     address!("1F98431c8aD98523631AE4a59f267346ea31F984");
 
+/// Base's Uniswap v3 factory — a chain-specific deployment, *not* the canonical address.
+pub const BASE_UNISWAP_V3_FACTORY_ADDRESS: Address =
+    address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
+
+/// BNB Chain's Uniswap v3 factory — a chain-specific deployment, *not* the canonical address.
+pub const BNB_UNISWAP_V3_FACTORY_ADDRESS: Address =
+    address!("dB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7");
+
+/// Avalanche's Uniswap v3 factory — a chain-specific deployment, *not* the canonical address.
+pub const AVALANCHE_UNISWAP_V3_FACTORY_ADDRESS: Address =
+    address!("740b1c1de25031C31FF4fC9A62f554A55cdC1baD");
+
 /// The Uniswap v3 factory address for a chain — the single chain-keyed source of truth used to validate
-/// discovered v3 pools. Both currently active chains share the canonical deterministic deployment; a
-/// future chain with a different factory is added here, not by reusing a per-chain constant elsewhere.
+/// discovered v3 pools. Ethereum, Arbitrum, Optimism and Polygon share the canonical deterministic
+/// deployment; Base, BNB and Avalanche each deploy their own. A future chain with a different factory is
+/// added here, not by reusing a per-chain constant elsewhere.
 pub fn v3_factory_address(chain: ChainKey) -> Address {
     match chain {
-        ChainKey::Ethereum | ChainKey::Arbitrum => ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS,
+        ChainKey::Ethereum
+        | ChainKey::Arbitrum
+        | ChainKey::Optimism
+        | ChainKey::Polygon => ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS,
+        ChainKey::Base => BASE_UNISWAP_V3_FACTORY_ADDRESS,
+        ChainKey::Bnb => BNB_UNISWAP_V3_FACTORY_ADDRESS,
+        ChainKey::Avalanche => AVALANCHE_UNISWAP_V3_FACTORY_ADDRESS,
     }
 }
 
@@ -159,7 +178,36 @@ mod tests {
     #[test]
     fn v3_factory_address_is_known_for_every_active_chain() {
         for &chain in crate::ACTIVE_CHAINS {
-            assert_eq!(v3_factory_address(chain), ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS);
+            assert_ne!(
+                v3_factory_address(chain),
+                Address::ZERO,
+                "missing v3 factory for {chain:?}"
+            );
         }
+    }
+
+    #[test]
+    fn v3_factory_address_matches_per_chain_deployments() {
+        assert_eq!(
+            v3_factory_address(ChainKey::Base),
+            BASE_UNISWAP_V3_FACTORY_ADDRESS
+        );
+        assert_eq!(
+            v3_factory_address(ChainKey::Bnb),
+            BNB_UNISWAP_V3_FACTORY_ADDRESS
+        );
+        assert_eq!(
+            v3_factory_address(ChainKey::Avalanche),
+            AVALANCHE_UNISWAP_V3_FACTORY_ADDRESS
+        );
+        // Optimism and Polygon share the canonical deterministic deployment.
+        assert_eq!(
+            v3_factory_address(ChainKey::Optimism),
+            ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS
+        );
+        assert_eq!(
+            v3_factory_address(ChainKey::Polygon),
+            ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS
+        );
     }
 }

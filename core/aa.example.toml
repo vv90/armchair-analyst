@@ -15,8 +15,9 @@
 # WebSocket subscription channel uses a SINGLE connection per chain — the highest-weight [[rpc]] entry
 # that declares a `ws` wins that chain's subscription slot.
 #
-# Every active chain (ethereum, arbitrum) MUST end up with at least one HTTP endpoint and one WS URL,
-# or startup fails.
+# Every active chain (ethereum, arbitrum, base, optimism, polygon, bnb, avalanche) MUST end up with at
+# least one HTTP endpoint and one WS URL, or startup fails. The per-chain table key (e.g. `bnb`) is the
+# chain's config slug, independent of any provider's own path segment in the URL (dRPC's is `bsc`).
 #
 # API keys: a `{key}` placeholder in any URL is filled from the provider's key — resolved from the env
 # var named by `key_env` (or the derived `AA_RPC_KEY_<NAME>` / `AA_GRAPH_KEY_<NAME>`), and if that is
@@ -35,30 +36,46 @@
 # RPC providers
 # ---------------------------------------------------------------------------------------------------
 
-# dRPC — both chains, HTTP + WebSocket. Highest weight, so it also serves the WS subscription channel.
-# The per-chain URL is `{base}/{network}/{key}`.
+# dRPC — every chain, HTTP + WebSocket. Highest weight, so it also serves the WS subscription channel
+# (the only provider here declaring `ws`, so it wins every chain's single subscription slot). The
+# per-chain URL is `{base}/{network}/{key}`; dRPC's network segment for BNB is `bsc`.
 [[rpc]]
 name = "drpc"
 weight = 3
 key_env = "AA_RPC_KEY_DRPC"
 ethereum = { http = "https://lb.drpc.org/ethereum/{key}", ws = "wss://lb.drpc.org/ethereum/{key}" }
 arbitrum = { http = "https://lb.drpc.org/arbitrum/{key}", ws = "wss://lb.drpc.org/arbitrum/{key}" }
+base = { http = "https://lb.drpc.org/base/{key}", ws = "wss://lb.drpc.org/base/{key}" }
+optimism = { http = "https://lb.drpc.org/optimism/{key}", ws = "wss://lb.drpc.org/optimism/{key}" }
+polygon = { http = "https://lb.drpc.org/polygon/{key}", ws = "wss://lb.drpc.org/polygon/{key}" }
+bnb = { http = "https://lb.drpc.org/bsc/{key}", ws = "wss://lb.drpc.org/bsc/{key}" }
+avalanche = { http = "https://lb.drpc.org/avalanche/{key}", ws = "wss://lb.drpc.org/avalanche/{key}" }
 
-# Alchemy — both chains, HTTP only. Two-chain backbone (30M CU/mo ≈ 1.15M eth_calls, shared).
+# Alchemy — every chain, HTTP only. Shared free CU budget across all chains.
 [[rpc]]
 name = "alchemy"
 weight = 4
 key_env = "AA_RPC_KEY_ALCHEMY"
 ethereum = { http = "https://eth-mainnet.g.alchemy.com/v2/{key}" }
 arbitrum = { http = "https://arb-mainnet.g.alchemy.com/v2/{key}" }
+base = { http = "https://base-mainnet.g.alchemy.com/v2/{key}" }
+optimism = { http = "https://opt-mainnet.g.alchemy.com/v2/{key}" }
+polygon = { http = "https://polygon-mainnet.g.alchemy.com/v2/{key}" }
+bnb = { http = "https://bnb-mainnet.g.alchemy.com/v2/{key}" }
+avalanche = { http = "https://avax-mainnet.g.alchemy.com/v2/{key}" }
 
-# Infura — both chains, HTTP only. Lowest effective free capacity here, so the lowest weight.
+# Infura — every chain, HTTP only. Lowest effective free capacity here, so the lowest weight.
 [[rpc]]
 name = "infura"
 weight = 2
 key_env = "AA_RPC_KEY_INFURA"
 ethereum = { http = "https://mainnet.infura.io/v3/{key}" }
 arbitrum = { http = "https://arbitrum-mainnet.infura.io/v3/{key}" }
+base = { http = "https://base-mainnet.infura.io/v3/{key}" }
+optimism = { http = "https://optimism-mainnet.infura.io/v3/{key}" }
+polygon = { http = "https://polygon-mainnet.infura.io/v3/{key}" }
+bnb = { http = "https://bsc-mainnet.infura.io/v3/{key}" }
+avalanche = { http = "https://avalanche-mainnet.infura.io/v3/{key}" }
 
 # Chainstack — Arbitrum ONLY (free Developer plan = one node), pointed at the bottleneck chain. The HOST
 # is node-specific: paste your node's host from the Chainstack console.
@@ -74,19 +91,36 @@ name = "publicnode"
 weight = 1
 ethereum = { http = "https://ethereum-rpc.publicnode.com" }
 arbitrum = { http = "https://arbitrum-one-rpc.publicnode.com" }
+base = { http = "https://base-rpc.publicnode.com" }
+optimism = { http = "https://optimism-rpc.publicnode.com" }
+polygon = { http = "https://polygon-bor-rpc.publicnode.com" }
+bnb = { http = "https://bsc-rpc.publicnode.com" }
+avalanche = { http = "https://avalanche-c-chain-rpc.publicnode.com" }
 
 # ---------------------------------------------------------------------------------------------------
 # Uniswap v4 subgraphs (optional — omit, or skip the key, to disable v4 metadata resolution)
 # ---------------------------------------------------------------------------------------------------
 
-# The Graph decentralized-network gateway. v4 is supported on Ethereum and Arbitrum; give a per-chain
-# subgraph whose schema matches the query/parser (id, token0{id}, token1{id}, feeTier, tickSpacing,
-# hooks). Replace each <…-deployment-id> with the subgraph you target for that chain. The gateway carries
-# its key in the path, so `{key}` is filled from AA_GRAPH_API_KEY. Add same-schema mirrors (Goldsky,
-# Alchemy Subgraphs, …) as extra [[subgraph]] entries with their own key_env to fail over alongside it.
+# The Graph decentralized-network gateway. v4 is deployed on every active chain; each subgraph below was
+# validated against the exact query/parser schema (id, token0{id}, token1{id}, feeTier, tickSpacing,
+# hooks) by issuing the client's `pools(where:{id_in:[...]})` query through the gateway — all returned a
+# live pool with every field, no indexing errors, synced to head (validated 2026-06-25). Ethereum is the
+# official Uniswap Labs subgraph; the rest are schema-compatible community `uniswap-v4-<chain>`
+# deployments on the decentralized network (the only Uniswap v4 subgraph Uniswap Labs publishes there is
+# Ethereum's). Swap any id you prefer, but re-validate the schema first: several similarly-named
+# subgraphs (e.g. the spaced "Uniswap V4 Ethereum") use an incompatible schema (`Pool` has no `token0`).
+# A chain omitted here simply skips v4 metadata resolution — v4 event discovery still runs. The gateway
+# carries its key in the path, so `{key}` is filled from AA_GRAPH_API_KEY. Add same-schema mirrors as
+# extra [[subgraph]] entries with their own key_env to fail over alongside it.
 [[subgraph]]
 name = "thegraph"
 weight = 3
 key_env = "AA_GRAPH_API_KEY"
-ethereum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/<ethereum-deployment-id>"
-arbitrum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/<arbitrum-deployment-id>"
+# ethereum: official "uniswap-v4-ethereum" (Uniswap Labs); others: community "uniswap-v4-<chain>".
+ethereum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/DiYPVdygkfjDWhbxGSqAQxwBKmfKnkWQojqeM2rkLb3G"
+arbitrum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/G5TsTKNi8yhPSV7kycaE23oWbqv9zzNqR49FoEQjzq1r"
+base = "https://gateway.thegraph.com/api/{key}/subgraphs/id/HNCFA9TyBqpo5qpe6QreQABAA1kV8g46mhkCcicu6v2R"
+optimism = "https://gateway.thegraph.com/api/{key}/subgraphs/id/6RBtsmGUYfeLeZsYyxyKSUiaA6WpuC69shMEQ1Cfuj9u"
+polygon = "https://gateway.thegraph.com/api/{key}/subgraphs/id/CwpebM66AH5uqS5sreKij8yEkkPcHvmyEs7EwFtdM5ND"
+bnb = "https://gateway.thegraph.com/api/{key}/subgraphs/id/EAq1nJKgjnuKH6Gj4RFjCW7LcL7E2uipbncdwV7TTWkX"
+avalanche = "https://gateway.thegraph.com/api/{key}/subgraphs/id/49JxRo9FGxWpSf5Y5GKQPj5NUpX2HhpoZHpGzNEWQZjq"

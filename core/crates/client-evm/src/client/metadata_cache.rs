@@ -140,8 +140,8 @@ impl MetadataCache {
         let table = read.open_table(POOLS_TABLE).map_err(database_error)?;
 
         // Pool keys sort by chain tag first, so a chain's rows (of either protocol and any length)
-        // are exactly the half-open range `[tag] .. [tag + 1]`. The chain tag is 0 or 1, so the
-        // `tag + 1` upper bound never overflows.
+        // are exactly the half-open range `[tag] .. [tag + 1]`. Chain tags are small (one per active
+        // chain), well below `u8::MAX`, so the `tag + 1` upper bound never overflows.
         let tag = chain_tag(chain);
         let lower = [tag];
         let upper = [tag + 1];
@@ -255,6 +255,11 @@ fn chain_tag(chain: ChainKey) -> u8 {
     match chain {
         ChainKey::Ethereum => 0,
         ChainKey::Arbitrum => 1,
+        ChainKey::Base => 2,
+        ChainKey::Optimism => 3,
+        ChainKey::Polygon => 4,
+        ChainKey::Bnb => 5,
+        ChainKey::Avalanche => 6,
     }
 }
 
