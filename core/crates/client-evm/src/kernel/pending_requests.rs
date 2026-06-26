@@ -148,6 +148,18 @@ impl PendingRequests {
         issue_request(self, payload, tick)
     }
 
+    /// Counts the requests in flight across every collection: dispatched RPC requests whose response
+    /// has not yet been folded back in. Read by the read-model observation as the per-chain backlog
+    /// ("inflight") gauge; the whole-pipeline count (queued → executing → on-wire → returning) is a
+    /// more faithful backlog signal than any execution-side counter.
+    pub(crate) fn len(&self) -> usize {
+        self.block_headers.values().count()
+            + self.block_logs.values().count()
+            + self.pool_data.values().count()
+            + self.pool_metadata.values().count()
+            + self.token_metadata.values().count()
+    }
+
     /// Reports whether no request is in flight across any collection. Used to gate the background
     /// pool-state backfill behind an idle priority tier.
     pub(crate) fn is_empty(&self) -> bool {
@@ -275,11 +287,7 @@ impl PendingRequests {
 #[cfg(test)]
 impl PendingRequests {
     pub(crate) fn len_for_test(&self) -> usize {
-        self.block_headers.len()
-            + self.block_logs.len()
-            + self.pool_data.len()
-            + self.pool_metadata.len()
-            + self.token_metadata.len()
+        self.len()
     }
 
     pub(crate) fn is_empty_for_test(&self) -> bool {

@@ -27,6 +27,9 @@ pub struct ChainProgress {
     /// Canonical blocks the tip is ahead of the chain's last dispatched optimization block.
     /// `None` while no optimization has been dispatched or the reference is off the current path.
     pub blocks_behind_tip: Option<usize>,
+    /// RPC requests currently in flight for the chain (dispatched, not yet answered): the per-chain
+    /// fetch-backlog gauge.
+    pub in_flight_requests: usize,
 }
 
 /// A render snapshot of one chain: lifecycle phase plus metrics that exist only while active.
@@ -242,6 +245,7 @@ fn observe_chain(
             verified_pools: chain_state.verified_pool_count(),
             blocks_behind_tip: last_optimized_block
                 .and_then(|reference| chain_state.blocks_behind(reference)),
+            in_flight_requests: chain_state.in_flight_request_count(),
         }),
     }
 }
@@ -1191,6 +1195,7 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 1,
                     blocks_behind_tip: None,
+                    in_flight_requests: 0,
                 })
             )]
         );
@@ -1220,6 +1225,7 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 1,
                     blocks_behind_tip: Some(0),
+                    in_flight_requests: 0,
                 })
             )]
         );

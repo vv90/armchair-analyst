@@ -687,6 +687,12 @@ impl State {
         self.pool_registry.verified_size()
     }
 
+    /// Counts RPC requests currently in flight: dispatched but not yet answered.
+    /// Added so read models can surface per-chain fetch backlog without reaching into the request store.
+    pub(crate) fn in_flight_request_count(&self) -> usize {
+        self.pending_requests.len()
+    }
+
     /// Latest complete pool-state overlay anchored at the current canonical tip.
     /// Added so optimization dispatch can read the tip's fully-fetched pool state without exposing `canonical_tip`.
     pub(crate) fn latest_complete_pool_state_update(

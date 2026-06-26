@@ -159,8 +159,9 @@ fn format_observation(observation: ChainObservation) -> String {
         ChainObservation::Active(ChainProgress {
             verified_pools,
             blocks_behind_tip,
+            in_flight_requests,
         }) => format!(
-            "Active  pools={verified_pools}  behind={}",
+            "Active  pools={verified_pools}  behind={}  inflight={in_flight_requests}",
             format_distance(blocks_behind_tip)
         ),
     }
@@ -206,12 +207,13 @@ mod tests {
             ChainObservation::Active(ChainProgress {
                 verified_pools: 37,
                 blocks_behind_tip: Some(2),
+                in_flight_requests: 5,
             }),
         )];
 
         assert_eq!(
             format_lines(&observations, None),
-            vec!["Ethereum: Active  pools=37  behind=2"]
+            vec!["Ethereum: Active  pools=37  behind=2  inflight=5"]
         );
     }
 
@@ -222,12 +224,13 @@ mod tests {
             ChainObservation::Active(ChainProgress {
                 verified_pools: 0,
                 blocks_behind_tip: None,
+                in_flight_requests: 0,
             }),
         )];
 
         assert_eq!(
             format_lines(&observations, None),
-            vec!["Ethereum: Active  pools=0  behind=?"]
+            vec!["Ethereum: Active  pools=0  behind=?  inflight=0"]
         );
     }
 

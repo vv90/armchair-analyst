@@ -14,7 +14,8 @@ use client_evm::{
     fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
     fetch_v4_pool_metadata, kernel,
     multi_chain_kernel::{
-        Effect, Event, OptimizationPoolReserves, State, Subscription, SubscriptionData, transition,
+        ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, State,
+        Subscription, SubscriptionData, transition,
     },
     subscribe_new_heads, subscribe_pool_events,
 };
@@ -24,7 +25,11 @@ use optimization::{
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{OnceLock, mpsc::Sender},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::Sender,
+    },
     thread::{self, JoinHandle},
     time,
 };
@@ -49,6 +54,9 @@ pub(crate) struct ClientEvmRuntime {
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
     view: View,
     logger: Logger,
+    /// Wall-clock millis of the last emitted gauge line, throttling it to roughly once per second so
+    /// the per-chain backlog snapshot lands in the log without per-transition spam.
+    last_gauge_millis: AtomicU64,
 }
 
 impl ClientEvmRuntime {
@@ -69,6 +77,7 @@ impl ClientEvmRuntime {
             optimization_sender: OnceLock::new(),
             view,
             logger,
+            last_gauge_millis: AtomicU64::new(0),
         }
     }
 
@@ -275,10 +284,28 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
 
     fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
         self.view.render(state);
+        self.log_gauge(state);
     }
 }
 
+/// Minimum gap between gauge lines. `observe_state` runs on every transition, so without this the
+/// gauge would be emitted thousands of times a second.
+const GAUGE_INTERVAL_MILLIS: u64 = 1000;
+
 impl ClientEvmRuntime {
+    /// Emits a single per-chain backlog snapshot (`behind` / `pools` / `inflight`) to the log, at most
+    /// once per [`GAUGE_INTERVAL_MILLIS`]. Runs on the single transition thread, so the throttle needs
+    /// no synchronization beyond interior mutability.
+    fn log_gauge(&self, state: &State) {
+        let now = now_millis();
+        if now.saturating_sub(self.last_gauge_millis.load(Ordering::Relaxed)) < GAUGE_INTERVAL_MILLIS
+        {
+            return;
+        }
+        self.last_gauge_millis.store(now, Ordering::Relaxed);
+        self.logger.log(&format_gauge_log(&state.observe()));
+    }
+
     fn send_optimization_input(&self, input: OptimizationPoolReserves) {
         if input.reserves.is_empty() {
             return;
@@ -348,6 +375,42 @@ fn format_run_optimization_effect_log(input: &OptimizationPoolReserves) -> Strin
         "effect run_optimization blocks={blocks} reserves={}",
         input.reserves.len()
     )
+}
+
+/// Wall-clock millis since the Unix epoch, used only to throttle the gauge line.
+fn now_millis() -> u64 {
+    time::SystemTime::now()
+        .duration_since(time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Renders one `gauge` line: a per-chain backlog snapshot. Active chains carry `behind`/`pools`/
+/// `inflight`; bootstrapping chains render as `init`. Pure so it can be unit-tested off a synthetic
+/// observation set.
+fn format_gauge_log(observations: &[(ChainKey, ChainObservation)]) -> String {
+    let segments = observations
+        .iter()
+        .map(|(chain, observation)| match observation {
+            ChainObservation::Initializing => format!("{chain:?}=init"),
+            ChainObservation::Active(ChainProgress {
+                verified_pools,
+                blocks_behind_tip,
+                in_flight_requests,
+            }) => {
+                let behind = match blocks_behind_tip {
+                    Some(distance) => distance.to_string(),
+                    None => "?".to_owned(),
+                };
+                format!(
+                    "{chain:?}=active behind={behind} pools={verified_pools} inflight={in_flight_requests}"
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+
+    format!("gauge {segments}")
 }
 
 fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> String {
@@ -917,6 +980,35 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn format_gauge_log_renders_active_and_initializing_chains() {
+        let observations = vec![
+            (
+                ChainKey::Ethereum,
+                ChainObservation::Active(ChainProgress {
+                    verified_pools: 37,
+                    blocks_behind_tip: Some(4),
+                    in_flight_requests: 12,
+                }),
+            ),
+            (ChainKey::Base, ChainObservation::Initializing),
+            (
+                ChainKey::Arbitrum,
+                ChainObservation::Active(ChainProgress {
+                    verified_pools: 0,
+                    blocks_behind_tip: None,
+                    in_flight_requests: 0,
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            format_gauge_log(&observations),
+            "gauge Ethereum=active behind=4 pools=37 inflight=12  Base=init  \
+             Arbitrum=active behind=? pools=0 inflight=0"
+        );
+    }
 
     #[test]
     fn runtime_constructor_stores_subscriptions() {

@@ -14,6 +14,10 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct Logger {
     sender: Sender<String>,
+    /// Wall-clock millis when the run started; every line is stamped with its offset from here so
+    /// latency can be read straight off the log. The absolute base is in the `run started_millis=…`
+    /// header.
+    started_millis: u128,
 }
 
 impl Logger {
@@ -26,13 +30,17 @@ impl Logger {
     /// A logger that discards everything it is given. Used by tests.
     pub(crate) fn sink() -> Logger {
         let (sender, _receiver) = mpsc::channel();
-        Logger { sender }
+        Logger {
+            sender,
+            started_millis: 0,
+        }
     }
 
-    /// Enqueues a line for the writer thread. Never blocks and never panics;
-    /// if the writer is gone the line is silently dropped.
+    /// Enqueues a line for the writer thread, prefixed with `t=<millis since run start>` so the log
+    /// carries timing. Never blocks and never panics; if the writer is gone the line is dropped.
     pub(crate) fn log(&self, line: &str) {
-        let _ = self.sender.send(line.to_owned());
+        let offset = unix_millis().saturating_sub(self.started_millis);
+        let _ = self.sender.send(format!("t={offset} {line}"));
     }
 }
 
@@ -48,7 +56,10 @@ fn create_in(dir: &Path) -> io::Result<Logger> {
 
     let (sender, _handle) = spawn_writer(file);
 
-    Ok(Logger { sender })
+    Ok(Logger {
+        sender,
+        started_millis,
+    })
 }
 
 fn spawn_writer(mut file: File) -> (Sender<String>, JoinHandle<()>) {
@@ -86,14 +97,46 @@ mod tests {
     #[test]
     fn log_forwards_lines_to_the_channel_in_order() {
         let (sender, receiver) = mpsc::channel();
-        let logger = Logger { sender };
+        let logger = Logger {
+            sender,
+            started_millis: 0,
+        };
 
         logger.log("first");
         logger.log("second");
         drop(logger);
 
         let lines = receiver.iter().collect::<Vec<_>>();
-        assert_eq!(lines, vec!["first".to_owned(), "second".to_owned()]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("t="), "missing timestamp: {}", lines[0]);
+        assert!(lines[0].ends_with(" first"), "unexpected line: {}", lines[0]);
+        assert!(lines[1].ends_with(" second"), "unexpected line: {}", lines[1]);
+    }
+
+    #[test]
+    fn log_stamps_each_line_with_a_non_decreasing_offset() {
+        let (sender, receiver) = mpsc::channel();
+        let logger = Logger {
+            sender,
+            started_millis: 0,
+        };
+
+        logger.log("first");
+        logger.log("second");
+        drop(logger);
+
+        let offsets = receiver
+            .iter()
+            .map(|line| {
+                line.strip_prefix("t=")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|millis| millis.parse::<u128>().ok())
+                    .expect("each line carries a numeric t= offset")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(offsets.len(), 2);
+        assert!(offsets[1] >= offsets[0], "offsets went backwards: {offsets:?}");
     }
 
     #[test]
