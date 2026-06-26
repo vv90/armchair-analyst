@@ -230,22 +230,38 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     ) {
         match subscription {
             Subscription::NewHeadsSubscription(chain) => {
-                let map_client_event = |client_event: ClientEvent| {
-                    map_client_subscription_data(client_event)
-                        .map(|data| Event::SubscriptionData { chain, data })
+                let ws_url = match self.subscriptions().ws(chain) {
+                    Ok(ws_url) => ws_url,
+                    Err(error) => {
+                        self.logger.log(&format!(
+                            "error chain={chain:?} subscription_ws_unavailable kind=new_heads error={error}"
+                        ));
+                        return;
+                    }
                 };
-                if let Ok(ws_url) = self.subscriptions().ws(chain) {
-                    let _ = subscribe_new_heads(ws_url, sender, map_client_event);
-                }
+                self.reconnect_loop(chain, "new_heads", || {
+                    subscribe_new_heads(ws_url, sender, |client_event| {
+                        map_client_subscription_data(client_event)
+                            .map(|data| Event::SubscriptionData { chain, data })
+                    })
+                });
             }
             Subscription::PoolEventsSubscription(chain) => {
-                let map_client_event = |client_event: ClientEvent| {
-                    map_client_subscription_data(client_event)
-                        .map(|data| Event::SubscriptionData { chain, data })
+                let ws_url = match self.subscriptions().ws(chain) {
+                    Ok(ws_url) => ws_url,
+                    Err(error) => {
+                        self.logger.log(&format!(
+                            "error chain={chain:?} subscription_ws_unavailable kind=pool_events error={error}"
+                        ));
+                        return;
+                    }
                 };
-                if let Ok(ws_url) = self.subscriptions().ws(chain) {
-                    let _ = subscribe_pool_events(ws_url, sender, map_client_event);
-                }
+                self.reconnect_loop(chain, "pool_events", || {
+                    subscribe_pool_events(ws_url, sender, |client_event| {
+                        map_client_subscription_data(client_event)
+                            .map(|data| Event::SubscriptionData { chain, data })
+                    })
+                });
             }
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
@@ -292,7 +308,68 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
 /// gauge would be emitted thousands of times a second.
 const GAUGE_INTERVAL_MILLIS: u64 = 1000;
 
+/// First wait after a subscription drops, and the value the backoff resets to after a healthy run.
+const RECONNECT_BASE: time::Duration = time::Duration::from_millis(250);
+/// Ceiling for the exponential backoff so a persistently-failing endpoint is retried steadily.
+const RECONNECT_CAP: time::Duration = time::Duration::from_secs(30);
+/// A subscription that ran at least this long counts as healthy, so its next drop reconnects fast
+/// instead of inheriting a grown backoff.
+const RECONNECT_STABILITY_WINDOW: time::Duration = time::Duration::from_secs(10);
+
+/// Backoff after a subscription attempt returns. A run that lasted at least the stability window is
+/// treated as healthy and resets to [`RECONNECT_BASE`]; otherwise the previous delay doubles up to
+/// [`RECONNECT_CAP`] (or starts at the base on the first drop). Pure so the policy is unit-tested
+/// without opening a socket.
+fn next_reconnect_delay(previous: Option<time::Duration>, ran_for: time::Duration) -> time::Duration {
+    if ran_for >= RECONNECT_STABILITY_WINDOW {
+        return RECONNECT_BASE;
+    }
+    match previous {
+        None => RECONNECT_BASE,
+        Some(previous) => (previous * 2).min(RECONNECT_CAP),
+    }
+}
+
 impl ClientEvmRuntime {
+    /// Runs a WebSocket subscription forever, reconnecting with [`next_reconnect_delay`] backoff when
+    /// it drops. `attempt` performs one connect-and-stream cycle (one of `subscribe_new_heads` /
+    /// `subscribe_pool_events`) and returns when the socket closes (`Ok`) or fails (`Err`) — either
+    /// way we reconnect, so a free-tier idle-timeout no longer kills a chain's feed for good. Never
+    /// returns; it owns the subscription thread for the life of the process.
+    fn reconnect_loop(
+        &self,
+        chain: ChainKey,
+        kind: &str,
+        mut attempt: impl FnMut() -> Result<(), ClientEvmError>,
+    ) {
+        let mut previous_delay: Option<time::Duration> = None;
+        let mut connects: u64 = 0;
+        loop {
+            connects += 1;
+            self.logger.log(&format!(
+                "subscription chain={chain:?} kind={kind} connecting attempt={connects}"
+            ));
+
+            let started = time::Instant::now();
+            let outcome = attempt();
+            let ran_for = started.elapsed();
+
+            let reason = match &outcome {
+                Ok(()) => "closed".to_owned(),
+                Err(error) => format!("error: {error}"),
+            };
+            let delay = next_reconnect_delay(previous_delay, ran_for);
+            self.logger.log(&format!(
+                "subscription chain={chain:?} kind={kind} disconnected ran_ms={} reason={reason} reconnect_in_ms={}",
+                ran_for.as_millis(),
+                delay.as_millis()
+            ));
+
+            thread::sleep(delay);
+            previous_delay = Some(delay);
+        }
+    }
+
     /// Emits a single per-chain backlog snapshot (`behind` / `pools` / `inflight`) to the log, at most
     /// once per [`GAUGE_INTERVAL_MILLIS`]. Runs on the single transition thread, so the throttle needs
     /// no synchronization beyond interior mutability.
@@ -980,6 +1057,31 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn next_reconnect_delay_starts_at_base_then_doubles_to_the_cap() {
+        let short = Duration::from_millis(0);
+
+        // First drop: base, no prior delay.
+        let first = next_reconnect_delay(None, short);
+        assert_eq!(first, RECONNECT_BASE);
+
+        // Consecutive short-lived drops double the delay until the cap, then stay there.
+        let mut delay = first;
+        for _ in 0..20 {
+            delay = next_reconnect_delay(Some(delay), short);
+            assert!(delay <= RECONNECT_CAP, "delay exceeded cap: {delay:?}");
+        }
+        assert_eq!(delay, RECONNECT_CAP);
+    }
+
+    #[test]
+    fn next_reconnect_delay_resets_to_base_after_a_healthy_run() {
+        let grown = RECONNECT_CAP;
+        let healthy = RECONNECT_STABILITY_WINDOW;
+
+        assert_eq!(next_reconnect_delay(Some(grown), healthy), RECONNECT_BASE);
+    }
 
     #[test]
     fn format_gauge_log_renders_active_and_initializing_chains() {

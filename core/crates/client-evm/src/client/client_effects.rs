@@ -11,7 +11,7 @@ use alloy::{
     rpc::types::Log,
     sol_types::SolCall,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
@@ -174,15 +174,45 @@ fn aggregate3_batched(
 
 type BlockingWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-#[derive(Debug, Deserialize)]
-struct SubscriptionDataParams<T> {
-    subscription: String,
-    result: T,
-}
+/// Classifies one raw JSON-RPC text frame read from a live subscription socket.
+///
+/// Providers interleave non-notification frames onto the same socket — subscribe acks, keepalives,
+/// and responses that carry `id`/`result` instead of `params`. Those are harmless and must be
+/// **skipped**, not treated as fatal, mirroring the tolerant handshake in
+/// [`parse_subscription_response`]. Returns:
+/// - `Ok(None)` when the frame is not a notification for `subscription_id` (skip it);
+/// - `Ok(Some(result))` for a matching notification whose payload decodes into `T`;
+/// - `Err(_)` only when a notification for our subscription carries a malformed payload.
+fn parse_subscription_notification<T>(
+    value: &Value,
+    subscription_id: &str,
+) -> Result<Option<T>, ClientEvmError>
+where
+    T: DeserializeOwned,
+{
+    let Some(params) = value.get("params") else {
+        return Ok(None);
+    };
 
-#[derive(Debug, Deserialize)]
-struct SubscriptionNotification<T> {
-    params: SubscriptionDataParams<T>,
+    if params.get("subscription").and_then(Value::as_str) != Some(subscription_id) {
+        return Ok(None);
+    }
+
+    let Some(result) = params.get("result") else {
+        return Err(ClientEvmError::MalformedResponse {
+            context: "subscription".to_owned(),
+            detail: "notification missing params.result".to_owned(),
+        });
+    };
+
+    let decoded = serde_json::from_value::<T>(result.clone()).map_err(|error| {
+        ClientEvmError::MalformedResponse {
+            context: "subscription".to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
+
+    Ok(Some(decoded))
 }
 
 pub fn fetch_block_header(
@@ -812,9 +842,7 @@ where
     F: Fn(ClientEvent) -> Option<T>,
 {
     loop {
-        let Some(sub_notification) =
-            read_json_rpc_message::<SubscriptionNotification<ClientHead>>(socket)?
-        else {
+        let Some(value) = read_json_rpc_message::<Value>(socket)? else {
             send_event(
                 sender,
                 ClientEvent::Closed {
@@ -825,19 +853,16 @@ where
             return Ok(());
         };
 
-        if sub_notification.params.subscription != subscription_id {
-            println!(
-                "Received notification for unexpected subscription: {}. Expected: {}. Ignoring.",
-                sub_notification.params.subscription, subscription_id
-            );
+        let Some(header) = parse_subscription_notification::<ClientHead>(&value, subscription_id)?
+        else {
             continue;
-        }
+        };
 
         send_event(
             sender,
             ClientEvent::NewHead {
-                subscription_id: sub_notification.params.subscription,
-                header: sub_notification.params.result,
+                subscription_id: subscription_id.to_owned(),
+                header,
             },
             map_event,
         )?;
@@ -884,9 +909,7 @@ where
     F: Fn(ClientEvent) -> Option<T>,
 {
     loop {
-        let Some(sub_notification) =
-            read_json_rpc_message::<SubscriptionNotification<Log>>(socket)?
-        else {
+        let Some(value) = read_json_rpc_message::<Value>(socket)? else {
             send_event(
                 sender,
                 ClientEvent::Closed {
@@ -897,11 +920,10 @@ where
             return Ok(());
         };
 
-        if sub_notification.params.subscription != subscription_id {
+        let Some(log) = parse_subscription_notification::<Log>(&value, subscription_id)? else {
             continue;
-        }
+        };
 
-        let log = sub_notification.params.result;
         // Drop logs we cannot attribute to a block or that are not state-relevant pool events.
         let (Some(block_hash), Some(pool_log)) = (log.block_hash, decode_pool_log(&log)) else {
             continue;
@@ -910,7 +932,7 @@ where
         send_event(
             sender,
             ClientEvent::PoolLogObserved {
-                subscription_id: sub_notification.params.subscription,
+                subscription_id: subscription_id.to_owned(),
                 block_hash,
                 log: pool_log,
             },
@@ -2056,35 +2078,31 @@ mod tests {
 
     #[test]
     fn new_head_notification_preserves_header_fields() {
-        let result =
-            serde_json::from_value::<SubscriptionNotification<ClientHead>>(new_head_notification());
+        let result = parse_subscription_notification::<ClientHead>(
+            &new_head_notification(),
+            "0xsubscription",
+        );
 
         assert!(matches!(
             result,
-            Ok(SubscriptionNotification {
-                params: SubscriptionDataParams {
-                    subscription,
-                    result,
-                },
-            }) if subscription == "0xsubscription"
-                && result.inner.hash == B256::with_last_byte(1)
-                && result.inner.inner.parent_hash == B256::with_last_byte(2)
-                && result.inner.inner.number == 9
-                && result.inner.inner.timestamp == 12
+            Ok(Some(header)) if header.inner.hash == B256::with_last_byte(1)
+                && header.inner.inner.parent_hash == B256::with_last_byte(2)
+                && header.inner.inner.number == 9
+                && header.inner.inner.timestamp == 12
         ));
     }
 
     #[test]
     fn new_head_notification_preserves_extra_header_fields() {
-        let result =
-            serde_json::from_value::<SubscriptionNotification<ClientHead>>(new_head_notification());
+        let result = parse_subscription_notification::<ClientHead>(
+            &new_head_notification(),
+            "0xsubscription",
+        );
 
         assert!(matches!(
             result,
-            Ok(SubscriptionNotification {
-                params: SubscriptionDataParams { result, .. },
-            }) if matches!(
-                result.other.get_deserialized::<String>("providerTag"),
+            Ok(Some(header)) if matches!(
+                header.other.get_deserialized::<String>("providerTag"),
                 Some(Ok(ref tag)) if tag == "observed"
             )
         ));
@@ -2092,17 +2110,58 @@ mod tests {
 
     #[test]
     fn client_new_head_event_carries_header() {
-        let parsed =
-            serde_json::from_value::<SubscriptionNotification<ClientHead>>(new_head_notification());
+        let header = parse_subscription_notification::<ClientHead>(
+            &new_head_notification(),
+            "0xsubscription",
+        )
+        .expect("notification parses")
+        .expect("notification matches the subscription");
+
+        let event = ClientEvent::NewHead {
+            subscription_id: "0xsubscription".to_owned(),
+            header,
+        };
 
         assert!(matches!(
-            parsed.map(|notification| ClientEvent::NewHead {
-                subscription_id: notification.params.subscription,
-                header: notification.params.result,
-            }),
-            Ok(ClientEvent::NewHead { header, .. })
+            event,
+            ClientEvent::NewHead { header, .. }
                 if header.inner.hash == B256::with_last_byte(1)
                     && header.inner.inner.number == 9
+        ));
+    }
+
+    #[test]
+    fn parse_subscription_notification_skips_a_non_notification_frame() {
+        // A keepalive / ack frame carrying `id`/`result` but no `params` — the ~30 s frame that
+        // used to kill the socket. It must be skipped, not fatal.
+        let frame = json!({"jsonrpc": "2.0", "id": 1, "result": "0xdeadbeef"});
+
+        let result = parse_subscription_notification::<ClientHead>(&frame, "0xsubscription");
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn parse_subscription_notification_skips_other_subscriptions() {
+        let result =
+            parse_subscription_notification::<ClientHead>(&new_head_notification(), "0xother");
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn parse_subscription_notification_fails_on_a_malformed_result() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_subscription",
+            "params": {"subscription": "0xsubscription", "result": {"not": "a header"}}
+        });
+
+        let result = parse_subscription_notification::<ClientHead>(&frame, "0xsubscription");
+
+        assert!(matches!(
+            result,
+            Err(ClientEvmError::MalformedResponse { .. })
         ));
     }
 
