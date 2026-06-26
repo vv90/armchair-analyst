@@ -441,10 +441,14 @@ pub(crate) fn is_retryable(error: &ClientEvmError) -> bool {
     match error {
         ClientEvmError::HttpTransport(_) => true,
         ClientEvmError::HttpStatus { status, .. } => {
-            // 401/403 are per-endpoint conditions (missing/insufficient key, archive-token-required,
-            // some providers' rate-limit), not request-shaped: another endpoint may serve the same
-            // request, so fail over (and bench this one). 400/404/405 are the same on every endpoint.
-            *status == 401
+            // 400/401/403 are per-endpoint conditions (missing/insufficient key,
+            // archive-token-required, some providers' rate-limit, and — for 400 — free-tier
+            // eth_getLogs range/result caps like dRPC's "10 block range / upgrade to PAYG"), not
+            // request-shaped: another endpoint may serve the same request, so fail over (and bench
+            // this one). Failover is bounded and surfaces as `FailoverExhausted`, so this cannot loop
+            // unboundedly. 404/405 are genuinely method/path-shaped and identical on every endpoint.
+            *status == 400
+                || *status == 401
                 || *status == 403
                 || *status == 408
                 || *status == 425
@@ -628,13 +632,14 @@ mod tests {
         let result: Result<(), _> = pool.with_failover(|_| {
             calls.set(calls.get() + 1);
             Err(ClientEvmError::HttpStatus {
-                status: 400,
-                body: "10 block range".to_owned(),
+                status: 404,
+                body: "not found".to_owned(),
             })
         });
 
-        // The other endpoint is not tried, and the trace says so explicitly — the visibility that
-        // distinguishes a short-circuit from an exhausted multi-endpoint failover.
+        // 404 is genuinely method/path-shaped and identical on every endpoint, so the other endpoint
+        // is not tried — the trace says so explicitly, distinguishing a short-circuit from an
+        // exhausted multi-endpoint failover.
         let Err(ClientEvmError::FailoverExhausted { detail }) = result else {
             panic!("a non-retryable error must surface as FailoverExhausted, got {result:?}");
         };
@@ -643,8 +648,45 @@ mod tests {
             detail.contains("tried 1 of 2 endpoint(s) — stopped on non-retryable error"),
             "detail: {detail}"
         );
-        // Whichever endpoint the cursor picked first carries the recorded 400.
-        assert!(detail.contains("=[http status 400: 10 block range]"), "detail: {detail}");
+        // Whichever endpoint the cursor picked first carries the recorded 404.
+        assert!(detail.contains("=[http status 404: not found]"), "detail: {detail}");
+    }
+
+    #[test]
+    fn http_400_range_cap_fails_over_and_benches_the_endpoint() {
+        // Regression: a free-tier eth_getLogs range/result cap (e.g. dRPC's "10 block range") comes
+        // back as HTTP 400 but is a per-provider condition — it must fail over to a capable endpoint,
+        // not short-circuit the request.
+        let pool = pool(&[1, 1]);
+        let first_url = std::cell::RefCell::new(None::<String>);
+
+        let result = pool.with_failover(|url| {
+            let mut first = first_url.borrow_mut();
+            match first.as_deref() {
+                None => {
+                    *first = Some(url.to_owned());
+                    Err(ClientEvmError::HttpStatus {
+                        status: 400,
+                        body: "up to a 10 block range".to_owned(),
+                    })
+                }
+                Some(previous) => {
+                    assert_ne!(previous, url, "400 must fail over to a different endpoint");
+                    Ok(url.to_owned())
+                }
+            }
+        });
+
+        assert!(result.is_ok());
+        let health = pool.health.lock().unwrap();
+        assert_eq!(
+            health
+                .iter()
+                .filter(|entry| entry.cooldown_until.is_some())
+                .count(),
+            1,
+            "the 400 endpoint should be benched"
+        );
     }
 
     #[test]
@@ -770,7 +812,12 @@ mod tests {
             status: 429,
             body: String::new()
         }));
-        // 401/403 are per-endpoint (auth / archive-token / provider rate-limit) → fail over.
+        // 400/401/403 are per-endpoint (free-tier getLogs range cap / auth / archive-token /
+        // provider rate-limit) → fail over.
+        assert!(is_retryable(&ClientEvmError::HttpStatus {
+            status: 400,
+            body: "up to a 10 block range".to_owned()
+        }));
         assert!(is_retryable(&ClientEvmError::HttpStatus {
             status: 401,
             body: String::new()
@@ -787,10 +834,7 @@ mod tests {
             context: String::new(),
             detail: String::new()
         }));
-        assert!(!is_retryable(&ClientEvmError::HttpStatus {
-            status: 400,
-            body: String::new()
-        }));
+        // 404/405 are genuinely method/path-shaped → identical on every endpoint, do not fail over.
         assert!(!is_retryable(&ClientEvmError::HttpStatus {
             status: 404,
             body: String::new()

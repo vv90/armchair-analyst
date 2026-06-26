@@ -27,11 +27,11 @@ use crate::{
 use super::{
     ClientEvent, ClientHead,
     client_utils::{
-        build_block_header_request, build_block_logs_request, build_finalized_block_header_request,
-        build_new_heads_subscribe_request, build_pool_events_subscribe_request,
-        build_pool_logs_range_request, parse_block_header_response,
-        parse_block_header_response_by_id, parse_block_logs_response,
-        parse_pool_logs_range_response, parse_subscription_response,
+        build_block_header_request, build_block_logs_request, build_block_number_request,
+        build_finalized_block_header_request, build_new_heads_subscribe_request,
+        build_pool_events_subscribe_request, build_pool_logs_range_request,
+        parse_block_header_response, parse_block_header_response_by_id, parse_block_logs_response,
+        parse_block_number_response, parse_pool_logs_range_response, parse_subscription_response,
     },
     multicall3::{
         MulticallBlock, MulticallCall, MulticallCallResult, build_multicall3_batch_request,
@@ -213,6 +213,13 @@ pub fn fetch_block_logs(
     })
 }
 
+/// Scans `from_block..=tip` for pool-candidate logs, paging the range into per-chain
+/// [`pool_candidate_block_range_chunk`]-block `eth_getLogs` windows so a large finalized-to-tip gap
+/// never exceeds a provider's single-request range/result cap. The window span is sized per chain to
+/// each chain's log density (see [`pool_candidate_block_range_chunk`]). The tip is resolved once up
+/// front; blocks produced after it are picked up by the live path after activation (the bootstrap
+/// only needs `finalized..tip`). Each window fails over independently; a window that no endpoint can
+/// serve fails the whole scan, which the bootstrap then retries.
 pub fn fetch_pool_candidates_in_range(
     agent: &ureq::Agent,
     endpoints: &ChainEndpoints,
@@ -220,10 +227,44 @@ pub fn fetch_pool_candidates_in_range(
     from_block: u64,
 ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
     let pool = endpoints.pool(chain)?;
-    let request = build_pool_logs_range_request(HTTP_REQUEST_ID, from_block);
+    let tip = fetch_block_number(agent, endpoints, chain)?;
+    if tip < from_block {
+        return Ok(Vec::new());
+    }
+
+    let chunk = crate::chain::pool_candidate_block_range_chunk(chain);
+    let mut blocks: Vec<RangeLogBlock> = Vec::new();
+    let mut cursor = from_block;
+    loop {
+        let window_end = cursor.saturating_add(chunk - 1).min(tip);
+        let request = build_pool_logs_range_request(HTTP_REQUEST_ID, cursor, window_end);
+        let window = pool.with_failover(|endpoint| {
+            let response_value = send_rpc_request(agent, endpoint, &request)?;
+            parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
+        })?;
+        blocks.extend(window);
+
+        if window_end >= tip {
+            break;
+        }
+        cursor = window_end + 1;
+    }
+
+    Ok(blocks)
+}
+
+/// Reads the chain's current tip block number (`eth_blockNumber`), used to bound the paged
+/// pool-candidate scan.
+pub fn fetch_block_number(
+    agent: &ureq::Agent,
+    endpoints: &ChainEndpoints,
+    chain: ChainKey,
+) -> Result<u64, ClientEvmError> {
+    let pool = endpoints.pool(chain)?;
+    let request = build_block_number_request(HTTP_REQUEST_ID);
     pool.with_failover(|endpoint| {
         let response_value = send_rpc_request(agent, endpoint, &request)?;
-        parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
+        parse_block_number_response(&response_value, HTTP_REQUEST_ID)
     })
 }
 
@@ -2614,5 +2655,84 @@ mod tests {
         };
 
         serde_json::to_value(&log).expect("log serializes to json")
+    }
+
+    /// Extracts an `eth_getLogs` filter field (e.g. `fromBlock`/`toBlock`) from a captured request.
+    fn range_filter(body: &Value, key: &str) -> Value {
+        body.get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.first())
+            .and_then(|filter| filter.get(key))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn fetch_pool_candidates_pages_the_range_into_bounded_windows() {
+        // The window span is the chain's per-chain chunk; a tip one chunk past `from_block` forces
+        // two contiguous windows: [0, chunk-1] then [chunk, tip]. Boundaries are derived from
+        // pool_candidate_block_range_chunk so the test tracks the per-chain constant.
+        let chain = ChainKey::Ethereum;
+        let chunk = crate::chain::pool_candidate_block_range_chunk(chain);
+        let tip_block = chunk + 50;
+
+        let tip = json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{tip_block:x}") });
+        let window_one = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [log_result(Address::with_last_byte(1), B256::with_last_byte(7))]
+        });
+        let window_two = json!({ "jsonrpc": "2.0", "id": 1, "result": [] });
+
+        let (http_url, received, server) =
+            spawn_json_rpc_server_sequence(vec![tip, window_one, window_two]);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let blocks = fetch_pool_candidates_in_range(&agent, &endpoints, chain, 0)
+            .expect("paged scan must succeed");
+
+        // The first window's block is carried through; the empty second window adds nothing.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].number, 4);
+
+        // The tip is resolved first, then the range is paged in bounded, contiguous windows.
+        let tip_request = received.recv().expect("tip request");
+        assert_eq!(tip_request.body.get("method"), Some(&json!("eth_blockNumber")));
+
+        let first = received.recv().expect("first window request");
+        assert_eq!(first.body.get("method"), Some(&json!("eth_getLogs")));
+        assert_eq!(range_filter(&first.body, "fromBlock"), json!("0x0"));
+        assert_eq!(
+            range_filter(&first.body, "toBlock"),
+            json!(format!("0x{:x}", chunk - 1))
+        );
+
+        let second = received.recv().expect("second window request");
+        assert_eq!(
+            range_filter(&second.body, "fromBlock"),
+            json!(format!("0x{chunk:x}"))
+        );
+        assert_eq!(
+            range_filter(&second.body, "toBlock"),
+            json!(format!("0x{tip_block:x}"))
+        );
+
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_candidates_returns_empty_when_tip_is_below_from_block() {
+        // Only the tip is fetched (no getLogs windows) when finalized is already at/above the tip.
+        let tip = json!({ "jsonrpc": "2.0", "id": 1, "result": "0x5" });
+        let (http_url, _received, server) = spawn_json_rpc_server_sequence(vec![tip]);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let blocks = fetch_pool_candidates_in_range(&agent, &endpoints, ChainKey::Ethereum, 100)
+            .expect("scan must succeed");
+
+        assert!(blocks.is_empty());
+        server.join().expect("server thread must complete");
     }
 }

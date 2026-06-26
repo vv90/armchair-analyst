@@ -68,7 +68,11 @@ pub(crate) fn build_block_logs_request(request_id: u64, block_hash: BlockHash) -
     })
 }
 
-pub(crate) fn build_pool_logs_range_request(request_id: u64, from_block: u64) -> Value {
+pub(crate) fn build_pool_logs_range_request(
+    request_id: u64,
+    from_block: u64,
+    to_block: u64,
+) -> Value {
     let event_topics = pool_event_topic_filter();
 
     json!({
@@ -77,9 +81,18 @@ pub(crate) fn build_pool_logs_range_request(request_id: u64, from_block: u64) ->
         "method": "eth_getLogs",
         "params": [{
             "fromBlock": format!("0x{from_block:x}"),
-            "toBlock": "latest",
+            "toBlock": format!("0x{to_block:x}"),
             "topics": [event_topics]
         }]
+    })
+}
+
+pub(crate) fn build_block_number_request(request_id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_blockNumber",
+        "params": []
     })
 }
 
@@ -255,6 +268,29 @@ pub(crate) fn parse_block_header_response_by_id(
         .map_err(|error| decode_failed(context, &error, result))?;
 
     Ok(Some(header))
+}
+
+/// Decodes an `eth_blockNumber` response: a hex-quantity string (`0x…`) giving the current chain tip.
+pub(crate) fn parse_block_number_response(
+    value: &Value,
+    expected_request_id: u64,
+) -> Result<u64, ClientEvmError> {
+    let context = "block number";
+    let result = json_rpc_result(value, expected_request_id, context)?;
+
+    let malformed = |detail: String| ClientEvmError::MalformedResponse {
+        context: context.to_owned(),
+        detail,
+    };
+
+    let hex = result
+        .as_str()
+        .ok_or_else(|| malformed(format!("expected hex string, got {}", describe_field(Some(result)))))?;
+    let digits = hex
+        .strip_prefix("0x")
+        .ok_or_else(|| malformed(format!("expected 0x-prefixed quantity, got {hex}")))?;
+    u64::from_str_radix(digits, 16)
+        .map_err(|error| malformed(format!("invalid hex quantity {hex}: {error}")))
 }
 
 pub(crate) fn parse_block_logs_response(
@@ -598,8 +634,8 @@ mod tests {
     }
 
     #[test]
-    fn pool_logs_range_request_uses_from_block_latest_and_pool_event_topics() {
-        let request = build_pool_logs_range_request(9, 4);
+    fn pool_logs_range_request_uses_bounded_from_to_block_and_pool_event_topics() {
+        let request = build_pool_logs_range_request(9, 4, 10);
         let expected_topics = expected_pool_event_topics();
 
         assert_eq!(
@@ -610,7 +646,7 @@ mod tests {
                 "method": "eth_getLogs",
                 "params": [{
                     "fromBlock": "0x4",
-                    "toBlock": "latest",
+                    "toBlock": "0xa",
                     "topics": [expected_topics]
                 }]
             })
@@ -618,8 +654,34 @@ mod tests {
     }
 
     #[test]
+    fn block_number_request_round_trips() {
+        let request = build_block_number_request(9);
+        assert_eq!(
+            request,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "eth_blockNumber",
+                "params": []
+            })
+        );
+
+        let response = json!({ "jsonrpc": "2.0", "id": 9, "result": "0x2d9b3da" });
+        assert_eq!(parse_block_number_response(&response, 9).unwrap(), 0x2d9b3da);
+    }
+
+    #[test]
+    fn block_number_response_rejects_non_hex_result() {
+        let response = json!({ "jsonrpc": "2.0", "id": 9, "result": "1234" });
+        assert!(matches!(
+            parse_block_number_response(&response, 9),
+            Err(ClientEvmError::MalformedResponse { .. })
+        ));
+    }
+
+    #[test]
     fn pool_logs_range_request_does_not_filter_by_address() {
-        let request = build_pool_logs_range_request(9, 4);
+        let request = build_pool_logs_range_request(9, 4, 10);
         let address_filter = request
             .get("params")
             .and_then(Value::as_array)
@@ -1213,11 +1275,12 @@ mod tests {
         }
 
         #[test]
-        fn pool_logs_range_request_preserves_request_id_and_from_block(
+        fn pool_logs_range_request_preserves_request_id_and_bounded_range(
             request_id in any::<u64>(),
             from_block in any::<u64>(),
+            to_block in any::<u64>(),
         ) {
-            let request = build_pool_logs_range_request(request_id, from_block);
+            let request = build_pool_logs_range_request(request_id, from_block, to_block);
 
             prop_assert_eq!(request.get("id"), Some(&json!(request_id)));
             prop_assert_eq!(request.get("method"), Some(&json!("eth_getLogs")));
@@ -1235,7 +1298,7 @@ mod tests {
                     .and_then(Value::as_array)
                     .and_then(|params| params.first())
                     .and_then(|filter| filter.get("toBlock")),
-                Some(&json!("latest"))
+                Some(&json!(format!("0x{to_block:x}")))
             );
         }
 

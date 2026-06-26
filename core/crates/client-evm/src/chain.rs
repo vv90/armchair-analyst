@@ -47,6 +47,23 @@ pub fn chain_key_for_network_path(path: &str) -> Option<ChainKey> {
         .find(|&chain| drpc_network_path(chain) == path)
 }
 
+/// Block span of a single pool-candidate `eth_getLogs` window during bootstrap. Sized per chain so a
+/// window stays under the free-tier providers' result caps (binding one: infura ~10000 results).
+/// Derived from observed log density: Base ~76 logs/block, Optimism ~29; the rest are sparse enough
+/// (or have a small finalized→tip gap) that one whole-gap window already serves them, so their value
+/// only trades call count for headroom and cannot break their bootstrap.
+pub fn pool_candidate_block_range_chunk(chain: ChainKey) -> u64 {
+    match chain {
+        ChainKey::Base => 100,    // ~76 logs/blk → ~7.6k logs/window
+        ChainKey::Optimism => 250, // ~29 logs/blk → ~7.3k logs/window
+        ChainKey::Ethereum
+        | ChainKey::Arbitrum
+        | ChainKey::Polygon
+        | ChainKey::Bnb
+        | ChainKey::Avalanche => 5000, // sparse / small gap; bounded, ~1–few calls
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +86,23 @@ mod tests {
             let slug = drpc_network_path(chain);
             assert!(slugs.insert(slug), "duplicate network slug: {slug}");
             assert_eq!(chain_key_for_network_path(slug), Some(chain));
+        }
+    }
+
+    #[test]
+    fn pool_candidate_chunk_is_tight_for_dense_chains_and_large_otherwise() {
+        assert_eq!(pool_candidate_block_range_chunk(ChainKey::Base), 100);
+        assert_eq!(pool_candidate_block_range_chunk(ChainKey::Optimism), 250);
+        assert_eq!(pool_candidate_block_range_chunk(ChainKey::Ethereum), 5000);
+    }
+
+    #[test]
+    fn every_active_chain_has_a_non_zero_pool_candidate_chunk() {
+        for &chain in ACTIVE_CHAINS {
+            assert!(
+                pool_candidate_block_range_chunk(chain) > 0,
+                "chain {chain:?} has a zero pool-candidate chunk"
+            );
         }
     }
 
