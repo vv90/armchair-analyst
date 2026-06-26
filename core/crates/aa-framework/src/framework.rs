@@ -44,6 +44,15 @@ pub trait Application {
 pub trait Runtime<App: Application>: Sized + Send + Sync + 'static {
     fn execute_effect(&self, effect: App::Effect) -> Vec<App::Input>;
     fn spawn_subscription(&self, sender: &Sender<App::Input>, subscription: App::Subscription);
+
+    /// Worker count for the dedicated blocking-I/O pool that runs effects. The default suits
+    /// CPU-bound effects; runtimes whose effects block on network I/O override this with a count
+    /// sized to their concurrency budget (i.e. their aggregate provider rate limit), not the CPU
+    /// count. This number is effectively the runtime's global cap on concurrent in-flight effects.
+    fn effect_pool_size(&self) -> usize {
+        8
+    }
+
     fn log_input(&self, _input: &App::Input) {}
     fn log_error(&self, _error: ApplicationError<App::Input>) {}
     fn observe_state(&self, _state: &App::State) {}
@@ -75,8 +84,20 @@ fn run<App: Application, R: Runtime<App>>(
 ) -> () {
     let Transition { state, effects } = App::init();
 
+    // One dedicated pool for the blocking effect work, sized for I/O rather than the CPU count of
+    // rayon's global pool. Its width is the runtime's global cap on concurrent in-flight effects, so
+    // a chain that falls behind can no longer pin every worker and starve the others. If the pool
+    // ever fails to build, fall back to the global pool (`None`) rather than failing to start.
+    let effect_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(runtime.effect_pool_size())
+        .thread_name(|index| format!("effect-io-{index}"))
+        .build()
+        .map(Arc::new)
+        .ok();
+
     drop(spawn_effects::<App, R>(
         runtime.clone(),
+        effect_pool.clone(),
         &input_sender,
         effects,
     ));
@@ -99,6 +120,7 @@ fn run<App: Application, R: Runtime<App>>(
         // spawn a thread to execute effects in parallel
         drop(spawn_effects::<App, R>(
             runtime.clone(),
+            effect_pool.clone(),
             &input_sender,
             effects,
         ));
@@ -111,20 +133,31 @@ fn run<App: Application, R: Runtime<App>>(
 
 fn spawn_effects<App: Application, R: Runtime<App>>(
     runtime: Arc<R>,
+    effect_pool: Option<Arc<rayon::ThreadPool>>,
     sender: &Sender<App::Input>,
     effects: Vec<App::Effect>,
 ) -> JoinHandle<()> {
     let sender_clone = sender.clone();
     std::thread::spawn(move || {
-        effects.into_par_iter().for_each(|effect| {
-            runtime
-                .execute_effect(effect)
-                .into_iter()
-                .for_each(|i| match sender_clone.send(i) {
-                    Ok(_) => (),
-                    Err(e) => runtime.log_error(ApplicationError::SendError(e)),
-                })
-        });
+        let run_effects = move || {
+            effects.into_par_iter().for_each(|effect| {
+                runtime
+                    .execute_effect(effect)
+                    .into_iter()
+                    .for_each(|i| match sender_clone.send(i) {
+                        Ok(_) => (),
+                        Err(e) => runtime.log_error(ApplicationError::SendError(e)),
+                    })
+            });
+        };
+
+        // Run the blocking effect work on the dedicated I/O pool rather than rayon's global,
+        // CPU-sized pool, so effects that block on network I/O get a worker each instead of
+        // queueing behind the CPU count. Fall back to the global pool if no dedicated pool exists.
+        match effect_pool {
+            Some(pool) => pool.install(run_effects),
+            None => run_effects(),
+        }
     })
 }
 
@@ -323,6 +356,7 @@ mod tests {
             let runtime = std::sync::Arc::new(EffectDeliveryRuntime);
             let handle = spawn_effects::<EffectDeliveryApp, EffectDeliveryRuntime>(
                 runtime,
+                test_effect_pool(4),
                 &sender,
                 effects,
             );
@@ -375,12 +409,56 @@ mod tests {
 
         let handle = spawn_effects::<EffectDeliveryApp, SendErrorLoggingRuntime>(
             runtime,
+            test_effect_pool(4),
             &sender,
             vec![DeliveryEffect(vec![7])],
         );
 
         assert!(handle.join().is_ok());
         assert_eq!(failed_inputs.lock().unwrap().as_slice(), &[7]);
+    }
+
+    #[test]
+    fn effect_pool_size_defaults_to_eight() {
+        assert_eq!(
+            <EffectDeliveryRuntime as Runtime<EffectDeliveryApp>>::effect_pool_size(
+                &EffectDeliveryRuntime
+            ),
+            8
+        );
+    }
+
+    #[test]
+    fn spawn_effects_delivers_every_input_on_a_single_worker_pool() {
+        // A pool narrower than the effect count still delivers every input exactly once — effects
+        // queue onto the lone worker instead of being dropped.
+        let effects = vec![
+            DeliveryEffect(vec![1, 2]),
+            DeliveryEffect(vec![3]),
+            DeliveryEffect(vec![4, 5, 6]),
+        ];
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let runtime = std::sync::Arc::new(EffectDeliveryRuntime);
+
+        let handle = spawn_effects::<EffectDeliveryApp, EffectDeliveryRuntime>(
+            runtime,
+            test_effect_pool(1),
+            &sender,
+            effects,
+        );
+        assert!(handle.join().is_ok());
+
+        let mut actual = receiver.try_iter().collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    fn test_effect_pool(threads: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map(std::sync::Arc::new)
+            .ok()
     }
 
     fn accumulator_input() -> impl Strategy<Value = AccumulatorInput> {

@@ -223,6 +223,10 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
         }
     }
 
+    fn effect_pool_size(&self) -> usize {
+        EFFECT_POOL_SIZE
+    }
+
     fn spawn_subscription(
         &self,
         sender: &Sender<<ClientEvmApp as Application>::Input>,
@@ -303,6 +307,15 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
         self.log_gauge(state);
     }
 }
+
+/// Width of the dedicated blocking-I/O pool that runs effects, replacing rayon's CPU-sized global
+/// pool. It is the runtime's global cap on concurrent in-flight RPC effects, so a chain running a
+/// deep ancestry walk can no longer occupy every worker and starve the others. Sized for I/O, not
+/// CPUs: with 7 chains, headroom for an ancestry-walk burst, and each effect's `aggregate3_batched`
+/// fan-out of up to `MULTICALL_MAX_CONCURRENT_BATCHES`, this caps peak sockets well under the level
+/// that trips free-tier provider rate limits. The single tuning knob — raise it if chains can't keep
+/// up, lower it if `json-rpc error 15: too many requests` climbs.
+const EFFECT_POOL_SIZE: usize = 64;
 
 /// Minimum gap between gauge lines. `observe_state` runs on every transition, so without this the
 /// gauge would be emitted thousands of times a second.
@@ -1127,6 +1140,23 @@ mod tests {
             runtime.subscriptions().ws(ChainKey::Ethereum).expect("ethereum ws"),
             "wss://example.invalid/ws"
         );
+    }
+
+    #[test]
+    fn runtime_sizes_the_effect_pool_for_io() {
+        let runtime = ClientEvmRuntime::new(
+            test_subscriptions(),
+            test_endpoints(),
+            GraphEndpoints::empty(),
+            in_memory_metadata_cache(),
+            Logger::sink(),
+            View::sink(),
+        );
+
+        // The blocking-I/O pool must be sized well above the CPU-bound default so a behind chain
+        // cannot pin every worker; guards against a silent regression to the trait default.
+        assert_eq!(runtime.effect_pool_size(), EFFECT_POOL_SIZE);
+        assert!(runtime.effect_pool_size() > 8);
     }
 
     #[test]
