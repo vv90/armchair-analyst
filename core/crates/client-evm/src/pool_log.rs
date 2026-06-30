@@ -23,6 +23,11 @@ use crate::uniswap_v4::{self, PoolId};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolLog {
     pub pool: ProtocolPoolKey,
+    #[deprecated(
+        note = "intra-block ordering is the `BTreeMap<u64, PoolLog>` key in the new BlocksGraph; \
+                new code must rely on that key, not this field. Retained only so pre-swap code \
+                paths keep compiling until the blocks-graph swap removes them."
+    )]
     pub log_index: u64,
     pub event: PoolLogEvent,
 }

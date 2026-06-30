@@ -5,6 +5,7 @@ use alloy::primitives::{Address, BlockHash, Bloom, BloomInput};
 pub(crate) mod pending_requests;
 pub(crate) mod pool_registry;
 pub(crate) mod token_registry;
+pub(crate) mod blocks_graph;
 
 use self::{pending_requests::*, pool_registry::*, token_registry::*};
 use crate::{ChainKey, PoolLog, PoolLogEvent, derive_pool_state, pool_state::*, tick::Tick, uniswap_v4};
@@ -523,6 +524,11 @@ impl BlocksGraph {
 }
 
 pub struct FinalizedState {
+    #[deprecated(
+        note = "the finalized block hash will be owned solely by `BlocksGraph::anchor` after the \
+                graph swap; new code must read the anchor from the graph, not this field. Retained \
+                only so pre-swap code paths keep compiling until the swap removes them."
+    )]
     pub block_hash: BlockHash,
     pool_snapshots: HashMap<PoolRef, PoolState>,
 }
