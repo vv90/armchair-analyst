@@ -114,7 +114,18 @@ enum NewBlockError {
     DuplicateBlock(BlocksGraph),
     /// `hash` is already present with a *different* parent — a fatal conflict for the caller.
     ConflictingParent(BlocksGraph),
+    /// The block would land `Pending` but the pending staging area is already at its cap
+    /// ([`MAX_PENDING_BLOCKS`]); the block is dropped and the graph handed back unchanged
+    /// (refuse-when-full, mirroring the legacy `MAX_STREAMED_LOG_BLOCKS` buffer). The authoritative
+    /// path / a later header re-observation, and ultimately finalization, recover it.
+    PendingBufferFull(BlocksGraph),
 }
+
+/// Caps the pending staging area (invariant B1), bounding it when blocks arrive whose parent never
+/// connects to the anchor (e.g. an orphaned fork below finalization). Refuse-when-full at admission;
+/// the principled prune of stale forks happens later at finalization. Mirrors the legacy
+/// `MAX_STREAMED_LOG_BLOCKS` subscription buffer.
+const MAX_PENDING_BLOCKS: usize = 1024;
 
 /// The raw hash a connected node's parent reference points at (the anchor for `Anchor`).
 fn connected_parent_hash(parent: &AnchoredRef, anchor: BlockHash) -> BlockHash {
@@ -155,12 +166,39 @@ impl BlocksGraph {
         })
     }
 
+    /// How many blocks are currently `Pending` (the bounded staging area, invariant B1). O(n) over
+    /// the node set; bounded, so a cached count is a possible later optimization, not needed now.
+    fn pending_count(&self) -> usize {
+        self.nodes
+            .values()
+            .filter(|node| matches!(node, Node::Pending(_)))
+            .count()
+    }
+
+    /// Admit a block from a header (production entry point), bounding the pending staging area at
+    /// [`MAX_PENDING_BLOCKS`]. See [`BlocksGraph::with_block_capped`] for the semantics.
+    fn with_block(self, hash: BlockHash, parent: BlockHash, bloom: Bloom) -> Result<BlocksGraph, NewBlockError> {
+        self.with_block_capped(hash, parent, bloom, MAX_PENDING_BLOCKS)
+    }
+
     /// Admit a block from a header. Classifies it as `Connected` (parent is the anchor or an
     /// existing connected node) or `Pending`, and — when it lands connected — promotes any pending
     /// subtree it now connects to the anchor (see `promote_reachable`). Does NOT move
     /// `canonical_tip`: admission and tip advancement are separate concerns (as in the legacy
     /// `HeadObserved` path).
-    fn with_block(self, hash: BlockHash, parent: BlockHash, bloom: Bloom) -> Result<BlocksGraph, NewBlockError> {
+    ///
+    /// `max_pending` bounds the pending staging area (B1): a block that would land `Pending` is
+    /// refused with [`NewBlockError::PendingBufferFull`] once `pending_count() >= max_pending`. The
+    /// cap gates only the pending branch — a connecting admission (and the promotion it triggers,
+    /// which only shrinks the pending set) is never refused. `with_block` calls this with
+    /// [`MAX_PENDING_BLOCKS`]; tests drive it at a small cap.
+    fn with_block_capped(
+        self,
+        hash: BlockHash,
+        parent: BlockHash,
+        bloom: Bloom,
+        max_pending: usize,
+    ) -> Result<BlocksGraph, NewBlockError> {
         if hash == parent {
             return Err(NewBlockError::SelfParent(self));
         }
@@ -182,6 +220,13 @@ impl BlocksGraph {
         // Connectivity is decided here, at insert time, rather than recomputed by a parent-walk.
         let connects =
             parent == self.anchor || matches!(self.nodes.get(&parent), Some(Node::Connected(_)));
+
+        // B1: refuse a block that would land pending once the staging area is at the cap. The cap
+        // gates only this branch — a connecting admission (and its promotion, which only shrinks
+        // pending) is never refused. The graph is handed back unchanged.
+        if !connects && self.pending_count() >= max_pending {
+            return Err(NewBlockError::PendingBufferFull(self));
+        }
 
         let BlocksGraph {
             anchor,
@@ -458,6 +503,31 @@ mod tests {
             let fingerprint_b = graph_fingerprint(&admit_in_order(&plan, &plan.order_b));
             prop_assert!(!fingerprint_a.is_empty());
             prop_assert_eq!(fingerprint_a, fingerprint_b);
+        }
+
+        /// B1: the pending staging area never exceeds the cap, in any insertion order, while every
+        /// topology invariant continues to hold. Refused admissions hand the (unchanged) graph back,
+        /// so the fold continues from it. (Does NOT assert full connectivity or order-independence:
+        /// once the cap bites, a refused pending block can leave its descendants permanently
+        /// unconnected and the outcome depends on arrival order.)
+        #[test]
+        fn with_block_capped_never_exceeds_bound(plan in admission_plan_strategy()) {
+            const MAX: usize = 3;
+            let mut graph = BlocksGraph::new(graph_hash(0));
+            for &node in &plan.order_a {
+                graph = match graph.with_block_capped(
+                    graph_hash(node),
+                    graph_hash(plan.parents[node]),
+                    Bloom::repeat_byte(0),
+                    MAX,
+                ) {
+                    Ok(graph) => graph,
+                    Err(NewBlockError::PendingBufferFull(graph)) => graph,
+                    Err(other) => return Err(TestCaseError::fail(format!("unexpected error: {other:?}"))),
+                };
+                prop_assert!(graph.pending_count() <= MAX);
+                assert_graph_invariants(&graph);
+            }
         }
     }
 
@@ -763,6 +833,91 @@ mod tests {
             .with_block(block, graph_hash(2), Bloom::repeat_byte(0))
             .unwrap_err();
         assert!(matches!(error, NewBlockError::ConflictingParent(_)));
+    }
+
+    // --- pending bound (B1) ---------------------------------------------------------------------
+
+    /// Admits `max` disconnected blocks (distinct absent parents) so the staging area is exactly
+    /// full, then a further disconnected block. The last one is refused and the graph handed back
+    /// unchanged.
+    fn graph_with_full_pending(anchor: BlockHash, max: usize) -> BlocksGraph {
+        let mut graph = BlocksGraph::new(anchor);
+        for index in 0..max {
+            // parents are absent (and distinct from any block hash) so every block lands pending.
+            let block = graph_hash(10 + index);
+            let absent_parent = graph_hash(100 + index);
+            graph = graph
+                .with_block_capped(block, absent_parent, Bloom::repeat_byte(0), max)
+                .expect("admitting a disconnected block below the cap must succeed");
+        }
+        graph
+    }
+
+    #[test]
+    fn pending_bound_refuses_new_when_full() {
+        // At the cap, a further pending block is refused with PendingBufferFull and the graph is
+        // returned unchanged (same pending count, the refused hash absent).
+        let anchor = graph_hash(1);
+        let max = 3;
+        let graph = graph_with_full_pending(anchor, max);
+        assert_eq!(graph.pending_count(), max);
+
+        let refused = graph_hash(50);
+        let error = graph
+            .with_block_capped(refused, graph_hash(200), Bloom::repeat_byte(0), max)
+            .unwrap_err();
+        let NewBlockError::PendingBufferFull(graph) = error else {
+            panic!("expected PendingBufferFull, got {error:?}");
+        };
+        assert_eq!(graph.pending_count(), max);
+        assert!(graph.get(refused).is_none());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn connected_admission_succeeds_at_pending_cap() {
+        // The cap gates only the pending branch: a child of the anchor connects even when the
+        // pending staging area is full.
+        let anchor = graph_hash(1);
+        let max = 3;
+        let graph = graph_with_full_pending(anchor, max);
+        assert_eq!(graph.pending_count(), max);
+
+        let child = graph_hash(2);
+        let graph = graph
+            .with_block_capped(child, anchor, Bloom::repeat_byte(0), max)
+            .expect("a connecting admission must not be refused by the pending cap");
+        assert!(graph.connected(child).is_some());
+        assert_eq!(graph.pending_count(), max);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn promotion_not_blocked_at_pending_cap() {
+        // A pending child counts toward a full buffer; admitting its awaited (anchor-rooted) parent
+        // connects and promotes the child — never refused, and the pending count drops.
+        let anchor = graph_hash(1);
+        let max = 3;
+        let parent = graph_hash(2);
+        let child = graph_hash(3);
+        // Fill to the cap with the child plus (max - 1) unrelated disconnected blocks.
+        let mut graph = BlocksGraph::new(anchor)
+            .with_block_capped(child, parent, Bloom::repeat_byte(0), max)
+            .unwrap();
+        for index in 0..(max - 1) {
+            graph = graph
+                .with_block_capped(graph_hash(10 + index), graph_hash(100 + index), Bloom::repeat_byte(0), max)
+                .unwrap();
+        }
+        assert_eq!(graph.pending_count(), max);
+
+        let graph = graph
+            .with_block_capped(parent, anchor, Bloom::repeat_byte(0), max)
+            .expect("admitting the awaited parent must not be refused by the pending cap");
+        assert!(graph.connected(parent).is_some());
+        assert!(graph.connected(child).is_some());
+        assert_eq!(graph.pending_count(), max - 1);
+        assert_graph_invariants(&graph);
     }
 
     #[test]
