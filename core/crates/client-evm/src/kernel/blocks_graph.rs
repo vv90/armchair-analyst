@@ -16,9 +16,8 @@ use crate::PoolLog;
 ///  - `anchor` is the single root and the sole home of the finalized hash (no node carries it).
 ///  - one `nodes` entry per hash (key uniqueness), and that entry is `Connected` XOR `Pending` —
 ///    a block cannot be in both states, nor in neither.
-///  - a connected node's parent and the canonical tip are `AnchoredRef` — the "missing/unknown
-///    parent" case the old `while current != finalized { … else break }` walk handled does not
-///    exist.
+///  - a connected node's parent is an `AnchoredRef` — the "missing/unknown parent" case the old
+///    `while current != finalized { … else break }` walk handled does not exist for connected nodes.
 ///  - per-block logs are a `BTreeMap` keyed by intra-block index: deduped and ordered for free; the
 ///    index lives only in the key.
 ///  - non-anchor blocks carry no pool snapshot (absolute state is reconstructed by fold-on-demand;
@@ -32,7 +31,12 @@ use crate::PoolLog;
 struct BlocksGraph {
     anchor: BlockHash,
     nodes: HashMap<BlockHash, Node>,
-    canonical_tip: AnchoredRef,
+    /// The latest head the feed reported — genuine external input (consensus picks the head; the DAG
+    /// alone cannot, multiple connected leaves can exist), so it is stored, not derived. It may name a
+    /// `Pending` (or, transiently, absent) block: the canonical chain is derived on demand and is empty
+    /// until the head connects, then auto-completes (see `canonical_oldest_to_newest`). Mirrors the
+    /// legacy `State.canonical_tip`, set unconditionally to the observed head.
+    observed_head: BlockHash,
 }
 
 /// A block is connected XOR pending. One keyed entry, exactly one of these states — disjointness is
@@ -140,7 +144,7 @@ impl BlocksGraph {
         BlocksGraph {
             anchor,
             nodes: HashMap::new(),
-            canonical_tip: AnchoredRef::Anchor,
+            observed_head: anchor,
         }
     }
 
@@ -183,9 +187,9 @@ impl BlocksGraph {
 
     /// Admit a block from a header. Classifies it as `Connected` (parent is the anchor or an
     /// existing connected node) or `Pending`, and — when it lands connected — promotes any pending
-    /// subtree it now connects to the anchor (see `promote_reachable`). Does NOT move
-    /// `canonical_tip`: admission and tip advancement are separate concerns (as in the legacy
-    /// `HeadObserved` path).
+    /// subtree it now connects to the anchor (see `promote_reachable`). Does NOT set `observed_head`:
+    /// admission and tip advancement are separate concerns (the kernel composes this with
+    /// `with_observed_head`, mirroring the legacy `HeadObserved` path).
     ///
     /// `max_pending` bounds the pending staging area (B1): a block that would land `Pending` is
     /// refused with [`NewBlockError::PendingBufferFull`] once `pending_count() >= max_pending`. The
@@ -231,7 +235,7 @@ impl BlocksGraph {
         let BlocksGraph {
             anchor,
             mut nodes,
-            canonical_tip,
+            observed_head,
         } = self;
         let data = BlockData {
             logs_bloom: Some(bloom),
@@ -246,10 +250,10 @@ impl BlocksGraph {
             };
             nodes.insert(hash, Node::Connected(ConnectedNode { parent: parent_ref, data }));
             // The new block may be the awaited parent of a pending subtree — connect it now (T6).
-            Ok(BlocksGraph { anchor, nodes, canonical_tip }.promote_reachable(ConnectedHash(hash)))
+            Ok(BlocksGraph { anchor, nodes, observed_head }.promote_reachable(ConnectedHash(hash)))
         } else {
             nodes.insert(hash, Node::Pending(PendingNode { parent, data }));
-            Ok(BlocksGraph { anchor, nodes, canonical_tip })
+            Ok(BlocksGraph { anchor, nodes, observed_head })
         }
     }
 
@@ -261,7 +265,7 @@ impl BlocksGraph {
         let BlocksGraph {
             anchor,
             mut nodes,
-            canonical_tip,
+            observed_head,
         } = self;
         let mut frontier = vec![newly_connected];
         while let Some(ConnectedHash(connected_hash)) = frontier.pop() {
@@ -286,16 +290,47 @@ impl BlocksGraph {
                 frontier.push(ConnectedHash(child_hash));
             }
         }
-        BlocksGraph { anchor, nodes, canonical_tip }
+        BlocksGraph { anchor, nodes, observed_head }
+    }
+
+    /// Records the latest observed head (the kernel's `HeadObserved` analog, composed after
+    /// `with_block` admits the block). Set unconditionally, like the legacy `State.canonical_tip`:
+    /// the head may be `Pending` — the canonical chain stays empty until it connects, then
+    /// auto-completes (see `canonical_oldest_to_newest`). Updates the field only when `hash` is the
+    /// anchor or a present node, so the "`observed_head` is the anchor or present" invariant cannot be
+    /// violated here; an absent hash (which the admit-first kernel never produces) is a no-op.
+    fn with_observed_head(self, hash: BlockHash) -> BlocksGraph {
+        if hash == self.anchor || self.nodes.contains_key(&hash) {
+            BlocksGraph { observed_head: hash, ..self }
+        } else {
+            self
+        }
+    }
+
+    /// The canonical chain from oldest (child of the anchor) to newest (`observed_head`), derived on
+    /// demand — never stored. When `observed_head` is `Connected`, its parent chain reaches the anchor
+    /// by T2, so the walk is total and gap-free; when it is the anchor, `Pending`, or absent, there is
+    /// no foldable suffix yet and the chain is empty. Takes no `finalized_hash` — the anchor is owned.
+    fn canonical_oldest_to_newest(&self) -> Vec<ConnectedHash> {
+        let mut chain = Vec::new();
+        let mut current = self.observed_head;
+        // Walks only while `current` is a connected node, so a pending/absent/anchor head yields an
+        // empty chain. Connected parents reach the anchor acyclically (T2), so the walk terminates.
+        while let Some(node) = self.connected(current) {
+            chain.push(ConnectedHash(current));
+            match node.parent {
+                AnchoredRef::Anchor => break,
+                AnchoredRef::Block(ConnectedHash(parent)) => current = parent,
+            }
+        }
+        chain.reverse();
+        chain
     }
 
     // --- planned interface (each lands test-first) ---------------------------------------------
     //
     // derived view, no longer re-walked: the dangling parents still being backfilled
     // fn missing_parents(&self) -> impl Iterator<Item = BlockHash> + '_;
-    //
-    // canonical queries take NO finalized_hash param — the anchor is owned
-    // fn canonical_oldest_to_newest(&self) -> Vec<ConnectedHash>;
     //
     // finalization: re-root at a connected descendant, prune non-descendants, reclassify
     // fn reanchored_to(self, new_anchor: ConnectedHash) -> BlocksGraph;
@@ -320,6 +355,11 @@ mod tests {
         }
     }
 
+    /// Unwraps a derived canonical chain to its raw hashes, for order-sensitive comparison.
+    fn chain_hashes(chain: &[ConnectedHash]) -> Vec<BlockHash> {
+        chain.iter().map(|ConnectedHash(hash)| *hash).collect()
+    }
+
     // --- invariant helper (mirrors `assert_state_invariants` in kernel/mod.rs) ------------------
 
     /// Asserts the structural/topology invariants of the graph. Called after every admission in the
@@ -328,7 +368,7 @@ mod tests {
     fn assert_graph_invariants(graph: &BlocksGraph) {
         assert_anchor_not_in_nodes(graph); // T5
         assert_connected_parents_resolve_to_anchor(graph); // T2 / T3 / I1
-        assert_canonical_tip_resolves(graph); // T4
+        assert_observed_head_present(graph); // T4
         assert_no_pending_reaches_anchor(graph); // T6
     }
 
@@ -364,13 +404,11 @@ mod tests {
         }
     }
 
-    fn assert_canonical_tip_resolves(graph: &BlocksGraph) {
-        if let AnchoredRef::Block(ConnectedHash(hash)) = &graph.canonical_tip {
-            assert!(
-                matches!(graph.nodes.get(hash), Some(Node::Connected(_))),
-                "canonical tip must resolve to a present connected node"
-            );
-        }
+    fn assert_observed_head_present(graph: &BlocksGraph) {
+        assert!(
+            graph.observed_head == graph.anchor || graph.nodes.contains_key(&graph.observed_head),
+            "observed head must be the anchor or a present node"
+        );
     }
 
     fn assert_no_pending_reaches_anchor(graph: &BlocksGraph) {
@@ -529,6 +567,35 @@ mod tests {
                 assert_graph_invariants(&graph);
             }
         }
+
+        /// The canonical chain derived from a connected head is exactly the parent path from that
+        /// head down to the anchor (oldest→newest), with every element resolving to a connected node.
+        /// Compared against an independent recompute over the generated parent links, across shapes.
+        #[test]
+        fn canonical_chain_is_connected_path_to_anchor(
+            plan in admission_plan_strategy(),
+            head_seed in any::<usize>(),
+        ) {
+            let node_count = plan.parents.len();
+            // A non-anchor node index (the set is anchor-rooted, so every such node is connected).
+            let head = 1 + head_seed % (node_count - 1);
+            let graph = admit_in_order(&plan, &plan.order_a).with_observed_head(graph_hash(head));
+
+            // Independently recompute the parent path head → anchor (node 0), oldest→newest.
+            let mut expected = Vec::new();
+            let mut current = head;
+            while current != 0 {
+                expected.push(graph_hash(current));
+                current = plan.parents[current];
+            }
+            expected.reverse();
+
+            let chain = graph.canonical_oldest_to_newest();
+            prop_assert_eq!(chain_hashes(&chain), expected);
+            for ConnectedHash(hash) in &chain {
+                prop_assert!(graph.connected(*hash).is_some());
+            }
+        }
     }
 
     // --- negative invariant tests (corrupt state, confirm the checker fires) --------------------
@@ -548,7 +615,7 @@ mod tests {
         let graph = BlocksGraph {
             anchor,
             nodes,
-            canonical_tip: AnchoredRef::Anchor,
+            observed_head: anchor,
         };
         assert_graph_invariants(&graph);
     }
@@ -568,7 +635,7 @@ mod tests {
         let graph = BlocksGraph {
             anchor,
             nodes,
-            canonical_tip: AnchoredRef::Anchor,
+            observed_head: anchor,
         };
         assert_graph_invariants(&graph);
     }
@@ -595,7 +662,7 @@ mod tests {
         let graph = BlocksGraph {
             anchor,
             nodes,
-            canonical_tip: AnchoredRef::Anchor,
+            observed_head: anchor,
         };
         assert_graph_invariants(&graph);
     }
@@ -624,7 +691,7 @@ mod tests {
         let graph = BlocksGraph {
             anchor,
             nodes,
-            canonical_tip: AnchoredRef::Anchor,
+            observed_head: anchor,
         };
         assert_graph_invariants(&graph);
     }
@@ -644,7 +711,19 @@ mod tests {
         let graph = BlocksGraph {
             anchor,
             nodes,
-            canonical_tip: AnchoredRef::Anchor,
+            observed_head: anchor,
+        };
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    #[should_panic(expected = "observed head must be the anchor or a present node")]
+    fn invariants_reject_absent_observed_head() {
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph {
+            anchor,
+            nodes: HashMap::new(),
+            observed_head: graph_hash(2),
         };
         assert_graph_invariants(&graph);
     }
@@ -917,6 +996,110 @@ mod tests {
         assert!(graph.connected(parent).is_some());
         assert!(graph.connected(child).is_some());
         assert_eq!(graph.pending_count(), max - 1);
+        assert_graph_invariants(&graph);
+    }
+
+    // --- canonical chain (observed head) --------------------------------------------------------
+
+    #[test]
+    fn canonical_chain_empty_when_head_is_anchor() {
+        // A fresh graph's head is the anchor: no non-anchor blocks, so the chain is empty.
+        let graph = BlocksGraph::new(graph_hash(1));
+        assert!(graph.canonical_oldest_to_newest().is_empty());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn canonical_chain_single_connected_head() {
+        // A child of the anchor, observed as head, is the whole canonical chain.
+        let anchor = graph_hash(1);
+        let child = graph_hash(2);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(child, anchor, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_observed_head(child);
+        assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![child]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn canonical_chain_full_path() {
+        // The chain runs oldest (child of the anchor) to newest (the head).
+        let anchor = graph_hash(1);
+        let b2 = graph_hash(2);
+        let b3 = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(b2, anchor, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(b3, b2, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_observed_head(b3);
+        assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![b2, b3]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn canonical_chain_empty_when_head_pending() {
+        // A head observed before its parent lands pending; no connected suffix exists yet.
+        let anchor = graph_hash(1);
+        let absent_parent = graph_hash(2);
+        let head = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(head, absent_parent, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_observed_head(head);
+        assert!(matches!(graph.nodes.get(&head), Some(Node::Pending(_))));
+        assert!(graph.canonical_oldest_to_newest().is_empty());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn canonical_chain_autocompletes_after_backfill() {
+        // The defining property: the head is observed while pending (chain empty); when its missing
+        // parent is later backfilled and promotion connects the head, the chain auto-completes with
+        // NO further with_observed_head call.
+        let anchor = graph_hash(1);
+        let parent = graph_hash(2);
+        let head = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(head, parent, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_observed_head(head);
+        assert!(graph.canonical_oldest_to_newest().is_empty());
+
+        let graph = graph.with_block(parent, anchor, Bloom::repeat_byte(0)).unwrap();
+        assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![parent, head]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn canonical_chain_follows_reorg() {
+        // Repointing the head to a sibling connected fork is a pure, non-destructive pointer move:
+        // the chain follows the head, both forks stay in the graph.
+        let anchor = graph_hash(1);
+        let fork_a = graph_hash(2);
+        let fork_b = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(fork_a, anchor, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(fork_b, anchor, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_observed_head(fork_a);
+        assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![fork_a]);
+
+        let graph = graph.with_observed_head(fork_b);
+        assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![fork_b]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn with_observed_head_ignores_absent_block() {
+        // Setting the head to a hash that is neither the anchor nor present is a no-op (keeps the
+        // "observed head is the anchor or present" invariant un-violable at the setter).
+        let anchor = graph_hash(1);
+        let absent = graph_hash(2);
+        let graph = BlocksGraph::new(anchor).with_observed_head(absent);
+        assert_eq!(graph.observed_head, anchor);
         assert_graph_invariants(&graph);
     }
 
