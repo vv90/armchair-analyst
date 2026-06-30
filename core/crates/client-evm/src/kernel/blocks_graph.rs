@@ -327,10 +327,32 @@ impl BlocksGraph {
         chain
     }
 
+    /// The dangling ancestors still to backfill: the distinct, sorted set of `Pending` nodes' parent
+    /// hashes that are absent from the graph (and not the anchor). A *present* pending parent is
+    /// awaited transitively, not fetched — only the gap root is reported. Connected nodes never
+    /// contribute (their parents resolve by T2). No `finalized_hash` parameter — the anchor is owned.
+    /// Sorted+deduped so downstream backfill request-id assignment is deterministic (mirrors the
+    /// legacy `missing_seed_parents`).
+    fn missing_parents(&self) -> Vec<BlockHash> {
+        let mut missing: Vec<BlockHash> = self
+            .nodes
+            .values()
+            .filter_map(|node| match node {
+                Node::Pending(pending)
+                    if pending.parent != self.anchor
+                        && !self.nodes.contains_key(&pending.parent) =>
+                {
+                    Some(pending.parent)
+                }
+                _ => None,
+            })
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    }
+
     // --- planned interface (each lands test-first) ---------------------------------------------
-    //
-    // derived view, no longer re-walked: the dangling parents still being backfilled
-    // fn missing_parents(&self) -> impl Iterator<Item = BlockHash> + '_;
     //
     // finalization: re-root at a connected descendant, prune non-descendants, reclassify
     // fn reanchored_to(self, new_anchor: ConnectedHash) -> BlocksGraph;
@@ -594,6 +616,42 @@ mod tests {
             prop_assert_eq!(chain_hashes(&chain), expected);
             for ConnectedHash(hash) in &chain {
                 prop_assert!(graph.connected(*hash).is_some());
+            }
+        }
+
+        /// `missing_parents()` is exactly the absent, non-anchor hashes referenced by pending nodes —
+        /// sound, complete, and strictly ascending — at every step of an incremental fold (where
+        /// genuine gaps exist before promotion closes them).
+        #[test]
+        fn missing_parents_are_exactly_absent_referenced_parents(plan in admission_plan_strategy()) {
+            let mut graph = BlocksGraph::new(graph_hash(0));
+            for &node in &plan.order_a {
+                graph = graph
+                    .with_block(graph_hash(node), graph_hash(plan.parents[node]), Bloom::repeat_byte(0))
+                    .expect("generated admission must succeed");
+                let missing = graph.missing_parents();
+
+                // distinct + strictly ascending
+                for pair in missing.windows(2) {
+                    prop_assert!(pair[0] < pair[1]);
+                }
+                // soundness: every reported hash is absent, not the anchor, and referenced by a pending node
+                for &hash in &missing {
+                    prop_assert!(hash != graph.anchor);
+                    prop_assert!(!graph.nodes.contains_key(&hash));
+                    prop_assert!(graph
+                        .nodes
+                        .values()
+                        .any(|node| matches!(node, Node::Pending(p) if p.parent == hash)));
+                }
+                // completeness: every pending node's absent, non-anchor parent is reported
+                for node in graph.nodes.values() {
+                    if let Node::Pending(pending) = node {
+                        if pending.parent != graph.anchor && !graph.nodes.contains_key(&pending.parent) {
+                            prop_assert!(missing.contains(&pending.parent));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1100,6 +1158,112 @@ mod tests {
         let absent = graph_hash(2);
         let graph = BlocksGraph::new(anchor).with_observed_head(absent);
         assert_eq!(graph.observed_head, anchor);
+        assert_graph_invariants(&graph);
+    }
+
+    // --- missing parents (backfill view) --------------------------------------------------------
+
+    #[test]
+    fn missing_parents_empty_graph() {
+        let graph = BlocksGraph::new(graph_hash(1));
+        assert!(graph.missing_parents().is_empty());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn missing_parents_all_connected() {
+        // An anchor-rooted chain has no gaps: every parent is present.
+        let anchor = graph_hash(1);
+        let b2 = graph_hash(2);
+        let b3 = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(b2, anchor, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(b3, b2, Bloom::repeat_byte(0))
+            .unwrap();
+        assert!(graph.missing_parents().is_empty());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn missing_parents_single_dangling() {
+        // A pending block's absent parent is the one ancestor to backfill.
+        let anchor = graph_hash(1);
+        let absent_parent = graph_hash(2);
+        let block = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(block, absent_parent, Bloom::repeat_byte(0))
+            .unwrap();
+        assert_eq!(graph.missing_parents(), vec![absent_parent]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn missing_parents_dedups_shared_absent_parent() {
+        // Two pending blocks awaiting the same absent parent report it once.
+        let anchor = graph_hash(1);
+        let shared_absent = graph_hash(2);
+        let b3 = graph_hash(3);
+        let b4 = graph_hash(4);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(b3, shared_absent, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(b4, shared_absent, Bloom::repeat_byte(0))
+            .unwrap();
+        assert_eq!(graph.missing_parents(), vec![shared_absent]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn missing_parents_excludes_present_pending_parent() {
+        // b4 → b3 (b3 absent on arrival), then b3 → absent_root. Both pending; b3 is present, so it is
+        // not missing (awaited transitively) — only the gap root, absent_root, is reported.
+        let anchor = graph_hash(1);
+        let absent_root = graph_hash(2);
+        let b3 = graph_hash(3);
+        let b4 = graph_hash(4);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(b4, b3, Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(b3, absent_root, Bloom::repeat_byte(0))
+            .unwrap();
+        assert!(matches!(graph.nodes.get(&b3), Some(Node::Pending(_))));
+        assert!(matches!(graph.nodes.get(&b4), Some(Node::Pending(_))));
+        assert_eq!(graph.missing_parents(), vec![absent_root]);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn missing_parents_sorted() {
+        // Absent parents admitted out of order are returned strictly ascending.
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(10), graph_hash(30), Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(graph_hash(11), graph_hash(20), Bloom::repeat_byte(0))
+            .unwrap()
+            .with_block(graph_hash(12), graph_hash(25), Bloom::repeat_byte(0))
+            .unwrap();
+        assert_eq!(
+            graph.missing_parents(),
+            vec![graph_hash(20), graph_hash(25), graph_hash(30)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn missing_parents_empty_after_promotion() {
+        // Once the awaited parent arrives and connects, the gap closes and nothing remains to fetch.
+        let anchor = graph_hash(1);
+        let parent = graph_hash(2);
+        let child = graph_hash(3);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(child, parent, Bloom::repeat_byte(0))
+            .unwrap();
+        assert_eq!(graph.missing_parents(), vec![parent]);
+
+        let graph = graph.with_block(parent, anchor, Bloom::repeat_byte(0)).unwrap();
+        assert!(graph.missing_parents().is_empty());
         assert_graph_invariants(&graph);
     }
 
