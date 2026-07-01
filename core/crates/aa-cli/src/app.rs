@@ -727,6 +727,7 @@ fn map_client_subscription_data(client_chain_event: ClientEvent) -> Option<Subsc
             hash: header.inner.hash,
             parent_hash: header.inner.inner.parent_hash,
             logs_bloom: header.inner.inner.logs_bloom,
+            number: header.inner.inner.number,
         }),
         ClientEvent::PoolLogObserved {
             block_hash, log, ..
@@ -943,6 +944,7 @@ where
                             hash: header.inner.hash,
                             parent_hash: header.inner.inner.parent_hash,
                             logs_bloom: header.inner.inner.logs_bloom,
+                            number: header.inner.inner.number,
                         },
                     }],
                     Ok(None) => vec![Event::ChainEvent {
@@ -1302,6 +1304,7 @@ mod tests {
                     hash: block_hash,
                     parent_hash,
                     logs_bloom: Bloom::default(),
+                    number: 1,
                 },
             }),
             format!("input chain=Ethereum head_observed hash={block_hash} parent={parent_hash}")
@@ -1314,6 +1317,7 @@ mod tests {
                     hash: block_hash,
                     parent_hash,
                     logs_bloom: Bloom::default(),
+                    number: 1,
                 },
             }),
             format!(
@@ -2210,6 +2214,7 @@ mod tests {
                 hash: observed_hash,
                 parent_hash: block_hash,
                 logs_bloom: Bloom::default(),
+                number: 3,
             },
         );
 

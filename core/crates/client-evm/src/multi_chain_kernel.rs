@@ -462,6 +462,7 @@ pub enum SubscriptionData {
         hash: BlockHash,
         parent_hash: BlockHash,
         logs_bloom: Bloom,
+        number: u64,
     },
     PoolLog {
         block_hash: BlockHash,
@@ -477,10 +478,12 @@ impl SubscriptionData {
                 hash,
                 parent_hash,
                 logs_bloom,
+                number,
             } => kernel::Event::HeadObserved {
                 hash,
                 parent_hash,
                 logs_bloom,
+                number,
             },
             SubscriptionData::PoolLog { block_hash, log } => kernel::Event::LogObserved {
                 block_hash,
@@ -1091,6 +1094,34 @@ mod tests {
         }
     }
 
+    // Maps a live-subscription new head into its kernel event.
+    // This pins that the block number survives the SubscriptionData -> kernel::Event hop, the one
+    // intermediate struct that carries it, so the graph's block-admission entry can read it.
+    #[test]
+    fn subscription_new_head_carries_block_number_into_head_observed_event() {
+        let head = BlockHash::with_last_byte(20);
+        let parent = BlockHash::with_last_byte(1);
+        let number = 4_242;
+
+        let event = SubscriptionData::NewHead {
+            hash: head,
+            parent_hash: parent,
+            logs_bloom: Bloom::ZERO,
+            number,
+        }
+        .into_kernel_event();
+
+        assert!(matches!(
+            event,
+            kernel::Event::HeadObserved {
+                hash,
+                parent_hash,
+                number: observed_number,
+                ..
+            } if hash == head && parent_hash == parent && observed_number == number
+        ));
+    }
+
     #[test]
     fn optimization_step_completed_stores_result_without_touching_chains() {
         let state = active_state_at(ChainKey::Ethereum, hash(1));
@@ -1265,6 +1296,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: child_hash,
                     parent_hash: finalized_hash,
+                    number: block_number_for(child_hash),
                 },
             },
         );
@@ -1325,6 +1357,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: observed_hash,
                     parent_hash: missing_parent_hash,
+                    number: block_number_for(observed_hash),
                 },
             },
         );
@@ -1357,6 +1390,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: observed_hash,
                     parent_hash: missing_parent_hash,
+                    number: block_number_for(observed_hash),
                 },
             },
         );
@@ -1507,6 +1541,7 @@ mod tests {
                         request_id,
                         hash: missing_hash,
                         parent_hash,
+                        number: block_number_for(missing_hash),
                     },
                 },
             );
@@ -1543,6 +1578,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: compacted_hash,
                     parent_hash: finalized_hash,
+                    number: block_number_for(compacted_hash),
                 },
             },
         );
@@ -1582,6 +1618,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: old_branch_hash,
                     parent_hash: finalized_hash,
+                    number: block_number_for(old_branch_hash),
                 },
             },
         );
@@ -2211,6 +2248,13 @@ mod tests {
         BlockHash::with_last_byte(value)
     }
 
+    /// Test-only block number recovered from a block hash's trailing byte. These tests encode block
+    /// identity in `BlockHash::with_last_byte(_)`, so this yields a per-hash-stable number for the
+    /// log-sourced graph's block-admission entry. No production consumer of the plumbed `number` yet.
+    fn block_number_for(hash: BlockHash) -> u64 {
+        hash.0[31] as u64
+    }
+
     fn pool(value: u8) -> PoolRef {
         pool_on(ChainKey::Ethereum, value)
     }
@@ -2492,6 +2536,7 @@ mod tests {
                     hash: head,
                     parent_hash: finalized,
                     logs_bloom: Bloom::ZERO,
+                    number: 20,
                 },
             },
         );
@@ -2596,6 +2641,7 @@ mod tests {
                     hash,
                     parent_hash,
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
+                    number: block_number_for(hash),
                 },
             },
         )

@@ -1135,6 +1135,7 @@ pub enum Event {
         hash: BlockHash,
         parent_hash: BlockHash,
         logs_bloom: Bloom,
+        number: u64,
     },
     FinalizedBlockObserved {
         block_hash: BlockHash,
@@ -1144,6 +1145,7 @@ pub enum Event {
         hash: BlockHash,
         parent_hash: BlockHash,
         logs_bloom: Bloom,
+        number: u64,
     },
     BlockHeaderNotFound {
         request_id: RequestId<GetBlockHeader>,
@@ -1603,6 +1605,9 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             hash,
             parent_hash,
             logs_bloom,
+            // Plumbed for the log-sourced graph's block-admission entry; consumed by the shadow
+            // graph in the next increment. Legacy admission does not track block numbers.
+            number: _number,
         } => {
             match state.blocks.with_new_block(
                 hash,
@@ -1692,6 +1697,9 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             hash,
             parent_hash,
             logs_bloom,
+            // Plumbed for the log-sourced graph's block-admission entry; consumed by the shadow
+            // graph in the next increment. Legacy admission does not track block numbers.
+            number: _number,
         } => {
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
 
@@ -2552,6 +2560,14 @@ mod tests {
         BlockHash::with_last_byte((node_index + 1) as u8)
     }
 
+    /// Test-only block number recovered from a block hash's trailing byte. These tests encode block
+    /// identity/height in `BlockHash::with_last_byte(_)`, so this yields a per-hash-stable,
+    /// height-ordered number for the log-sourced graph's block-admission entry. There is no
+    /// production consumer of the plumbed `number` yet (see `Event::HeadObserved`).
+    fn block_number_for(hash: BlockHash) -> u64 {
+        hash.0[31] as u64
+    }
+
     /// Converts generated event cases into real kernel events.
     /// This separates shrinking-friendly inputs from the concrete transition API.
     fn event_from_generated(generated_event: GeneratedEvent) -> Event {
@@ -2563,6 +2579,7 @@ mod tests {
                 logs_bloom: bloom_matching_any(),
                 hash: hash_for_node(hash_index),
                 parent_hash: hash_for_node(parent_index),
+                number: hash_index as u64,
             },
             GeneratedEvent::BlockHeaderReceived {
                 request_id,
@@ -2573,6 +2590,7 @@ mod tests {
                 request_id: RequestId::from_raw_for_test(u64::from(request_id)),
                 hash: hash_for_node(hash_index),
                 parent_hash: hash_for_node(parent_index),
+                number: hash_index as u64,
             },
             GeneratedEvent::BlockHeaderNotFound { request_id } => Event::BlockHeaderNotFound {
                 request_id: RequestId::from_raw_for_test(u64::from(request_id)),
@@ -2760,6 +2778,7 @@ mod tests {
                         ChainKey::Ethereum,
                         state,
                         Event::BlockHeaderReceived {
+                            number: block_number_for(block_hash),
                             logs_bloom: bloom_matching_any(),
                             request_id,
                             hash: block_hash,
@@ -2843,6 +2862,7 @@ mod tests {
                         ChainKey::Ethereum,
                         state,
                         Event::BlockHeaderReceived {
+                            number: block_number_for(block_hash),
                             logs_bloom: bloom_matching_any(),
                             request_id: current_request_id,
                             hash: block_hash,
@@ -3671,6 +3691,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: head_hash,
@@ -3704,6 +3725,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -3749,6 +3771,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -3801,6 +3824,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -3898,6 +3922,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(new_head),
                 logs_bloom: bloom_matching_any(),
                 hash: new_head,
                 parent_hash: seed_hash,
@@ -3968,6 +3993,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(new_head),
                 logs_bloom: bloom_matching_any(),
                 hash: new_head,
                 parent_hash: seed_hash,
@@ -4019,6 +4045,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(old_head),
                 logs_bloom: bloom_matching_any(),
                 hash: old_head,
                 parent_hash: seed_hash,
@@ -4031,6 +4058,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(new_head),
                 logs_bloom: bloom_matching_any(),
                 hash: new_head,
                 parent_hash: new_gap_block,
@@ -4045,6 +4073,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(new_gap_block),
                 logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: new_gap_block,
@@ -4349,6 +4378,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(fresh_head_hash()),
                 logs_bloom: bloom_matching_any(),
                 hash: fresh_head_hash(),
                 parent_hash: seed_tip,
@@ -4395,6 +4425,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(fresh_head_hash()),
                 logs_bloom: bloom_matching_any(),
                 hash: fresh_head_hash(),
                 parent_hash: seed_tip,
@@ -4538,6 +4569,7 @@ mod tests {
                     let (next_state, effects) = transition(ChainKey::Ethereum,
                         state,
                         Event::HeadObserved {
+                            number: block_number_for(fresh_head_hash()),
                             logs_bloom: bloom_matching_any(),
                             hash: fresh_head_hash(),
                             parent_hash: seed_tip,
@@ -4568,6 +4600,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
@@ -4605,6 +4638,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(cycle_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: cycle_hash,
                 parent_hash: second_hash,
@@ -4629,6 +4663,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(finalized_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: finalized_hash,
                 parent_hash,
@@ -4652,6 +4687,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
@@ -4676,6 +4712,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -4705,6 +4742,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(first_head),
                 logs_bloom: bloom_matching_any(),
                 hash: first_head,
                 parent_hash: shared_missing_parent,
@@ -4717,6 +4755,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(second_head),
                 logs_bloom: bloom_matching_any(),
                 hash: second_head,
                 parent_hash: shared_missing_parent,
@@ -4759,6 +4798,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(first_head),
                 logs_bloom: bloom_matching_any(),
                 hash: first_head,
                 parent_hash: first_missing_parent,
@@ -4769,6 +4809,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(second_head),
                 logs_bloom: bloom_matching_any(),
                 hash: second_head,
                 parent_hash: second_missing_parent,
@@ -4803,6 +4844,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -4815,6 +4857,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: missing_parent_hash,
@@ -4859,6 +4902,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash,
@@ -4887,6 +4931,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash,
@@ -4898,6 +4943,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: parent_hash,
@@ -4910,6 +4956,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: parent_hash,
@@ -4945,6 +4992,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
@@ -4978,6 +5026,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
@@ -5722,6 +5771,7 @@ mod tests {
             ChainKey::Ethereum,
             buffered_state,
             Event::HeadObserved {
+                number: block_number_for(block_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: block_hash,
                 parent_hash: finalized,
@@ -8656,6 +8706,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: finalized_hash,
@@ -8667,6 +8718,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -8704,6 +8756,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -8715,6 +8768,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
@@ -8749,6 +8803,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -8808,6 +8863,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -8855,6 +8911,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -8866,6 +8923,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
@@ -8906,6 +8964,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -8952,6 +9011,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -8994,6 +9054,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9036,6 +9097,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9075,6 +9137,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9086,6 +9149,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(unrelated_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: unrelated_hash,
@@ -9123,6 +9187,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9134,6 +9199,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(unrelated_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: RequestId::from_raw_for_test(99),
                 hash: unrelated_hash,
@@ -9146,6 +9212,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(unrelated_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: unrelated_hash,
@@ -9177,6 +9244,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(first_head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: first_head_hash,
                 parent_hash: first_missing_parent_hash,
@@ -9189,6 +9257,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(first_head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: first_head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -9202,6 +9271,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(second_head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: second_head_hash,
                 parent_hash: second_missing_parent_hash,
@@ -9229,6 +9299,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9259,6 +9330,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9296,6 +9368,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9333,6 +9406,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9487,6 +9561,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9527,6 +9602,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9566,6 +9642,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9612,6 +9689,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9656,6 +9734,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9668,6 +9747,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -9704,6 +9784,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9715,6 +9796,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
@@ -9755,6 +9837,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9775,6 +9858,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: failed_request_id,
                 hash: missing_parent_hash,
@@ -9809,6 +9893,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9828,6 +9913,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: retry_request_id,
                 hash: missing_parent_hash,
@@ -9868,6 +9954,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9881,6 +9968,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id,
                 hash: missing_parent_hash,
@@ -9917,6 +10005,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9964,6 +10053,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -9980,6 +10070,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
+                number: block_number_for(missing_parent_hash),
                 logs_bloom: bloom_matching_any(),
                 request_id: expired_request_id,
                 hash: missing_parent_hash,
@@ -10014,6 +10105,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: missing_parent_hash,
@@ -10028,6 +10120,7 @@ mod tests {
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
+                number: block_number_for(head_hash),
                 logs_bloom: bloom_matching_any(),
                 hash: head_hash,
                 parent_hash: conflicting_parent_hash,
@@ -10217,6 +10310,7 @@ mod tests {
             let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
+                    number: block_number_for(tip_hash),
                     logs_bloom: bloom_matching_any(),
                     hash: tip_hash,
                     parent_hash: tip_parent_hash,
@@ -10239,6 +10333,7 @@ mod tests {
             let (next_state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
+                    number: block_number_for(tip_hash),
                     logs_bloom: bloom_matching_any(),
                     hash: tip_hash,
                     parent_hash: tip_parent_hash,
@@ -10270,7 +10365,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any(), number: block_number_for(hash) },
                 );
 
                 assert_present_canonical_logs_are_resolved(&state);
@@ -10296,6 +10391,7 @@ mod tests {
                 let (next_state, effects) = transition(ChainKey::Ethereum,
                     state,
                     Event::HeadObserved {
+                        number: block_number_for(block_hash),
                         logs_bloom: bloom_matching_any(),
                         hash: block_hash,
                         parent_hash,
@@ -10826,6 +10922,7 @@ mod tests {
                 let (next_state, effects) = transition(ChainKey::Ethereum,
                     state,
                     Event::HeadObserved {
+                        number: block_number_for(block_hash),
                         logs_bloom: bloom_matching_any(),
                         hash: block_hash,
                         parent_hash,
@@ -10886,7 +10983,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any(), number: block_number_for(hash) },
                 );
             }
 
@@ -10933,6 +11030,7 @@ mod tests {
                         ChainKey::Ethereum,
                         state,
                         Event::HeadObserved {
+                            number: block_number_for(hash),
                             hash,
                             parent_hash,
                             logs_bloom: bloom_matching_any(),
@@ -10958,6 +11056,7 @@ mod tests {
                         let (next_state, effects) = transition(ChainKey::Ethereum,
                             state,
                             Event::BlockHeaderReceived {
+                                number: block_number_for(block_hash),
                                 logs_bloom: bloom_matching_any(),
                                 request_id,
                                 hash: block_hash,
@@ -11022,7 +11121,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers_with_retries(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any(), number: block_number_for(hash) },
                     &retry_plans,
                 );
             }
@@ -11209,6 +11308,7 @@ mod tests {
             let (state, effects) = transition(ChainKey::Ethereum,
                 state,
                 Event::HeadObserved {
+                    number: block_number_for(first_head_hash),
                     logs_bloom: bloom_matching_any(),
                     hash: first_head_hash,
                     parent_hash: first_parent_hash,
@@ -11232,7 +11332,7 @@ mod tests {
                 state = apply_event_and_drain_block_headers(
                     state,
                     &chain,
-                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any() },
+                    Event::HeadObserved { hash, parent_hash , logs_bloom: bloom_matching_any(), number: block_number_for(hash) },
                 );
             }
 
