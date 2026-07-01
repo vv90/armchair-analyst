@@ -28,7 +28,7 @@ use crate::{PoolLog, PoolLogEvent, PoolRef, PoolState, ProtocolPoolKey, derive_p
 /// not yet anchor-reachable; bloom consistency; the monotone `Unknown → Streamed → Complete` log
 /// ladder; the finalization re-root/prune and its foldability gate; and the `pending` bound.
 #[derive(Debug)]
-struct BlocksGraph {
+pub(crate) struct BlocksGraph {
     anchor: BlockHash,
     nodes: HashMap<BlockHash, Node>,
     /// The latest head the feed reported — genuine external input (consensus picks the head; the DAG
@@ -252,7 +252,7 @@ fn connected_parent_hash(parent: &AnchoredRef, anchor: BlockHash) -> BlockHash {
 }
 
 impl BlocksGraph {
-    fn new(anchor: BlockHash) -> BlocksGraph {
+    pub(crate) fn new(anchor: BlockHash) -> BlocksGraph {
         BlocksGraph {
             anchor,
             nodes: HashMap::new(),
@@ -301,6 +301,25 @@ impl BlocksGraph {
         bloom: Bloom,
     ) -> Result<BlocksGraph, NewBlockError> {
         self.with_block_capped(hash, parent, number, bloom, MAX_PENDING_BLOCKS)
+    }
+
+    /// Kernel admission entry: [`with_block`], but every refusal keeps the (unchanged) graph rather
+    /// than surfacing an error. This is the reorg-safety decision (b) in
+    /// `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md` — a `ConflictingParent` (provably bad data) is refused
+    /// and the first-seen block kept, not reset; every other refusal (self-parent, anchor-readmit,
+    /// duplicate, pending-buffer-full) is already a benign no-op. The kernel is pure, so a refusal is
+    /// silently dropped (no telemetry channel); finalization ultimately prunes any poisoned fork.
+    pub(crate) fn admitted(
+        self,
+        hash: BlockHash,
+        parent: BlockHash,
+        number: u64,
+        bloom: Bloom,
+    ) -> BlocksGraph {
+        match self.with_block(hash, parent, number, bloom) {
+            Ok(graph) => graph,
+            Err(error) => error.into_graph(),
+        }
     }
 
     /// Admit a block from a header. Classifies it as `Connected` (parent is the anchor or an
@@ -419,7 +438,7 @@ impl BlocksGraph {
     /// auto-completes (see `canonical_oldest_to_newest`). Updates the field only when `hash` is the
     /// anchor or a present node, so the "`observed_head` is the anchor or present" invariant cannot be
     /// violated here; an absent hash (which the admit-first kernel never produces) is a no-op.
-    fn with_observed_head(self, hash: BlockHash) -> BlocksGraph {
+    pub(crate) fn with_observed_head(self, hash: BlockHash) -> BlocksGraph {
         if hash == self.anchor || self.nodes.contains_key(&hash) {
             BlocksGraph { observed_head: hash, ..self }
         } else {
@@ -441,7 +460,7 @@ impl BlocksGraph {
     /// a further `Streamed` merge grows the set by union on the intra-block index. Never steps back
     /// off an authoritative `Complete` block (the merge is a no-op there), and a no-op when the block
     /// is absent. Keys the logs by `log_index` (L3) via [`key_by_log_index`].
-    fn with_streamed_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
+    pub(crate) fn with_streamed_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
         if let Some(data) = self.block_data_mut(hash) {
             match &mut data.logs {
                 // Authoritative logs stand — L5 forbids Complete → Streamed.
@@ -457,7 +476,7 @@ impl BlocksGraph {
     /// supersedes any prior `Unknown`/`Streamed` (replace semantics — `Complete` is the authoritative
     /// full set). Idempotent on an already-`Complete` block (same hash ⇒ same logs) and a no-op when
     /// the block is absent. Keys the logs by `log_index` (L3) via [`key_by_log_index`].
-    fn with_complete_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
+    pub(crate) fn with_complete_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
         if let Some(data) = self.block_data_mut(hash) {
             data.logs = BlockLogs::Complete(key_by_log_index(logs));
         }
@@ -602,7 +621,7 @@ impl BlocksGraph {
     ///
     /// The Stage-4 seam the kernel's optimization dispatch will call in place of
     /// `State::latest_complete_pool_state_update`; it has no production caller until that swap.
-    fn optimization_pool_states(
+    pub(crate) fn optimization_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
     ) -> HashMap<PoolRef, PoolState> {
@@ -699,6 +718,112 @@ impl BlocksGraph {
             },
             new_snapshot,
         ))
+    }
+
+    /// Kernel finalization entry: advance the anchor toward `target` (the observed finalized block) as
+    /// far as the canonical prefix is fully foldable, folding into `base`. Mirrors legacy
+    /// partial-compaction (reorg-safety decision (c) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`): it
+    /// reanchors to the *latest complete connected block ≤ target*, so a hole short of `target`
+    /// advances only to just before that hole (fold-on-demand), and an absent/pending/unconnected
+    /// `target` is a no-op. Infallible — the chosen sub-target is hole-free by construction, so the
+    /// inner [`reanchored_to`] never returns `Incomplete`; the returned snapshot replaces the caller's
+    /// finalized base only when the anchor actually advances.
+    pub(crate) fn finalized_to(
+        self,
+        target: BlockHash,
+        base: &HashMap<PoolRef, PoolState>,
+        v4_manager: Address,
+    ) -> (BlocksGraph, HashMap<PoolRef, PoolState>) {
+        // Only a connected target is finalizable; an absent/pending one has no foldable prefix yet.
+        if self.connected(target).is_none() {
+            return (self, base.clone());
+        }
+        let watched = watched_addresses(base, v4_manager);
+
+        // Walk the canonical prefix oldest→newest, advancing the candidate anchor across each block
+        // whose whole prefix stays foldable, and stopping at the first hole (a non-`Complete` block
+        // whose bloom may touch a watched pool). The result is the latest complete connected block
+        // whose prefix `anchor → it` is entirely foldable — legacy's "latest complete ≤ target".
+        let mut new_anchor: Option<ConnectedHash> = None;
+        for ConnectedHash(hash) in self.connected_oldest_to_newest(ConnectedHash(target)) {
+            let Some(node) = self.connected(hash) else {
+                break;
+            };
+            let is_hole = !matches!(node.data.logs, BlockLogs::Complete(_))
+                && bloom_may_touch(node.data.logs_bloom, &watched);
+            if is_hole {
+                break;
+            }
+            new_anchor = Some(ConnectedHash(hash));
+        }
+
+        match new_anchor {
+            // The first canonical block is already a hole: nothing foldable, stay put.
+            None => (self, base.clone()),
+            Some(anchor) => match self.reanchored_to(anchor, base, v4_manager) {
+                Ok(pair) => pair,
+                // Hole-free by construction ⇒ unreachable; keep the graph and base if it ever fires.
+                Err(ReanchorError::Incomplete(graph, _)) => (graph, base.clone()),
+            },
+        }
+    }
+
+    /// The canonical chain `anchor → target`, oldest→newest, as connected hashes. Like
+    /// [`connected_path_data`] but yielding the hashes (finalization needs the hash to reanchor).
+    /// `target` is connected (holds the [`ConnectedHash`] proof), so the walk reaches the anchor (T2).
+    fn connected_oldest_to_newest(&self, target: ConnectedHash) -> Vec<ConnectedHash> {
+        let mut chain = Vec::new();
+        let mut current = target.0;
+        while let Some(node) = self.connected(current) {
+            chain.push(ConnectedHash(current));
+            match node.parent {
+                AnchoredRef::Anchor => break,
+                AnchoredRef::Block(ConnectedHash(parent)) => current = parent,
+            }
+        }
+        chain.reverse();
+        chain
+    }
+}
+
+impl NewBlockError {
+    /// Recovers the (unchanged) graph every refusal hands back, so [`BlocksGraph::admitted`] can keep
+    /// the first-seen graph on any admission refusal (reorg-safety decision (b)).
+    fn into_graph(self) -> BlocksGraph {
+        match self {
+            NewBlockError::SelfParent(graph)
+            | NewBlockError::AnchorReadmit(graph)
+            | NewBlockError::DuplicateBlock(graph)
+            | NewBlockError::ConflictingParent(graph)
+            | NewBlockError::PendingBufferFull(graph) => graph,
+        }
+    }
+}
+
+/// TEMPORARY (Stage-4 swap): plain-`BlockHash` accessors for the kernel's `shadow_parity` tests, which
+/// compare this graph's structure against the legacy graph. `ConnectedHash` is module-private, so these
+/// project it away. Delete with the parity tests when the swap makes the graph the sole source of truth.
+#[cfg(test)]
+impl BlocksGraph {
+    pub(crate) fn anchor_hash(&self) -> BlockHash {
+        self.anchor
+    }
+
+    pub(crate) fn observed_head_hash(&self) -> BlockHash {
+        self.observed_head
+    }
+
+    /// The canonical chain hashes, oldest→newest (empty when the head is not connected).
+    pub(crate) fn canonical_hashes(&self) -> Vec<BlockHash> {
+        self.canonical_oldest_to_newest()
+            .into_iter()
+            .map(|ConnectedHash(hash)| hash)
+            .collect()
+    }
+
+    /// Every admitted block hash, connected or pending.
+    pub(crate) fn node_hashes(&self) -> HashSet<BlockHash> {
+        self.nodes.keys().copied().collect()
     }
 }
 

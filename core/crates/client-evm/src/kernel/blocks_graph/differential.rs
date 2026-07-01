@@ -362,6 +362,8 @@ fn legacy_state(scenario: &Scenario) -> State {
         token_registry: TokenRegistry::new(),
         tick: Tick::initial(),
         streamed_logs: HashMap::new(),
+        // Unused here: this scaffolding drives the new graph directly, not via `State.log_shadow`.
+        log_shadow: crate::kernel::LogGraphShadow::new(dh(0), HashMap::new()),
     }
 }
 
@@ -632,6 +634,8 @@ fn registry_only_pool_is_excluded_from_new_fold_but_present_in_legacy() {
         token_registry: TokenRegistry::new(),
         tick: Tick::initial(),
         streamed_logs: HashMap::new(),
+        // Unused here: this scaffolding drives the new graph directly, not via `State.log_shadow`.
+        log_shadow: crate::kernel::LogGraphShadow::new(dh(0), HashMap::new()),
     }
     .with_finalized_block_observed(CHAIN, dh(1));
 

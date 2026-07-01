@@ -578,6 +578,38 @@ pub struct State {
     /// into the block when it enters via a head/header observation. Bounded by
     /// [`MAX_STREAMED_LOG_BLOCKS`]; raw input staging only, safe to drop.
     streamed_logs: HashMap<BlockHash, Vec<PoolLog>>,
+    /// The log-sourced blocks graph run in parallel with the legacy `blocks`/`finalized_state`.
+    /// Fed by `transition` from real events (Increment 2) but NOT yet read by production — its sole
+    /// consumer is the temporary `shadow_parity` test module. See [`LogGraphShadow`].
+    log_shadow: LogGraphShadow,
+}
+
+/// The log-sourced [`blocks_graph::BlocksGraph`] and its advancing finalized base snapshot, run
+/// alongside the legacy `blocks` + `finalized_state` during the pre-swap shadow period.
+///
+/// TEMPORARY COUPLING (Stage-4 swap): production reads still come from the legacy fields; this pair
+/// is fed but only read by the `shadow_parity` tests. At the swap it *replaces* `blocks` +
+/// `finalized_state` (whose `block_hash` is already `#[deprecated]` in favor of the graph anchor),
+/// and the legacy fields are deleted. Grouped so the swap has a single seam to unbundle.
+#[derive(Debug)]
+struct LogGraphShadow {
+    graph: blocks_graph::BlocksGraph,
+    /// The finalized base the graph folds over — advances on each `reanchored_to`. Mirrors
+    /// `finalized_state.pool_snapshots`, but holds only fold-resident (base) pools (the new fold
+    /// excludes registry-only pools), so parity is asserted on base-resident keys.
+    finalized_snapshot: HashMap<PoolRef, PoolState>,
+}
+
+impl LogGraphShadow {
+    /// A fresh shadow anchored at `finalized_hash` with the given finalized base — the graph analog of
+    /// `State::init`/`reset` (empty recent region, anchor = finalized). Used everywhere the legacy
+    /// `blocks` starts empty.
+    fn new(finalized_hash: BlockHash, finalized_snapshot: HashMap<PoolRef, PoolState>) -> LogGraphShadow {
+        LogGraphShadow {
+            graph: blocks_graph::BlocksGraph::new(finalized_hash),
+            finalized_snapshot,
+        }
+    }
 }
 
 /// Caps how many not-yet-known blocks can hold buffered subscription logs at once, bounding the
@@ -588,9 +620,14 @@ impl State {
     /// Creates kernel state from a finalized snapshot with no pending requests or recent blocks.
     /// Added as the pure state-machine entry point for runtimes that will feed events and execute effects.
     pub fn init(finalized_state: FinalizedState) -> State {
+        // `block_hash` seeds both the legacy tip and the new graph anchor at bootstrap — the one place
+        // a finalized hash legitimately comes from the field rather than the graph anchor.
+        #[allow(deprecated)]
+        let finalized_hash = finalized_state.block_hash;
         State {
             blocks: BlocksGraph::new(),
-            canonical_tip: finalized_state.block_hash,
+            canonical_tip: finalized_hash,
+            log_shadow: LogGraphShadow::new(finalized_hash, finalized_state.pool_snapshots.clone()),
             pending_requests: PendingRequests::new(),
             finalized_state,
             pool_registry: TrustedPoolRegistry::new(),
@@ -655,6 +692,12 @@ impl State {
         let state = State {
             blocks,
             canonical_tip: finalized_hash,
+            // The shadow graph starts empty at the finalized anchor: seed blocks carry no block
+            // `number`/`logs_bloom` (BlockNode has `logs_bloom: None`, logs pre-`Resolved`), so they
+            // cannot be replayed through `with_block` (which requires both). The shadow warms up from
+            // live events after bootstrap, exactly as it would from a bare `State::init`. Seed replay
+            // is deferred to a later increment (needs number/bloom plumbed into the seed).
+            log_shadow: LogGraphShadow::new(finalized_hash, finalized_pool_snapshots.clone()),
             pending_requests,
             finalized_state: FinalizedState {
                 block_hash: finalized_hash,
@@ -726,9 +769,12 @@ impl State {
         pool_registry: TrustedPoolRegistry,
         token_registry: TokenRegistry,
     ) -> State {
+        #[allow(deprecated)]
+        let finalized_hash = finalized_state.block_hash;
         State {
             blocks: BlocksGraph::new(),
-            canonical_tip: finalized_state.block_hash,
+            canonical_tip: finalized_hash,
+            log_shadow: LogGraphShadow::new(finalized_hash, finalized_state.pool_snapshots.clone()),
             pending_requests: PendingRequests::new(),
             finalized_state,
             pool_registry,
@@ -767,9 +813,16 @@ impl State {
         pool_registry: TrustedPoolRegistry,
         token_registry: TokenRegistry,
     ) -> State {
+        // Legacy reorg recovery rebuilds the shadow fresh at the finalized anchor too: during the
+        // shadow period the new graph rides inside the same `State` legacy resets, so it mirrors that
+        // reset. The reorg-safety decision (b) "re-root naturally instead of resetting" takes effect
+        // only at the Stage-4 swap, when this whole `reset` path is deleted.
+        #[allow(deprecated)]
+        let finalized_hash = finalized_state.block_hash;
         State {
             blocks: BlocksGraph::new(),
-            canonical_tip: finalized_state.block_hash,
+            canonical_tip: finalized_hash,
+            log_shadow: LogGraphShadow::new(finalized_hash, finalized_state.pool_snapshots.clone()),
             pending_requests: PendingRequests::new(),
             finalized_state,
             pool_registry,
@@ -988,6 +1041,87 @@ impl State {
         }
     }
 
+    // ---- Log-sourced shadow feed (Increment 2) --------------------------------------------------
+    // These thread real events into the parallel `log_shadow.graph`. Production still reads legacy;
+    // the shadow's only consumer is the `shadow_parity` tests. At the Stage-4 swap the legacy feed is
+    // deleted and this becomes the primary path (the field/feed are permanent; only legacy is temp).
+
+    /// Maps the shadow graph in place, leaving the finalized base untouched.
+    fn map_log_graph(
+        mut self,
+        f: impl FnOnce(blocks_graph::BlocksGraph) -> blocks_graph::BlocksGraph,
+    ) -> State {
+        let LogGraphShadow {
+            graph,
+            finalized_snapshot,
+        } = self.log_shadow;
+        self.log_shadow = LogGraphShadow {
+            graph: f(graph),
+            finalized_snapshot,
+        };
+        self
+    }
+
+    /// `HeadObserved` shadow feed: admit the block (refuse-and-keep, decision (b)) and mark it the
+    /// observed head, then drain any streamed logs staged before the head arrived — mirroring the
+    /// legacy `streamed_logs` buffer drain so a log-before-head ordering does not lose data.
+    fn with_log_head_observed(
+        self,
+        hash: BlockHash,
+        parent_hash: BlockHash,
+        number: u64,
+        bloom: Bloom,
+    ) -> State {
+        let buffered = self.streamed_logs.get(&hash).cloned().unwrap_or_default();
+        self.map_log_graph(move |graph| {
+            let graph = graph.admitted(hash, parent_hash, number, bloom);
+            let graph = if buffered.is_empty() {
+                graph
+            } else {
+                graph.with_streamed_logs(hash, buffered)
+            };
+            // Legacy leaves `canonical_tip` unchanged on a self-parent observation (a garbage event);
+            // every other outcome — admit, duplicate, anchor-readmit — advances the tip, which
+            // `with_observed_head` matches (it updates only for a present or anchor hash).
+            if hash == parent_hash {
+                graph
+            } else {
+                graph.with_observed_head(hash)
+            }
+        })
+    }
+
+    /// `BlockHeaderReceived` shadow feed: admit without advancing the observed head (the header path
+    /// does not move the tip in the legacy graph), draining any pre-staged streamed logs.
+    fn with_log_header_received(
+        self,
+        hash: BlockHash,
+        parent_hash: BlockHash,
+        number: u64,
+        bloom: Bloom,
+    ) -> State {
+        let buffered = self.streamed_logs.get(&hash).cloned().unwrap_or_default();
+        self.map_log_graph(move |graph| {
+            let graph = graph.admitted(hash, parent_hash, number, bloom);
+            if buffered.is_empty() {
+                graph
+            } else {
+                graph.with_streamed_logs(hash, buffered)
+            }
+        })
+    }
+
+    /// `LogObserved` shadow feed: best-effort streamed logs (a no-op if the block is not yet admitted;
+    /// such pre-head logs are staged in `streamed_logs` and drained at admission above).
+    fn with_log_streamed(self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
+        self.map_log_graph(move |graph| graph.with_streamed_logs(block_hash, logs))
+    }
+
+    /// `BlockLogsReceived` shadow feed: authoritative complete logs (replaces any streamed set).
+    fn with_log_complete(self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
+        self.map_log_graph(move |graph| graph.with_complete_logs(block_hash, logs))
+    }
+
     /// Resolves a pool's snapshot as of `parent_hash` for forward derivation by walking the
     /// canonical ancestry newest→oldest. The first ancestor that changed the pool fixes the base to
     /// its snapshot; if no ancestor changed the pool, the base is the finalized snapshot. Returns
@@ -1056,7 +1190,23 @@ impl State {
             token_registry,
             tick,
             streamed_logs: _,
+            log_shadow,
         } = self;
+
+        // Reanchor the shadow independently toward the observed finalized target: `finalized_to`
+        // advances the anchor to the latest complete connected block ≤ `block_hash` (fold-on-demand,
+        // reorg-safety decision (c)), mirroring legacy's partial compaction above without depending on
+        // its computed `update.block_hash`. A target not (yet) connected in the shadow is a no-op.
+        let LogGraphShadow {
+            graph: log_graph,
+            finalized_snapshot: log_base,
+        } = log_shadow;
+        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
+        let (log_graph, log_base) = log_graph.finalized_to(block_hash, &log_base, v4_manager);
+        let log_shadow = LogGraphShadow {
+            graph: log_graph,
+            finalized_snapshot: log_base,
+        };
 
         // Move each pool's latest snapshot out of its block instead of cloning. Every referenced
         // block is at or before the frontier, so `retaining_descendants_of` below prunes them all
@@ -1092,6 +1242,7 @@ impl State {
             // Finalization evicts the staging buffer: any logs whose head has not arrived by now
             // are almost certainly orphaned, and a real future block re-fetches authoritatively.
             streamed_logs: HashMap::new(),
+            log_shadow,
         }
     }
 }
@@ -1238,6 +1389,7 @@ fn schedule_unknown_canonical_log_requests(
         token_registry,
         tick,
         streamed_logs,
+        log_shadow,
     } = state;
 
     let pending_log_hashes = pending_requests.pending_block_log_hashes();
@@ -1302,6 +1454,7 @@ fn schedule_unknown_canonical_log_requests(
             token_registry,
             tick,
             streamed_logs,
+            log_shadow,
         },
         effects,
     )
@@ -1323,6 +1476,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
         token_registry,
         tick,
         streamed_logs,
+        log_shadow,
     } = state;
 
     let pending_candidates = pending_requests.pending_pool_metadata_candidates();
@@ -1362,6 +1516,7 @@ fn schedule_unknown_canonical_pool_metadata_requests(
             token_registry,
             tick,
             streamed_logs,
+            log_shadow,
         },
         effects,
     )
@@ -1383,6 +1538,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
         token_registry,
         tick,
         streamed_logs,
+        log_shadow,
     } = state;
 
     let pending_tokens = pending_requests.pending_token_metadata_tokens();
@@ -1423,6 +1579,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
             token_registry,
             tick,
             streamed_logs,
+            log_shadow,
         },
         effects,
     )
@@ -1444,6 +1601,7 @@ fn schedule_unknown_canonical_pool_data_request(
         token_registry,
         tick,
         streamed_logs,
+        log_shadow,
     } = state;
 
     let pending_pool_data_by_block = pending_requests.pending_pool_data_pools_by_block();
@@ -1478,6 +1636,7 @@ fn schedule_unknown_canonical_pool_data_request(
             token_registry,
             tick,
             streamed_logs,
+            log_shadow,
         },
         effects,
     )
@@ -1511,6 +1670,7 @@ fn schedule_registry_backfill_pool_data(
         token_registry,
         tick,
         streamed_logs,
+        log_shadow,
     } = state;
 
     let pools = blocks.uncovered_verified_pool_chunk(
@@ -1548,6 +1708,7 @@ fn schedule_registry_backfill_pool_data(
             token_registry,
             tick,
             streamed_logs,
+            log_shadow,
         },
         effects,
     )
@@ -1605,10 +1766,12 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             hash,
             parent_hash,
             logs_bloom,
-            // Plumbed for the log-sourced graph's block-admission entry; consumed by the shadow
-            // graph in the next increment. Legacy admission does not track block numbers.
-            number: _number,
+            number,
         } => {
+            // Feed the shadow graph its first consumer of the plumbed `number` (admit + observe head).
+            // On the reset branches below (`State::reset`) this fed shadow is discarded and rebuilt,
+            // mirroring legacy; every non-reset branch spreads it through via `..state`.
+            let state = state.with_log_head_observed(hash, parent_hash, number, logs_bloom);
             match state.blocks.with_new_block(
                 hash,
                 parent_hash,
@@ -1697,10 +1860,11 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             hash,
             parent_hash,
             logs_bloom,
-            // Plumbed for the log-sourced graph's block-admission entry; consumed by the shadow
-            // graph in the next increment. Legacy admission does not track block numbers.
-            number: _number,
+            number,
         } => {
+            // Feed the shadow graph (admit without advancing the observed head; the header path does
+            // not move the tip). Non-reset branches spread it via `..state`; reset rebuilds it.
+            let state = state.with_log_header_received(hash, parent_hash, number, logs_bloom);
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
 
             let retry_request_payload = match request_payload {
@@ -1866,6 +2030,8 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                         pending_requests,
                         ..state
                     }
+                    // Shadow: authoritative complete logs (clone; legacy consumes the original).
+                    .with_log_complete(block_hash, logs.clone())
                     .with_block_logs_applied(chain, block_hash, logs, true);
 
                     schedule_unknown_canonical_requests(chain, state, vec![])
@@ -1883,10 +2049,15 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             if state.blocks.get(&block_hash).is_some() {
                 // Known block: apply provisionally, then schedule the authoritative `GetBlockLogs`
                 // (the block is now `Partial`, which still needs a complete fetch).
-                let state = state.with_block_logs_applied(chain, block_hash, logs, false);
+                let state = state
+                    // Shadow: best-effort streamed logs (clone; legacy consumes the original).
+                    .with_log_streamed(block_hash, logs.clone())
+                    .with_block_logs_applied(chain, block_hash, logs, false);
                 schedule_unknown_canonical_requests(chain, state, vec![])
             } else {
-                // The head has not arrived yet: stage the logs until the block enters the graph.
+                // The head has not arrived yet: stage the logs until the block enters the graph. The
+                // shadow has no separate buffer; `with_log_head_observed` drains this staging map into
+                // the shadow graph when the block is later admitted, so no shadow feed is needed here.
                 (state.with_streamed_logs_buffered(block_hash, logs), vec![])
             }
         }
@@ -2919,6 +3090,7 @@ mod tests {
         State {
             blocks: BlocksGraph::new(),
             canonical_tip: finalized_hash,
+            log_shadow: LogGraphShadow::new(finalized_hash, HashMap::new()),
             pending_requests: PendingRequests::new(),
             finalized_state: FinalizedState {
                 block_hash: finalized_hash,
@@ -11539,5 +11711,307 @@ mod tests {
                 state = next_state;
             }
         }
+    }
+
+    // ============================================================================================
+    // TEMPORARY — Stage-4 swap: `shadow_parity` tests.
+    //
+    // These drive the real `transition` reducer and assert the log-sourced shadow graph
+    // (`State.log_shadow`) that Increment 2 wired in stays in step with the legacy graph on the
+    // observable reads (canonical topology, optimization overlay, finalized snapshot). They cover the
+    // runtime *wiring* the Stage-2 differential proptest cannot (it drives the pure fold directly).
+    // DELETE this whole section at the swap, together with the legacy graph and `differential.rs`.
+    // ============================================================================================
+
+    /// The legacy optimization overlay: the read `pool_reserves_for_optimization` performs today —
+    /// the finalized snapshots merged with the complete-pool-state overlay at the canonical tip.
+    fn legacy_optimization_overlay(state: &State, chain: ChainKey) -> HashMap<PoolRef, PoolState> {
+        let mut merged = state.finalized_pool_snapshots().clone();
+        let Some(update) = state.latest_complete_pool_state_update(chain) else {
+            return merged;
+        };
+        let Some(overlay) = state.resolve_complete_pool_states(&update) else {
+            return merged;
+        };
+        for (pool, pool_state) in overlay {
+            merged.insert(pool, pool_state.clone());
+        }
+        merged
+    }
+
+    /// The shadow optimization overlay: the new graph's `AllowStreamed` fold over its finalized base —
+    /// the read the swap will call in place of the legacy overlay above.
+    fn shadow_optimization_overlay(state: &State) -> HashMap<PoolRef, PoolState> {
+        state
+            .log_shadow
+            .graph
+            .optimization_pool_states(&state.log_shadow.finalized_snapshot)
+    }
+
+    /// Asserts the two overlays agree on every base-resident pool (the new fold excludes registry-only
+    /// pools, so parity is asserted on base keys — as in `differential.rs`).
+    fn assert_overlay_parity(
+        legacy: &HashMap<PoolRef, PoolState>,
+        shadow: &HashMap<PoolRef, PoolState>,
+        base: &HashMap<PoolRef, PoolState>,
+    ) {
+        for pool in base.keys() {
+            assert_eq!(
+                shadow.get(pool),
+                legacy.get(pool),
+                "overlay parity mismatch for pool {pool:?}"
+            );
+        }
+    }
+
+    /// Extracts the `GetBlockLogs` request id scheduled for `block_hash`, ignoring other effects.
+    fn block_logs_request_id(effects: &[Effect], block_hash: BlockHash) -> RequestId<GetBlockLogs> {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+                    request_id,
+                    request_payload: GetBlockLogs { block_hash: requested },
+                })) if *requested == block_hash => Some(*request_id),
+                _ => None,
+            })
+            .expect("a block-logs request must be scheduled for the bloom-touched block")
+    }
+
+    // Admission/reset wiring: across arbitrary head/header/failure/tick orderings the shadow tracks
+    // exactly the same block set and tip/anchor as legacy (both admit, promote, and reset together).
+    proptest! {
+        #[test]
+        fn shadow_tracks_legacy_block_set_and_tip(
+            generated_events in generated_event_sequence_strategy(),
+        ) {
+            let finalized_hash = hash_for_node(0);
+            let mut state = empty_state_at(finalized_hash);
+
+            for generated_event in generated_events {
+                let (next_state, _effects) =
+                    transition(ChainKey::Ethereum, state, event_from_generated(generated_event));
+                state = next_state;
+
+                prop_assert_eq!(
+                    state.log_shadow.graph.node_hashes(),
+                    state.blocks.hashes(),
+                    "shadow node set diverged from legacy"
+                );
+                prop_assert_eq!(
+                    state.log_shadow.graph.observed_head_hash(),
+                    state.canonical_tip,
+                    "shadow observed head diverged from legacy canonical tip"
+                );
+                // No finalization in this generator: the anchor never advances on either side.
+                prop_assert_eq!(state.log_shadow.graph.anchor_hash(), finalized_hash);
+            }
+        }
+    }
+
+    // Sequential heads build the same canonical chain on both graphs.
+    #[test]
+    fn shadow_canonical_chain_matches_legacy_on_sequential_heads() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let mut state = empty_state_at(finalized);
+
+        let mut parent = finalized;
+        let expected: Vec<BlockHash> = (1..=3).map(hash_for_node).collect();
+        for &hash in &expected {
+            let (next, _effects) = transition(
+                chain,
+                state,
+                Event::HeadObserved {
+                    hash,
+                    parent_hash: parent,
+                    logs_bloom: Bloom::default(),
+                    number: block_number_for(hash),
+                },
+            );
+            state = next;
+            parent = hash;
+        }
+
+        let legacy_chain = state
+            .blocks
+            .connected_path_hashes_oldest_to_newest(state.canonical_tip, finalized)
+            .unwrap_or_default();
+        assert_eq!(legacy_chain, expected);
+        assert_eq!(state.log_shadow.graph.canonical_hashes(), expected);
+    }
+
+    // A best-effort streamed log reaches the shadow's `AllowStreamed` optimization read.
+    #[test]
+    fn shadow_optimization_read_reflects_streamed_log() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let block = hash_for_node(1);
+        let candidate = pool_candidate_address(7);
+        let pool = PoolRef { key: candidate, chain };
+        let swapped = pool_state(9);
+        let base = HashMap::from([(pool, pool_state(3))]);
+
+        let mut state = State::init(FinalizedState::with_pool_snapshots_for_test(
+            finalized,
+            base.clone(),
+        ));
+        state.pool_registry = registry_verifying(candidate);
+
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: block,
+                parent_hash: finalized,
+                logs_bloom: bloom_matching_any(),
+                number: block_number_for(block),
+            },
+        );
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::LogObserved {
+                block_hash: block,
+                logs: vec![swap_log(candidate, 0, &swapped)],
+            },
+        );
+
+        // The swap is absolute, so the shadow's streamed fold yields exactly `swapped`.
+        assert_eq!(shadow_optimization_overlay(&state).get(&pool), Some(&swapped));
+    }
+
+    // With authoritative complete logs, the shadow optimization overlay equals the legacy overlay.
+    #[test]
+    fn shadow_optimization_overlay_matches_legacy_on_complete_logs() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let block = hash_for_node(1);
+        let candidate = pool_candidate_address(7);
+        let pool = PoolRef { key: candidate, chain };
+        let swapped = pool_state(9);
+        let base = HashMap::from([(pool, pool_state(3))]);
+
+        let mut state = State::init(FinalizedState::with_pool_snapshots_for_test(
+            finalized,
+            base.clone(),
+        ));
+        state.pool_registry = registry_verifying(candidate);
+
+        let (state, effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: block,
+                parent_hash: finalized,
+                logs_bloom: bloom_matching_any(),
+                number: block_number_for(block),
+            },
+        );
+        let request_id = block_logs_request_id(&effects, block);
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![swap_log(candidate, 0, &swapped)],
+            },
+        );
+
+        assert_overlay_parity(
+            &legacy_optimization_overlay(&state, chain),
+            &shadow_optimization_overlay(&state),
+            &base,
+        );
+        assert_eq!(shadow_optimization_overlay(&state).get(&pool), Some(&swapped));
+    }
+
+    // Finalization reanchors the shadow to the same block legacy compacts to, folding the same
+    // finalized snapshot (on base pools).
+    #[test]
+    fn shadow_finalization_matches_legacy() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let block = hash_for_node(1);
+        let candidate = pool_candidate_address(7);
+        let pool = PoolRef { key: candidate, chain };
+        let swapped = pool_state(9);
+        let base = HashMap::from([(pool, pool_state(3))]);
+
+        let mut state = State::init(FinalizedState::with_pool_snapshots_for_test(
+            finalized,
+            base.clone(),
+        ));
+        state.pool_registry = registry_verifying(candidate);
+
+        let (state, effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: block,
+                parent_hash: finalized,
+                logs_bloom: bloom_matching_any(),
+                number: block_number_for(block),
+            },
+        );
+        let request_id = block_logs_request_id(&effects, block);
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![swap_log(candidate, 0, &swapped)],
+            },
+        );
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::FinalizedBlockObserved { block_hash: block },
+        );
+
+        // Legacy compacted to `block` with the swapped snapshot.
+        assert_eq!(state.finalized_state.pool_snapshots.get(&pool), Some(&swapped));
+        // Shadow reanchored to the same block and folded the same base-pool snapshot.
+        assert_eq!(state.log_shadow.graph.anchor_hash(), block);
+        assert_eq!(state.log_shadow.finalized_snapshot.get(&pool), Some(&swapped));
+    }
+
+    // A conflicting-parent re-observation resets both graphs to the finalized anchor together.
+    #[test]
+    fn shadow_resets_with_legacy_on_conflicting_parent() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let block = hash_for_node(1);
+        let other_parent = hash_for_node(2);
+        let state = empty_state_at(finalized);
+
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: block,
+                parent_hash: finalized,
+                logs_bloom: Bloom::default(),
+                number: block_number_for(block),
+            },
+        );
+        assert!(state.blocks.hashes().contains(&block));
+        assert!(state.log_shadow.graph.node_hashes().contains(&block));
+
+        // Same hash, different parent -> legacy `ConflictingBlockParent` -> `State::reset`, which
+        // rebuilds the shadow empty at the finalized anchor too (shadow period behavior).
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: block,
+                parent_hash: other_parent,
+                logs_bloom: Bloom::default(),
+                number: block_number_for(block),
+            },
+        );
+        assert!(state.blocks.hashes().is_empty());
+        assert!(state.log_shadow.graph.node_hashes().is_empty());
+        assert_eq!(state.log_shadow.graph.anchor_hash(), finalized);
     }
 }
