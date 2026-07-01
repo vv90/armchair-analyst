@@ -633,6 +633,13 @@ impl BlocksGraph {
     }
 }
 
+// Stage-2 differential proptest scaffolding: matches the new `reanchored_to` against the legacy
+// `State::with_finalized_block_observed`. A child module of `blocks_graph` (not a sibling), so it can
+// reach both the new graph's internals here and the module-private legacy `kernel` types. Delete this
+// declaration and the file wholesale at the Stage-4 swap, together with the legacy finalization path.
+#[cfg(test)]
+mod differential;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
