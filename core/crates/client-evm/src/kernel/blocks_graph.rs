@@ -544,6 +544,28 @@ impl BlocksGraph {
             .collect()
     }
 
+    /// The optimization read: each tracked pool's freshest absolute state at the canonical tip
+    /// (`observed_head`), folding the canonical path `anchor → observed_head` over `base` while
+    /// reading **best-effort `Streamed`** logs as well as authoritative `Complete` ones
+    /// ([`Authority::AllowStreamed`]) — so the optimizer runs on the most recent state, not just the
+    /// last fully-verified one. The finalization counterpart is [`reanchored_to`]
+    /// ([`Authority::RequireComplete`], to the anchor); this one never mutates and imposes no
+    /// completeness gate. When `observed_head` is the anchor, `Pending`, or absent there is no
+    /// foldable suffix ([`canonical_oldest_to_newest`] is empty) and `base` is returned unchanged.
+    ///
+    /// The Stage-4 seam the kernel's optimization dispatch will call in place of
+    /// `State::latest_complete_pool_state_update`; it has no production caller until that swap.
+    fn optimization_pool_states(
+        &self,
+        base: &HashMap<PoolRef, PoolState>,
+    ) -> HashMap<PoolRef, PoolState> {
+        let target = self
+            .canonical_oldest_to_newest()
+            .pop()
+            .unwrap_or(ConnectedHash(self.anchor));
+        self.folded_pool_states(base, target, Authority::AllowStreamed)
+    }
+
     /// Advances the anchor to `new_anchor`, folding the now-final logs into `base` and pruning every
     /// block that no longer descends from the new anchor (A3). Owns the foldability gate (A4): the
     /// canonical path `anchor → new_anchor` must be fully `Complete`/bloom-clear for the tracked pools,

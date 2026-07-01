@@ -130,6 +130,33 @@ fn complete_events(events: &[(usize, PoolLogEvent)]) -> BlockLogs {
     )
 }
 
+/// Keys logs by arrival order into the `Streamed` (best-effort WS) payload — read only under
+/// `AllowStreamed` (the optimization view), refused by the finalization fold.
+fn streamed(logs: Vec<PoolLog>) -> BlockLogs {
+    BlockLogs::Streamed(
+        logs.into_iter()
+            .enumerate()
+            .map(|(index, log)| (index as u64, log))
+            .collect(),
+    )
+}
+
+/// A block's `(pool index, event)` list as `Streamed` or `Complete` logs per `is_streamed`. The
+/// optimization fold (`AllowStreamed`) reads both identically, so the choice only exercises the
+/// authority seam — both must contribute to match the legacy overlay (which stores snapshots
+/// regardless of Streamed/Complete).
+fn view_events(events: &[(usize, PoolLogEvent)], is_streamed: bool) -> BlockLogs {
+    let logs: Vec<PoolLog> = events
+        .iter()
+        .map(|(index, event)| pool_log(pool_of(*index), event.clone()))
+        .collect();
+    if is_streamed {
+        streamed(logs)
+    } else {
+        complete(logs)
+    }
+}
+
 // ---- scenario model + generator ------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -141,10 +168,14 @@ struct Scenario {
     number: Vec<u64>,
     /// `events[i]` is node `i`'s `(pool index, event)` list; `events[0]` is empty (the anchor).
     events: Vec<Vec<(usize, PoolLogEvent)>>,
-    /// The connected node to finalize to (`1..node_count`).
+    /// The connected node to finalize to / observe as the optimization head (`1..node_count`).
     target: usize,
     /// An admission permutation of `1..node_count` (stresses the new graph's order-independence).
     order: Vec<usize>,
+    /// Per node, whether the optimization-view builder plants its logs `Streamed` (best-effort WS)
+    /// rather than `Complete`; `streamed[0]` (the anchor) is unused. Ignored by the Stage-2
+    /// finalization builders, which are all-`Complete`.
+    streamed: Vec<bool>,
 }
 
 fn swap_strategy() -> impl Strategy<Value = PoolLogEvent> {
@@ -189,10 +220,11 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                 ),
                 1usize..node_count,
                 Just(admit).prop_shuffle(),
+                prop::collection::vec(any::<bool>(), node_count - 1),
             )
         })
         .prop_map(
-            |(node_count, parent_choices, node_events, target, order)| {
+            |(node_count, parent_choices, node_events, target, order, streamed_choices)| {
                 let parents: Vec<usize> = (0..node_count)
                     .map(|index| if index == 0 { 0 } else { parent_choices[index - 1] % index })
                     .collect();
@@ -202,6 +234,8 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                 }
                 let mut events = vec![Vec::new()];
                 events.extend(node_events);
+                let mut streamed = vec![false];
+                streamed.extend(streamed_choices);
                 Scenario {
                     node_count,
                     parents,
@@ -209,6 +243,7 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                     events,
                     target,
                     order,
+                    streamed,
                 }
             },
         )
@@ -240,9 +275,36 @@ fn build_new(scenario: &Scenario) -> NewGraph {
     graph
 }
 
-/// Builds the legacy `State`, planting each block's absolute per-pool snapshots via an incremental
-/// `derive_pool_state` fold (block = parent snapshot + block logs), then finalizes to the target.
-fn build_legacy(scenario: &Scenario) -> State {
+/// Builds the new graph for the optimization view: like [`build_new`] but plants each block's logs as
+/// `Streamed` or `Complete` per `scenario.streamed`, then sets `observed_head` to the target so the
+/// optimization read folds the canonical suffix `anchor → target`.
+fn build_new_optimization(scenario: &Scenario) -> NewGraph {
+    let mut graph = NewGraph::new(dh(0));
+    for &node in &scenario.order {
+        graph = graph
+            .with_block(
+                dh(node),
+                dh(scenario.parents[node]),
+                scenario.number[node],
+                Bloom::repeat_byte(0xFF),
+            )
+            .expect("generated admission succeeds");
+    }
+    for node in 1..scenario.node_count {
+        let logs = view_events(&scenario.events[node], scenario.streamed[node]);
+        match graph.nodes.get_mut(&dh(node)) {
+            Some(Node::Connected(connected)) => connected.data.logs = logs,
+            _ => panic!("every generated block must be connected after full admission"),
+        }
+    }
+    graph.with_observed_head(dh(scenario.target))
+}
+
+/// Builds the pre-finalization legacy `State`, planting each block's absolute per-pool snapshots via
+/// an incremental `derive_pool_state` fold (block = parent snapshot + block logs) and setting the
+/// canonical tip to the target. Shared by the finalization builder ([`build_legacy`]) and the
+/// optimization-view read (`optimization_view_matches_legacy`).
+fn legacy_state(scenario: &Scenario) -> State {
     let base = base_snapshot();
 
     // `state_at[node]` is every base pool's absolute state at `node`; `stored[node]` is the subset a
@@ -288,7 +350,7 @@ fn build_legacy(scenario: &Scenario) -> State {
         })
         .collect();
 
-    let state = State {
+    State {
         blocks: LegacyGraph(blocks),
         canonical_tip: dh(scenario.target),
         pending_requests: PendingRequests::new(),
@@ -300,8 +362,29 @@ fn build_legacy(scenario: &Scenario) -> State {
         token_registry: TokenRegistry::new(),
         tick: Tick::initial(),
         streamed_logs: HashMap::new(),
-    };
-    state.with_finalized_block_observed(CHAIN, dh(scenario.target))
+    }
+}
+
+/// The legacy finalization path: builds the pre-finalization state, then finalizes to the target.
+fn build_legacy(scenario: &Scenario) -> State {
+    legacy_state(scenario).with_finalized_block_observed(CHAIN, dh(scenario.target))
+}
+
+/// The legacy optimization overlay at the canonical tip, merged over the finalized base — the read
+/// the kernel's optimization dispatch performs today (`latest_complete_pool_state_update` +
+/// `resolve_complete_pool_states`, then overlaid on the finalized snapshots).
+fn legacy_optimization_snapshot(state: &State) -> HashMap<PoolRef, PoolState> {
+    let update = state
+        .latest_complete_pool_state_update(CHAIN)
+        .expect("an all-resolved path yields a complete overlay");
+    let overlay = state
+        .resolve_complete_pool_states(&update)
+        .expect("every overlay location is present");
+    let mut merged = base_snapshot();
+    for (pool, pool_state) in overlay {
+        merged.insert(pool, pool_state.clone());
+    }
+    merged
 }
 
 /// Every connected node's parent chain reaches the anchor (the post-reanchor form of T2).
@@ -362,6 +445,30 @@ proptest! {
 
         // Legacy post-state: the finalized block is no longer a recent block.
         prop_assert!(!legacy.blocks.0.contains_key(&dh(scenario.target)));
+    }
+}
+
+proptest! {
+    /// Two-sided: the new graph's `optimization_pool_states` (fold to the observed head under
+    /// `AllowStreamed`, reading best-effort `Streamed` logs as well as `Complete`) produces the same
+    /// per-pool overlay — on base-resident keys — as the legacy optimization read at the canonical
+    /// tip. Blocks are a random Streamed/Complete mix; because `AllowStreamed` must read both, a
+    /// dropped stream would diverge from the legacy overlay (which stores snapshots regardless of
+    /// log kind), so the mix directly exercises the authority seam. No finalization: the fold spans
+    /// the unfinalized region `anchor → head`, unlike the Stage-2 finalization test.
+    #[test]
+    fn optimization_view_matches_legacy(scenario in scenario_strategy()) {
+        let base = base_snapshot();
+        let new_snapshot = build_new_optimization(&scenario).optimization_pool_states(&base);
+        let legacy_snapshot = legacy_optimization_snapshot(&legacy_state(&scenario));
+
+        for pool in base.keys() {
+            prop_assert_eq!(
+                new_snapshot.get(pool),
+                legacy_snapshot.get(pool),
+                "optimization overlay mismatch for pool {:?}", pool
+            );
+        }
     }
 }
 
