@@ -181,6 +181,16 @@ fn bloom_may_touch(bloom: Option<Bloom>, watched: &HashSet<Address>) -> bool {
     }
 }
 
+/// Keys incoming logs by their intra-block `log_index` into the `BTreeMap` a block stores (L1/L3).
+/// This ingestion boundary is the one place `PoolLog::log_index` is read: the external index becomes
+/// the map key here, and all downstream logic orders/dedups by the key alone (the field is
+/// `#[deprecated]`, removed at the swap). Positional keying would be wrong — streamed fragments would
+/// each restart at 0 and collide on union.
+#[allow(deprecated)]
+fn key_by_log_index(logs: Vec<PoolLog>) -> BTreeMap<u64, PoolLog> {
+    logs.into_iter().map(|log| (log.log_index, log)).collect()
+}
+
 /// The per-block logs a fold of the given `authority` may read: `Complete` always (authoritative),
 /// `Streamed` only when streamed logs are allowed (the optimization view). `Unknown` never has logs.
 /// The single point where the finalization/optimization authority axis is decided.
@@ -415,6 +425,43 @@ impl BlocksGraph {
         } else {
             self
         }
+    }
+
+    /// A present block's mutable payload, regardless of its connectivity — the log-merge transitions
+    /// write here so promotion never has to move logs. `None` when the hash is absent (pruned/never
+    /// admitted); the anchor has no node and so is never returned.
+    fn block_data_mut(&mut self, hash: BlockHash) -> Option<&mut BlockData> {
+        self.nodes.get_mut(&hash).map(|node| match node {
+            Node::Connected(connected) => &mut connected.data,
+            Node::Pending(pending) => &mut pending.data,
+        })
+    }
+
+    /// Merges best-effort streamed (WS) logs into a present block, upholding L5. `Unknown → Streamed`;
+    /// a further `Streamed` merge grows the set by union on the intra-block index. Never steps back
+    /// off an authoritative `Complete` block (the merge is a no-op there), and a no-op when the block
+    /// is absent. Keys the logs by `log_index` (L3) via [`key_by_log_index`].
+    fn with_streamed_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
+        if let Some(data) = self.block_data_mut(hash) {
+            match &mut data.logs {
+                // Authoritative logs stand — L5 forbids Complete → Streamed.
+                BlockLogs::Complete(_) => {}
+                BlockLogs::Streamed(existing) => existing.extend(key_by_log_index(logs)),
+                BlockLogs::Unknown => data.logs = BlockLogs::Streamed(key_by_log_index(logs)),
+            }
+        }
+        self
+    }
+
+    /// Records authoritative (getLogs) logs for a present block, upholding L5: sets `Complete`, which
+    /// supersedes any prior `Unknown`/`Streamed` (replace semantics — `Complete` is the authoritative
+    /// full set). Idempotent on an already-`Complete` block (same hash ⇒ same logs) and a no-op when
+    /// the block is absent. Keys the logs by `log_index` (L3) via [`key_by_log_index`].
+    fn with_complete_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
+        if let Some(data) = self.block_data_mut(hash) {
+            data.logs = BlockLogs::Complete(key_by_log_index(logs));
+        }
+        self
     }
 
     /// The canonical chain from oldest (child of the anchor) to newest (`observed_head`), derived on
@@ -664,7 +711,7 @@ mod differential;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use alloy::primitives::{U160, aliases::I24};
     use proptest::prelude::*;
@@ -1868,6 +1915,185 @@ mod tests {
 
     fn streamed(logs: Vec<PoolLog>) -> BlockLogs {
         BlockLogs::Streamed(keyed(logs))
+    }
+
+    // --- log-merge transition (L5) --------------------------------------------------------------
+
+    /// A distinct swap keyed off `n`, so different `log_index`es carry visibly different logs.
+    fn sw(n: u64) -> PoolLogEvent {
+        PoolLogEvent::Swap {
+            sqrt_price_x96: U160::from(n + 1),
+            tick: tk(0),
+            liquidity: u128::from(n) + 1,
+        }
+    }
+
+    /// A pool log carrying an explicit intra-block `log_index` — the key the merge transition uses.
+    #[allow(deprecated)]
+    fn log_at(log_index: u64) -> PoolLog {
+        PoolLog {
+            pool: v3_pool(0xA1).key,
+            log_index,
+            event: sw(log_index),
+        }
+    }
+
+    fn logs_at(indices: &[u64]) -> Vec<PoolLog> {
+        indices.iter().map(|&index| log_at(index)).collect()
+    }
+
+    /// `(is_complete, sorted keys)` for a block's logs, or `None` when still `Unknown`.
+    fn log_keys(logs: &BlockLogs) -> Option<(bool, Vec<u64>)> {
+        match logs {
+            BlockLogs::Unknown => None,
+            BlockLogs::Streamed(map) => Some((false, map.keys().copied().collect())),
+            BlockLogs::Complete(map) => Some((true, map.keys().copied().collect())),
+        }
+    }
+
+    fn block_logs(graph: &BlocksGraph, hash: BlockHash) -> Option<(bool, Vec<u64>)> {
+        log_keys(&graph.get(hash).expect("block present").logs)
+    }
+
+    /// A graph with a single connected block (`graph_hash(1)`) off the anchor, logs `Unknown`.
+    fn one_block_graph() -> BlocksGraph {
+        BlocksGraph::new(graph_hash(0))
+            .with_block(graph_hash(1), graph_hash(0), 1, hit_bloom())
+            .expect("admission succeeds")
+    }
+
+    #[test]
+    fn streamed_logs_promote_unknown_to_streamed() {
+        let graph = one_block_graph().with_streamed_logs(graph_hash(1), logs_at(&[2, 5]));
+        assert_eq!(block_logs(&graph, graph_hash(1)), Some((false, vec![2, 5])));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn streamed_logs_grow_by_union_on_log_index() {
+        let graph = one_block_graph()
+            .with_streamed_logs(graph_hash(1), logs_at(&[2, 5]))
+            .with_streamed_logs(graph_hash(1), logs_at(&[3]));
+        // Union on the true index — not positional, which would collide fragments at key 0.
+        assert_eq!(block_logs(&graph, graph_hash(1)), Some((false, vec![2, 3, 5])));
+    }
+
+    #[test]
+    fn complete_logs_replace_prior_streamed() {
+        // Replace semantics (chosen over union): `Complete` is authoritative and self-sufficient.
+        let graph = one_block_graph()
+            .with_streamed_logs(graph_hash(1), logs_at(&[2, 5]))
+            .with_complete_logs(graph_hash(1), logs_at(&[7]));
+        assert_eq!(block_logs(&graph, graph_hash(1)), Some((true, vec![7])));
+    }
+
+    #[test]
+    fn streamed_after_complete_is_a_noop() {
+        // L5: never step backward off the authoritative `Complete`.
+        let graph = one_block_graph()
+            .with_complete_logs(graph_hash(1), logs_at(&[7]))
+            .with_streamed_logs(graph_hash(1), logs_at(&[2]));
+        assert_eq!(block_logs(&graph, graph_hash(1)), Some((true, vec![7])));
+    }
+
+    #[test]
+    fn complete_logs_are_idempotent() {
+        let graph = one_block_graph()
+            .with_complete_logs(graph_hash(1), logs_at(&[7, 9]))
+            .with_complete_logs(graph_hash(1), logs_at(&[7, 9]));
+        assert_eq!(block_logs(&graph, graph_hash(1)), Some((true, vec![7, 9])));
+    }
+
+    #[test]
+    fn logs_on_an_absent_block_are_a_noop() {
+        let graph = one_block_graph()
+            .with_streamed_logs(graph_hash(9), logs_at(&[1]))
+            .with_complete_logs(graph_hash(9), logs_at(&[1]));
+        assert_eq!(block_logs(&graph, graph_hash(1)), None); // admitted block untouched
+        assert!(graph.get(graph_hash(9)).is_none()); // absent hash never materialized
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn logs_apply_to_a_pending_block() {
+        // Parent `graph_hash(1)` is absent, so `graph_hash(2)` lands pending; logs still attach
+        // (`BlockData` is shared across the connectivity split).
+        let graph = BlocksGraph::new(graph_hash(0))
+            .with_block(graph_hash(2), graph_hash(1), 2, hit_bloom())
+            .expect("admission succeeds")
+            .with_streamed_logs(graph_hash(2), logs_at(&[4]));
+        assert!(matches!(graph.nodes.get(&graph_hash(2)), Some(Node::Pending(_))));
+        assert_eq!(block_logs(&graph, graph_hash(2)), Some((false, vec![4])));
+        assert_graph_invariants(&graph);
+    }
+
+    #[derive(Debug, Clone)]
+    enum LogOp {
+        Streamed(Vec<u64>),
+        Complete(Vec<u64>),
+    }
+
+    /// The reference model of L5: the expected authority + key set after a sequence of merges.
+    #[derive(Debug, Clone, PartialEq)]
+    enum ExpectedLogs {
+        Unknown,
+        Streamed(BTreeSet<u64>),
+        Complete(BTreeSet<u64>),
+    }
+
+    fn log_op_strategy() -> impl Strategy<Value = LogOp> {
+        let indices = prop::collection::vec(0u64..8, 0..5);
+        prop_oneof![
+            indices.clone().prop_map(LogOp::Streamed),
+            indices.prop_map(LogOp::Complete),
+        ]
+    }
+
+    proptest! {
+        /// L5 on the merge op: over any sequence of streamed/complete merges the authority is
+        /// monotone (`Unknown → Streamed → Complete`, never backward), `Streamed` only grows, and
+        /// `Complete` replaces (the chosen rule). The graph's logs match the reference model at
+        /// every step.
+        #[test]
+        fn log_merge_upholds_l5(ops in prop::collection::vec(log_op_strategy(), 1..12)) {
+            let mut graph = one_block_graph();
+            let mut expected = ExpectedLogs::Unknown;
+            let mut prev_rank = 0u8;
+            for op in ops {
+                expected = match (op.clone(), expected) {
+                    (LogOp::Streamed(idx), ExpectedLogs::Unknown) => {
+                        ExpectedLogs::Streamed(idx.into_iter().collect())
+                    }
+                    (LogOp::Streamed(idx), ExpectedLogs::Streamed(mut prev)) => {
+                        prev.extend(idx);
+                        ExpectedLogs::Streamed(prev)
+                    }
+                    // A streamed merge onto Complete is a no-op.
+                    (LogOp::Streamed(_), ExpectedLogs::Complete(keys)) => ExpectedLogs::Complete(keys),
+                    (LogOp::Complete(idx), _) => ExpectedLogs::Complete(idx.into_iter().collect()),
+                };
+                graph = match op {
+                    LogOp::Streamed(idx) => graph.with_streamed_logs(graph_hash(1), logs_at(&idx)),
+                    LogOp::Complete(idx) => graph.with_complete_logs(graph_hash(1), logs_at(&idx)),
+                };
+
+                let actual = match &graph.get(graph_hash(1)).unwrap().logs {
+                    BlockLogs::Unknown => ExpectedLogs::Unknown,
+                    BlockLogs::Streamed(map) => ExpectedLogs::Streamed(map.keys().copied().collect()),
+                    BlockLogs::Complete(map) => ExpectedLogs::Complete(map.keys().copied().collect()),
+                };
+                prop_assert_eq!(&actual, &expected);
+
+                let rank = match actual {
+                    ExpectedLogs::Unknown => 0,
+                    ExpectedLogs::Streamed(_) => 1,
+                    ExpectedLogs::Complete(_) => 2,
+                };
+                prop_assert!(rank >= prev_rank, "authority must never step backward");
+                prev_rank = rank;
+            }
+            assert_graph_invariants(&graph);
+        }
     }
 
     #[test]
