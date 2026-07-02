@@ -461,9 +461,14 @@ proptest! {
     #[test]
     fn optimization_view_matches_legacy(scenario in scenario_strategy()) {
         let base = base_snapshot();
-        // `optimization_pool_states` returns only the changed pools; merge onto `base` for comparison
-        // (an untouched pool reads through to `base`), mirroring the production optimization consumer.
-        let new_overlay = build_new_optimization(&scenario).optimization_pool_states(&base);
+        // `optimization_pool_states` returns the changed-pool overlay plus its frontier hash; take the
+        // overlay (`.0`) and merge onto `base` for comparison (an untouched pool reads through to
+        // `base`), mirroring the production optimization consumer. The scenario plants every block
+        // `Streamed`/`Complete` (never `Unknown`), so the fold never stops short of the head and the
+        // frontier hash is the observed head — the overlay is exactly the full-path fold.
+        let new_overlay = build_new_optimization(&scenario)
+            .optimization_pool_states(&base, Address::ZERO)
+            .0;
         let legacy_snapshot = legacy_optimization_snapshot(&legacy_state(&scenario));
 
         for pool in base.keys() {

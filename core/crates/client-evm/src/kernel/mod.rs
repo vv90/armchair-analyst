@@ -11741,12 +11741,14 @@ mod tests {
 
     /// The shadow optimization overlay: the new graph's `AllowStreamed` fold over its finalized base —
     /// the read the swap will call in place of the legacy overlay above. `optimization_pool_states`
-    /// returns only the changed pools, so merge it onto the finalized base (as the sibling
+    /// returns the changed-pool overlay plus its frontier hash (ignored here — the parity assertion is
+    /// on pool state), so merge the overlay onto the finalized base (as the sibling
     /// `legacy_optimization_overlay` does, and as production Increment 3 will).
-    fn shadow_optimization_overlay(state: &State) -> HashMap<PoolRef, PoolState> {
+    fn shadow_optimization_overlay(state: &State, chain: ChainKey) -> HashMap<PoolRef, PoolState> {
         let base = &state.log_shadow.finalized_snapshot;
+        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
         let mut merged = base.clone();
-        merged.extend(state.log_shadow.graph.optimization_pool_states(base));
+        merged.extend(state.log_shadow.graph.optimization_pool_states(base, v4_manager).0);
         merged
     }
 
@@ -11880,7 +11882,7 @@ mod tests {
         );
 
         // The swap is absolute, so the shadow's streamed fold yields exactly `swapped`.
-        assert_eq!(shadow_optimization_overlay(&state).get(&pool), Some(&swapped));
+        assert_eq!(shadow_optimization_overlay(&state, chain).get(&pool), Some(&swapped));
     }
 
     // With authoritative complete logs, the shadow optimization overlay equals the legacy overlay.
@@ -11922,10 +11924,10 @@ mod tests {
 
         assert_overlay_parity(
             &legacy_optimization_overlay(&state, chain),
-            &shadow_optimization_overlay(&state),
+            &shadow_optimization_overlay(&state, chain),
             &base,
         );
-        assert_eq!(shadow_optimization_overlay(&state).get(&pool), Some(&swapped));
+        assert_eq!(shadow_optimization_overlay(&state, chain).get(&pool), Some(&swapped));
     }
 
     // Finalization reanchors the shadow to the same block legacy compacts to, folding the same

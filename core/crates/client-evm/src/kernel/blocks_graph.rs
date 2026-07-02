@@ -637,28 +637,72 @@ impl BlocksGraph {
         snapshot
     }
 
-    /// The optimization read: the per-pool **overlay** of freshest state at the canonical tip
-    /// (`observed_head`), folding the canonical path `anchor → observed_head` over `base` while
-    /// reading **best-effort `Streamed`** logs as well as authoritative `Complete` ones
-    /// ([`Authority::AllowStreamed`]) — so the optimizer runs on the most recent state, not just the
-    /// last fully-verified one. Returns only the pools that changed since the anchor; the caller merges
-    /// this onto `base` (an untouched pool is absent). The finalization counterpart is [`reanchored_to`]
-    /// ([`Authority::RequireComplete`], to the anchor, full snapshot); this one never mutates, imposes
-    /// no completeness gate, and clones nothing beyond the changed pools. When `observed_head` is the
-    /// anchor, `Pending`, or absent there is no foldable suffix ([`canonical_oldest_to_newest`] is
-    /// empty) and the overlay is empty (the caller sees `base` unchanged).
+    /// The latest connected block on the canonical path `anchor → target` whose whole prefix is
+    /// foldable under `authority`: walk oldest→newest, advancing the frontier across each block, and
+    /// **stop before the first "blocker"** — a block with no readable logs for this authority
+    /// ([`readable_logs`] is `None`) **and** a `logs_bloom` that may touch a watched pool
+    /// ([`bloom_may_touch`]). A block that is bloom-clear (proven untouched) is skipped, not a blocker,
+    /// so the frontier advances past it. Returns the last good block, or `ConnectedHash(anchor)` when
+    /// the first canonical block already blocks or the chain is empty (a non-connected `target` yields
+    /// an empty walk, [`connected_oldest_to_newest`]).
+    ///
+    /// The single "stop at the first unfoldable block" predicate shared by both folds, differing only
+    /// on which logs count as readable ([`Authority`]): finalization ([`Authority::RequireComplete`])
+    /// treats a `Streamed` block as a blocker, the optimization read ([`Authority::AllowStreamed`])
+    /// folds through it and blocks only on an `Unknown` bloom-touching one.
+    fn foldable_frontier(
+        &self,
+        target: ConnectedHash,
+        watched: &HashSet<Address>,
+        authority: Authority,
+    ) -> ConnectedHash {
+        let mut frontier = ConnectedHash(self.anchor);
+        for ConnectedHash(hash) in self.connected_oldest_to_newest(target) {
+            let Some(node) = self.connected(hash) else {
+                break;
+            };
+            let blocks = readable_logs(&node.data.logs, authority).is_none()
+                && bloom_may_touch(node.data.logs_bloom, watched);
+            if blocks {
+                break;
+            }
+            frontier = ConnectedHash(hash);
+        }
+        frontier
+    }
+
+    /// The optimization read: the per-pool **overlay** of freshest state, folding the canonical path
+    /// `anchor → observed_head` over `base` while reading **best-effort `Streamed`** logs as well as
+    /// authoritative `Complete` ones ([`Authority::AllowStreamed`]) — so the optimizer runs on the most
+    /// recent state, not just the last fully-verified one.
+    ///
+    /// **Stops at the first `Unknown` block whose bloom may touch a watched pool** ([`foldable_frontier`]):
+    /// its logs could move a tracked pool, so folding *past* it onto pre-gap state would be wrong. The
+    /// read never fails — it returns the overlay folded up to (and including) the last good block before
+    /// that gap, together with **that frontier block's hash** so the caller knows the height the reserves
+    /// are valid at (the caller merges the overlay onto `base`; an untouched pool is absent). When
+    /// `observed_head` is the anchor, `Pending`, or absent, the overlay is empty and the hash is the
+    /// anchor. An `Unknown` block with a *clear* bloom is proven untouched and does not stop the fold.
+    ///
+    /// The finalization counterpart is [`reanchored_to`] ([`Authority::RequireComplete`], to the anchor,
+    /// full snapshot); this one never mutates and clones nothing beyond the changed pools.
     ///
     /// The Stage-4 seam the kernel's optimization dispatch will call in place of
     /// `State::latest_complete_pool_state_update`; it has no production caller until that swap.
+    /// `v4_manager` is the chain's v4 PoolManager address, used for v4 bloom-touch checks.
     pub(crate) fn optimization_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
-    ) -> HashMap<PoolRef, PoolState> {
-        let target = self
-            .canonical_oldest_to_newest()
-            .pop()
-            .unwrap_or(ConnectedHash(self.anchor));
-        self.folded_overlay(base, target, Authority::AllowStreamed)
+        v4_manager: Address,
+    ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
+        let watched = watched_addresses(base, v4_manager);
+        let frontier =
+            self.foldable_frontier(ConnectedHash(self.observed_head), &watched, Authority::AllowStreamed);
+        let frontier_hash = frontier.0;
+        (
+            self.folded_overlay(base, frontier, Authority::AllowStreamed),
+            frontier_hash,
+        )
     }
 
     /// Advances the anchor to `new_anchor`, folding the now-final logs into `base` and pruning every
@@ -769,31 +813,17 @@ impl BlocksGraph {
         }
         let watched = watched_addresses(base, v4_manager);
 
-        // Walk the canonical prefix oldest→newest, advancing the candidate anchor across each block
-        // whose whole prefix stays foldable, and stopping at the first hole (a non-`Complete` block
-        // whose bloom may touch a watched pool). The result is the latest complete connected block
-        // whose prefix `anchor → it` is entirely foldable — legacy's "latest complete ≤ target".
-        let mut new_anchor: Option<ConnectedHash> = None;
-        for ConnectedHash(hash) in self.connected_oldest_to_newest(ConnectedHash(target)) {
-            let Some(node) = self.connected(hash) else {
-                break;
-            };
-            let is_hole = !matches!(node.data.logs, BlockLogs::Complete(_))
-                && bloom_may_touch(node.data.logs_bloom, &watched);
-            if is_hole {
-                break;
-            }
-            new_anchor = Some(ConnectedHash(hash));
-        }
+        // The latest complete connected block whose prefix `anchor → it` is entirely foldable —
+        // legacy's "latest complete ≤ target". `RequireComplete` makes a non-`Complete` bloom-touching
+        // block a blocker (the finalization "hole"), so the shared frontier walk stops just before it.
+        // A frontier equal to the anchor means nothing is foldable yet.
+        let frontier = self.foldable_frontier(ConnectedHash(target), &watched, Authority::RequireComplete);
 
-        match new_anchor {
-            // The first canonical block is already a hole: nothing foldable, stay put.
-            None => (self, base.clone()),
-            Some(anchor) => match self.reanchored_to(anchor, base, v4_manager) {
-                Ok(pair) => pair,
-                // Hole-free by construction ⇒ unreachable; keep the graph and base if it ever fires.
-                Err(ReanchorError::Incomplete(graph, _)) => (graph, base.clone()),
-            },
+        match self.reanchored_to(frontier, base, v4_manager) {
+            // A frontier at the anchor is `reanchored_to`'s base-clone no-op — nothing foldable, stay put.
+            Ok(pair) => pair,
+            // Hole-free by construction ⇒ unreachable; keep the graph and base if it ever fires.
+            Err(ReanchorError::Incomplete(graph, _)) => (graph, base.clone()),
         }
     }
 
@@ -2410,6 +2440,165 @@ mod tests {
             graph.folded_pool_states(&base, target, Authority::AllowStreamed),
             HashMap::from([(pool, ps(777, 9, 42))])
         );
+        assert_graph_invariants(&graph);
+    }
+
+    // --- optimization read: stop-on-unknown (goal 3) --------------------------------------------
+
+    /// A `Swap` event, which sets absolute pool state (so the fold result is the last swap on the path).
+    fn swap_to(sqrt: u128, tick: i32, liquidity: u128) -> PoolLogEvent {
+        PoolLogEvent::Swap {
+            sqrt_price_x96: U160::from(sqrt),
+            tick: tk(tick),
+            liquidity,
+        }
+    }
+
+    /// A `Swap` for the watched pool, wrapped as `Complete` block logs.
+    fn complete_swap(sqrt: u128, tick: i32, liquidity: u128) -> BlockLogs {
+        complete(vec![pool_log(watched_pool(), swap_to(sqrt, tick, liquidity))])
+    }
+
+    /// Builds a connected linear chain off the anchor with explicit per-block `(logs_bloom, logs)`;
+    /// block `i` (0-based) has hash `graph_hash(i + 2)` and number `i + 1`, and `observed_head` is the
+    /// last block. Gives the per-block bloom/authority control `fold_chain` (all-hit) does not.
+    fn opt_chain(blocks: Vec<(Option<Bloom>, BlockLogs)>) -> BlocksGraph {
+        let anchor = graph_hash(1);
+        let mut nodes = HashMap::new();
+        let mut parent = AnchoredRef::Anchor;
+        let mut last = anchor;
+        for (index, (bloom, logs)) in blocks.into_iter().enumerate() {
+            let hash = graph_hash(index + 2);
+            nodes.insert(
+                hash,
+                Node::Connected(ConnectedNode {
+                    parent,
+                    data: BlockData {
+                        number: (index as u64) + 1,
+                        logs_bloom: bloom,
+                        logs,
+                    },
+                }),
+            );
+            parent = AnchoredRef::Block(ConnectedHash(hash));
+            last = hash;
+        }
+        BlocksGraph {
+            anchor,
+            nodes,
+            observed_head: last,
+        }
+    }
+
+    #[test]
+    fn optimization_stops_at_unknown_bloom_touching_block() {
+        // [good][good][Unknown+hit][good]: fold the two good blocks, stop before the gap, and never
+        // reach the post-gap block. Frontier is the last folded (2nd good) block.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), complete_swap(100, 1, 10)),
+            (Some(hit_bloom()), complete_swap(200, 2, 20)),
+            (Some(hit_bloom()), BlockLogs::Unknown),
+            (Some(hit_bloom()), complete_swap(999, 9, 99)),
+        ]);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
+        assert_eq!(frontier, graph_hash(3));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn optimization_skips_unknown_with_clear_bloom() {
+        // An Unknown block with a clear bloom is proven untouched, so the fold continues past it to the
+        // head; the post-gap swap is applied.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), complete_swap(100, 1, 10)),
+            (Some(clear_bloom()), BlockLogs::Unknown),
+            (Some(hit_bloom()), complete_swap(200, 2, 20)),
+        ]);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
+        assert_eq!(frontier, graph_hash(4));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn optimization_folds_through_streamed_block() {
+        // A Streamed (best-effort WS) block is readable under AllowStreamed, so it never stops the fold
+        // and its swap contributes to the overlay.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = opt_chain(vec![(
+            Some(hit_bloom()),
+            streamed(vec![pool_log(pool, swap_to(150, 3, 15))]),
+        )]);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert_eq!(overlay, HashMap::from([(pool, ps(150, 3, 15))]));
+        assert_eq!(frontier, graph_hash(2));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn optimization_stops_at_header_less_unknown_block() {
+        // A header-less Unknown block (no bloom) conservatively may-touch, so it stops the fold; the
+        // post-gap block is never reached.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), complete_swap(100, 1, 10)),
+            (None, BlockLogs::Unknown),
+            (Some(hit_bloom()), complete_swap(999, 9, 99)),
+        ]);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert_eq!(overlay, HashMap::from([(pool, ps(100, 1, 10))]));
+        assert_eq!(frontier, graph_hash(2));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn optimization_no_gap_folds_to_head() {
+        // With no unknown blocks the fold spans the whole path; frontier is the observed head.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), complete_swap(100, 1, 10)),
+            (Some(hit_bloom()), complete_swap(200, 2, 20)),
+        ]);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
+        assert_eq!(frontier, graph.observed_head);
+        assert_eq!(frontier, graph_hash(3));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn optimization_empty_graph_yields_empty_overlay_at_anchor() {
+        // No recent blocks: nothing to fold, overlay empty, frontier is the anchor.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = BlocksGraph::new(graph_hash(0));
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert!(overlay.is_empty());
+        assert_eq!(frontier, graph_hash(0));
+    }
+
+    #[test]
+    fn optimization_non_connected_head_yields_empty_overlay_at_anchor() {
+        // `observed_head` points at a Pending block (its parent never connected): there is no foldable
+        // suffix, so the overlay is empty and the frontier is the anchor.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let graph = BlocksGraph::new(graph_hash(0))
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
+            .expect("admission succeeds")
+            .with_observed_head(graph_hash(3));
+        assert!(matches!(graph.nodes.get(&graph_hash(3)), Some(Node::Pending(_))));
+        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        assert!(overlay.is_empty());
+        assert_eq!(frontier, graph_hash(0));
         assert_graph_invariants(&graph);
     }
 
