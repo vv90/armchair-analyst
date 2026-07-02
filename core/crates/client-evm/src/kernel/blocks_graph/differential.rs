@@ -461,12 +461,14 @@ proptest! {
     #[test]
     fn optimization_view_matches_legacy(scenario in scenario_strategy()) {
         let base = base_snapshot();
-        let new_snapshot = build_new_optimization(&scenario).optimization_pool_states(&base);
+        // `optimization_pool_states` returns only the changed pools; merge onto `base` for comparison
+        // (an untouched pool reads through to `base`), mirroring the production optimization consumer.
+        let new_overlay = build_new_optimization(&scenario).optimization_pool_states(&base);
         let legacy_snapshot = legacy_optimization_snapshot(&legacy_state(&scenario));
 
         for pool in base.keys() {
             prop_assert_eq!(
-                new_snapshot.get(pool),
+                new_overlay.get(pool).or_else(|| base.get(pool)),
                 legacy_snapshot.get(pool),
                 "optimization overlay mismatch for pool {:?}", pool
             );

@@ -580,44 +580,73 @@ impl BlocksGraph {
         ranges
     }
 
-    /// Folds the canonical path `anchor → target` over `base`, producing each tracked pool's absolute
-    /// state at `target`. Reuses [`derive_pool_state`] per pool, gathering that pool's logs in path
-    /// order. Folds **only** pools present in `base` (others have no base and are seeded elsewhere via
-    /// `GetPoolData`); pool identity comes from each log's own [`ProtocolPoolKey`], never the registry.
+    /// The per-pool **overlay** of the canonical path `anchor → target` folded over `base`: only pools
+    /// whose state actually changes on the path appear; an untouched pool is absent and the caller
+    /// reads `base` for it. The single fold engine — see [`folded_pool_states`] for the full-snapshot
+    /// wrapper and [`optimization_pool_states`] for the overlay consumer.
+    ///
+    /// Single pass: walk the path once ([`connected_path_data`], oldest→newest) and bucket each
+    /// **readable** log's `&PoolLogEvent` by its [`ProtocolPoolKey`] — buckets borrow, nothing is
+    /// cloned. Block order plus each block's `BTreeMap` `log_index` order give every bucket the exact
+    /// fold order [`derive_pool_state`] requires. Then fold each touched pool once from its `base`
+    /// state, keyed by the log's own [`ProtocolPoolKey`] (never the registry): a pool absent from
+    /// `base` has no bucket match and is skipped (it is seeded elsewhere via `GetPoolData`).
     /// `authority` selects which blocks contribute logs (see [`Authority`]). A pool whose run is
-    /// underivable (a liquidity overflow — impossible for protocol-bounded `Complete` data) keeps its
-    /// base state rather than being dropped. Borrows: shared read with the optimization view.
+    /// underivable (a liquidity overflow — impossible for protocol-bounded `Complete` data) produces no
+    /// overlay entry, so the caller keeps its base state. Cost is `O(B + L)` over the path plus cheap
+    /// per-`base`-pool bucket probes, cloning only the pools that changed.
+    fn folded_overlay(
+        &self,
+        base: &HashMap<PoolRef, PoolState>,
+        target: ConnectedHash,
+        authority: Authority,
+    ) -> HashMap<PoolRef, PoolState> {
+        let mut buckets: HashMap<ProtocolPoolKey, Vec<&PoolLogEvent>> = HashMap::new();
+        for data in self.connected_path_data(target) {
+            if let Some(logs) = readable_logs(&data.logs, authority) {
+                for log in logs.values() {
+                    buckets.entry(log.pool).or_default().push(&log.event);
+                }
+            }
+        }
+
+        let mut overlay = HashMap::new();
+        for (pool_ref, base_state) in base {
+            if let Some(run) = buckets.get(&pool_ref.key) {
+                if let Some(folded) = derive_pool_state(Some(base_state), run) {
+                    overlay.insert(*pool_ref, folded);
+                }
+            }
+        }
+        overlay
+    }
+
+    /// The full absolute snapshot of every tracked pool at `target`: `base` with the path's changes
+    /// ([`folded_overlay`]) applied. Folds **only** pools present in `base` (others are seeded via
+    /// `GetPoolData`); a pool whose run is underivable keeps its base state. Clones `base` once — the
+    /// finalization path ([`reanchored_to`]) needs a fresh owned snapshot to store; the per-event
+    /// optimization read uses the bare overlay instead. Borrows `base`: shared read.
     fn folded_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
         target: ConnectedHash,
         authority: Authority,
     ) -> HashMap<PoolRef, PoolState> {
-        let path = self.connected_path_data(target);
-        base.iter()
-            .map(|(pool_ref, base_state)| {
-                let run: Vec<&PoolLogEvent> = path
-                    .iter()
-                    .filter_map(|data| readable_logs(&data.logs, authority))
-                    .flat_map(|logs| logs.values())
-                    .filter(|log| log.pool == pool_ref.key)
-                    .map(|log| &log.event)
-                    .collect();
-                let folded =
-                    derive_pool_state(Some(base_state), &run).unwrap_or_else(|| base_state.clone());
-                (*pool_ref, folded)
-            })
-            .collect()
+        let mut snapshot = base.clone();
+        snapshot.extend(self.folded_overlay(base, target, authority));
+        snapshot
     }
 
-    /// The optimization read: each tracked pool's freshest absolute state at the canonical tip
+    /// The optimization read: the per-pool **overlay** of freshest state at the canonical tip
     /// (`observed_head`), folding the canonical path `anchor → observed_head` over `base` while
     /// reading **best-effort `Streamed`** logs as well as authoritative `Complete` ones
     /// ([`Authority::AllowStreamed`]) — so the optimizer runs on the most recent state, not just the
-    /// last fully-verified one. The finalization counterpart is [`reanchored_to`]
-    /// ([`Authority::RequireComplete`], to the anchor); this one never mutates and imposes no
-    /// completeness gate. When `observed_head` is the anchor, `Pending`, or absent there is no
-    /// foldable suffix ([`canonical_oldest_to_newest`] is empty) and `base` is returned unchanged.
+    /// last fully-verified one. Returns only the pools that changed since the anchor; the caller merges
+    /// this onto `base` (an untouched pool is absent). The finalization counterpart is [`reanchored_to`]
+    /// ([`Authority::RequireComplete`], to the anchor, full snapshot); this one never mutates, imposes
+    /// no completeness gate, and clones nothing beyond the changed pools. When `observed_head` is the
+    /// anchor, `Pending`, or absent there is no foldable suffix ([`canonical_oldest_to_newest`] is
+    /// empty) and the overlay is empty (the caller sees `base` unchanged).
     ///
     /// The Stage-4 seam the kernel's optimization dispatch will call in place of
     /// `State::latest_complete_pool_state_update`; it has no production caller until that swap.
@@ -629,7 +658,7 @@ impl BlocksGraph {
             .canonical_oldest_to_newest()
             .pop()
             .unwrap_or(ConnectedHash(self.anchor));
-        self.folded_pool_states(base, target, Authority::AllowStreamed)
+        self.folded_overlay(base, target, Authority::AllowStreamed)
     }
 
     /// Advances the anchor to `new_anchor`, folding the now-final logs into `base` and pruning every

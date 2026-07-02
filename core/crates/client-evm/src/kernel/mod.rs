@@ -11740,12 +11740,14 @@ mod tests {
     }
 
     /// The shadow optimization overlay: the new graph's `AllowStreamed` fold over its finalized base —
-    /// the read the swap will call in place of the legacy overlay above.
+    /// the read the swap will call in place of the legacy overlay above. `optimization_pool_states`
+    /// returns only the changed pools, so merge it onto the finalized base (as the sibling
+    /// `legacy_optimization_overlay` does, and as production Increment 3 will).
     fn shadow_optimization_overlay(state: &State) -> HashMap<PoolRef, PoolState> {
-        state
-            .log_shadow
-            .graph
-            .optimization_pool_states(&state.log_shadow.finalized_snapshot)
+        let base = &state.log_shadow.finalized_snapshot;
+        let mut merged = base.clone();
+        merged.extend(state.log_shadow.graph.optimization_pool_states(base));
+        merged
     }
 
     /// Asserts the two overlays agree on every base-resident pool (the new fold excludes registry-only
