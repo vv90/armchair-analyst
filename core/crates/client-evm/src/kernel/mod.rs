@@ -1202,7 +1202,10 @@ impl State {
             finalized_snapshot: log_base,
         } = log_shadow;
         let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
-        let (log_graph, log_base) = log_graph.finalized_to(block_hash, &log_base, v4_manager);
+        // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
+        // discovered after bootstrap (the shadow graph is registry-free; identity comes from here).
+        let verified = pool_registry.verified_pools(chain);
+        let (log_graph, log_base) = log_graph.finalized_to(block_hash, &log_base, &verified, v4_manager);
         let log_shadow = LogGraphShadow {
             graph: log_graph,
             finalized_snapshot: log_base,
@@ -11747,8 +11750,15 @@ mod tests {
     fn shadow_optimization_overlay(state: &State, chain: ChainKey) -> HashMap<PoolRef, PoolState> {
         let base = &state.log_shadow.finalized_snapshot;
         let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
+        let verified = state.pool_registry.verified_pools(chain);
         let mut merged = base.clone();
-        merged.extend(state.log_shadow.graph.optimization_pool_states(base, v4_manager).0);
+        merged.extend(
+            state
+                .log_shadow
+                .graph
+                .optimization_pool_states(base, &verified, v4_manager)
+                .0,
+        );
         merged
     }
 

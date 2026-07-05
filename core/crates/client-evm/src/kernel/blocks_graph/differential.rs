@@ -80,6 +80,14 @@ fn base_snapshot() -> HashMap<PoolRef, PoolState> {
     ])
 }
 
+/// The verified tracked set spanning exactly the base pools — what the fold watches and may seed. The
+/// generated scenarios only ever touch base pools, so verified == base keeps the fold restricted to
+/// them (matching the base-keys-only comparison); the new-pool seeding is exercised by the targeted
+/// tests below, which pass a widened set.
+fn base_verified() -> HashSet<PoolRef> {
+    base_snapshot().keys().copied().collect()
+}
+
 fn pool_meta() -> PoolMetadata {
     PoolMetadata {
         token0: Address::with_last_byte(1),
@@ -419,7 +427,7 @@ proptest! {
     fn new_finalization_matches_legacy(scenario in scenario_strategy()) {
         let base = base_snapshot();
         let (new_graph, new_snapshot) = build_new(&scenario)
-            .reanchored_to(ConnectedHash(dh(scenario.target)), &base, Address::ZERO)
+            .reanchored_to(ConnectedHash(dh(scenario.target)), &base, &base_verified(), Address::ZERO)
             .expect("an all-Complete path must fold");
         let legacy = build_legacy(&scenario);
 
@@ -467,7 +475,7 @@ proptest! {
         // `Streamed`/`Complete` (never `Unknown`), so the fold never stops short of the head and the
         // frontier hash is the observed head — the overlay is exactly the full-path fold.
         let new_overlay = build_new_optimization(&scenario)
-            .optimization_pool_states(&base, Address::ZERO)
+            .optimization_pool_states(&base, &base_verified(), Address::ZERO)
             .0;
         let legacy_snapshot = legacy_optimization_snapshot(&legacy_state(&scenario));
 
@@ -542,7 +550,7 @@ proptest! {
         let expected = expected_hole_ranges(&is_complete);
         let node_count = is_complete.len();
 
-        let result = graph.reanchored_to(ConnectedHash(dh(node_count)), &base, Address::ZERO);
+        let result = graph.reanchored_to(ConnectedHash(dh(node_count)), &base, &base_verified(), Address::ZERO);
 
         if expected.is_empty() {
             prop_assert!(result.is_ok(), "a fully-complete path must fold");
@@ -571,7 +579,7 @@ fn reanchor_to_anchor_is_noop() {
         .expect("admission succeeds");
 
     let (graph, snapshot) = graph
-        .reanchored_to(ConnectedHash(dh(0)), &base, Address::ZERO)
+        .reanchored_to(ConnectedHash(dh(0)), &base, &base_verified(), Address::ZERO)
         .expect("reanchoring to the current anchor is a no-op");
 
     assert_eq!(graph.anchor, dh(0));
@@ -579,9 +587,14 @@ fn reanchor_to_anchor_is_noop() {
 }
 
 #[test]
-fn registry_only_pool_is_excluded_from_new_fold_but_present_in_legacy() {
+fn registry_verified_new_pool_is_absolute_seeded_into_new_fold() {
+    // Blocker 1: a pool discovered after bootstrap (absent from `base`) but registry-verified is
+    // absolute-seeded into the new fold from its own Swap via `derive_pool_state(None, run)` — so it
+    // now enters the finalized snapshot, matching legacy which snapshots the path-discovered pool.
     let base = base_snapshot();
     let extra = PoolRef::uniswap_v3(Address::with_last_byte(0xC1), CHAIN);
+    let mut verified = base_verified();
+    verified.insert(extra);
     // Self-seeding swaps (absolute), so a snapshot is derivable for both pools with no prior base.
     let base_swap = PoolLogEvent::Swap {
         sqrt_price_x96: U160::from(7_000u128),
@@ -609,11 +622,11 @@ fn registry_only_pool_is_excluded_from_new_fold_but_present_in_legacy() {
         _ => panic!("block must be connected"),
     }
     let (_, new_snapshot) = graph
-        .reanchored_to(ConnectedHash(dh(1)), &base, Address::ZERO)
+        .reanchored_to(ConnectedHash(dh(1)), &base, &verified, Address::ZERO)
         .expect("path folds");
 
-    // The registry-only pool has no base, so the new fold excludes it; the base pool is folded.
-    assert!(!new_snapshot.contains_key(&extra));
+    // The verified new pool is absolute-seeded; the base pool is folded.
+    assert_eq!(new_snapshot.get(&extra), Some(&extra_state));
     assert_eq!(new_snapshot.get(&pool_of(0)), Some(&base0_state));
 
     // Legacy: the same block, with both snapshots planted and both pools verified.
@@ -647,7 +660,94 @@ fn registry_only_pool_is_excluded_from_new_fold_but_present_in_legacy() {
     .with_finalized_block_observed(CHAIN, dh(1));
 
     assert_eq!(legacy.finalized_state.block_hash, dh(1));
-    // Legacy keeps the registry-only pool; both agree on the base pool.
+    // Both paths now keep the new pool and agree on the base pool.
     assert_eq!(legacy.finalized_state.pool_snapshots.get(&extra), Some(&extra_state));
+    assert_eq!(
+        new_snapshot.get(&extra),
+        legacy.finalized_state.pool_snapshots.get(&extra)
+    );
     assert_eq!(legacy.finalized_state.pool_snapshots.get(&pool_of(0)), Some(&base0_state));
+}
+
+#[test]
+fn delta_only_new_pool_new_graph_advances_but_legacy_waits() {
+    // Blocker 1b divergence (one-sided, documented). A verified new pool (absent from `base`) whose
+    // only path log is a Mint is un-baseable: `derive_pool_state(None, [Mint])` is `None`. The two
+    // paths deliberately differ here, and Blocker 1b must reconcile them before the legacy delete:
+    //   - New graph: a `Complete` block is never a finalization hole, so `reanchored_to` advances the
+    //     anchor past it and simply skips the un-baseable pool (it will be seeded at the anchor via
+    //     `GetPoolData` — Blocker 1b).
+    //   - Legacy: `latest_complete_pool_state_update_from` only marks a block complete once every
+    //     verified candidate has a snapshot (`invalid_pools.is_empty()`), so the un-baseable pool
+    //     *blocks* finalization — legacy waits for `GetPoolData` while the block is still unfinalized.
+    let base = base_snapshot();
+    let extra = PoolRef::uniswap_v3(Address::with_last_byte(0xC2), CHAIN);
+    let mut verified = base_verified();
+    verified.insert(extra);
+
+    let base_swap = PoolLogEvent::Swap {
+        sqrt_price_x96: U160::from(7_000u128),
+        tick: tk(4),
+        liquidity: 55_555,
+    };
+    let base0_state = ps(7_000, 4, 55_555);
+    let extra_mint = PoolLogEvent::Mint {
+        tick_lower: tk(-10),
+        tick_upper: tk(10),
+        amount: 1_000,
+    };
+
+    // New graph: a block carrying the base pool's swap plus the new pool's delta-only mint.
+    let mut graph = NewGraph::new(dh(0))
+        .with_block(dh(1), dh(0), 1, Bloom::repeat_byte(0xFF))
+        .expect("admission succeeds");
+    let logs = complete(vec![
+        pool_log(pool_of(0), base_swap.clone()),
+        pool_log(extra, extra_mint.clone()),
+    ]);
+    match graph.nodes.get_mut(&dh(1)) {
+        Some(Node::Connected(connected)) => connected.data.logs = logs,
+        _ => panic!("block must be connected"),
+    }
+    let (new_graph, new_snapshot) = graph
+        .reanchored_to(ConnectedHash(dh(1)), &base, &verified, Address::ZERO)
+        .expect("a Complete path folds (the delta-only pool is simply skipped)");
+
+    // New graph advanced, seeded the base pool, and skipped the un-baseable new pool.
+    assert_eq!(new_graph.anchor, dh(1));
+    assert!(!new_snapshot.contains_key(&extra));
+    assert_eq!(new_snapshot.get(&pool_of(0)), Some(&base0_state));
+
+    // Legacy: the block snapshots only the base pool (its derivation yields nothing for the
+    // delta-only new pool), so the un-baseable verified candidate holds finalization at the anchor.
+    let candidates = HashSet::from([pool_of(0).key, extra.key]);
+    let snapshots = HashMap::from([(pool_of(0), base0_state.clone())]);
+    let blocks = HashMap::from([(
+        dh(1),
+        BlockNode {
+            parent_hash: dh(0),
+            logs_bloom: None,
+            pool_logs: PoolLogsStatus::Resolved(candidates),
+            pool_snapshots: snapshots,
+            pool_data_failures: HashMap::new(),
+        },
+    )]);
+    let legacy = State {
+        blocks: LegacyGraph(blocks),
+        canonical_tip: dh(1),
+        pending_requests: PendingRequests::new(),
+        finalized_state: FinalizedState {
+            block_hash: dh(0),
+            pool_snapshots: base,
+        },
+        pool_registry: registry(&[extra.key]),
+        token_registry: TokenRegistry::new(),
+        tick: Tick::initial(),
+        streamed_logs: HashMap::new(),
+        log_shadow: crate::kernel::LogGraphShadow::new(dh(0), HashMap::new()),
+    }
+    .with_finalized_block_observed(CHAIN, dh(1));
+
+    // Legacy did NOT advance: the un-baseable pool blocks the block from being "complete".
+    assert_eq!(legacy.finalized_state.block_hash, dh(0));
 }

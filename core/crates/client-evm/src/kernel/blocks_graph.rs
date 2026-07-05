@@ -231,10 +231,12 @@ fn connected_descends_from(
 
 /// The bloom addresses to watch for a set of tracked pools: each v3 pool's own contract address, and
 /// the chain's v4 PoolManager when any v4 pool is tracked (v4 pools share the singleton emitter).
-/// Registry-free — identity comes from the pool key itself.
-fn watched_addresses(base: &HashMap<PoolRef, PoolState>, v4_manager: Address) -> HashSet<Address> {
+/// Registry-free — identity comes from the pool key itself. Spans the whole `verified` tracked set,
+/// not just `base`: a pool whose absolute-state logs seed it into the fold ([`folded_overlay`]) must
+/// also be watched, so a bloom-touching block on its path is treated as a hole until it is foldable.
+fn watched_addresses(verified: &HashSet<PoolRef>, v4_manager: Address) -> HashSet<Address> {
     let mut watched = HashSet::new();
-    for pool_ref in base.keys() {
+    for pool_ref in verified {
         match pool_ref.key {
             ProtocolPoolKey::UniswapV3(address) => watched.insert(address),
             ProtocolPoolKey::UniswapV4(_) => watched.insert(v4_manager),
@@ -595,9 +597,16 @@ impl BlocksGraph {
     /// underivable (a liquidity overflow — impossible for protocol-bounded `Complete` data) produces no
     /// overlay entry, so the caller keeps its base state. Cost is `O(B + L)` over the path plus cheap
     /// per-`base`-pool bucket probes, cloning only the pools that changed.
+    ///
+    /// **Seeding.** A `verified` pool absent from `base` (discovered after bootstrap) is seeded from
+    /// its own path logs via `derive_pool_state(None, run)`: it yields a state iff the run begins with
+    /// an absolute event (Swap/Initialize) — a Mint/Burn-only run stays underivable and absent (its
+    /// anchor-height state is fetched via `GetPoolData`). Only `verified` keys are ever seeded, so
+    /// topic-spoofing non-pools never enter and every seeded pool already has registry metadata.
     fn folded_overlay(
         &self,
         base: &HashMap<PoolRef, PoolState>,
+        verified: &HashSet<PoolRef>,
         target: ConnectedHash,
         authority: Authority,
     ) -> HashMap<PoolRef, PoolState> {
@@ -618,6 +627,16 @@ impl BlocksGraph {
                 }
             }
         }
+        for pool_ref in verified {
+            if base.contains_key(pool_ref) {
+                continue;
+            }
+            if let Some(run) = buckets.get(&pool_ref.key) {
+                if let Some(folded) = derive_pool_state(None, run) {
+                    overlay.insert(*pool_ref, folded);
+                }
+            }
+        }
         overlay
     }
 
@@ -629,11 +648,12 @@ impl BlocksGraph {
     fn folded_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
+        verified: &HashSet<PoolRef>,
         target: ConnectedHash,
         authority: Authority,
     ) -> HashMap<PoolRef, PoolState> {
         let mut snapshot = base.clone();
-        snapshot.extend(self.folded_overlay(base, target, authority));
+        snapshot.extend(self.folded_overlay(base, verified, target, authority));
         snapshot
     }
 
@@ -693,14 +713,15 @@ impl BlocksGraph {
     pub(crate) fn optimization_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
+        verified: &HashSet<PoolRef>,
         v4_manager: Address,
     ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
-        let watched = watched_addresses(base, v4_manager);
+        let watched = watched_addresses(verified, v4_manager);
         let frontier =
             self.foldable_frontier(ConnectedHash(self.observed_head), &watched, Authority::AllowStreamed);
         let frontier_hash = frontier.0;
         (
-            self.folded_overlay(base, frontier, Authority::AllowStreamed),
+            self.folded_overlay(base, verified, frontier, Authority::AllowStreamed),
             frontier_hash,
         )
     }
@@ -717,6 +738,7 @@ impl BlocksGraph {
         self,
         new_anchor: ConnectedHash,
         base: &HashMap<PoolRef, PoolState>,
+        verified: &HashSet<PoolRef>,
         v4_manager: Address,
     ) -> Result<(BlocksGraph, HashMap<PoolRef, PoolState>), ReanchorError> {
         let new_anchor_hash = new_anchor.0;
@@ -726,15 +748,19 @@ impl BlocksGraph {
         }
 
         // A4 gate first (value-free), so the consuming prune below is infallible.
-        let watched = watched_addresses(base, v4_manager);
+        let watched = watched_addresses(verified, v4_manager);
         let ranges = self.missing_complete_ranges(ConnectedHash(new_anchor_hash), &watched);
         if !ranges.is_empty() {
             return Err(ReanchorError::Incomplete(self, ranges));
         }
 
         // Fold the now-final prefix (borrowed) before consuming self for the re-root.
-        let new_snapshot =
-            self.folded_pool_states(base, ConnectedHash(new_anchor_hash), Authority::RequireComplete);
+        let new_snapshot = self.folded_pool_states(
+            base,
+            verified,
+            ConnectedHash(new_anchor_hash),
+            Authority::RequireComplete,
+        );
 
         let BlocksGraph {
             anchor: _,
@@ -805,13 +831,14 @@ impl BlocksGraph {
         self,
         target: BlockHash,
         base: &HashMap<PoolRef, PoolState>,
+        verified: &HashSet<PoolRef>,
         v4_manager: Address,
     ) -> (BlocksGraph, HashMap<PoolRef, PoolState>) {
         // Only a connected target is finalizable; an absent/pending one has no foldable prefix yet.
         if self.connected(target).is_none() {
             return (self, base.clone());
         }
-        let watched = watched_addresses(base, v4_manager);
+        let watched = watched_addresses(verified, v4_manager);
 
         // The latest complete connected block whose prefix `anchor → it` is entirely foldable —
         // legacy's "latest complete ≤ target". `RequireComplete` makes a non-`Complete` bloom-touching
@@ -819,7 +846,7 @@ impl BlocksGraph {
         // A frontier equal to the anchor means nothing is foldable yet.
         let frontier = self.foldable_frontier(ConnectedHash(target), &watched, Authority::RequireComplete);
 
-        match self.reanchored_to(frontier, base, v4_manager) {
+        match self.reanchored_to(frontier, base, verified, v4_manager) {
             // A frontier at the anchor is `reanchored_to`'s base-clone no-op — nothing foldable, stay put.
             Ok(pair) => pair,
             // Hole-free by construction ⇒ unreachable; keep the graph and base if it ever fires.
@@ -2044,6 +2071,12 @@ mod tests {
         PoolRef::uniswap_v3(Address::with_last_byte(byte), ChainKey::Ethereum)
     }
 
+    /// The tracked/verified set for a fold test: exactly the `base` pools. Existing tests seed no new
+    /// pool, so verified == base keeps the fold behavior identical to before seeding was added.
+    fn verified_of(base: &HashMap<PoolRef, PoolState>) -> HashSet<PoolRef> {
+        base.keys().copied().collect()
+    }
+
     #[allow(deprecated)]
     fn pool_log(pool: PoolRef, event: PoolLogEvent) -> PoolLog {
         PoolLog {
@@ -2286,7 +2319,7 @@ mod tests {
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let (graph, target) = fold_chain(vec![(2, complete(vec![]))]);
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::RequireComplete),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::RequireComplete),
             base
         );
         assert_graph_invariants(&graph);
@@ -2308,7 +2341,7 @@ mod tests {
             )]),
         )]);
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::RequireComplete),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::RequireComplete),
             HashMap::from([(pool, ps(777, 9, 42))])
         );
         assert_graph_invariants(&graph);
@@ -2330,16 +2363,16 @@ mod tests {
             )]),
         )]);
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::RequireComplete),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::RequireComplete),
             HashMap::from([(pool, ps(10, 5, 1500))])
         );
         assert_graph_invariants(&graph);
     }
 
     #[test]
-    fn fold_ignores_pool_absent_from_base() {
-        // A Complete block carries a log for a pool with no base: it has nothing to fold into and must
-        // not appear in the result (it is seeded later via GetPoolData).
+    fn fold_ignores_pool_absent_from_base_and_unverified() {
+        // A Complete block carries a Swap for a pool that is neither in `base` nor `verified`: it is
+        // not a seed candidate (only verified keys are seeded), so it must not appear in the result.
         let tracked = v3_pool(0xA1);
         let untracked = v3_pool(0xB2);
         let base = HashMap::from([(tracked, ps(10, 5, 1000))]);
@@ -2354,11 +2387,93 @@ mod tests {
                 },
             )]),
         )]);
+        // `verified_of(&base)` excludes `untracked`, so it is never seeded.
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::RequireComplete),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::RequireComplete),
             base
         );
         assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn fold_seeds_verified_pool_absent_from_base_via_absolute_log() {
+        // Blocker 1: a verified pool absent from `base` (discovered after bootstrap) whose run begins
+        // with an absolute Swap is seeded into the fold from `derive_pool_state(None, run)`.
+        let tracked = v3_pool(0xA1);
+        let new_pool = v3_pool(0xC1);
+        let base = HashMap::from([(tracked, ps(10, 5, 1000))]);
+        let verified = HashSet::from([tracked, new_pool]);
+        let (graph, target) = fold_chain(vec![(
+            2,
+            complete(vec![pool_log(
+                new_pool,
+                PoolLogEvent::Swap {
+                    sqrt_price_x96: U160::from(777u128),
+                    tick: tk(9),
+                    liquidity: 42,
+                },
+            )]),
+        )]);
+        assert_eq!(
+            graph.folded_pool_states(&base, &verified, target, Authority::RequireComplete),
+            HashMap::from([(tracked, ps(10, 5, 1000)), (new_pool, ps(777, 9, 42))])
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn fold_does_not_seed_verified_pool_from_delta_only_run() {
+        // A verified new pool whose only log is a Mint has no absolute anchor, so
+        // `derive_pool_state(None, [Mint])` is `None`: it stays unseeded (awaits GetPoolData).
+        let new_pool = v3_pool(0xC1);
+        let base: HashMap<PoolRef, PoolState> = HashMap::new();
+        let verified = HashSet::from([new_pool]);
+        let (graph, target) = fold_chain(vec![(
+            2,
+            complete(vec![pool_log(
+                new_pool,
+                PoolLogEvent::Mint {
+                    tick_lower: tk(0),
+                    tick_upper: tk(10),
+                    amount: 500,
+                },
+            )]),
+        )]);
+        assert!(
+            graph
+                .folded_overlay(&base, &verified, target, Authority::RequireComplete)
+                .is_empty()
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn finalization_waits_for_complete_before_seeding_new_pool() {
+        // Watched-set widening: a verified pool absent from `base` whose Swap sits in a Streamed-only
+        // (not yet Complete) bloom-touching block is a finalization hole — `finalized_to` must NOT
+        // advance the anchor past it (which would drop the swap forever), it waits for Complete logs.
+        // `watched_pool()` sits at `watched_addr()`, the one address `fold_chain`'s `hit_bloom` sets,
+        // so the block's bloom actually touches it.
+        let new_pool = watched_pool();
+        let base: HashMap<PoolRef, PoolState> = HashMap::new();
+        let verified = HashSet::from([new_pool]);
+        let swap = PoolLogEvent::Swap {
+            sqrt_price_x96: U160::from(777u128),
+            tick: tk(9),
+            liquidity: 42,
+        };
+
+        // Streamed: the block is a hole under RequireComplete, so the anchor stays put and nothing seeds.
+        let (graph, target) = fold_chain(vec![(2, streamed(vec![pool_log(new_pool, swap.clone())]))]);
+        let (graph, snapshot) = graph.finalized_to(target.0, &base, &verified, Address::ZERO);
+        assert_eq!(graph.anchor, graph_hash(1));
+        assert!(snapshot.is_empty());
+
+        // Complete: the same block now folds — the anchor advances and the new pool is absolute-seeded.
+        let (graph, target) = fold_chain(vec![(2, complete(vec![pool_log(new_pool, swap)]))]);
+        let (graph, snapshot) = graph.finalized_to(target.0, &base, &verified, Address::ZERO);
+        assert_eq!(graph.anchor, graph_hash(2));
+        assert_eq!(snapshot.get(&new_pool), Some(&ps(777, 9, 42)));
     }
 
     #[test]
@@ -2391,7 +2506,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::RequireComplete),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::RequireComplete),
             HashMap::from([(pool, ps(50, 0, 125))])
         );
         assert_graph_invariants(&graph);
@@ -2414,7 +2529,7 @@ mod tests {
             )]),
         )]);
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::RequireComplete),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::RequireComplete),
             base
         );
         assert_graph_invariants(&graph);
@@ -2437,7 +2552,7 @@ mod tests {
             )]),
         )]);
         assert_eq!(
-            graph.folded_pool_states(&base, target, Authority::AllowStreamed),
+            graph.folded_pool_states(&base, &verified_of(&base), target, Authority::AllowStreamed),
             HashMap::from([(pool, ps(777, 9, 42))])
         );
         assert_graph_invariants(&graph);
@@ -2502,7 +2617,7 @@ mod tests {
             (Some(hit_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph_hash(3));
         assert_graph_invariants(&graph);
@@ -2519,7 +2634,7 @@ mod tests {
             (Some(clear_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph_hash(4));
         assert_graph_invariants(&graph);
@@ -2535,7 +2650,7 @@ mod tests {
             Some(hit_bloom()),
             streamed(vec![pool_log(pool, swap_to(150, 3, 15))]),
         )]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert_eq!(overlay, HashMap::from([(pool, ps(150, 3, 15))]));
         assert_eq!(frontier, graph_hash(2));
         assert_graph_invariants(&graph);
@@ -2552,7 +2667,7 @@ mod tests {
             (None, BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert_eq!(overlay, HashMap::from([(pool, ps(100, 1, 10))]));
         assert_eq!(frontier, graph_hash(2));
         assert_graph_invariants(&graph);
@@ -2567,7 +2682,7 @@ mod tests {
             (Some(hit_bloom()), complete_swap(100, 1, 10)),
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph.observed_head);
         assert_eq!(frontier, graph_hash(3));
@@ -2580,7 +2695,7 @@ mod tests {
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let graph = BlocksGraph::new(graph_hash(0));
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert!(overlay.is_empty());
         assert_eq!(frontier, graph_hash(0));
     }
@@ -2596,7 +2711,7 @@ mod tests {
             .expect("admission succeeds")
             .with_observed_head(graph_hash(3));
         assert!(matches!(graph.nodes.get(&graph_hash(3)), Some(Node::Pending(_))));
-        let (overlay, frontier) = graph.optimization_pool_states(&base, Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
         assert!(overlay.is_empty());
         assert_eq!(frontier, graph_hash(0));
         assert_graph_invariants(&graph);
@@ -2629,7 +2744,7 @@ mod tests {
             .unwrap();
         let base = HashMap::from([(v3_pool(0xA1), ps(1, 1, 1))]);
         let (graph, snapshot) = graph
-            .reanchored_to(ConnectedHash(anchor), &base, Address::ZERO)
+            .reanchored_to(ConnectedHash(anchor), &base, &verified_of(&base), Address::ZERO)
             .expect("reanchor to the current anchor is a no-op");
         assert_eq!(graph.anchor, anchor);
         assert!(graph.connected(graph_hash(2)).is_some());
@@ -2644,7 +2759,7 @@ mod tests {
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let (graph, target) = fold_chain(vec![(7, BlockLogs::Unknown)]);
-        match graph.reanchored_to(target, &base, Address::ZERO) {
+        match graph.reanchored_to(target, &base, &verified_of(&base), Address::ZERO) {
             Err(ReanchorError::Incomplete(graph, ranges)) => {
                 assert_eq!(ranges, vec![BlockRange { from: 7, to: 7 }]);
                 assert_eq!(graph.anchor, graph_hash(1));
@@ -2666,7 +2781,7 @@ mod tests {
         ]);
         let (b2, b3, b4) = (graph_hash(2), graph_hash(3), graph_hash(4));
         let (graph, snapshot) = graph
-            .reanchored_to(ConnectedHash(b2), &HashMap::new(), Address::ZERO)
+            .reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new(), Address::ZERO)
             .expect("a fully-Complete path folds");
         assert!(snapshot.is_empty());
         assert_eq!(graph.anchor, b2);
@@ -2704,7 +2819,7 @@ mod tests {
             observed_head: b4,
         };
         let (graph, _) = graph
-            .reanchored_to(ConnectedHash(b2), &HashMap::new(), Address::ZERO)
+            .reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new(), Address::ZERO)
             .expect("clear path folds");
         assert_eq!(graph.anchor, b2);
         assert!(graph.nodes.get(&b3).is_none());
@@ -2734,7 +2849,7 @@ mod tests {
             observed_head: b3,
         };
         let (graph, _) = graph
-            .reanchored_to(ConnectedHash(b2), &HashMap::new(), Address::ZERO)
+            .reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new(), Address::ZERO)
             .expect("clear path folds");
         assert_eq!(graph.observed_head, b2);
         assert_graph_invariants(&graph);
@@ -2747,7 +2862,7 @@ mod tests {
         let (graph, target) = fold_chain(vec![(2, complete(vec![])), (3, complete(vec![]))]);
         let b3 = graph_hash(3);
         let (graph, _) = graph
-            .reanchored_to(target, &HashMap::new(), Address::ZERO)
+            .reanchored_to(target, &HashMap::new(), &HashSet::new(), Address::ZERO)
             .expect("clear path folds");
         assert_eq!(graph.anchor, b3);
         assert!(graph.nodes.is_empty());
@@ -2773,7 +2888,7 @@ mod tests {
             )]),
         )]);
         let (graph, snapshot) = graph
-            .reanchored_to(target, &base, Address::ZERO)
+            .reanchored_to(target, &base, &verified_of(&base), Address::ZERO)
             .expect("a Complete block folds");
         assert_eq!(snapshot, HashMap::from([(pool, ps(777, 9, 42))]));
         assert_eq!(graph.anchor, graph_hash(2));
@@ -2813,7 +2928,7 @@ mod tests {
             }
 
             let (regraphed, snapshot) = graph
-                .reanchored_to(ConnectedHash(new_anchor_hash), &HashMap::new(), Address::ZERO)
+                .reanchored_to(ConnectedHash(new_anchor_hash), &HashMap::new(), &HashSet::new(), Address::ZERO)
                 .unwrap_or_else(|_| panic!("a clear-bloom graph with no tracked pools must fold"));
             prop_assert!(snapshot.is_empty());
             prop_assert_eq!(regraphed.anchor, new_anchor_hash);
