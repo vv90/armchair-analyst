@@ -1,11 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use alloy::{primitives::BlockHash, rpc::types::Log};
 use serde_json::{Value, json};
 
 use crate::{
-    ClientEvmError, ClientHead, ProtocolPoolKey, PoolLog, RangeLogBlock, decode_pool_log, uniswap_v3,
-    uniswap_v4,
+    ClientEvmError, ClientHead, PoolLog, RangeLogBlock, decode_pool_log, uniswap_v3, uniswap_v4,
 };
 
 /// The `topic0` filter for every pool-log request (subscribe / block-logs / range), unioning the
@@ -352,12 +351,13 @@ pub(crate) fn parse_pool_logs_range_response(
     Ok(group_range_logs_by_block(logs))
 }
 
-/// Groups ranged-`eth_getLogs` results into per-block candidate sets, ordered by block number.
-/// Logs missing block number or hash cannot be attributed to a block and are dropped at this
-/// boundary; the result is deterministic so downstream graph inference stays reproducible.
+/// Groups ranged-`eth_getLogs` results into per-block decoded pool-log sets, ordered by block
+/// number. Logs missing block number or hash cannot be attributed to a block and are dropped at
+/// this boundary; the result is deterministic so downstream graph inference stays reproducible.
+/// The full decoded `PoolLog`s are kept (registry-free) — the seeded blocks graph stores them as
+/// its authoritative `Complete` payload, keyed by `log_index` like the live block-logs path.
 fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
-    let mut candidates_by_block: HashMap<(u64, BlockHash), HashSet<ProtocolPoolKey>> =
-        HashMap::new();
+    let mut logs_by_block: HashMap<(u64, BlockHash), Vec<PoolLog>> = HashMap::new();
 
     for log in logs {
         let (Some(number), Some(hash)) = (log.block_number, log.block_hash) else {
@@ -370,19 +370,12 @@ fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
             continue;
         };
 
-        candidates_by_block
-            .entry((number, hash))
-            .or_default()
-            .insert(pool_log.pool);
+        logs_by_block.entry((number, hash)).or_default().push(pool_log);
     }
 
-    let mut blocks = candidates_by_block
+    let mut blocks = logs_by_block
         .into_iter()
-        .map(|((number, hash), candidates)| RangeLogBlock {
-            number,
-            hash,
-            candidates,
-        })
+        .map(|((number, hash), logs)| RangeLogBlock { number, hash, logs })
         .collect::<Vec<_>>();
 
     blocks.sort_by(|left, right| {
@@ -691,8 +684,23 @@ mod tests {
         assert_eq!(address_filter, None);
     }
 
+    /// The `PoolLog` a [`range_log_result`] fixture decodes to — its fixed v3 swap at `log_index` 7.
+    #[allow(deprecated)]
+    fn expected_v3_range_log(address: Address) -> crate::PoolLog {
+        use alloy::primitives::{U160, aliases::I24};
+        crate::PoolLog {
+            pool: ProtocolPoolKey::UniswapV3(address),
+            log_index: 7,
+            event: crate::PoolLogEvent::Swap {
+                sqrt_price_x96: U160::from(1u128),
+                tick: I24::ZERO,
+                liquidity: 1,
+            },
+        }
+    }
+
     #[test]
-    fn pool_logs_range_response_groups_candidates_by_block() {
+    fn pool_logs_range_response_groups_decoded_logs_by_block() {
         let first_hash = B256::with_last_byte(7);
         let second_hash = B256::with_last_byte(8);
         let first_pool = Address::with_last_byte(1);
@@ -710,21 +718,24 @@ mod tests {
 
         let blocks = parse_pool_logs_range_response(&response, 9).unwrap();
 
+        // Full decoded logs, in arrival order (the duplicate stays here; graph ingestion dedups by
+        // `log_index`); candidate identity is derivable per log via `pool`.
         assert_eq!(
             blocks,
             vec![
                 RangeLogBlock {
                     number: 4,
                     hash: first_hash,
-                    candidates: HashSet::from([
-                        ProtocolPoolKey::UniswapV3(first_pool),
-                        ProtocolPoolKey::UniswapV3(second_pool),
-                    ]),
+                    logs: vec![
+                        expected_v3_range_log(first_pool),
+                        expected_v3_range_log(second_pool),
+                        expected_v3_range_log(first_pool),
+                    ],
                 },
                 RangeLogBlock {
                     number: 5,
                     hash: second_hash,
-                    candidates: HashSet::from([ProtocolPoolKey::UniswapV3(first_pool)]),
+                    logs: vec![expected_v3_range_log(first_pool)],
                 },
             ]
         );
@@ -746,16 +757,19 @@ mod tests {
 
         let blocks = parse_pool_logs_range_response(&response, 9).unwrap();
 
+        // Emitter identities of the decoded logs — one per protocol, attributed to the same block.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!((blocks[0].number, blocks[0].hash), (4, block_hash));
         assert_eq!(
-            blocks,
-            vec![RangeLogBlock {
-                number: 4,
-                hash: block_hash,
-                candidates: HashSet::from([
-                    ProtocolPoolKey::UniswapV3(v3_pool),
-                    ProtocolPoolKey::UniswapV4(crate::uniswap_v4::PoolId(v4_pool_id)),
-                ]),
-            }]
+            blocks[0]
+                .logs
+                .iter()
+                .map(|log| log.pool)
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                ProtocolPoolKey::UniswapV3(v3_pool),
+                ProtocolPoolKey::UniswapV4(crate::uniswap_v4::PoolId(v4_pool_id)),
+            ])
         );
     }
 
@@ -778,7 +792,7 @@ mod tests {
             vec![RangeLogBlock {
                 number: 4,
                 hash: block_hash,
-                candidates: HashSet::from([ProtocolPoolKey::UniswapV3(pool)]),
+                logs: vec![expected_v3_range_log(pool)],
             }]
         );
     }

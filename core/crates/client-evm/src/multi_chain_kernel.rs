@@ -763,7 +763,7 @@ fn activate_bootstrap_outcome(
 
     let seed_blocks = seed_blocks
         .into_iter()
-        .map(|block| (block.hash, block.parent_hash, block.candidates))
+        .map(|block| (block.hash, block.parent_hash, block.number, block.logs))
         .collect();
 
     kernel::State::activate_from_seed(

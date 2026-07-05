@@ -645,17 +645,21 @@ impl State {
         finalized_pool_snapshots: HashMap<PoolRef, PoolState>,
         pool_registry: TrustedPoolRegistry,
         token_registry: TokenRegistry,
-        seed_blocks: Vec<(BlockHash, BlockHash, HashSet<ProtocolPoolKey>)>,
+        seed_blocks: Vec<(BlockHash, BlockHash, u64, Vec<PoolLog>)>,
     ) -> (State, Vec<Effect>) {
+        // The legacy candidate set is the seed logs' emitter keys — the same registry-free
+        // derivation the live `with_block_logs_applied` performs on a getLogs response.
         let blocks = seed_blocks
-            .into_iter()
-            .map(|(hash, parent_hash, candidates)| {
+            .iter()
+            .map(|(hash, parent_hash, _number, logs)| {
                 (
-                    hash,
+                    *hash,
                     BlockNode {
-                        parent_hash,
+                        parent_hash: *parent_hash,
                         logs_bloom: None,
-                        pool_logs: PoolLogsStatus::Resolved(candidates),
+                        pool_logs: PoolLogsStatus::Resolved(
+                            logs.iter().map(|log| log.pool).collect(),
+                        ),
                         pool_snapshots: HashMap::new(),
                         pool_data_failures: HashMap::new(),
                     },
@@ -692,12 +696,15 @@ impl State {
         let state = State {
             blocks,
             canonical_tip: finalized_hash,
-            // The shadow graph starts empty at the finalized anchor: seed blocks carry no block
-            // `number`/`logs_bloom` (BlockNode has `logs_bloom: None`, logs pre-`Resolved`), so they
-            // cannot be replayed through `with_block` (which requires both). The shadow warms up from
-            // live events after bootstrap, exactly as it would from a bare `State::init`. Seed replay
-            // is deferred to a later increment (needs number/bloom plumbed into the seed).
-            log_shadow: LogGraphShadow::new(finalized_hash, finalized_pool_snapshots.clone()),
+            // The shadow starts warm: the seed window enters as header-less `Complete` blocks (the
+            // ranged-getLogs payload is the full pool-vocabulary log set per block, and absence is
+            // proof of emptiness — both registry-independent, since the range query is topics-only).
+            // The first live head that lands on the seeded chain makes the whole window foldable at
+            // once, so the optimization read serves recent state without a per-block header walk.
+            log_shadow: LogGraphShadow {
+                graph: blocks_graph::BlocksGraph::from_seed(finalized_hash, seed_blocks),
+                finalized_snapshot: finalized_pool_snapshots.clone(),
+            },
             pending_requests,
             finalized_state: FinalizedState {
                 block_hash: finalized_hash,
@@ -4087,7 +4094,12 @@ mod tests {
             HashMap::new(),
             pool_registry,
             token_registry,
-            vec![(seed_hash, finalized_hash, HashSet::from([candidate]))],
+            vec![(
+                seed_hash,
+                finalized_hash,
+                block_number_for(seed_hash),
+                pool_logs(&HashSet::from([candidate])),
+            )],
         );
 
         // The seed block's parent is the finalized anchor, so nothing needs reconnecting.
@@ -4156,8 +4168,13 @@ mod tests {
             token_registry,
             vec![
                 // Filler bridging the gap to the anchor, then the real block parented to the filler.
-                (filler, finalized_hash, HashSet::new()),
-                (seed_hash, filler, HashSet::from([candidate])),
+                (filler, finalized_hash, block_number_for(filler), Vec::new()),
+                (
+                    seed_hash,
+                    filler,
+                    block_number_for(seed_hash),
+                    pool_logs(&HashSet::from([candidate])),
+                ),
             ],
         );
 
@@ -4212,8 +4229,13 @@ mod tests {
             pool_registry,
             token_registry,
             vec![
-                (filler, finalized_hash, HashSet::new()),
-                (seed_hash, filler, HashSet::from([candidate])),
+                (filler, finalized_hash, block_number_for(filler), Vec::new()),
+                (
+                    seed_hash,
+                    filler,
+                    block_number_for(seed_hash),
+                    pool_logs(&HashSet::from([candidate])),
+                ),
             ],
         );
         let (state, _effects) = transition(
@@ -4293,12 +4315,13 @@ mod tests {
         pool_candidate_address(number as u8)
     }
 
-    /// A one-block range-logs entry, as the bootstrap candidate scan would report it.
+    /// A one-block range-logs entry, as the bootstrap candidate scan would report it: one decoded
+    /// delta-only log naming the block's candidate (derives no snapshot, like `pool_logs`).
     fn range_log_block(number: u64) -> RangeLogBlock {
         RangeLogBlock {
             number,
             hash: block_hash_for_number(number),
-            candidates: HashSet::from([candidate_for_number(number)]),
+            logs: pool_logs(&HashSet::from([candidate_for_number(number)])),
         }
     }
 
@@ -4435,7 +4458,7 @@ mod tests {
         } = outcome;
         let seed_blocks = seed_blocks
             .into_iter()
-            .map(|block| (block.hash, block.parent_hash, block.candidates))
+            .map(|block| (block.hash, block.parent_hash, block.number, block.logs))
             .collect();
 
         State::activate_from_seed(
@@ -4652,11 +4675,11 @@ mod tests {
             "the gap must be bridged, leaving no floating parent"
         );
 
-        // The bridge is a filler: a seeded block with no candidates (real blocks each contribute one).
+        // The bridge is a filler: a seeded block with no logs (real blocks each contribute one).
         let filler_count = outcome
             .seed_blocks
             .iter()
-            .filter(|block| block.candidates.is_empty())
+            .filter(|block| block.logs.is_empty())
             .count();
         assert_eq!(
             filler_count, 1,
@@ -11938,6 +11961,54 @@ mod tests {
             &base,
         );
         assert_eq!(shadow_optimization_overlay(&state, chain).get(&pool), Some(&swapped));
+    }
+
+    // Activation seeds the shadow graph from the bootstrap window (the seed-activation warmup fix):
+    // the seeded block is present in both graphs, and the first live head folds the whole seeded
+    // window into the shadow's optimization read at once — no header walk needed.
+    #[test]
+    fn shadow_is_seeded_at_activation_and_folds_on_first_head() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let seed_block = hash_for_node(1);
+        let head = hash_for_node(2);
+        let candidate = pool_candidate_address(7);
+        let pool = PoolRef { key: candidate, chain };
+        let swapped = pool_state(9);
+
+        let (state, _effects) = State::activate_from_seed(
+            finalized,
+            HashMap::new(),
+            registry_verifying(candidate),
+            TokenRegistry::new(),
+            vec![(
+                seed_block,
+                finalized,
+                block_number_for(seed_block),
+                vec![swap_log(candidate, 0, &swapped)],
+            )],
+        );
+
+        // Both graphs carry the seeded block from the very first state.
+        assert!(state.blocks.hashes().contains(&seed_block));
+        assert!(state.log_shadow.graph.node_hashes().contains(&seed_block));
+
+        // The first live head (clear bloom, so not a hole) connects on top of the seed: the
+        // seeded absolute swap is served immediately by the shadow read.
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: head,
+                parent_hash: seed_block,
+                logs_bloom: Bloom::default(),
+                number: block_number_for(head),
+            },
+        );
+        assert_eq!(
+            shadow_optimization_overlay(&state, chain).get(&pool),
+            Some(&swapped)
+        );
     }
 
     // Finalization reanchors the shadow to the same block legacy compacts to, folding the same

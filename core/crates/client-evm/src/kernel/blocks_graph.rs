@@ -262,6 +262,38 @@ impl BlocksGraph {
         }
     }
 
+    /// Builds a graph pre-populated from the bootstrap seed window (the seed-activation warmup fix):
+    /// each seed block enters through the same connect-or-pending classification as live admission,
+    /// but header-less (`logs_bloom: None`) and with its ranged-getLogs payload stored as
+    /// authoritative `Complete`. The range query is topics-only (no address filter), so a present
+    /// block's payload is its full pool-vocabulary log set and a gap-filler's empty set is *proven*
+    /// empty — both independent of the verified-pool set, which may grow after activation (`Complete`
+    /// blocks never consult the bloom, so the missing header is semantically inert).
+    ///
+    /// `observed_head` stays at the anchor, mirroring legacy activation (`canonical_tip` starts at
+    /// the finalized hash; live replay advances it). Degenerate entries (self-parent, anchor
+    /// re-admit, duplicate/conflicting hash, cap overflow) are skipped refuse-and-keep, as in
+    /// [`BlocksGraph::admitted`].
+    pub(crate) fn from_seed(
+        anchor: BlockHash,
+        blocks: Vec<(BlockHash, BlockHash, u64, Vec<PoolLog>)>,
+    ) -> BlocksGraph {
+        blocks.into_iter().fold(
+            BlocksGraph::new(anchor),
+            |graph, (hash, parent, number, logs)| {
+                let data = BlockData {
+                    number,
+                    logs_bloom: None,
+                    logs: BlockLogs::Complete(key_by_log_index(logs)),
+                };
+                match graph.with_data_capped(hash, parent, data, MAX_PENDING_BLOCKS) {
+                    Ok(graph) => graph,
+                    Err(error) => error.into_graph(),
+                }
+            },
+        )
+    }
+
     /// True when no recent blocks are tracked yet — only the anchor exists.
     fn is_empty(&self) -> bool {
         self.nodes.is_empty()
@@ -343,6 +375,24 @@ impl BlocksGraph {
         bloom: Bloom,
         max_pending: usize,
     ) -> Result<BlocksGraph, NewBlockError> {
+        let data = BlockData {
+            number,
+            logs_bloom: Some(bloom),
+            logs: BlockLogs::Unknown,
+        };
+        self.with_data_capped(hash, parent, data, max_pending)
+    }
+
+    /// The admission core shared by live headers ([`with_block_capped`], bloom + `Unknown` logs) and
+    /// the bootstrap seed ([`from_seed`], header-less + `Complete` logs): classification, the B1 cap,
+    /// and pending promotion are identical for both; only the per-block payload differs.
+    fn with_data_capped(
+        self,
+        hash: BlockHash,
+        parent: BlockHash,
+        data: BlockData,
+        max_pending: usize,
+    ) -> Result<BlocksGraph, NewBlockError> {
         if hash == parent {
             return Err(NewBlockError::SelfParent(self));
         }
@@ -377,11 +427,6 @@ impl BlocksGraph {
             mut nodes,
             observed_head,
         } = self;
-        let data = BlockData {
-            number,
-            logs_bloom: Some(bloom),
-            logs: BlockLogs::Unknown,
-        };
 
         if connects {
             let parent_ref = if parent == anchor {
@@ -2944,5 +2989,144 @@ mod tests {
         let graph = BlocksGraph::new(BlockHash::ZERO);
 
         assert!(graph.is_empty());
+    }
+
+    // --- bootstrap seed (from_seed) --------------------------------------------------------------
+
+    /// A pool log with an explicit intra-block index for a given pool — seed payloads are keyed by
+    /// `log_index` exactly like live ingestion.
+    #[allow(deprecated)]
+    fn seed_log(log_index: u64, pool: PoolRef, event: PoolLogEvent) -> PoolLog {
+        PoolLog {
+            pool: pool.key,
+            log_index,
+            event,
+        }
+    }
+
+    /// The seed window under test: anchor(1) → s2 (absolute swap) → s3 (gap filler, proven-empty
+    /// logs) → s4 (in-range mint). Folding it for [`watched_pool`] from any base yields
+    /// `ps(500, 5, base_liquidity-agnostic 5_000 + 100)` since the swap is absolute.
+    fn seeded_graph() -> BlocksGraph {
+        let pool = watched_pool();
+        BlocksGraph::from_seed(
+            graph_hash(1),
+            vec![
+                (
+                    graph_hash(2),
+                    graph_hash(1),
+                    2,
+                    vec![seed_log(
+                        0,
+                        pool,
+                        PoolLogEvent::Swap {
+                            sqrt_price_x96: U160::from(500),
+                            tick: tk(5),
+                            liquidity: 5_000,
+                        },
+                    )],
+                ),
+                (graph_hash(3), graph_hash(2), 3, vec![]),
+                (
+                    graph_hash(4),
+                    graph_hash(3),
+                    4,
+                    vec![seed_log(
+                        1,
+                        pool,
+                        PoolLogEvent::Mint {
+                            tick_lower: tk(0),
+                            tick_upper: tk(10),
+                            amount: 100,
+                        },
+                    )],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn seed_builds_connected_header_less_complete_chain() {
+        let graph = seeded_graph();
+        for index in 2..=4 {
+            let node = graph
+                .connected(graph_hash(index))
+                .expect("seed block must be connected");
+            assert_eq!(node.data.logs_bloom, None, "seed blocks are header-less");
+            assert!(matches!(node.data.logs, BlockLogs::Complete(_)));
+        }
+        // Activation mirrors legacy: the head starts at the anchor; live replay advances it.
+        assert_eq!(graph.observed_head, graph_hash(1));
+        assert!(graph.canonical_hashes().is_empty());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn seed_window_folds_into_optimization_read_once_head_connects() {
+        // The first live block lands on the seeded chain and the whole window folds immediately —
+        // the warmup property: no header walk is needed before serving recent state.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 0, 1_000))]);
+        let graph = seeded_graph()
+            .admitted(graph_hash(5), graph_hash(4), 5, clear_bloom())
+            .with_observed_head(graph_hash(5));
+        let (overlay, frontier) =
+            graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        assert_eq!(frontier, graph_hash(5));
+        assert_eq!(overlay.get(&pool), Some(&ps(500, 5, 5_100)));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn seed_finalizes_through_header_less_window() {
+        // RequireComplete folds the seeded window: header-less (`None`-bloom) blocks are foldable
+        // because they are `Complete` — including the empty gap filler, whose emptiness the ranged
+        // response proved. The anchor advances with no backfill ranges.
+        let pool = watched_pool();
+        let base = HashMap::from([(pool, ps(10, 0, 1_000))]);
+        let (graph, snapshot) =
+            seeded_graph().finalized_to(graph_hash(4), &base, &verified_of(&base), Address::ZERO);
+        assert_eq!(graph.anchor, graph_hash(4));
+        assert_eq!(snapshot.get(&pool), Some(&ps(500, 5, 5_100)));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn seed_window_seeds_pool_verified_after_activation() {
+        // Registry growth after activation: the seed stores logs registry-free, so a pool verified
+        // only later folds out of the seeded window exactly as it would from live blocks.
+        let pool = watched_pool();
+        let base: HashMap<PoolRef, PoolState> = HashMap::new();
+        let graph = seeded_graph().with_observed_head(graph_hash(4));
+
+        let (before, _) = graph.optimization_pool_states(&base, &HashSet::new(), Address::ZERO);
+        assert!(before.is_empty(), "unverified pool must stay invisible");
+
+        let (after, frontier) =
+            graph.optimization_pool_states(&base, &HashSet::from([pool]), Address::ZERO);
+        assert_eq!(frontier, graph_hash(4));
+        assert_eq!(after.get(&pool), Some(&ps(500, 5, 5_100)));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn seed_skips_degenerate_entries_first_seen_kept() {
+        let pool = watched_pool();
+        let graph = BlocksGraph::from_seed(
+            graph_hash(1),
+            vec![
+                (graph_hash(2), graph_hash(1), 2, vec![seed_log(0, pool, sw(7))]),
+                // Self-parent, anchor re-admit, and a conflicting duplicate: skipped, first-seen kept.
+                (graph_hash(9), graph_hash(9), 9, vec![]),
+                (graph_hash(1), graph_hash(2), 1, vec![]),
+                (graph_hash(2), graph_hash(4), 2, vec![]),
+            ],
+        );
+        assert_eq!(graph.node_hashes(), HashSet::from([graph_hash(2)]));
+        let node = graph
+            .connected(graph_hash(2))
+            .expect("first-seen block must stay connected");
+        assert!(matches!(&node.parent, AnchoredRef::Anchor));
+        assert_graph_invariants(&graph);
     }
 }

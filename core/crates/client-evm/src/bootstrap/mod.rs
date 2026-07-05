@@ -11,7 +11,7 @@ use alloy::primitives::{BlockHash, keccak256};
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
 use crate::{
-    ChainKey, PoolRef, ProtocolPoolKey, PoolMetadataResult, PoolState, RangeLogBlock,
+    ChainKey, PoolLog, PoolRef, ProtocolPoolKey, PoolMetadataResult, PoolState, RangeLogBlock,
     TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry, tick::Tick,
 };
 pub use crate::{GetPoolMetadata, GetTokenMetadata};
@@ -39,13 +39,16 @@ pub struct FinalizedAnchor {
     pub number: u64,
 }
 
-/// One recent canonical block to pre-insert into the kernel block graph, with its pool-event
-/// candidates. `parent_hash` is inferred from block-number adjacency in the range-logs snapshot.
+/// One recent canonical block to pre-insert into the kernel block graphs, with its decoded pool
+/// logs (registry-free — candidate keys derive from them). `parent_hash` is inferred from
+/// block-number adjacency in the range-logs snapshot; `number` rides along so the log-sourced
+/// graph can seed the block directly (its backfill gate coalesces by number).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeedBlock {
     pub hash: BlockHash,
     pub parent_hash: BlockHash,
-    pub candidates: HashSet<ProtocolPoolKey>,
+    pub number: u64,
+    pub logs: Vec<PoolLog>,
 }
 
 /// Inferred block-graph seed for the `finalized..tip` window (parents by number adjacency).
@@ -121,7 +124,11 @@ impl GraphSeed {
                 blocks.push(SeedBlock {
                     hash: filler,
                     parent_hash: previous_hash,
-                    candidates: HashSet::new(),
+                    // The filler spans the whole no-log gap; the number below its upper neighbor is
+                    // representative. It only ever feeds backfill-range coalescing, which a
+                    // proven-empty (`Complete`) block never enters.
+                    number: number - 1,
+                    logs: Vec::new(),
                 });
                 filler
             };
@@ -129,7 +136,8 @@ impl GraphSeed {
             blocks.push(SeedBlock {
                 hash: block.hash,
                 parent_hash,
-                candidates: block.candidates.clone(),
+                number: *number,
+                logs: block.logs.clone(),
             });
 
             previous_number = *number;
@@ -325,9 +333,11 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             match phase {
                 Phase::Discovering { anchor } if taken.is_some() => {
                     let seed = GraphSeed::from_window(&blocks, anchor, policy.tip_trim);
+                    // Candidate keys derive from the decoded logs (registry-free emitter identity),
+                    // exactly as the live path derives them from a getLogs response.
                     let candidates = blocks
                         .into_iter()
-                        .flat_map(|block| block.candidates)
+                        .flat_map(|block| block.logs.into_iter().map(|log| log.pool))
                         .collect();
                     let payload = GetPoolMetadata {
                         at: anchor.hash,
@@ -542,19 +552,36 @@ mod tests {
         }
     }
 
+    /// The single decoded log a window block carries — its candidate identity with a fixed swap.
+    #[allow(deprecated)]
+    fn window_log(byte: u8) -> PoolLog {
+        use alloy::primitives::{U160, aliases::I24};
+        PoolLog {
+            pool: candidate(byte),
+            log_index: 0,
+            event: crate::PoolLogEvent::Swap {
+                sqrt_price_x96: U160::from(1u128),
+                tick: I24::ZERO,
+                liquidity: 1,
+            },
+        }
+    }
+
     fn window_block(number: u64, hash_byte: u8) -> RangeLogBlock {
         RangeLogBlock {
             number,
             hash: hash(hash_byte),
-            candidates: HashSet::from([candidate(hash_byte)]),
+            logs: vec![window_log(hash_byte)],
         }
     }
 
+    /// A real seed block; the fixtures' hash byte doubles as the block number.
     fn seed_block(hash_byte: u8, parent_byte: u8) -> SeedBlock {
         SeedBlock {
             hash: hash(hash_byte),
             parent_hash: hash(parent_byte),
-            candidates: HashSet::from([candidate(hash_byte)]),
+            number: u64::from(hash_byte),
+            logs: vec![window_log(hash_byte)],
         }
     }
 
@@ -563,16 +590,19 @@ mod tests {
         SeedBlock {
             hash: hash(hash_byte),
             parent_hash,
-            candidates: HashSet::from([candidate(hash_byte)]),
+            number: u64::from(hash_byte),
+            logs: vec![window_log(hash_byte)],
         }
     }
 
-    /// The filler bridging the gap between the real blocks `lower_byte` and `upper_byte`.
+    /// The filler bridging the gap between the real blocks `lower_byte` and `upper_byte` (the
+    /// fixtures' hash byte doubles as the block number, so the filler sits just below the upper).
     fn filler(lower_byte: u8, upper_byte: u8) -> SeedBlock {
         SeedBlock {
             hash: filler_hash(hash(lower_byte), hash(upper_byte)),
             parent_hash: hash(lower_byte),
-            candidates: HashSet::new(),
+            number: u64::from(upper_byte) - 1,
+            logs: Vec::new(),
         }
     }
 
@@ -779,8 +809,8 @@ mod tests {
                         }
                         previous_real_number = Some(number);
                     }
-                    // A filler: a synthetic node, never a window block, carrying no candidates.
-                    None => prop_assert!(seed.candidates.is_empty()),
+                    // A filler: a synthetic node, never a window block, carrying no logs.
+                    None => prop_assert!(seed.logs.is_empty()),
                 }
 
                 // Connectivity: following parent_hash from this block reaches the anchor through
