@@ -9,14 +9,23 @@
 //! module-private legacy `State`/`BlockNode`/`BlocksGraph`/`FinalizedState` and the registries).
 //!
 //! What is compared, and how divergences are normalized:
-//!  - **Two-sided equivalence** (`new_finalization_matches_legacy`): both paths finalize to the same
-//!    target and produce the same finalized snapshot, restricted to base-resident pools. To make them
-//!    comparable, generated canonical paths are **all `Complete`** (legacy would otherwise stop at the
-//!    latest fully-complete block ≤ target — partial compaction), and comparison is on **base keys
-//!    only** (the new fold folds only snapshot-resident pools; legacy also snapshots path-discovered
-//!    pools — see `registry_only_pool_*`).
+//!  - **Two-sided exact** (`new_finalization_matches_legacy`): on an **all-`Complete`** rendering of
+//!    the canonical path, both sides finalize fully to the target and produce the same finalized
+//!    snapshot on every tracked pool.
+//!  - **Two-sided partial** (`partial_finalization_matches_legacy`): with mixed per-block log
+//!    authority (`Complete`/`Streamed`/`Unknown`, bloom hit/clear — [`BlockKind`]), `finalized_to`
+//!    and legacy partial compaction advance to the **same frontier** and agree on the snapshot there.
+//!  - **Two-sided optimization** (`optimization_view_matches_legacy`): the `AllowStreamed` fold to
+//!    the observed head matches the overlay of a fully-informed legacy state, and both report the
+//!    same frontier hash.
 //!  - **One-sided A4** (`incomplete_path_is_refused_with_hole_ranges`): new-only — an incomplete path
 //!    is refused with the exact hole ranges; legacy has no equivalent (it silently compacts short).
+//!
+//! Scenarios may also plant a **post-bootstrap-discovered pool** — verified but absent from `base` —
+//! whose per-block runs are always Swap-led (absolute), so both sides derive it identically (the
+//! Blocker-1 seeding class). Delta-only (Mint-led) discovered pools are deliberately *not* generated:
+//! that case genuinely diverges until Blocker 1b lands — see
+//! `delta_only_new_pool_new_graph_advances_but_legacy_waits`.
 //!
 //! The legacy per-block *derivation* (`BlockLogsReceived` → snapshot) is not the subject here — it is
 //! not what `reanchored_to` replaces — so per-block snapshots are planted directly via the same
@@ -64,8 +73,12 @@ fn ps(sqrt: u128, tick: i32, liquidity: u128) -> PoolState {
     }
 }
 
-/// The fixed base pool set — all v3, all present in the finalized snapshot.
-const POOL_BYTES: [u8; 3] = [0xA1, 0xA2, 0xA3];
+/// The fixed tracked pool set — all v3. The first [`BASE_POOL_COUNT`] are present in the finalized
+/// snapshot; the last is the post-bootstrap-discovered pool (verified, absent from `base`), which
+/// the folds must absolute-seed from its Swap-led runs.
+const POOL_BYTES: [u8; 4] = [0xA1, 0xA2, 0xA3, 0xA4];
+const BASE_POOL_COUNT: usize = 3;
+const DISCOVERED_POOL_INDEX: usize = 3;
 
 fn pool_of(index: usize) -> PoolRef {
     PoolRef::uniswap_v3(Address::with_last_byte(POOL_BYTES[index]), CHAIN)
@@ -80,12 +93,18 @@ fn base_snapshot() -> HashMap<PoolRef, PoolState> {
     ])
 }
 
-/// The verified tracked set spanning exactly the base pools — what the fold watches and may seed. The
-/// generated scenarios only ever touch base pools, so verified == base keeps the fold restricted to
-/// them (matching the base-keys-only comparison); the new-pool seeding is exercised by the targeted
-/// tests below, which pass a widened set.
+/// The verified tracked set spanning exactly the base pools — verified == base keeps a fold
+/// restricted to them. Used by the targeted tests below (which widen it explicitly) and the A4
+/// range property (whose linear chains carry no discovered pool).
 fn base_verified() -> HashSet<PoolRef> {
     base_snapshot().keys().copied().collect()
+}
+
+/// The verified tracked set the generated scenarios hand the folds: the base pools plus the
+/// discovered pool — so every generated fold exercises watching and absolute-seeding a pool with no
+/// `base` entry, and comparisons span all tracked pools.
+fn scenario_verified() -> HashSet<PoolRef> {
+    (0..POOL_BYTES.len()).map(pool_of).collect()
 }
 
 fn pool_meta() -> PoolMetadata {
@@ -149,19 +168,37 @@ fn streamed(logs: Vec<PoolLog>) -> BlockLogs {
     )
 }
 
-/// A block's `(pool index, event)` list as `Streamed` or `Complete` logs per `is_streamed`. The
-/// optimization fold (`AllowStreamed`) reads both identically, so the choice only exercises the
-/// authority seam — both must contribute to match the legacy overlay (which stores snapshots
-/// regardless of Streamed/Complete).
-fn view_events(events: &[(usize, PoolLogEvent)], is_streamed: bool) -> BlockLogs {
-    let logs: Vec<PoolLog> = events
-        .iter()
-        .map(|(index, event)| pool_log(pool_of(*index), event.clone()))
-        .collect();
-    if is_streamed {
-        streamed(logs)
-    } else {
-        complete(logs)
+/// A block's `(pool index, event)` list rendered as new-graph `Streamed` (best-effort WS) logs.
+fn streamed_events(events: &[(usize, PoolLogEvent)]) -> BlockLogs {
+    streamed(
+        events
+            .iter()
+            .map(|(index, event)| pool_log(pool_of(*index), event.clone()))
+            .collect(),
+    )
+}
+
+/// A generated block's log authority — the per-block axis both sides render from.
+///
+/// `UnknownClear` models a block whose logs were never fetched but whose header bloom proves no
+/// watched pool emitted: legacy's scheduler promotes it to `Resolved` (empty) without a fetch, and
+/// the new graph's frontier walks past it — it stops no scan on either side. `UnknownHit` is the
+/// true hole: no logs, and a bloom that may touch a watched pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Complete,
+    Streamed,
+    UnknownClear,
+    UnknownHit,
+}
+
+/// The header bloom a block is admitted with: zero (proven untouched) for `UnknownClear`, saturated
+/// (may touch everything) otherwise. Only `Unknown` blocks ever have their bloom consulted, but the
+/// saturated default keeps every non-clear block conservatively bloom-hit.
+fn admission_bloom(kind: BlockKind) -> Bloom {
+    match kind {
+        BlockKind::UnknownClear => Bloom::default(),
+        _ => Bloom::repeat_byte(0xFF),
     }
 }
 
@@ -180,10 +217,11 @@ struct Scenario {
     target: usize,
     /// An admission permutation of `1..node_count` (stresses the new graph's order-independence).
     order: Vec<usize>,
-    /// Per node, whether the optimization-view builder plants its logs `Streamed` (best-effort WS)
-    /// rather than `Complete`; `streamed[0]` (the anchor) is unused. Ignored by the Stage-2
-    /// finalization builders, which are all-`Complete`.
-    streamed: Vec<bool>,
+    /// Per-node log authority for the mixed-authority builders/interpreters; `kind[0]` (the anchor)
+    /// is unused. `Unknown*` nodes carry no events (their content is unreadable on both sides, and a
+    /// clear bloom *proves* emptiness). The exact-finalization property ignores this axis and
+    /// renders everything `Complete`.
+    kind: Vec<BlockKind>,
 }
 
 fn swap_strategy() -> impl Strategy<Value = PoolLogEvent> {
@@ -210,9 +248,35 @@ fn mint_strategy() -> impl Strategy<Value = PoolLogEvent> {
 
 fn event_strategy() -> impl Strategy<Value = (usize, PoolLogEvent)> {
     (
-        0usize..POOL_BYTES.len(),
+        0usize..BASE_POOL_COUNT,
         prop_oneof![swap_strategy(), mint_strategy()],
     )
+}
+
+/// The discovered pool's per-block run: always Swap-led (absolute), so both sides can derive a state
+/// for it with no prior `base` entry regardless of which branch or admission order the block lands
+/// in. Delta-only (Mint-led) runs are the Blocker-1b divergence and are deliberately not generated.
+fn discovered_run_strategy() -> impl Strategy<Value = Vec<PoolLogEvent>> {
+    (
+        swap_strategy(),
+        prop::collection::vec(prop_oneof![swap_strategy(), mint_strategy()], 0..2),
+    )
+        .prop_map(|(lead, tail)| {
+            let mut run = vec![lead];
+            run.extend(tail);
+            run
+        })
+}
+
+/// `Complete` is weighted dominant so folds usually advance deep enough to exercise the seams the
+/// rarer kinds plant (streamed reads, holes, bloom-proven skips).
+fn block_kind_strategy() -> impl Strategy<Value = BlockKind> {
+    prop_oneof![
+        4 => Just(BlockKind::Complete),
+        2 => Just(BlockKind::Streamed),
+        1 => Just(BlockKind::UnknownClear),
+        1 => Just(BlockKind::UnknownHit),
+    ]
 }
 
 fn scenario_strategy() -> impl Strategy<Value = Scenario> {
@@ -223,16 +287,19 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                 Just(node_count),
                 prop::collection::vec(any::<usize>(), node_count - 1),
                 prop::collection::vec(
-                    prop::collection::vec(event_strategy(), 0..3),
+                    (
+                        prop::collection::vec(event_strategy(), 0..3),
+                        prop::option::weighted(0.3, discovered_run_strategy()),
+                    ),
                     node_count - 1,
                 ),
                 1usize..node_count,
                 Just(admit).prop_shuffle(),
-                prop::collection::vec(any::<bool>(), node_count - 1),
+                prop::collection::vec(block_kind_strategy(), node_count - 1),
             )
         })
         .prop_map(
-            |(node_count, parent_choices, node_events, target, order, streamed_choices)| {
+            |(node_count, parent_choices, node_events, target, order, kind_choices)| {
                 let parents: Vec<usize> = (0..node_count)
                     .map(|index| if index == 0 { 0 } else { parent_choices[index - 1] % index })
                     .collect();
@@ -240,10 +307,27 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                 for index in 1..node_count {
                     number[index] = number[parents[index]] + 1;
                 }
+                let mut kind = vec![BlockKind::Complete];
+                kind.extend(kind_choices);
                 let mut events = vec![Vec::new()];
-                events.extend(node_events);
-                let mut streamed = vec![false];
-                streamed.extend(streamed_choices);
+                for (node, (base_events, discovered_run)) in node_events.into_iter().enumerate() {
+                    // `Unknown` blocks carry no events: a clear bloom *proves* the block is empty,
+                    // and a bloom-hit block's content is unreadable on both sides — planting some
+                    // anyway would leak data neither interpreter is allowed to see.
+                    if matches!(
+                        kind[node + 1],
+                        BlockKind::UnknownClear | BlockKind::UnknownHit
+                    ) {
+                        events.push(Vec::new());
+                        continue;
+                    }
+                    let mut block_events = base_events;
+                    if let Some(run) = discovered_run {
+                        block_events
+                            .extend(run.into_iter().map(|event| (DISCOVERED_POOL_INDEX, event)));
+                    }
+                    events.push(block_events);
+                }
                 Scenario {
                     node_count,
                     parents,
@@ -251,7 +335,7 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                     events,
                     target,
                     order,
-                    streamed,
+                    kind,
                 }
             },
         )
@@ -283,10 +367,10 @@ fn build_new(scenario: &Scenario) -> NewGraph {
     graph
 }
 
-/// Builds the new graph for the optimization view: like [`build_new`] but plants each block's logs as
-/// `Streamed` or `Complete` per `scenario.streamed`, then sets `observed_head` to the target so the
-/// optimization read folds the canonical suffix `anchor → target`.
-fn build_new_optimization(scenario: &Scenario) -> NewGraph {
+/// Builds the new graph rendering each block per its [`BlockKind`]: admit every block in `order`
+/// with the kind's bloom ([`admission_bloom`]), then plant `Complete`/`Streamed` payloads —
+/// `Unknown*` blocks keep the admission default (`BlockLogs::Unknown`, bloom deciding hole vs skip).
+fn build_new_kinds(scenario: &Scenario) -> NewGraph {
     let mut graph = NewGraph::new(dh(0));
     for &node in &scenario.order {
         graph = graph
@@ -294,25 +378,61 @@ fn build_new_optimization(scenario: &Scenario) -> NewGraph {
                 dh(node),
                 dh(scenario.parents[node]),
                 scenario.number[node],
-                Bloom::repeat_byte(0xFF),
+                admission_bloom(scenario.kind[node]),
             )
             .expect("generated admission succeeds");
     }
     for node in 1..scenario.node_count {
-        let logs = view_events(&scenario.events[node], scenario.streamed[node]);
+        let logs = match scenario.kind[node] {
+            BlockKind::Complete => complete_events(&scenario.events[node]),
+            BlockKind::Streamed => streamed_events(&scenario.events[node]),
+            BlockKind::UnknownClear | BlockKind::UnknownHit => continue,
+        };
         match graph.nodes.get_mut(&dh(node)) {
             Some(Node::Connected(connected)) => connected.data.logs = logs,
             _ => panic!("every generated block must be connected after full admission"),
         }
     }
-    graph.with_observed_head(dh(scenario.target))
+    graph
+}
+
+/// The canonical node-index path anchor → target (anchor excluded), derived from `parents`.
+fn canonical_path(scenario: &Scenario) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut node = scenario.target;
+    while node != 0 {
+        path.push(node);
+        node = scenario.parents[node];
+    }
+    path.reverse();
+    path
+}
+
+/// The independently-computed frontier both sides must stop at: the last canonical block before the
+/// first block whose kind `blocks` the given fold (node `0` — the anchor — when the very first path
+/// block already blocks). Guards against a shared bug in the two interpreters masking a divergence.
+fn expected_frontier(scenario: &Scenario, blocks: impl Fn(BlockKind) -> bool) -> usize {
+    let mut frontier = 0;
+    for &node in &canonical_path(scenario) {
+        if blocks(scenario.kind[node]) {
+            break;
+        }
+        frontier = node;
+    }
+    frontier
 }
 
 /// Builds the pre-finalization legacy `State`, planting each block's absolute per-pool snapshots via
 /// an incremental `derive_pool_state` fold (block = parent snapshot + block logs) and setting the
-/// canonical tip to the target. Shared by the finalization builder ([`build_legacy`]) and the
-/// optimization-view read (`optimization_view_matches_legacy`).
-fn legacy_state(scenario: &Scenario) -> State {
+/// canonical tip to the target. Shared by all comparisons; `kinds` decides each block's rendering
+/// (callers pass `scenario.kind`, an all-`Complete` vector, or a "fully informed" mapping):
+///  - `Complete` → `Resolved` candidates + derived snapshots (authoritative logs arrived);
+///  - `Streamed` → `Partial` candidates, no snapshots (subscription logs are provisional and never
+///    unblock the legacy scans);
+///  - `UnknownClear` → `Resolved` empty, no snapshots (the production scheduler promotes a
+///    bloom-clear block without a fetch — `resolve_empty_candidates` in the kernel);
+///  - `UnknownHit` → `Unknown`, stopping every legacy scan.
+fn legacy_state(scenario: &Scenario, kinds: &[BlockKind]) -> State {
     let base = base_snapshot();
 
     // `state_at[node]` is every base pool's absolute state at `node`; `stored[node]` is the subset a
@@ -330,8 +450,9 @@ fn legacy_state(scenario: &Scenario) -> State {
         for (pool_index, events) in by_pool {
             let pool = pool_of(pool_index);
             let run: Vec<&PoolLogEvent> = events.iter().collect();
+            // Base pools fold from `base`; the discovered pool's runs are Swap-led by construction.
             let folded = derive_pool_state(current.get(&pool), &run)
-                .expect("base pool fold is always derivable");
+                .expect("every generated per-block run is derivable");
             current.insert(pool, folded.clone());
             snapshots.insert(pool, folded);
         }
@@ -345,13 +466,23 @@ fn legacy_state(scenario: &Scenario) -> State {
                 .iter()
                 .map(|(pool_index, _)| pool_of(*pool_index).key)
                 .collect();
+            let (pool_logs, pool_snapshots) = match kinds[node] {
+                BlockKind::Complete => {
+                    (PoolLogsStatus::Resolved(candidates), stored[node].clone())
+                }
+                BlockKind::Streamed => (PoolLogsStatus::Partial(candidates), HashMap::new()),
+                // `Unknown*` blocks have no events, so `candidates` is empty either way; the clear
+                // case renders as the scheduler's fetch-free `Resolved` promotion.
+                BlockKind::UnknownClear => (PoolLogsStatus::Resolved(candidates), HashMap::new()),
+                BlockKind::UnknownHit => (PoolLogsStatus::Unknown, HashMap::new()),
+            };
             (
                 dh(node),
                 BlockNode {
                     parent_hash: dh(scenario.parents[node]),
                     logs_bloom: None,
-                    pool_logs: PoolLogsStatus::Resolved(candidates),
-                    pool_snapshots: stored[node].clone(),
+                    pool_logs,
+                    pool_snapshots,
                     pool_data_failures: HashMap::new(),
                 },
             )
@@ -375,18 +506,21 @@ fn legacy_state(scenario: &Scenario) -> State {
     }
 }
 
-/// The legacy finalization path: builds the pre-finalization state, then finalizes to the target.
+/// The legacy finalization path on an all-`Complete` rendering (the exact-equivalence premise):
+/// builds the pre-finalization state, then finalizes to the target.
 fn build_legacy(scenario: &Scenario) -> State {
-    legacy_state(scenario).with_finalized_block_observed(CHAIN, dh(scenario.target))
+    legacy_state(scenario, &vec![BlockKind::Complete; scenario.node_count])
+        .with_finalized_block_observed(CHAIN, dh(scenario.target))
 }
 
-/// The legacy optimization overlay at the canonical tip, merged over the finalized base — the read
-/// the kernel's optimization dispatch performs today (`latest_complete_pool_state_update` +
-/// `resolve_complete_pool_states`, then overlaid on the finalized snapshots).
-fn legacy_optimization_snapshot(state: &State) -> HashMap<PoolRef, PoolState> {
+/// The legacy optimization overlay at the canonical tip, merged over the finalized base, plus the
+/// reference block hash the overlay is valid at — the read the kernel's optimization dispatch
+/// performs today (`latest_complete_pool_state_update` + `resolve_complete_pool_states`, then
+/// overlaid on the finalized snapshots).
+fn legacy_optimization_snapshot(state: &State) -> (HashMap<PoolRef, PoolState>, BlockHash) {
     let update = state
         .latest_complete_pool_state_update(CHAIN)
-        .expect("an all-resolved path yields a complete overlay");
+        .expect("a connected path yields an overlay descriptor");
     let overlay = state
         .resolve_complete_pool_states(&update)
         .expect("every overlay location is present");
@@ -394,7 +528,7 @@ fn legacy_optimization_snapshot(state: &State) -> HashMap<PoolRef, PoolState> {
     for (pool, pool_state) in overlay {
         merged.insert(pool, pool_state.clone());
     }
-    merged
+    (merged, update.block_hash)
 }
 
 /// Every connected node's parent chain reaches the anchor (the post-reanchor form of T2).
@@ -420,22 +554,25 @@ fn connected_reaches_anchor(graph: &NewGraph, start: BlockHash) -> bool {
 // ---- properties ----------------------------------------------------------------------------------
 
 proptest! {
-    /// Two-sided: on an all-`Complete` canonical path, the new fold/re-root produces the same
-    /// finalized snapshot (on base-resident pools) as the legacy finalization, and both advance to
+    /// Two-sided: on an all-`Complete` rendering of the canonical path, the new fold/re-root
+    /// produces the same finalized snapshot as the legacy finalization — on every tracked pool,
+    /// including the discovered pool both sides must introduce identically — and both advance to
     /// the same target.
     #[test]
     fn new_finalization_matches_legacy(scenario in scenario_strategy()) {
         let base = base_snapshot();
+        let verified = scenario_verified();
         let (new_graph, new_snapshot) = build_new(&scenario)
-            .reanchored_to(ConnectedHash(dh(scenario.target)), &base, &base_verified(), Address::ZERO)
+            .reanchored_to(ConnectedHash(dh(scenario.target)), &base, &verified, Address::ZERO)
             .expect("an all-Complete path must fold");
         let legacy = build_legacy(&scenario);
 
         // Full advance — no partial compaction, since every path block is Complete.
         prop_assert_eq!(legacy.finalized_state.block_hash, dh(scenario.target));
 
-        // Snapshots agree on base-resident keys.
-        for pool in base.keys() {
+        // Snapshots agree on every tracked pool (absence must agree too: a discovered pool whose
+        // logs sit off the canonical path stays out of both snapshots).
+        for pool in &verified {
             prop_assert_eq!(
                 new_snapshot.get(pool),
                 legacy.finalized_state.pool_snapshots.get(pool),
@@ -461,29 +598,79 @@ proptest! {
 proptest! {
     /// Two-sided: the new graph's `optimization_pool_states` (fold to the observed head under
     /// `AllowStreamed`, reading best-effort `Streamed` logs as well as `Complete`) produces the same
-    /// per-pool overlay — on base-resident keys — as the legacy optimization read at the canonical
-    /// tip. Blocks are a random Streamed/Complete mix; because `AllowStreamed` must read both, a
-    /// dropped stream would diverge from the legacy overlay (which stores snapshots regardless of
-    /// log kind), so the mix directly exercises the authority seam. No finalization: the fold spans
-    /// the unfinalized region `anchor → head`, unlike the Stage-2 finalization test.
+    /// per-pool overlay — on every tracked pool, discovered included — and the same frontier hash as
+    /// the legacy optimization read at the canonical tip. Legacy is rendered **fully informed** on
+    /// `Streamed` blocks (`Resolved` + snapshots): the fold reads streamed logs, and its equivalence
+    /// target is the overlay legacy builds once the same logs arrive authoritatively — a dropped
+    /// stream would therefore diverge. A bloom-hit `Unknown` block stops both sides at the same
+    /// frontier (legacy's scan break, the new fold's hole); a bloom-clear one stops neither.
     #[test]
     fn optimization_view_matches_legacy(scenario in scenario_strategy()) {
         let base = base_snapshot();
-        // `optimization_pool_states` returns the changed-pool overlay plus its frontier hash; take the
-        // overlay (`.0`) and merge onto `base` for comparison (an untouched pool reads through to
-        // `base`), mirroring the production optimization consumer. The scenario plants every block
-        // `Streamed`/`Complete` (never `Unknown`), so the fold never stops short of the head and the
-        // frontier hash is the observed head — the overlay is exactly the full-path fold.
-        let new_overlay = build_new_optimization(&scenario)
-            .optimization_pool_states(&base, &base_verified(), Address::ZERO)
-            .0;
-        let legacy_snapshot = legacy_optimization_snapshot(&legacy_state(&scenario));
+        let verified = scenario_verified();
+        let frontier = expected_frontier(
+            &scenario,
+            |kind| matches!(kind, BlockKind::UnknownHit),
+        );
 
-        for pool in base.keys() {
+        // The changed-pool overlay plus the frontier hash the reserves are valid at; the overlay is
+        // merged onto `base` for comparison (an untouched pool reads through to `base`), mirroring
+        // the production optimization consumer.
+        let (new_overlay, new_frontier) = build_new_kinds(&scenario)
+            .with_observed_head(dh(scenario.target))
+            .optimization_pool_states(&base, &verified, Address::ZERO);
+
+        let informed: Vec<BlockKind> = scenario
+            .kind
+            .iter()
+            .map(|kind| match kind {
+                BlockKind::Streamed => BlockKind::Complete,
+                other => *other,
+            })
+            .collect();
+        let (legacy_snapshot, legacy_frontier) =
+            legacy_optimization_snapshot(&legacy_state(&scenario, &informed));
+
+        prop_assert_eq!(new_frontier, dh(frontier), "new frontier");
+        prop_assert_eq!(legacy_frontier, dh(frontier), "legacy frontier");
+        for pool in &verified {
             prop_assert_eq!(
                 new_overlay.get(pool).or_else(|| base.get(pool)),
                 legacy_snapshot.get(pool),
                 "optimization overlay mismatch for pool {:?}", pool
+            );
+        }
+    }
+}
+
+proptest! {
+    /// Two-sided partial compaction under mixed log authority: `finalized_to` — the production
+    /// shadow finalization entry — and legacy `with_finalized_block_observed` advance to the same
+    /// frontier (the last canonical block before the first `Streamed` or bloom-hit `Unknown` block)
+    /// and agree on the finalized snapshot there, discovered pool included. A bloom-clear `Unknown`
+    /// block stops neither side: legacy's scheduler promotes it to `Resolved` (empty) without a
+    /// fetch, and the new frontier walks past a proven-untouched block.
+    #[test]
+    fn partial_finalization_matches_legacy(scenario in scenario_strategy()) {
+        let base = base_snapshot();
+        let verified = scenario_verified();
+        let frontier = expected_frontier(
+            &scenario,
+            |kind| matches!(kind, BlockKind::Streamed | BlockKind::UnknownHit),
+        );
+
+        let (new_graph, new_snapshot) = build_new_kinds(&scenario)
+            .finalized_to(dh(scenario.target), &base, &verified, Address::ZERO);
+        let legacy = legacy_state(&scenario, &scenario.kind)
+            .with_finalized_block_observed(CHAIN, dh(scenario.target));
+
+        prop_assert_eq!(new_graph.anchor, dh(frontier), "new frontier");
+        prop_assert_eq!(legacy.finalized_state.block_hash, dh(frontier), "legacy frontier");
+        for pool in &verified {
+            prop_assert_eq!(
+                new_snapshot.get(pool),
+                legacy.finalized_state.pool_snapshots.get(pool),
+                "finalized snapshot mismatch for pool {:?}", pool
             );
         }
     }
