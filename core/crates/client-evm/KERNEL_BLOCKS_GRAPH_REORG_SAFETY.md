@@ -140,6 +140,49 @@ legacy's on base-resident pools.
 
 ---
 
+## Case (d): off-canonical finalization target — no-op and wait (gating re-derivation)
+
+Added with the finalization-gating re-derivation (shadow `finalized_to` hoisted above the legacy
+early-return gates in `with_finalized_block_observed`, so the shadow gates on its own graph).
+
+**The input.** A `FinalizedBlockObserved` whose hash is *connected* in the graph (descends from the
+anchor) but is **not on the canonical chain** `anchor → observed_head` — a side fork from the head's
+perspective. This happens when the finality feed and the head feed transiently disagree (head lagging
+on another branch, or head on a doomed fork the finality signal has already left behind).
+
+**The hazard.** `finalized_to` reanchors via `reanchored_to`, which prunes every non-descendant of the
+new anchor (A3) and resets a pruned `observed_head` to the anchor. Blindly honoring an off-canonical
+target would prune the entire current head branch — destructive if the disagreement is a transient
+feed glitch rather than a real reorg.
+
+**Decision (d): mirror legacy — no-op and wait.** `finalized_to` only advances when the target lies on
+the canonical chain (`canonical_oldest_to_newest` membership); otherwise it returns the graph and base
+unchanged. This is exactly legacy's `connected_path_contains(tip, target, finalized)` gate re-derived
+from the graph. If the head is merely lagging, a later `HeadObserved` on the finalized branch flips the
+canonical chain there and the next (recurring) finality observation lands. An empty canonical chain
+(head pending/absent, e.g. right after seed activation) refuses too — matching legacy, whose canonical
+tip also sits at the anchor until the first post-activation head connects.
+
+**Documented alternative (not chosen): trust finality immediately.** Reanchor onto the fork and prune
+the head branch — finality is authoritative, so this is eventually right on a real reorg. Rejected for
+the shadow period: it is destructive on a transiently disagreeing feed pair, diverges from legacy, and
+buys nothing (the wait resolves within one head + finality observation cycle).
+
+**Accepted divergence (Blockers 1b/1c, signed off 2026-07-05).** The hoist deliberately does NOT
+re-derive legacy's completeness gates: legacy holds finalization while a verified pool awaits
+`GetPoolData` (1b) or a candidate is pending validation (1c); the shadow folds past any `Complete`
+block, so its anchor can advance ahead of legacy's `finalized_state`. The affected pool stays absent
+from the shadow base (absent-never-stale; re-seeds on the next absolute event). Pinned one-sided by
+`shadow_finalizes_past_legacy_pending_validation_halt` (kernel) and
+`delta_only_new_pool_new_graph_advances_but_legacy_waits` (differential). The anchor-height
+`GetPoolData` seeding that closes the gap is a **deferred coverage/liveness follow-up** (decided
+2026-07-05), not an Increment-4 blocker: absent-never-stale is structural, production reads are
+already shadow-only, active pools heal on their next absolute event, and dormant pools heal at the
+next restart's bootstrap seeding. Increment 4 must still explicitly decide `GetPoolData`'s fate
+(dormant vs delete-and-readd) — this seeding is its only remaining post-swap role.
+
+---
+
 ## Summary of decisions (for sign-off)
 
 1. **(a) Cycle reset:** dropped — acyclic-by-construction connected forest; pending cycles inert +
@@ -149,5 +192,9 @@ legacy's on base-resident pools.
    but not chosen.
 3. **(c) Finalization:** reanchor to the latest complete connected block ≤ target (needs a new helper),
    not blindly to target — matching legacy's partial-compaction and the fold-on-demand design.
+4. **(d) Off-canonical finalization target:** no-op and wait (canonical-membership gate in
+   `finalized_to`), mirroring legacy's connected-path gate; trust-finality-immediately documented but
+   not chosen. 1b/1c wait-vs-advance divergence accepted until the anchor-height `GetPoolData` fix.
 
-Sign-off on these three gates Increment 2 (embedding + feeding the new graph from `transition`).
+Sign-off on these three gates Increment 2 (embedding + feeding the new graph from `transition`);
+decision (d) signed off with the finalization-gating re-derivation (2026-07-05).

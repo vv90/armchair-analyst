@@ -1186,7 +1186,26 @@ impl State {
 
     /// Attempts to compact recent block data into the finalized snapshot.
     /// Added to bound block graph growth without remembering failed finalized observations.
-    fn with_finalized_block_observed(self, chain: ChainKey, block_hash: BlockHash) -> State {
+    fn with_finalized_block_observed(mut self, chain: ChainKey, block_hash: BlockHash) -> State {
+        // Advance the shadow first, self-gated by its graph: `finalized_to` no-ops on an absent/
+        // pending/unconnected/off-canonical target and advances only over the foldable canonical
+        // prefix (fold-on-demand, reorg-safety decisions (c)/(d)). It deliberately does NOT wait on
+        // the legacy gates below — legacy holds finalization for GetPoolData / candidate validation
+        // (Blockers 1b/1c), the shadow folds past any Complete block (signed-off divergence).
+        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
+        // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
+        // discovered after bootstrap (the shadow graph is registry-free; identity comes from here).
+        let verified = self.pool_registry.verified_pools(chain);
+        let LogGraphShadow {
+            graph: log_graph,
+            finalized_snapshot: log_base,
+        } = self.log_shadow;
+        let (log_graph, log_base) = log_graph.finalized_to(block_hash, &log_base, &verified, v4_manager);
+        self.log_shadow = LogGraphShadow {
+            graph: log_graph,
+            finalized_snapshot: log_base,
+        };
+
         if block_hash == self.finalized_state.block_hash {
             return self;
         }
@@ -1225,24 +1244,6 @@ impl State {
             streamed_logs: _,
             log_shadow,
         } = self;
-
-        // Reanchor the shadow independently toward the observed finalized target: `finalized_to`
-        // advances the anchor to the latest complete connected block ≤ `block_hash` (fold-on-demand,
-        // reorg-safety decision (c)), mirroring legacy's partial compaction above without depending on
-        // its computed `update.block_hash`. A target not (yet) connected in the shadow is a no-op.
-        let LogGraphShadow {
-            graph: log_graph,
-            finalized_snapshot: log_base,
-        } = log_shadow;
-        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
-        // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
-        // discovered after bootstrap (the shadow graph is registry-free; identity comes from here).
-        let verified = pool_registry.verified_pools(chain);
-        let (log_graph, log_base) = log_graph.finalized_to(block_hash, &log_base, &verified, v4_manager);
-        let log_shadow = LogGraphShadow {
-            graph: log_graph,
-            finalized_snapshot: log_base,
-        };
 
         // Move each pool's latest snapshot out of its block instead of cloning. Every referenced
         // block is at or before the frontier, so `retaining_descendants_of` below prunes them all
@@ -12075,6 +12076,100 @@ mod tests {
         // Shadow reanchored to the same block and folded the same base-pool snapshot.
         assert_eq!(state.log_shadow.graph.anchor_hash(), block);
         assert_eq!(state.log_shadow.finalized_snapshot.get(&pool), Some(&swapped));
+    }
+
+    // A finality signal for a connected side-fork block (off the canonical chain) is refused by
+    // both graphs together: legacy's connected-path gate and the shadow's canonical-membership
+    // gate (reorg-safety decision (d)) — neither prunes the head branch.
+    #[test]
+    fn shadow_refuses_side_fork_finalization_with_legacy() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let fork = hash_for_node(1);
+        let head = hash_for_node(2);
+        let state = empty_state_at(finalized);
+
+        // Two children of the finalized block; the head lands on the second, leaving the first a
+        // connected side fork.
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: fork,
+                parent_hash: finalized,
+                logs_bloom: Bloom::default(),
+                number: block_number_for(fork),
+            },
+        );
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: head,
+                parent_hash: finalized,
+                logs_bloom: Bloom::default(),
+                number: block_number_for(head),
+            },
+        );
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::FinalizedBlockObserved { block_hash: fork },
+        );
+
+        // Legacy refused (tip does not descend from the fork) and pruned nothing.
+        assert_eq!(state.finalized_state.block_hash, finalized);
+        assert_eq!(state.canonical_tip, head);
+        assert!(state.blocks.hashes().contains(&fork));
+        // The shadow refused on its own gate: anchor and head unchanged, fork retained.
+        assert_eq!(state.log_shadow.graph.anchor_hash(), finalized);
+        assert_eq!(state.log_shadow.graph.observed_head_hash(), head);
+        assert!(state.log_shadow.graph.node_hashes().contains(&fork));
+    }
+
+    // Blocker 1c divergence (signed off 2026-07-05): a pending-validation candidate halts the
+    // legacy completeness scan, but the shadow gates on its own graph and advances past the
+    // Complete block. The unverified pool stays absent from the shadow base (absent-never-stale)
+    // until the anchor-height GetPoolData fix lands (pre-Increment 4).
+    #[test]
+    fn shadow_finalizes_past_legacy_pending_validation_halt() {
+        let chain = ChainKey::Ethereum;
+        let finalized = hash_for_node(0);
+        let block = hash_for_node(1);
+        // Unknown to the default registry: neither verified nor rejected -> PendingValidation.
+        let candidate = pool_candidate_address(9);
+        let state = empty_state_at(finalized);
+
+        let (state, effects) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: block,
+                parent_hash: finalized,
+                logs_bloom: bloom_matching_any(),
+                number: block_number_for(block),
+            },
+        );
+        let request_id = block_logs_request_id(&effects, block);
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::BlockLogsReceived {
+                request_id,
+                logs: vec![swap_log(candidate, 0, &pool_state(9))],
+            },
+        );
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::FinalizedBlockObserved { block_hash: block },
+        );
+
+        // Legacy waits for candidate validation before compacting.
+        assert_eq!(state.finalized_state.block_hash, finalized);
+        // The shadow advances past the Complete block; the unverified pool is not seeded.
+        assert_eq!(state.log_shadow.graph.anchor_hash(), block);
+        assert!(state.log_shadow.finalized_snapshot.is_empty());
     }
 
     // A conflicting-parent re-observation resets both graphs to the finalized anchor together.

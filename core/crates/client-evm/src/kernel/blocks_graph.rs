@@ -868,8 +868,8 @@ impl BlocksGraph {
     /// far as the canonical prefix is fully foldable, folding into `base`. Mirrors legacy
     /// partial-compaction (reorg-safety decision (c) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`): it
     /// reanchors to the *latest complete connected block ≤ target*, so a hole short of `target`
-    /// advances only to just before that hole (fold-on-demand), and an absent/pending/unconnected
-    /// `target` is a no-op. Infallible — the chosen sub-target is hole-free by construction, so the
+    /// advances only to just before that hole (fold-on-demand), and an absent/pending/unconnected/
+    /// off-canonical `target` is a no-op. Infallible — the chosen sub-target is hole-free by construction, so the
     /// inner [`reanchored_to`] never returns `Incomplete`; the returned snapshot replaces the caller's
     /// finalized base only when the anchor actually advances.
     pub(crate) fn finalized_to(
@@ -881,6 +881,16 @@ impl BlocksGraph {
     ) -> (BlocksGraph, HashMap<PoolRef, PoolState>) {
         // Only a connected target is finalizable; an absent/pending one has no foldable prefix yet.
         if self.connected(target).is_none() {
+            return (self, base.clone());
+        }
+        // Decision (d) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`: only a target on the canonical
+        // chain (anchor → observed_head) may finalize — a connected side-fork target would prune
+        // the head branch; no-op and wait for the head to catch up instead.
+        if !self
+            .canonical_oldest_to_newest()
+            .iter()
+            .any(|ConnectedHash(hash)| *hash == target)
+        {
             return (self, base.clone());
         }
         let watched = watched_addresses(verified, v4_manager);
@@ -2522,6 +2532,74 @@ mod tests {
     }
 
     #[test]
+    fn finalization_ignores_connected_side_fork_target() {
+        // Decision (d): a finality signal for a connected block OFF the canonical chain
+        // (anchor → observed_head) must not reanchor — advancing would prune the head branch on a
+        // possibly transient head/finality feed disagreement. No-op and wait for the head instead.
+        let pool = v3_pool(0xA1);
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let (mut graph, _tip) = fold_chain(vec![(2, complete(vec![]))]);
+        // A second child of the anchor: connected and fully foldable, but the head is on block 2.
+        let fork = graph_hash(3);
+        graph.nodes.insert(
+            fork,
+            Node::Connected(ConnectedNode {
+                parent: AnchoredRef::Anchor,
+                data: BlockData {
+                    number: 2,
+                    logs_bloom: Some(hit_bloom()),
+                    logs: complete(vec![pool_log(
+                        pool,
+                        PoolLogEvent::Swap {
+                            sqrt_price_x96: U160::from(777u128),
+                            tick: tk(9),
+                            liquidity: 42,
+                        },
+                    )]),
+                },
+            }),
+        );
+
+        let (graph, snapshot) = graph.finalized_to(fork, &base, &verified_of(&base), Address::ZERO);
+
+        assert_eq!(graph.anchor, graph_hash(1));
+        assert_eq!(graph.observed_head, graph_hash(2));
+        assert!(graph.nodes.contains_key(&graph_hash(2)));
+        assert_eq!(snapshot, base);
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn finalization_advances_to_mid_canonical_target() {
+        // The canonical-membership gate must not over-refuse: a target strictly between the anchor
+        // and the observed head is on the canonical chain and finalizes normally.
+        let pool = v3_pool(0xA1);
+        let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+        let (graph, _tip) = fold_chain(vec![
+            (
+                2,
+                complete(vec![pool_log(
+                    pool,
+                    PoolLogEvent::Swap {
+                        sqrt_price_x96: U160::from(777u128),
+                        tick: tk(9),
+                        liquidity: 42,
+                    },
+                )]),
+            ),
+            (3, complete(vec![])),
+        ]);
+
+        let (graph, snapshot) =
+            graph.finalized_to(graph_hash(2), &base, &verified_of(&base), Address::ZERO);
+
+        assert_eq!(graph.anchor, graph_hash(2));
+        assert_eq!(graph.observed_head, graph_hash(3));
+        assert_eq!(snapshot.get(&pool), Some(&ps(777, 9, 42)));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
     fn fold_composes_across_blocks_in_path_order() {
         // Swap in the first block sets absolute state; mint in the second adjusts it.
         let pool = v3_pool(0xA1);
@@ -3081,11 +3159,14 @@ mod tests {
     fn seed_finalizes_through_header_less_window() {
         // RequireComplete folds the seeded window: header-less (`None`-bloom) blocks are foldable
         // because they are `Complete` — including the empty gap filler, whose emptiness the ranged
-        // response proved. The anchor advances with no backfill ranges.
+        // response proved. The anchor advances with no backfill ranges. The head must have connected
+        // through the window first (decision (d): off-canonical targets no-op) — same as legacy,
+        // whose canonical tip also sits at the anchor until the first post-activation head.
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 0, 1_000))]);
-        let (graph, snapshot) =
-            seeded_graph().finalized_to(graph_hash(4), &base, &verified_of(&base), Address::ZERO);
+        let (graph, snapshot) = seeded_graph()
+            .with_observed_head(graph_hash(4))
+            .finalized_to(graph_hash(4), &base, &verified_of(&base), Address::ZERO);
         assert_eq!(graph.anchor, graph_hash(4));
         assert_eq!(snapshot.get(&pool), Some(&ps(500, 5, 5_100)));
         assert_graph_invariants(&graph);

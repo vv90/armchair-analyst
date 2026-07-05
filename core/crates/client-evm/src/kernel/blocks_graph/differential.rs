@@ -659,7 +659,10 @@ proptest! {
             |kind| matches!(kind, BlockKind::Streamed | BlockKind::UnknownHit),
         );
 
+        // The head sits at the target: decision (d) only finalizes canonical-chain targets, and in
+        // production a finalizable target is on the observed chain (legacy gate 2 mirrors this).
         let (new_graph, new_snapshot) = build_new_kinds(&scenario)
+            .with_observed_head(dh(scenario.target))
             .finalized_to(dh(scenario.target), &base, &verified, Address::ZERO);
         let legacy = legacy_state(&scenario, &scenario.kind)
             .with_finalized_block_observed(CHAIN, dh(scenario.target));
