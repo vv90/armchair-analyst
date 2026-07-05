@@ -43,8 +43,8 @@ pub enum ChainObservation {
 pub struct State {
     chains: BTreeMap<ChainKey, ChainLifecycle>,
     latest_optimization_result: Option<OptimizationStepResult>,
-    /// Latest fully-fetched block per chain for which optimization reserves were dispatched.
-    /// Added so `RunOptimization` fires only when a chain's complete pool-state frontier advances.
+    /// Latest fold-frontier block per chain for which optimization reserves were dispatched.
+    /// Added so `RunOptimization` fires only when a chain's optimization fold frontier advances.
     last_optimized_block: BTreeMap<ChainKey, BlockHash>,
 }
 
@@ -250,27 +250,29 @@ fn observe_chain(
     }
 }
 
-/// Projects the requested chain's active kernel state and a complete pool-state overlay into optimization reserves.
+/// Projects the requested chain's active kernel state and its optimization overlay into optimization reserves.
 /// Added as the pure bridge from validated EVM pool state into the optimization crate's directional reserve model.
 pub fn pool_reserves_for_optimization(
     state: &State,
     chain: ChainKey,
-    update: &kernel::CompletePoolStateUpdate,
+    update: &kernel::OptimizationStateUpdate,
 ) -> Result<Option<ChainPoolReserves>, PoolReserveProjectionError> {
     let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&chain) else {
         return Ok(None);
     };
 
-    // Resolve the overlay descriptor against the current block graph. `None` means a snapshot
-    // location is missing — a broken invariant — so we emit no reserves rather than untrustworthy ones.
-    let Some(overlay) = chain_state.resolve_complete_pool_states(update) else {
-        return Ok(None);
-    };
+    // The overlay carries owned folded states (no locations to resolve — the shadow read cannot
+    // dangle); merge it over the shadow's finalized base for the full per-pool view.
+    let overlay = update
+        .pool_states
+        .iter()
+        .map(|(pool, pool_state)| (*pool, pool_state))
+        .collect();
 
     let mut reserves = Vec::new();
 
     for (pool, pool_state) in
-        sorted_pool_states_for_projection(chain_state.finalized_pool_snapshots(), overlay)
+        sorted_pool_states_for_projection(chain_state.shadow_finalized_pool_snapshots(), overlay)
     {
         let Some((token0, token1, fee, token0_decimals, token1_decimals)) =
             projection_metadata(chain_state, chain, pool)
@@ -307,7 +309,7 @@ pub fn pool_reserves_for_optimization(
 /// Rebuilds the merged optimizer input from every active chain's current kernel state. Pure over
 /// `&State`: each call re-projects from the authoritative per-chain states rather than reading any
 /// cached reserves, so the merge can never serve stale or drifted data. Chains that are still
-/// bootstrapping, lack a resolvable overlay, or fail projection simply contribute nothing this round.
+/// bootstrapping or fail projection simply contribute nothing this round.
 fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
     let mut block_hashes = BTreeMap::new();
     let mut reserves = Vec::new();
@@ -316,9 +318,7 @@ fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
         let ChainLifecycle::Active(chain_state) = lifecycle else {
             continue;
         };
-        let Some(update) = chain_state.latest_complete_pool_state_update(chain) else {
-            continue;
-        };
+        let update = chain_state.shadow_optimization_update(chain);
         if let Ok(Some(chain_reserves)) = pool_reserves_for_optimization(state, chain, &update) {
             block_hashes.insert(chain, chain_reserves.block_hash);
             reserves.extend(chain_reserves.reserves);
@@ -863,14 +863,14 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
-            // Re-derives the complete pool-state overlay on every chain event. The walk from tip to
-            // the finalized anchor only accumulates snapshot *locations* (`pool -> block_hash`), so it
-            // clones no `PoolState` and costs O(unfinalized-path + recent activity) — cheap. The real
-            // cost is downstream in reserve projection (the O(N log N) sort over all tracked pools),
-            // which at block cadence is still negligible next to the optimization backend's work.
-            // Caching the overlay is intentionally avoided: keeping a cached overlay valid across
-            // reorgs is complex and error-prone, and the recompute is not a bottleneck.
-            let optimization_update = chain_state.latest_complete_pool_state_update(chain);
+            // Re-derives the optimization overlay on every chain event: the shadow graph folds its
+            // canonical unfinalized path over the finalized base, cloning only the pools that path
+            // touched — O(unfinalized-path × its logs), cheap at block cadence next to the
+            // downstream reserve projection (the O(N log N) sort over all tracked pools) and the
+            // optimization backend's work. Caching the overlay is intentionally avoided: keeping a
+            // cached overlay valid across reorgs is complex and error-prone, and the recompute is
+            // not a bottleneck.
+            let update = chain_state.shadow_optimization_update(chain);
 
             chains.insert(chain, ChainLifecycle::Active(chain_state));
 
@@ -880,24 +880,22 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 last_optimized_block,
             };
 
-            if let Some(update) = optimization_update {
-                let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
-                // Dispatch only when *this* chain's fully-fetched block advanced and its own
-                // projection is ready. Record the hash only on that success so an unready
-                // (`Ok(None)`) or failed (`Err`) chain retries this block next event. The dispatched
-                // input is then re-derived across *all* active chains, so a slow chain rides along
-                // with its current state and a fast chain never stalls waiting for it.
-                if changed
-                    && matches!(
-                        pool_reserves_for_optimization(&state, chain, &update),
-                        Ok(Some(_))
-                    )
-                {
-                    state.last_optimized_block.insert(chain, update.block_hash);
-                    let input = merged_optimization_reserves(&state);
-                    if !input.reserves.is_empty() {
-                        effects.push(Effect::RunOptimization { input });
-                    }
+            let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
+            // Dispatch only when *this* chain's fold frontier advanced and its own projection is
+            // ready. Record the hash only on that success so an unready (`Ok(None)`) or failed
+            // (`Err`) chain retries this block next event. The dispatched input is then re-derived
+            // across *all* active chains, so a slow chain rides along with its current state and a
+            // fast chain never stalls waiting for it.
+            if changed
+                && matches!(
+                    pool_reserves_for_optimization(&state, chain, &update),
+                    Ok(Some(_))
+                )
+            {
+                state.last_optimized_block.insert(chain, update.block_hash);
+                let input = merged_optimization_reserves(&state);
+                if !input.reserves.is_empty() {
+                    effects.push(Effect::RunOptimization { input });
                 }
             }
 
@@ -1721,7 +1719,7 @@ mod tests {
     #[test]
     fn pool_reserves_projection_returns_none_when_ethereum_chain_is_inactive() {
         let (state, _) = State::init(&[ChainKey::Ethereum]);
-        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(1), HashMap::new());
+        let update = projection_update(hash(1), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -1737,7 +1735,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(2), HashMap::new());
+        let update = projection_update(hash(2), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1760,7 +1758,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(2), HashMap::new());
+        let update = projection_update(hash(2), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1819,10 +1817,8 @@ mod tests {
             last_optimized_block: BTreeMap::new(),
         };
 
-        let (state, ethereum_update) =
-            projection_update(ChainKey::Ethereum, state, hash(3), HashMap::new());
-        let (state, arbitrum_update) =
-            projection_update(ChainKey::Arbitrum, state, hash(4), HashMap::new());
+        let ethereum_update = projection_update(hash(3), HashMap::new());
+        let arbitrum_update = projection_update(hash(4), HashMap::new());
 
         let ethereum_reserves =
             pool_reserves_for_optimization(&state, ChainKey::Ethereum, &ethereum_update)
@@ -1996,12 +1992,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, updated_pool_state.clone())]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, updated_pool_state.clone())]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -2026,12 +2017,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, balanced_pool_state(1_000_000))]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -2050,12 +2036,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, balanced_pool_state(1_000_000))]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -2078,12 +2059,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(native, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, pool_state.clone())]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, pool_state.clone())]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -2111,12 +2087,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(0)), (token1, token_metadata(0))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, pool_state)]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, pool_state)]));
 
         let error =
             pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
@@ -2149,12 +2120,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, inconsistent_pool_state)]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, inconsistent_pool_state)]));
 
         let error =
             pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
@@ -2202,8 +2168,7 @@ mod tests {
                 pool_metadata,
                 token_metadata,
             );
-            let (state, update) = projection_update(ChainKey::Ethereum,
-                state,
+            let update = projection_update(
                 update_hash,
                 pools
                     .iter()
@@ -2341,50 +2306,17 @@ mod tests {
         }
     }
 
-    /// Seeds the overlay snapshots into a block on the given chain and returns the matching
-    /// locations descriptor, mirroring how the kernel produces overlays the projection resolves.
+    /// Builds the owned overlay update the kernel's shadow optimization read produces, so
+    /// projection tests can exercise `pool_reserves_for_optimization` without driving log events
+    /// through the fold.
     fn projection_update(
-        chain: ChainKey,
-        state: State,
         block_hash: BlockHash,
-        overlay_pool_states: HashMap<PoolRef, PoolState>,
-    ) -> (State, kernel::CompletePoolStateUpdate) {
-        let pool_snapshot_blocks = overlay_pool_states
-            .keys()
-            .map(|pool| (*pool, block_hash))
-            .collect();
-
-        let State {
-            mut chains,
-            latest_optimization_result,
-            last_optimized_block,
-        } = state;
-        match chains.remove(&chain) {
-            Some(ChainLifecycle::Active(chain_state)) => {
-                chains.insert(
-                    chain,
-                    ChainLifecycle::Active(
-                        chain_state.with_overlay_block_for_test(block_hash, overlay_pool_states),
-                    ),
-                );
-            }
-            Some(other) => {
-                chains.insert(chain, other);
-            }
-            None => {}
+        pool_states: HashMap<PoolRef, PoolState>,
+    ) -> kernel::OptimizationStateUpdate {
+        kernel::OptimizationStateUpdate {
+            block_hash,
+            pool_states,
         }
-
-        (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            kernel::CompletePoolStateUpdate {
-                block_hash,
-                pool_snapshot_blocks,
-            },
-        )
     }
 
     fn assert_directional_pair(

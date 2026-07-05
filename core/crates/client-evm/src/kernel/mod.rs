@@ -542,6 +542,17 @@ pub struct CompletePoolStateUpdate {
     pub pool_snapshot_blocks: HashMap<PoolRef, BlockHash>,
 }
 
+/// The optimization read's result: for each pool the canonical unfinalized path touched, its
+/// freshest folded state, plus the frontier block the overlay is valid at. Unlike
+/// [`CompletePoolStateUpdate`] it carries owned states rather than snapshot locations, so it stays
+/// valid across graph mutations. Merge over [`State::shadow_finalized_pool_snapshots`] for the full
+/// per-pool view — an untouched pool is absent from the overlay.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptimizationStateUpdate {
+    pub block_hash: BlockHash,
+    pub pool_states: HashMap<PoolRef, PoolState>,
+}
+
 impl FinalizedState {
     /// Creates a finalized snapshot with only its block hash and no pool snapshots.
     /// Added as the bootstrap path before finalized pool-state persistence exists.
@@ -720,9 +731,19 @@ impl State {
     }
 
     /// Exposes finalized pool snapshots to pure read models.
-    /// Added so multi-chain projections can merge finalized state with a complete recent-block overlay without mutating kernel state.
+    /// TEMPORARY — the production projection was retargeted onto the shadow base
+    /// ([`Self::shadow_finalized_pool_snapshots`], Increment 3); kept for the legacy-parity tests
+    /// until the Stage-4 swap deletes the legacy graph.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finalized_pool_snapshots(&self) -> &HashMap<PoolRef, PoolState> {
         &self.finalized_state.pool_snapshots
+    }
+
+    /// Exposes the shadow's finalized base to pure read models — the merge target for the
+    /// optimization overlay ([`Self::shadow_optimization_update`]). Holds fold-resident pools only:
+    /// a verified pool with no absolute-log seed yet is absent (Blocker 1b/1c — absent, never stale).
+    pub(crate) fn shadow_finalized_pool_snapshots(&self) -> &HashMap<PoolRef, PoolState> {
+        &self.log_shadow.finalized_snapshot
     }
 
     /// Looks up verified pool metadata without exposing registry internals.
@@ -750,12 +771,38 @@ impl State {
     }
 
     /// Latest complete pool-state overlay anchored at the current canonical tip.
-    /// Added so optimization dispatch can read the tip's fully-fetched pool state without exposing `canonical_tip`.
+    /// TEMPORARY — optimization dispatch was retargeted onto the shadow read
+    /// ([`Self::shadow_optimization_update`], Increment 3); kept for the legacy-parity tests until
+    /// the Stage-4 swap deletes the legacy graph.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn latest_complete_pool_state_update(
         &self,
         chain: ChainKey,
     ) -> Option<CompletePoolStateUpdate> {
         self.latest_complete_pool_state_update_from(chain, self.canonical_tip)
+    }
+
+    /// The production optimization read: the shadow graph's best-effort fold over its finalized
+    /// base ([`blocks_graph::BlocksGraph::optimization_pool_states`]), reading `Streamed` as well
+    /// as `Complete` logs so the optimizer runs on the freshest state rather than stalling on the
+    /// last fully-verified block. Total: an unconnected or unfoldable head yields an empty overlay
+    /// at the anchor (the finalized state — never stale, at worst behind). The returned
+    /// `block_hash` is the fold frontier, the height the reserves are valid at; the dispatch gate
+    /// and progress reporting key on it as they did on the legacy complete-block hash.
+    pub(crate) fn shadow_optimization_update(&self, chain: ChainKey) -> OptimizationStateUpdate {
+        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
+        // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
+        // discovered after bootstrap (the shadow graph is registry-free; identity comes from here).
+        let verified = self.pool_registry.verified_pools(chain);
+        let (pool_states, block_hash) = self.log_shadow.graph.optimization_pool_states(
+            &self.log_shadow.finalized_snapshot,
+            &verified,
+            v4_manager,
+        );
+        OptimizationStateUpdate {
+            block_hash,
+            pool_states,
+        }
     }
 
     /// Counts canonical blocks the tip is ahead of `reference_hash` on a connected path.
@@ -789,27 +836,6 @@ impl State {
             tick: Tick::initial(),
             streamed_logs: HashMap::new(),
         }
-    }
-
-    #[cfg(test)]
-    /// Seeds a block carrying the given pool snapshots so projection tests can resolve overlay
-    /// descriptors (`pool_snapshot_blocks`) that point at it.
-    pub(crate) fn with_overlay_block_for_test(
-        mut self,
-        block_hash: BlockHash,
-        pool_snapshots: HashMap<PoolRef, PoolState>,
-    ) -> State {
-        self.blocks.0.insert(
-            block_hash,
-            BlockNode {
-                parent_hash: self.finalized_state.block_hash,
-                logs_bloom: None,
-                pool_logs: PoolLogsStatus::Resolved(HashSet::new()),
-                pool_snapshots,
-                pool_data_failures: HashMap::new(),
-            },
-        );
-        self
     }
 
     /// Rebuilds volatile chain state around a finalized anchor while preserving registries and tick.
@@ -11765,23 +11791,13 @@ mod tests {
         merged
     }
 
-    /// The shadow optimization overlay: the new graph's `AllowStreamed` fold over its finalized base —
-    /// the read the swap will call in place of the legacy overlay above. `optimization_pool_states`
-    /// returns the changed-pool overlay plus its frontier hash (ignored here — the parity assertion is
-    /// on pool state), so merge the overlay onto the finalized base (as the sibling
-    /// `legacy_optimization_overlay` does, and as production Increment 3 will).
+    /// The shadow optimization overlay: since the Increment-3 retarget this is the *production*
+    /// read (`State::shadow_optimization_update`, the frontier hash ignored here — the parity
+    /// assertion is on pool state), merged onto the shadow's finalized base exactly as
+    /// `pool_reserves_for_optimization` merges it.
     fn shadow_optimization_overlay(state: &State, chain: ChainKey) -> HashMap<PoolRef, PoolState> {
-        let base = &state.log_shadow.finalized_snapshot;
-        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
-        let verified = state.pool_registry.verified_pools(chain);
-        let mut merged = base.clone();
-        merged.extend(
-            state
-                .log_shadow
-                .graph
-                .optimization_pool_states(base, &verified, v4_manager)
-                .0,
-        );
+        let mut merged = state.shadow_finalized_pool_snapshots().clone();
+        merged.extend(state.shadow_optimization_update(chain).pool_states);
         merged
     }
 
