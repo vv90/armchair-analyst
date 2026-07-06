@@ -183,6 +183,30 @@ next restart's bootstrap seeding. Increment 4 must still explicitly decide `GetP
 
 ---
 
+## Case (e): `BlockHeaderNotFound` — refuse-and-keep, no reset (Stage-4 swap)
+
+Added at the Stage-4 swap (2026-07-06), when `State::reset` was deleted. Legacy treated a provider's
+"unknown block" answer to a header backfill as a reset-worthy inconsistency and rebuilt the whole
+recent region.
+
+**The input.** A `BlockHeaderNotFound` for an in-flight `GetBlockHeader` — most often a provider
+transiently lagging behind the head that referenced the parent; rarely, a genuinely fabricated
+ancestry that no provider will ever serve.
+
+**Decision (e): drop the request only.** The pending subtree stays; the missing-parents scheduler
+re-emits the backfill on the next event that runs the scheduling chain (a lagging provider
+self-heals within one head observation). Deliberately NOT re-emitted in the same transition — an
+immediate retry would hammer a provider that just said "unknown"; the next head is the natural
+retry cadence. A fabricated hash retries once per scheduling event until finalization prunes its
+pending subtree — bounded, the same argument as case (b)'s poisoning window.
+
+**GetPoolData note.** The tip-targeted `GetPoolData` request path was deleted wholesale at the same
+swap (the log-sourced graph stores no per-block snapshots — L6 — so the results had no sink). The
+deferred 1b/1c follow-up re-introduces an anchor-height variant routed into the graph's finalized
+snapshot; the retained RPC reader is `client_effects::fetch_pool_data`.
+
+---
+
 ## Summary of decisions (for sign-off)
 
 1. **(a) Cycle reset:** dropped — acyclic-by-construction connected forest; pending cycles inert +
@@ -195,6 +219,9 @@ next restart's bootstrap seeding. Increment 4 must still explicitly decide `GetP
 4. **(d) Off-canonical finalization target:** no-op and wait (canonical-membership gate in
    `finalized_to`), mirroring legacy's connected-path gate; trust-finality-immediately documented but
    not chosen. 1b/1c wait-vs-advance divergence accepted until the anchor-height `GetPoolData` fix.
+5. **(e) `BlockHeaderNotFound`:** refuse-and-keep — drop only the request, no reset; re-emission
+   rides the next scheduling event, boundedness via finalization pruning.
 
 Sign-off on these three gates Increment 2 (embedding + feeding the new graph from `transition`);
-decision (d) signed off with the finalization-gating re-derivation (2026-07-05).
+decision (d) signed off with the finalization-gating re-derivation (2026-07-05); decision (e)
+signed off with the Stage-4 swap plan (2026-07-06, `State::reset` deleted).

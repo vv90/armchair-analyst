@@ -32,7 +32,7 @@ remaining *runtime* set small, explicit, and individually tested.
 | T1 | `anchor` is the root and has no parent within the graph | **Structural** — `anchor: BlockHash` is a field, not a node; there is no parent slot for it | none | carried |
 | T2 | Every `connected` node's parent chain reaches `Anchor` (referential integrity: each `ConnectedHash` in a parent resolves to a present `connected` node) | **Runtime** — upheld by the single admission/promotion path | invariant test + proptest across insertion orders | carried (parent-walk) |
 | T3 | `connected` is acyclic | **Runtime** — corollary of T2's referential integrity (not free, because T2 is runtime) | covered by the T2 proptest (walk terminates) | carried (cycle defense) |
-| T4 | `canonical_tip` resolves to a present connected node (or `Anchor`) | **Runtime** — referential integrity of the stored `AnchoredRef` | invariant test | carried ("tip known-or-finalized") |
+| T4 | `observed_head` resolves to a present node or the anchor (the derived canonical chain is empty until the head connects) | **Runtime** — `with_observed_head` refuses an absent hash | invariant test | carried ("tip known-or-finalized"; the stored pointer is the raw observed head, not a connected proof) |
 | T5 | `{anchor} / connected / pending` key-sets are pairwise disjoint | **Runtime** — nothing stops the same hash being inserted into two maps | debug assert + proptest | carried (self-parent/overlap) |
 | T6 | A `pending` node is genuinely *not yet reachable* to the anchor (not merely unchecked) | **Runtime** — requires promotion to be *exhaustive* on every admission | proptest: after any admission, no `pending` node is anchor-reachable | new framing |
 
@@ -84,7 +84,7 @@ is a terminal authoritative superset.
 
 | # | Invariant | Enforcement | Test obligation |
 |---|-----------|-------------|-----------------|
-| A1 | The finalized hash is held in exactly one place (`anchor`); `FinalizedState.block_hash` is removed | **Structural** *after* the swap — once no other field can hold it, duplication is unrepresentable. Pre-swap: anchor is the sole home (Decision 2 → own now); `FinalizedState.block_hash` is `#[deprecated]` and unread by new code until removed at swap | none (post-swap) |
+| A1 | The finalized hash is held in exactly one place (`anchor`) | **Structural** since the Stage-4 swap (2026-07-06): `FinalizedState` is deleted, no other field can hold the finalized hash, so duplication is unrepresentable | none |
 | A2 | `reanchored_to(new)` targets a connected descendant of the current anchor | **Runtime** — `ConnectedHash` gives shape (runtime referent, I1); descendant relation is a runtime check | reorg test |
 | A3 | After reanchor, every surviving `connected` node descends from the new anchor; non-descendant forks and now-unreachable `pending` are pruned | **Runtime** — the prune step | reorg test + post-state invariant check |
 | A4 | **Finalization safety gate:** the anchor advances to `new` only if the path old-anchor→`new` is fully *foldable* for every tracked pool (each block `Complete`, or bloom-clear for that pool). Otherwise backfill (getLogs) first | **Runtime** — precondition before reanchor | proptest: reanchor refuses an incompletely-resolved path |
@@ -120,14 +120,15 @@ than leaking.
 
 ## Structural vs runtime — the scorecard
 
-**Structural (no test needed):** I2, L1, L2, L6; A1 (post-swap); the *shape totality* of
-`AnchoredRef` (no dangling-parent state).
+**Structural (no test needed):** I2, L1, L2, L6; A1 (structural since the swap); the *shape
+totality* of `AnchoredRef` (no dangling-parent state).
 
-**Runtime (must be tested):** T2, T3, T4, T5, T6, I1, L3 (if field retained), L4, L5, A2, A3, A4,
-B1, B2.
+**Runtime (must be tested):** T2, T3, T4, T5, T6, I1, L3 (field retained as the ingestion-boundary
+carrier), L4, L5, A2, A3, A4, B1, B2.
 
-The two runtime properties to pin hardest in the differential proptest:
-1. **A4** — new fold-from-logs == old stored-derivation, *and* finalization refuses an incomplete path.
+The two runtime properties pinned hardest (formerly by the Stage-2 differential proptest, deleted
+with the legacy graph at the swap; now by the blocks_graph unit/property suites):
+1. **A4** — finalization advances only over a fully-foldable prefix and refuses an incomplete path.
 2. **L5** — log merge is monotone and `Complete` is an authoritative superset.
 
 Everything else runtime is a localized invariant test or a corollary of these.

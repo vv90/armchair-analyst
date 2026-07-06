@@ -261,8 +261,8 @@ pub fn pool_reserves_for_optimization(
         return Ok(None);
     };
 
-    // The overlay carries owned folded states (no locations to resolve — the shadow read cannot
-    // dangle); merge it over the shadow's finalized base for the full per-pool view.
+    // The overlay carries owned folded states (no locations to resolve — the fold cannot
+    // dangle); merge it over the finalized base for the full per-pool view.
     let overlay = update
         .pool_states
         .iter()
@@ -272,7 +272,7 @@ pub fn pool_reserves_for_optimization(
     let mut reserves = Vec::new();
 
     for (pool, pool_state) in
-        sorted_pool_states_for_projection(chain_state.shadow_finalized_pool_snapshots(), overlay)
+        sorted_pool_states_for_projection(chain_state.finalized_pool_snapshots(), overlay)
     {
         let Some((token0, token1, fee, token0_decimals, token1_decimals)) =
             projection_metadata(chain_state, chain, pool)
@@ -318,7 +318,7 @@ fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
         let ChainLifecycle::Active(chain_state) = lifecycle else {
             continue;
         };
-        let update = chain_state.shadow_optimization_update(chain);
+        let update = chain_state.optimization_update(chain);
         if let Ok(Some(chain_reserves)) = pool_reserves_for_optimization(state, chain, &update) {
             block_hashes.insert(chain, chain_reserves.block_hash);
             reserves.extend(chain_reserves.reserves);
@@ -863,14 +863,14 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
-            // Re-derives the optimization overlay on every chain event: the shadow graph folds its
+            // Re-derives the optimization overlay on every chain event: the blocks graph folds its
             // canonical unfinalized path over the finalized base, cloning only the pools that path
             // touched — O(unfinalized-path × its logs), cheap at block cadence next to the
             // downstream reserve projection (the O(N log N) sort over all tracked pools) and the
             // optimization backend's work. Caching the overlay is intentionally avoided: keeping a
             // cached overlay valid across reorgs is complex and error-prone, and the recompute is
             // not a bottleneck.
-            let update = chain_state.shadow_optimization_update(chain);
+            let update = chain_state.optimization_update(chain);
 
             chains.insert(chain, ChainLifecycle::Active(chain_state));
 
@@ -2273,10 +2273,6 @@ mod tests {
         pool_metadata: HashMap<PoolRef, PoolMetadata>,
         token_metadata: HashMap<TokenAddress, TokenMetadata>,
     ) -> State {
-        let finalized_state = kernel::FinalizedState::with_pool_snapshots_for_test(
-            finalized_hash,
-            finalized_snapshots,
-        );
         let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
             chain,
             pool_metadata
@@ -2294,7 +2290,8 @@ mod tests {
                 .collect(),
         );
         let chain_state = kernel::State::for_pool_reserve_projection_test(
-            finalized_state,
+            finalized_hash,
+            finalized_snapshots,
             pool_registry,
             token_registry,
         );
@@ -2306,7 +2303,7 @@ mod tests {
         }
     }
 
-    /// Builds the owned overlay update the kernel's shadow optimization read produces, so
+    /// Builds the owned overlay update the kernel's optimization read produces, so
     /// projection tests can exercise `pool_reserves_for_optimization` without driving log events
     /// through the fold.
     fn projection_update(

@@ -122,6 +122,18 @@ deliverable — see Stage 0.)
 - **Stage 4 — Swap + drop per-block getLogs.** Once the differential tests and shadow comparison hold,
   switch the kernel to the new graph and remove per-block `eth_getLogs` as the discovery mechanism.
 
+> **STATUS (2026-07-06): the swap half of Stage 4 is COMPLETE.** The legacy graph, `FinalizedState`,
+> `canonical_tip`, the reset paths, and the tip-targeted `GetPoolData` plumbing are deleted; the
+> log-sourced graph is the kernel's sole chain-state authority (schedulers, finalization, lag
+> metrics, optimization reads). Ordering deviation from the plan above: Stage 3 (multi-provider WS)
+> was deliberately deferred — it hardens the streamed-log input but adds no correctness invariant —
+> so per-block `eth_getLogs` REMAINS the completeness/discovery driver until the WS-primary work
+> lands (it must land before production runs); "drop per-block getLogs" pairs with that later work.
+> The Stage-2 differential proptest and the shadow-parity suite were deleted with the legacy graph,
+> as planned. The anchor-height `GetPoolData` seeding for un-baseable pools (Blockers 1b/1c) is a
+> deferred coverage/liveness follow-up (`KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`, case (d)); the
+> retained RPC reader is `client_effects::fetch_pool_data`.
+
 ---
 
 ## Non-goals / explicitly retained

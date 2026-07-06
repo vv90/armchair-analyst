@@ -553,7 +553,6 @@ mod tests {
     }
 
     /// The single decoded log a window block carries — its candidate identity with a fixed swap.
-    #[allow(deprecated)]
     fn window_log(byte: u8) -> PoolLog {
         use alloy::primitives::{U160, aliases::I24};
         PoolLog {

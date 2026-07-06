@@ -685,7 +685,6 @@ mod tests {
     }
 
     /// The `PoolLog` a [`range_log_result`] fixture decodes to — its fixed v3 swap at `log_index` 7.
-    #[allow(deprecated)]
     fn expected_v3_range_log(address: Address) -> crate::PoolLog {
         use alloy::primitives::{U160, aliases::I24};
         crate::PoolLog {

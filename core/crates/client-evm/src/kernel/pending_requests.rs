@@ -1,14 +1,11 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use std::{collections::HashSet, fmt};
 
 use alloy::primitives::BlockHash;
 
 use super::token_registry::TokenAddress;
 pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
 use crate::{
-    pool_state::{PoolRef, ProtocolPoolKey},
+    pool_state::ProtocolPoolKey,
     request_tracking::{
         RequestCollection, RequestIdSequence, RequestIssuer, RequestStore, expired_request_ids,
         issue_request, retry_request, take_request,
@@ -27,12 +24,6 @@ pub struct GetBlockHeader {
 }
 
 #[derive(Clone)]
-pub struct GetPoolData {
-    pub at: BlockHash,
-    pub pools: HashSet<PoolRef>,
-}
-
-#[derive(Clone)]
 pub struct GetPoolMetadata {
     pub at: BlockHash,
     pub candidates: HashSet<ProtocolPoolKey>,
@@ -48,7 +39,6 @@ pub struct GetTokenMetadata {
 pub enum AnyRequestId {
     BlockHeader(RequestId<GetBlockHeader>),
     BlockLogs(RequestId<GetBlockLogs>),
-    PoolData(RequestId<GetPoolData>),
     PoolMetadata(RequestId<GetPoolMetadata>),
     TokenMetadata(RequestId<GetTokenMetadata>),
 }
@@ -60,7 +50,6 @@ impl fmt::Debug for AnyRequestId {
                 write!(formatter, "block_header#{request_id:?}")
             }
             AnyRequestId::BlockLogs(request_id) => write!(formatter, "block_logs#{request_id:?}"),
-            AnyRequestId::PoolData(request_id) => write!(formatter, "pool_data#{request_id:?}"),
             AnyRequestId::PoolMetadata(request_id) => {
                 write!(formatter, "pool_metadata#{request_id:?}")
             }
@@ -74,7 +63,6 @@ impl fmt::Debug for AnyRequestId {
 pub enum AnyIssuedRequest {
     BlockHeader(IssuedRequest<GetBlockHeader>),
     BlockLogs(IssuedRequest<GetBlockLogs>),
-    PoolData(IssuedRequest<GetPoolData>),
     PoolMetadata(IssuedRequest<GetPoolMetadata>),
     TokenMetadata(IssuedRequest<GetTokenMetadata>),
 }
@@ -82,7 +70,6 @@ pub enum AnyIssuedRequest {
 // pub enum AnyPendingPayload {
 //     BlockHeader(PendingPayload<GetBlockHeader>),
 //     BlockLogs(PendingPayload<GetBlockLogs>),
-//     PoolData(PendingPayload<GetPoolData>),
 //     PoolMetadata(PendingPayload<GetPoolMetadata>),
 //     TokenMetadata(PendingPayload<GetTokenMetadata>),
 // }
@@ -91,7 +78,6 @@ pub struct PendingRequests {
     request_ids: RequestIdSequence,
     block_logs: RequestCollection<GetBlockLogs>,
     block_headers: RequestCollection<GetBlockHeader>,
-    pool_data: RequestCollection<GetPoolData>,
     pool_metadata: RequestCollection<GetPoolMetadata>,
     token_metadata: RequestCollection<GetTokenMetadata>,
 }
@@ -102,7 +88,6 @@ impl PendingRequests {
             request_ids: RequestIdSequence::new(),
             block_logs: RequestCollection::new(),
             block_headers: RequestCollection::new(),
-            pool_data: RequestCollection::new(),
             pool_metadata: RequestCollection::new(),
             token_metadata: RequestCollection::new(),
         }
@@ -122,11 +107,6 @@ impl PendingRequests {
                 expired_request_ids::<Self, GetBlockLogs>(self, tick)
                     .into_iter()
                     .map(AnyRequestId::BlockLogs),
-            )
-            .chain(
-                expired_request_ids::<Self, GetPoolData>(self, tick)
-                    .into_iter()
-                    .map(AnyRequestId::PoolData),
             )
             .chain(
                 expired_request_ids::<Self, GetPoolMetadata>(self, tick)
@@ -155,19 +135,8 @@ impl PendingRequests {
     pub(crate) fn len(&self) -> usize {
         self.block_headers.values().count()
             + self.block_logs.values().count()
-            + self.pool_data.values().count()
             + self.pool_metadata.values().count()
             + self.token_metadata.values().count()
-    }
-
-    /// Reports whether no request is in flight across any collection. Used to gate the background
-    /// pool-state backfill behind an idle priority tier.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.block_headers.values().next().is_none()
-            && self.block_logs.values().next().is_none()
-            && self.pool_data.values().next().is_none()
-            && self.pool_metadata.values().next().is_none()
-            && self.token_metadata.values().next().is_none()
     }
 
     pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
@@ -200,21 +169,6 @@ impl PendingRequests {
             .collect()
     }
 
-    pub(crate) fn pending_pool_data_pools_by_block(
-        &self,
-    ) -> HashMap<BlockHash, HashSet<PoolRef>> {
-        self.pool_data
-            .values()
-            .fold(HashMap::new(), |mut pools_by_block, request| {
-                pools_by_block
-                    .entry(request.payload.at)
-                    .or_default()
-                    .extend(request.payload.pools.iter().copied());
-
-                pools_by_block
-            })
-    }
-
     pub(crate) fn retaining_block_targets(self, retained_blocks: &HashSet<BlockHash>) -> Self {
         let mut requests = self;
 
@@ -224,9 +178,6 @@ impl PendingRequests {
         requests
             .block_logs
             .retain(|_, request| retained_blocks.contains(&request.payload.block_hash));
-        requests
-            .pool_data
-            .retain(|_, request| retained_blocks.contains(&request.payload.at));
         requests
             .pool_metadata
             .retain(|_, request| retained_blocks.contains(&request.payload.at));
@@ -256,9 +207,6 @@ impl PendingRequests {
             }
             AnyRequestId::BlockLogs(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::BlockLogs)
-            }
-            AnyRequestId::PoolData(request_id) => {
-                self.retry_typed(request_id, tick, AnyIssuedRequest::PoolData)
             }
             AnyRequestId::PoolMetadata(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::PoolMetadata)
@@ -316,7 +264,6 @@ impl PendingRequests {
         match request_id {
             AnyRequestId::BlockHeader(request_id) => self.contains(&request_id),
             AnyRequestId::BlockLogs(request_id) => self.contains(&request_id),
-            AnyRequestId::PoolData(request_id) => self.contains(&request_id),
             AnyRequestId::PoolMetadata(request_id) => self.contains(&request_id),
             AnyRequestId::TokenMetadata(request_id) => self.contains(&request_id),
         }
@@ -353,7 +300,6 @@ impl PendingRequests {
                     .values()
                     .map(|request| request.dispatched_at),
             )
-            .chain(self.pool_data.values().map(|request| request.dispatched_at))
             .chain(
                 self.pool_metadata
                     .values()
@@ -391,16 +337,6 @@ impl RequestStore<GetBlockHeader> for PendingRequests {
 
     fn request_collection_mut(&mut self) -> &mut RequestCollection<GetBlockHeader> {
         &mut self.block_headers
-    }
-}
-
-impl RequestStore<GetPoolData> for PendingRequests {
-    fn request_collection(&self) -> &RequestCollection<GetPoolData> {
-        &self.pool_data
-    }
-
-    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetPoolData> {
-        &mut self.pool_data
     }
 }
 

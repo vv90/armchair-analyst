@@ -298,6 +298,11 @@ pub fn fetch_block_number(
     })
 }
 
+/// Reads absolute pool state (slot0 + liquidity) for a pool set at a specific block via multicall.
+/// Currently uncalled: the kernel's tip-targeted `GetPoolData` plumbing was deleted at Increment 4
+/// (the log-sourced graph stores no per-block snapshots). Kept — with its tests — as the RPC reader
+/// for the queued anchor-height seeding follow-up (Blockers 1b/1c), which routes results into the
+/// graph's finalized snapshot instead of a block node.
 pub fn fetch_pool_data(
     agent: &ureq::Agent,
     endpoints: &ChainEndpoints,

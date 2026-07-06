@@ -21,7 +21,7 @@ use crate::{PoolLog, PoolLogEvent, PoolRef, PoolState, ProtocolPoolKey, derive_p
 ///  - per-block logs are a `BTreeMap` keyed by intra-block index: deduped and ordered for free; the
 ///    index lives only in the key.
 ///  - non-anchor blocks carry no pool snapshot (absolute state is reconstructed by fold-on-demand;
-///    the finalized snapshot stays in `FinalizedState`, its sole home).
+///    the finalized snapshot lives beside the graph in the kernel `State`, its sole home).
 ///
 /// Runtime (upheld by the methods, tested): referential integrity of every `ConnectedHash` /
 /// `AnchoredRef`, hence parent-walk termination and acyclicity; that a `Pending` node is genuinely
@@ -183,10 +183,8 @@ fn bloom_may_touch(bloom: Option<Bloom>, watched: &HashSet<Address>) -> bool {
 
 /// Keys incoming logs by their intra-block `log_index` into the `BTreeMap` a block stores (L1/L3).
 /// This ingestion boundary is the one place `PoolLog::log_index` is read: the external index becomes
-/// the map key here, and all downstream logic orders/dedups by the key alone (the field is
-/// `#[deprecated]`, removed at the swap). Positional keying would be wrong — streamed fragments would
-/// each restart at 0 and collide on union.
-#[allow(deprecated)]
+/// the map key here, and all downstream logic orders/dedups by the key alone. Positional keying
+/// would be wrong — streamed fragments would each restart at 0 and collide on union.
 fn key_by_log_index(logs: Vec<PoolLog>) -> BTreeMap<u64, PoolLog> {
     logs.into_iter().map(|log| (log.log_index, log)).collect()
 }
@@ -555,8 +553,9 @@ impl BlocksGraph {
     /// awaited transitively, not fetched — only the gap root is reported. Connected nodes never
     /// contribute (their parents resolve by T2). No `finalized_hash` parameter — the anchor is owned.
     /// Sorted+deduped so downstream backfill request-id assignment is deterministic (mirrors the
-    /// legacy `missing_seed_parents`).
-    fn missing_parents(&self) -> Vec<BlockHash> {
+    /// legacy `missing_seed_parents`). The production header-backfill source: the kernel requests
+    /// each of these (minus in-flight) via `GetBlockHeader`.
+    pub(crate) fn missing_parents(&self) -> Vec<BlockHash> {
         let mut missing: Vec<BlockHash> = self
             .nodes
             .values()
@@ -573,6 +572,136 @@ impl BlocksGraph {
         missing.sort_unstable();
         missing.dedup();
         missing
+    }
+
+    /// The raw parent hash of any present node — proven (`AnchoredRef`) for connected nodes, unproven
+    /// for pending ones. The present-chain walks below follow it without caring about connectivity,
+    /// mirroring the legacy graph's flat parent-pointer walk.
+    fn node_parent_hash(&self, node: &Node) -> BlockHash {
+        match node {
+            Node::Connected(connected) => connected_parent_hash(&connected.parent, self.anchor),
+            Node::Pending(pending) => pending.parent,
+        }
+    }
+
+    /// The *present* chain from `observed_head` toward the anchor, newest→oldest: follows raw parent
+    /// pointers through connected AND pending nodes and stops at the anchor or the first absent
+    /// block. This deliberately reaches past the connected region — during a header backfill the
+    /// suffix above the gap is still `Pending`, and the schedulers must keep fetching its logs and
+    /// validating its candidates in parallel with the headers, exactly as the legacy tip walk did.
+    /// Newest-first so request emission order (and thus request-id assignment) matches legacy.
+    /// A cycle (representable only among pending nodes, inert otherwise) yields an empty walk,
+    /// mirroring the legacy visited-guard.
+    fn present_chain_from_head(&self) -> Vec<(BlockHash, &BlockData)> {
+        let mut chain = Vec::new();
+        let mut current = self.observed_head;
+        let mut visited = HashSet::new();
+        while current != self.anchor {
+            if !visited.insert(current) {
+                return Vec::new();
+            }
+            let Some(node) = self.nodes.get(&current) else {
+                break;
+            };
+            let data = match node {
+                Node::Connected(connected) => &connected.data,
+                Node::Pending(pending) => &pending.data,
+            };
+            chain.push((current, data));
+            current = self.node_parent_hash(node);
+        }
+        chain
+    }
+
+    /// The blocks still needing an authoritative `GetBlockLogs`, newest→oldest: present-chain blocks
+    /// whose logs are not yet `Complete` (`Streamed` is provisional and still fetched), minus
+    /// `exclude` (the in-flight request set — the graph is pure and holds no request state).
+    ///
+    /// The bloom gate mirrors the legacy scheduler, NOT the fold's `watched_addresses`: `trusted` is
+    /// the scheduler-owned set (each verified pool's address plus the v4 PoolManager unconditionally —
+    /// the discovery anchor), and with `gate_active == false` (no verified pools yet) every block is
+    /// fetched because the per-block fetch is still the discovery channel. A bloom-clear block is
+    /// simply not fetched — no `Resolved`-promotion write exists here; the fold already skips
+    /// bloom-clear non-`Complete` blocks, and unlike legacy's sticky promotion the gate re-evaluates
+    /// against the *current* trusted set, so a block turns fetchable when a later-verified pool's
+    /// address hits its bloom.
+    pub(crate) fn unresolved_log_request_hashes(
+        &self,
+        trusted: &HashSet<Address>,
+        gate_active: bool,
+        exclude: &HashSet<BlockHash>,
+    ) -> Vec<BlockHash> {
+        self.present_chain_from_head()
+            .into_iter()
+            .filter(|(hash, data)| {
+                !matches!(data.logs, BlockLogs::Complete(_))
+                    && !exclude.contains(hash)
+                    && (!gate_active || bloom_may_touch(data.logs_bloom, trusted))
+            })
+            .map(|(hash, _)| hash)
+            .collect()
+    }
+
+    /// Candidate pools named by stored logs on the present chain, newest→oldest, one non-empty set
+    /// per block. Candidates are derived from the logs themselves (`log.pool` — never stored, the
+    /// L6 discipline), from `Streamed` as well as `Complete` payloads so subscription-discovered
+    /// pools validate before the authoritative fetch lands (legacy `Partial` behaved the same).
+    /// Registry filtering (known/pending) stays kernel-side; the graph knows nothing of registries.
+    pub(crate) fn pool_log_candidates_from_head(&self) -> Vec<(BlockHash, HashSet<ProtocolPoolKey>)> {
+        self.present_chain_from_head()
+            .into_iter()
+            .filter_map(|(hash, data)| {
+                let logs = match &data.logs {
+                    BlockLogs::Unknown => return None,
+                    BlockLogs::Streamed(logs) | BlockLogs::Complete(logs) => logs,
+                };
+                let candidates: HashSet<ProtocolPoolKey> =
+                    logs.values().map(|log| log.pool).collect();
+                (!candidates.is_empty()).then_some((hash, candidates))
+            })
+            .collect()
+    }
+
+    /// How many present-chain blocks separate `observed_head` from `reference` (0 when the head *is*
+    /// the reference; the reference block itself is not counted). `None` when `reference` is not on
+    /// the present chain — absent, on a side fork, or beyond a gap. Follows raw parent pointers like
+    /// [`present_chain_from_head`], mirroring the legacy `connected_path_hashes_oldest_to_newest`
+    /// walk that fed `blocks_behind` and `canonical_path_len_from_finalized` (pass the anchor as
+    /// `reference` for the latter).
+    pub(crate) fn distance_from_head(&self, reference: BlockHash) -> Option<usize> {
+        let mut current = self.observed_head;
+        let mut distance = 0;
+        let mut visited = HashSet::new();
+        while current != reference {
+            if !visited.insert(current) {
+                return None;
+            }
+            let node = self.nodes.get(&current)?;
+            distance += 1;
+            current = self.node_parent_hash(node);
+        }
+        Some(distance)
+    }
+
+    /// Every admitted block hash, connected or pending — the graph's key-space. Finalization prunes
+    /// block-targeted pending requests against this after the re-root, mirroring the legacy
+    /// `blocks.hashes()` (the anchor is not a node and block-scoped requests never target it).
+    pub(crate) fn node_hashes(&self) -> HashSet<BlockHash> {
+        self.nodes.keys().copied().collect()
+    }
+
+    /// The finalized anchor hash — its sole home (invariant A1). Production reads it for the
+    /// finalized-distance metric ([`distance_from_head`](Self::distance_from_head) to the anchor)
+    /// and wherever the kernel needs the finalized boundary.
+    pub(crate) fn anchor_hash(&self) -> BlockHash {
+        self.anchor
+    }
+
+    /// Whether `hash` is an admitted block (connected or pending; the anchor is not a node). The
+    /// kernel uses it to route a streamed log to the block versus the pre-head staging buffer, and
+    /// to drain that buffer only once the block actually entered the graph.
+    pub(crate) fn contains(&self, hash: BlockHash) -> bool {
+        self.nodes.contains_key(&hash)
     }
 
     /// The finalization backfill gate: the block-number ranges on the canonical path `anchor →
@@ -637,7 +766,7 @@ impl BlocksGraph {
     /// cloned. Block order plus each block's `BTreeMap` `log_index` order give every bucket the exact
     /// fold order [`derive_pool_state`] requires. Then fold each touched pool once from its `base`
     /// state, keyed by the log's own [`ProtocolPoolKey`] (never the registry): a pool absent from
-    /// `base` has no bucket match and is skipped (it is seeded elsewhere via `GetPoolData`).
+    /// `base` has no bucket match and is skipped (absent, never stale).
     /// `authority` selects which blocks contribute logs (see [`Authority`]). A pool whose run is
     /// underivable (a liquidity overflow — impossible for protocol-bounded `Complete` data) produces no
     /// overlay entry, so the caller keeps its base state. Cost is `O(B + L)` over the path plus cheap
@@ -646,7 +775,7 @@ impl BlocksGraph {
     /// **Seeding.** A `verified` pool absent from `base` (discovered after bootstrap) is seeded from
     /// its own path logs via `derive_pool_state(None, run)`: it yields a state iff the run begins with
     /// an absolute event (Swap/Initialize) — a Mint/Burn-only run stays underivable and absent (its
-    /// anchor-height state is fetched via `GetPoolData`). Only `verified` keys are ever seeded, so
+    /// anchor-height seeding is the deferred 1b/1c follow-up). Only `verified` keys are ever seeded, so
     /// topic-spoofing non-pools never enter and every seeded pool already has registry metadata.
     fn folded_overlay(
         &self,
@@ -687,7 +816,8 @@ impl BlocksGraph {
 
     /// The full absolute snapshot of every tracked pool at `target`: `base` with the path's changes
     /// ([`folded_overlay`]) applied. Folds **only** pools present in `base` (others are seeded via
-    /// `GetPoolData`); a pool whose run is underivable keeps its base state. Clones `base` once — the
+    /// the deferred anchor-height seeding); a pool whose run is underivable keeps its base state.
+    /// Clones `base` once — the
     /// finalization path ([`reanchored_to`]) needs a fresh owned snapshot to store; the per-event
     /// optimization read uses the bare overlay instead. Borrows `base`: shared read.
     fn folded_pool_states(
@@ -752,8 +882,7 @@ impl BlocksGraph {
     /// The finalization counterpart is [`reanchored_to`] ([`Authority::RequireComplete`], to the anchor,
     /// full snapshot); this one never mutates and clones nothing beyond the changed pools.
     ///
-    /// The Stage-4 seam the kernel's optimization dispatch will call in place of
-    /// `State::latest_complete_pool_state_update`; it has no production caller until that swap.
+    /// The production optimization read, called by `State::optimization_update`.
     /// `v4_manager` is the chain's v4 PoolManager address, used for v4 bloom-touch checks.
     pub(crate) fn optimization_pool_states(
         &self,
@@ -941,15 +1070,11 @@ impl NewBlockError {
     }
 }
 
-/// TEMPORARY (Stage-4 swap): plain-`BlockHash` accessors for the kernel's `shadow_parity` tests, which
-/// compare this graph's structure against the legacy graph. `ConnectedHash` is module-private, so these
-/// project it away. Delete with the parity tests when the swap makes the graph the sole source of truth.
+/// Plain-`BlockHash` test accessors for the kernel's behavior tests. `ConnectedHash` is
+/// module-private (the connectivity proof must not cross the module boundary), so these project it
+/// away for assertions.
 #[cfg(test)]
 impl BlocksGraph {
-    pub(crate) fn anchor_hash(&self) -> BlockHash {
-        self.anchor
-    }
-
     pub(crate) fn observed_head_hash(&self) -> BlockHash {
         self.observed_head
     }
@@ -962,18 +1087,30 @@ impl BlocksGraph {
             .collect()
     }
 
-    /// Every admitted block hash, connected or pending.
-    pub(crate) fn node_hashes(&self) -> HashSet<BlockHash> {
-        self.nodes.keys().copied().collect()
+    /// The raw parent hash a present node references (proven for connected, raw for pending).
+    pub(crate) fn parent_hash_for_test(&self, hash: BlockHash) -> Option<BlockHash> {
+        self.nodes
+            .get(&hash)
+            .map(|node| self.node_parent_hash(node))
+    }
+
+    /// `Some(true)` when the block's logs are authoritative (`Complete`), `Some(false)` for
+    /// `Unknown`/`Streamed`, `None` when the block is absent.
+    pub(crate) fn has_complete_logs_for_test(&self, hash: BlockHash) -> Option<bool> {
+        self.get(hash)
+            .map(|data| matches!(data.logs, BlockLogs::Complete(_)))
+    }
+
+    /// The candidate pools named by a present block's stored logs (empty while `Unknown`).
+    pub(crate) fn log_candidates_for_test(&self, hash: BlockHash) -> Option<HashSet<ProtocolPoolKey>> {
+        self.get(hash).map(|data| match &data.logs {
+            BlockLogs::Unknown => HashSet::new(),
+            BlockLogs::Streamed(logs) | BlockLogs::Complete(logs) => {
+                logs.values().map(|log| log.pool).collect()
+            }
+        })
     }
 }
-
-// Stage-2 differential proptest scaffolding: matches the new `reanchored_to` against the legacy
-// `State::with_finalized_block_observed`. A child module of `blocks_graph` (not a sibling), so it can
-// reach both the new graph's internals here and the module-private legacy `kernel` types. Delete this
-// declaration and the file wholesale at the Stage-4 swap, together with the legacy finalization path.
-#[cfg(test)]
-mod differential;
 
 #[cfg(test)]
 mod tests {
@@ -1888,6 +2025,174 @@ mod tests {
         assert_graph_invariants(&graph);
     }
 
+    // --- scheduling queries (present-chain walk from the head) ---------------------------------
+
+    #[test]
+    fn log_requests_walk_present_chain_newest_first() {
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
+            .unwrap()
+            .with_observed_head(graph_hash(4));
+        assert_eq!(
+            graph.unresolved_log_request_hashes(&watched(), true, &HashSet::new()),
+            vec![graph_hash(4), graph_hash(3), graph_hash(2)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn log_requests_reach_pending_suffix_and_stop_at_gap() {
+        // b4/b5 are pending above the absent b3: the walk fetches their logs in parallel with the
+        // header backfill, and stops at the gap — the connected b2 below it is not reached until
+        // the headers connect (mirrors the legacy tip walk, which broke at the first absent block).
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(5), graph_hash(4), 5, hit_bloom())
+            .unwrap()
+            .with_observed_head(graph_hash(5));
+        assert_eq!(
+            graph.unresolved_log_request_hashes(&watched(), true, &HashSet::new()),
+            vec![graph_hash(5), graph_hash(4)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn log_requests_skip_complete_and_in_flight_but_fetch_streamed() {
+        // Complete is authoritative (never refetched); an in-flight request is deduped by the
+        // caller-supplied exclude set; Streamed is provisional and still needs the authoritative
+        // fetch (legacy `Partial` behaved the same).
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
+            .unwrap()
+            .with_complete_logs(graph_hash(2), Vec::new())
+            .with_streamed_logs(graph_hash(3), Vec::new())
+            .with_observed_head(graph_hash(4));
+        let exclude = HashSet::from([graph_hash(4)]);
+        assert_eq!(
+            graph.unresolved_log_request_hashes(&watched(), true, &exclude),
+            vec![graph_hash(3)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn log_requests_bloom_gate_only_fires_when_active() {
+        // Gate active: a bloom-clear block is provably untouched and skipped. Gate inactive (no
+        // verified pools yet — the per-block fetch is still the discovery channel): everything
+        // non-Complete is fetched, bloom-clear included.
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, clear_bloom())
+            .unwrap()
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
+            .unwrap()
+            .with_observed_head(graph_hash(3));
+        assert_eq!(
+            graph.unresolved_log_request_hashes(&watched(), true, &HashSet::new()),
+            vec![graph_hash(3)]
+        );
+        assert_eq!(
+            graph.unresolved_log_request_hashes(&watched(), false, &HashSet::new()),
+            vec![graph_hash(3), graph_hash(2)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn candidates_come_from_streamed_and_complete_logs_newest_first() {
+        let pool_a = v3_pool(0xA1);
+        let pool_b = v3_pool(0xB2);
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
+            .unwrap()
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
+            .unwrap()
+            .with_complete_logs(graph_hash(2), vec![pool_log(pool_a, sw(0))])
+            .with_streamed_logs(graph_hash(3), vec![pool_log(pool_b, sw(1))])
+            .with_observed_head(graph_hash(4));
+        // b4 is Unknown (no logs yet), so it contributes no candidate entry.
+        assert_eq!(
+            graph.pool_log_candidates_from_head(),
+            vec![
+                (graph_hash(3), HashSet::from([pool_b.key])),
+                (graph_hash(2), HashSet::from([pool_a.key])),
+            ]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn candidates_skip_empty_complete_block() {
+        // A Complete block with no pool logs names no candidates — no empty entries downstream.
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom())
+            .unwrap()
+            .with_complete_logs(graph_hash(2), Vec::new())
+            .with_observed_head(graph_hash(2));
+        assert!(graph.pool_log_candidates_from_head().is_empty());
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn distance_from_head_counts_blocks_above_reference() {
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, clear_bloom())
+            .unwrap()
+            .with_block(graph_hash(3), graph_hash(2), 3, clear_bloom())
+            .unwrap()
+            .with_block(graph_hash(4), graph_hash(3), 4, clear_bloom())
+            .unwrap()
+            .with_observed_head(graph_hash(4));
+        assert_eq!(graph.distance_from_head(graph_hash(4)), Some(0));
+        assert_eq!(graph.distance_from_head(graph_hash(2)), Some(2));
+        assert_eq!(graph.distance_from_head(anchor), Some(3));
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn distance_from_head_is_none_off_the_present_chain() {
+        // A fork sibling is not on the head's parent chain.
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, clear_bloom())
+            .unwrap()
+            .with_block(graph_hash(3), anchor, 2, clear_bloom())
+            .unwrap()
+            .with_observed_head(graph_hash(2));
+        assert_eq!(graph.distance_from_head(graph_hash(3)), None);
+
+        // A pending head above an absent parent cannot reach the anchor — but the walk counts
+        // through pending nodes and stops AT the reference, so the absent gap root itself is
+        // reachable as a reference (mirrors the legacy flat parent-pointer walk exactly).
+        let gapped = BlocksGraph::new(anchor)
+            .with_block(graph_hash(5), graph_hash(4), 5, clear_bloom())
+            .unwrap()
+            .with_observed_head(graph_hash(5));
+        assert_eq!(gapped.distance_from_head(anchor), None);
+        assert_eq!(gapped.distance_from_head(graph_hash(5)), Some(0));
+        assert_eq!(gapped.distance_from_head(graph_hash(4)), Some(1));
+    }
+
     // --- finalization gate (missing complete ranges) -------------------------------------------
 
     fn watched_addr() -> Address {
@@ -2132,7 +2437,6 @@ mod tests {
         base.keys().copied().collect()
     }
 
-    #[allow(deprecated)]
     fn pool_log(pool: PoolRef, event: PoolLogEvent) -> PoolLog {
         PoolLog {
             pool: pool.key,
@@ -2201,7 +2505,6 @@ mod tests {
     }
 
     /// A pool log carrying an explicit intra-block `log_index` — the key the merge transition uses.
-    #[allow(deprecated)]
     fn log_at(log_index: u64) -> PoolLog {
         PoolLog {
             pool: v3_pool(0xA1).key,
@@ -2479,7 +2782,7 @@ mod tests {
     #[test]
     fn fold_does_not_seed_verified_pool_from_delta_only_run() {
         // A verified new pool whose only log is a Mint has no absolute anchor, so
-        // `derive_pool_state(None, [Mint])` is `None`: it stays unseeded (awaits GetPoolData).
+        // `derive_pool_state(None, [Mint])` is `None`: it stays unseeded (awaits the anchor-height seeding follow-up).
         let new_pool = v3_pool(0xC1);
         let base: HashMap<PoolRef, PoolState> = HashMap::new();
         let verified = HashSet::from([new_pool]);
@@ -3073,7 +3376,6 @@ mod tests {
 
     /// A pool log with an explicit intra-block index for a given pool — seed payloads are keyed by
     /// `log_index` exactly like live ingestion.
-    #[allow(deprecated)]
     fn seed_log(log_index: u64, pool: PoolRef, event: PoolLogEvent) -> PoolLog {
         PoolLog {
             pool: pool.key,

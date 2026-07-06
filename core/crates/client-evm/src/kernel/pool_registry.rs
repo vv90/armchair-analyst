@@ -167,7 +167,7 @@ impl TrustedPoolRegistry {
         self.verified.len()
     }
 
-    /// The verified pools tracked on `chain` — the identity set the shadow fold watches and may seed.
+    /// The verified pools tracked on `chain` — the identity set the graph fold watches and may seed.
     /// Added so the log-sourced graph (registry-free by design) can be handed the tracked-pool set to
     /// widen its bloom-watch and seed absolute-state logs for pools discovered after bootstrap.
     pub fn verified_pools(&self, chain: ChainKey) -> HashSet<PoolRef> {
