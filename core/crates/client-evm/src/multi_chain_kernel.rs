@@ -466,7 +466,9 @@ pub enum SubscriptionData {
     },
     PoolLog {
         block_hash: BlockHash,
-        log: PoolLog,
+        /// A consolidated, `log_index`-ordered batch for one block — the adapter's debounce window
+        /// dedups a burst (and repeats across providers) into a single delivery.
+        logs: Vec<PoolLog>,
     },
 }
 
@@ -485,10 +487,9 @@ impl SubscriptionData {
                 logs_bloom,
                 number,
             },
-            SubscriptionData::PoolLog { block_hash, log } => kernel::Event::LogObserved {
-                block_hash,
-                logs: vec![log],
-            },
+            SubscriptionData::PoolLog { block_hash, logs } => {
+                kernel::Event::LogObserved { block_hash, logs }
+            }
         }
     }
 }

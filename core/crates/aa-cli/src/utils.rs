@@ -129,12 +129,13 @@ enum KeyResolution {
 }
 
 /// Every endpoint setting resolved from the config file, with keys substituted: per-chain HTTP specs for
-/// the failover pools, a single WS URL per chain for the subscription channel, and per-chain subgraph
-/// specs for v4 metadata resolution. The caller assembles these into the client-evm endpoint types.
+/// the failover pools, every provider's WS spec per chain for the fanned-out subscription channels, and
+/// per-chain subgraph specs for v4 metadata resolution. The caller assembles these into the client-evm
+/// endpoint types.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResolvedEndpoints {
     pub rpc_http: BTreeMap<ChainKey, Vec<EndpointSpec>>,
-    pub rpc_ws: BTreeMap<ChainKey, String>,
+    pub rpc_ws: BTreeMap<ChainKey, Vec<EndpointSpec>>,
     pub subgraph: BTreeMap<ChainKey, Vec<EndpointSpec>>,
     /// Names of `[[rpc]]` providers dropped because their key was skipped (blank prompt / unset env).
     /// A dropped provider is absent from every pool above; recorded so startup can surface it, since a
@@ -184,8 +185,6 @@ where
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
     let mut resolved = ResolvedEndpoints::default();
-    // The highest-weight provider that declares a WS URL wins each chain's single subscription slot.
-    let mut best_ws: BTreeMap<ChainKey, (u32, String)> = BTreeMap::new();
 
     for provider in file.rpc {
         let needs_key = provider.chains.values().any(|urls| {
@@ -223,20 +222,16 @@ where
 
             if let Some(ws) = &urls.ws {
                 let ws = substitute_key(ws, key.as_deref());
-                let replace = best_ws
-                    .get(&chain)
-                    .is_none_or(|(best_weight, _)| weight > *best_weight);
-                if replace {
-                    best_ws.insert(chain, (weight, ws));
-                }
+                // Keep every provider's WS URL: the runtime fans subscriptions out across all of
+                // them per chain (redundancy), rather than picking a single best endpoint.
+                resolved
+                    .rpc_ws
+                    .entry(chain)
+                    .or_default()
+                    .push(EndpointSpec::new(provider.name.clone(), ws, weight));
             }
         }
     }
-
-    resolved.rpc_ws = best_ws
-        .into_iter()
-        .map(|(chain, (_, url))| (chain, url))
-        .collect();
 
     for provider in file.subgraph {
         let needs_key = provider
@@ -287,11 +282,17 @@ pub(crate) fn summarize_endpoints(resolved: &ResolvedEndpoints) -> Vec<String> {
                 .map(|spec| format!("{}:{}", spec.label, spec.weight))
                 .collect::<Vec<_>>()
                 .join(",");
-            let ws = if resolved.rpc_ws.contains_key(chain) {
-                "present"
-            } else {
-                "absent"
-            };
+            let ws = resolved
+                .rpc_ws
+                .get(chain)
+                .map(|specs| {
+                    specs
+                        .iter()
+                        .map(|spec| format!("{}:{}", spec.label, spec.weight))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
             format!("endpoints chain={chain:?} http={providers} ws={ws}")
         })
         .collect();
@@ -470,14 +471,23 @@ mod tests {
             EndpointSpec::new("publicnode", "https://ethereum-rpc.publicnode.com", 1)
         );
 
-        // Single WS per chain (the weight-3 dRPC wins; publicnode declares no ws).
+        // Every provider that declares a WS URL is kept per chain (here only dRPC does; publicnode
+        // declares no ws), with the key substituted.
         assert_eq!(
-            resolved.rpc_ws.get(&ChainKey::Ethereum).map(String::as_str),
-            Some("wss://lb.drpc.org/ethereum/rpc-secret")
+            resolved.rpc_ws.get(&ChainKey::Ethereum),
+            Some(&vec![EndpointSpec::new(
+                "drpc",
+                "wss://lb.drpc.org/ethereum/rpc-secret",
+                3
+            )])
         );
         assert_eq!(
-            resolved.rpc_ws.get(&ChainKey::Arbitrum).map(String::as_str),
-            Some("wss://lb.drpc.org/arbitrum/rpc-secret")
+            resolved.rpc_ws.get(&ChainKey::Arbitrum),
+            Some(&vec![EndpointSpec::new(
+                "drpc",
+                "wss://lb.drpc.org/arbitrum/rpc-secret",
+                3
+            )])
         );
 
         // Subgraph on Ethereum with the graph key substituted.
@@ -493,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn highest_weight_provider_wins_the_ws_slot() {
+    fn every_provider_ws_url_is_kept_for_fan_out() {
         let toml = r#"
             [[rpc]]
             name = "low"
@@ -512,9 +522,13 @@ mod tests {
         )
         .expect("resolution succeeds");
 
+        // Both providers' WS URLs survive, in configuration order — no single-slot collapse.
         assert_eq!(
-            resolved.rpc_ws.get(&ChainKey::Ethereum).map(String::as_str),
-            Some("wss://high/ws")
+            resolved.rpc_ws.get(&ChainKey::Ethereum),
+            Some(&vec![
+                EndpointSpec::new("low", "wss://low/ws", 1),
+                EndpointSpec::new("high", "wss://high/ws", 5),
+            ])
         );
     }
 
@@ -601,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_endpoints_lists_providers_ws_presence_and_skips() {
+    fn summarize_endpoints_lists_providers_ws_composition_and_skips() {
         let mut resolved = ResolvedEndpoints::default();
         resolved.rpc_http.insert(
             ChainKey::Ethereum,
@@ -613,15 +627,21 @@ mod tests {
         resolved
             .rpc_http
             .insert(ChainKey::Arbitrum, vec![EndpointSpec::new("publicnode", "https://p", 1)]);
-        // Only Ethereum has a WS endpoint, so Arbitrum must read as `ws=absent`.
-        resolved.rpc_ws.insert(ChainKey::Ethereum, "wss://d".to_owned());
+        // Ethereum has two WS providers; Arbitrum has none, so its `ws=` list must render empty.
+        resolved.rpc_ws.insert(
+            ChainKey::Ethereum,
+            vec![
+                EndpointSpec::new("drpc", "wss://d", 3),
+                EndpointSpec::new("alchemy", "wss://a", 4),
+            ],
+        );
         resolved.skipped_rpc_providers.push("infura".to_owned());
 
         assert_eq!(
             summarize_endpoints(&resolved),
             vec![
-                "endpoints chain=Ethereum http=drpc:3,alchemy:4 ws=present".to_owned(),
-                "endpoints chain=Arbitrum http=publicnode:1 ws=absent".to_owned(),
+                "endpoints chain=Ethereum http=drpc:3,alchemy:4 ws=drpc:3,alchemy:4".to_owned(),
+                "endpoints chain=Arbitrum http=publicnode:1 ws=".to_owned(),
                 "endpoints skipped_rpc_providers=infura".to_owned(),
             ]
         );

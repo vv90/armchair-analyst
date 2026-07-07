@@ -8,16 +8,16 @@ use client_evm::{
     ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
     OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
     POLYGON_USDC_TOKEN_ADDRESS,
-    GraphEndpoints, MetadataCache, ProtocolPoolKey, PoolLog, PoolMetadata,
-    PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult, bootstrap,
-    fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
-    fetch_pool_candidates_in_range, fetch_pool_metadata, fetch_token_metadata,
-    fetch_v4_pool_metadata, kernel,
+    GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog, PoolMetadata,
+    PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
+    bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
+    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_metadata,
+    fetch_token_metadata, fetch_v4_pool_metadata, kernel,
     multi_chain_kernel::{
         ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, State,
         Subscription, SubscriptionData, transition,
     },
-    subscribe_new_heads, subscribe_pool_events,
+    plan_ws_subscriptions, subscribe_new_heads, subscribe_pool_events,
 };
 use optimization::{
     OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
@@ -28,7 +28,7 @@ use std::{
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
-        mpsc::Sender,
+        mpsc::{Sender, channel},
     },
     thread::{self, JoinHandle},
     time,
@@ -234,38 +234,10 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     ) {
         match subscription {
             Subscription::NewHeadsSubscription(chain) => {
-                let ws_url = match self.subscriptions().ws(chain) {
-                    Ok(ws_url) => ws_url,
-                    Err(error) => {
-                        self.logger.log(&format!(
-                            "error chain={chain:?} subscription_ws_unavailable kind=new_heads error={error}"
-                        ));
-                        return;
-                    }
-                };
-                self.reconnect_loop(chain, "new_heads", || {
-                    subscribe_new_heads(ws_url, sender, |client_event| {
-                        map_client_subscription_data(client_event)
-                            .map(|data| Event::SubscriptionData { chain, data })
-                    })
-                });
+                self.spawn_new_heads_fan_out(sender, chain);
             }
             Subscription::PoolEventsSubscription(chain) => {
-                let ws_url = match self.subscriptions().ws(chain) {
-                    Ok(ws_url) => ws_url,
-                    Err(error) => {
-                        self.logger.log(&format!(
-                            "error chain={chain:?} subscription_ws_unavailable kind=pool_events error={error}"
-                        ));
-                        return;
-                    }
-                };
-                self.reconnect_loop(chain, "pool_events", || {
-                    subscribe_pool_events(ws_url, sender, |client_event| {
-                        map_client_subscription_data(client_event)
-                            .map(|data| Event::SubscriptionData { chain, data })
-                    })
-                });
+                self.spawn_pool_events_fan_out(sender, chain);
             }
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
@@ -343,44 +315,134 @@ fn next_reconnect_delay(previous: Option<time::Duration>, ran_for: time::Duratio
     }
 }
 
+/// Runs one WebSocket subscription forever, reconnecting with [`next_reconnect_delay`] backoff when it
+/// drops. `attempt` performs one connect-and-stream cycle (one of `subscribe_new_heads` /
+/// `subscribe_pool_events`) and returns when the socket closes (`Ok`) or fails (`Err`) — either way we
+/// reconnect, so a free-tier idle-timeout no longer kills a feed for good. Free of `self` so each of a
+/// chain's fanned-out provider threads owns its own loop with a cloned [`Logger`]. Never returns.
+fn reconnect_loop(
+    logger: &Logger,
+    chain: ChainKey,
+    kind: &str,
+    mut attempt: impl FnMut() -> Result<(), ClientEvmError>,
+) {
+    let mut previous_delay: Option<time::Duration> = None;
+    let mut connects: u64 = 0;
+    loop {
+        connects += 1;
+        logger.log(&format!(
+            "subscription chain={chain:?} kind={kind} connecting attempt={connects}"
+        ));
+
+        let started = time::Instant::now();
+        let outcome = attempt();
+        let ran_for = started.elapsed();
+
+        let reason = match &outcome {
+            Ok(()) => "closed".to_owned(),
+            Err(error) => format!("error: {error}"),
+        };
+        let delay = next_reconnect_delay(previous_delay, ran_for);
+        logger.log(&format!(
+            "subscription chain={chain:?} kind={kind} disconnected ran_ms={} reason={reason} reconnect_in_ms={}",
+            ran_for.as_millis(),
+            delay.as_millis()
+        ));
+
+        thread::sleep(delay);
+        previous_delay = Some(delay);
+    }
+}
+
+/// Blocks on every fanned-out subscription thread. Each [`reconnect_loop`] never returns, so this
+/// parks the owning subscription thread for the life of the process (the threads run concurrently).
+fn join_all(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        drop(handle.join());
+    }
+}
+
 impl ClientEvmRuntime {
-    /// Runs a WebSocket subscription forever, reconnecting with [`next_reconnect_delay`] backoff when
-    /// it drops. `attempt` performs one connect-and-stream cycle (one of `subscribe_new_heads` /
-    /// `subscribe_pool_events`) and returns when the socket closes (`Ok`) or fails (`Err`) — either
-    /// way we reconnect, so a free-tier idle-timeout no longer kills a chain's feed for good. Never
-    /// returns; it owns the subscription thread for the life of the process.
-    fn reconnect_loop(
-        &self,
-        chain: ChainKey,
-        kind: &str,
-        mut attempt: impl FnMut() -> Result<(), ClientEvmError>,
-    ) {
-        let mut previous_delay: Option<time::Duration> = None;
-        let mut connects: u64 = 0;
-        loop {
-            connects += 1;
-            self.logger.log(&format!(
-                "subscription chain={chain:?} kind={kind} connecting attempt={connects}"
-            ));
+    /// Fans the new-heads feed out across every configured WS provider for `chain`: one independent
+    /// reconnecting connection each, all delivering straight into the kernel channel. Duplicate heads
+    /// across providers are absorbed by the kernel (`DuplicateBlock`); heads are latency-sensitive, so
+    /// there is no debounce here. Blocks for the life of the process (each connection loops forever).
+    fn spawn_new_heads_fan_out(&self, sender: &Sender<Event>, chain: ChainKey) {
+        let endpoints = self.chain_ws_endpoints(chain, "new_heads");
+        let handles = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let logger = self.logger.clone();
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    let kind = format!("new_heads provider={}", endpoint.label);
+                    reconnect_loop(&logger, chain, &kind, || {
+                        subscribe_new_heads(&endpoint.url, &sender, |client_event| {
+                            map_new_head_data(client_event)
+                                .map(|data| Event::SubscriptionData { chain, data })
+                        })
+                    });
+                })
+            })
+            .collect();
+        join_all(handles);
+    }
 
-            let started = time::Instant::now();
-            let outcome = attempt();
-            let ran_for = started.elapsed();
-
-            let reason = match &outcome {
-                Ok(()) => "closed".to_owned(),
-                Err(error) => format!("error: {error}"),
-            };
-            let delay = next_reconnect_delay(previous_delay, ran_for);
-            self.logger.log(&format!(
-                "subscription chain={chain:?} kind={kind} disconnected ran_ms={} reason={reason} reconnect_in_ms={}",
-                ran_for.as_millis(),
-                delay.as_millis()
-            ));
-
-            thread::sleep(delay);
-            previous_delay = Some(delay);
+    /// Fans the pool-events feed out across every configured WS provider for `chain`: each provider's
+    /// per-log stream is funnelled through one mpsc into a single consolidator, which debounces and
+    /// dedups the burst (pure [`consolidate_pool_logs`]) into one batched `LogObserved` per block
+    /// before it reaches the kernel channel. Blocks for the life of the process.
+    fn spawn_pool_events_fan_out(&self, sender: &Sender<Event>, chain: ChainKey) {
+        let endpoints = self.chain_ws_endpoints(chain, "pool_events");
+        if endpoints.is_empty() {
+            return;
         }
+
+        let (raw_sender, raw_receiver) = channel::<(BlockHash, PoolLog)>();
+        let mut handles: Vec<JoinHandle<()>> = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let logger = self.logger.clone();
+                let raw_sender = raw_sender.clone();
+                thread::spawn(move || {
+                    let kind = format!("pool_events provider={}", endpoint.label);
+                    reconnect_loop(&logger, chain, &kind, || {
+                        subscribe_pool_events(&endpoint.url, &raw_sender, map_pool_log_data)
+                    });
+                })
+            })
+            .collect();
+        // Drop the original handle so the consolidator only sees `Disconnected` once every provider
+        // thread is gone (never, in practice — each reconnects forever).
+        drop(raw_sender);
+
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            consolidate_pool_logs(&raw_receiver, POOL_LOG_BATCH_WINDOW, |block_hash, logs| {
+                let event = Event::SubscriptionData {
+                    chain,
+                    data: SubscriptionData::PoolLog { block_hash, logs },
+                };
+                drop(sender.send(event));
+            });
+        }));
+        join_all(handles);
+    }
+
+    /// The configured WS endpoints for one chain, taken from the pure fan-out plan. Logs (once) and
+    /// yields empty when the chain has none, so a missing WS config surfaces rather than silently
+    /// opening no feed.
+    fn chain_ws_endpoints(&self, chain: ChainKey, kind: &str) -> Vec<WsSubscriptionEndpoint> {
+        let endpoints: Vec<WsSubscriptionEndpoint> = plan_ws_subscriptions(self.subscriptions())
+            .into_iter()
+            .filter(|endpoint| endpoint.chain == chain)
+            .collect();
+        if endpoints.is_empty() {
+            self.logger.log(&format!(
+                "error chain={chain:?} subscription_ws_unavailable kind={kind}"
+            ));
+        }
+        endpoints
     }
 
     /// Emits a single per-chain backlog snapshot (`behind` / `pools` / `inflight`) to the log, at most
@@ -508,8 +570,11 @@ fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> Str
         SubscriptionData::NewHead {
             hash, parent_hash, ..
         } => format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}"),
-        SubscriptionData::PoolLog { block_hash, .. } => {
-            format!("input chain={chain:?} log_observed block={block_hash} pools=1")
+        SubscriptionData::PoolLog { block_hash, logs } => {
+            format!(
+                "input chain={chain:?} log_observed block={block_hash} pools={}",
+                logs.len(),
+            )
         }
     }
 }
@@ -715,7 +780,7 @@ impl ClientEvmRuntime {
     }
 }
 
-fn map_client_subscription_data(client_chain_event: ClientEvent) -> Option<SubscriptionData> {
+fn map_new_head_data(client_chain_event: ClientEvent) -> Option<SubscriptionData> {
     match client_chain_event {
         ClientEvent::NewHead { header, .. } => Some(SubscriptionData::NewHead {
             hash: header.inner.hash,
@@ -723,11 +788,23 @@ fn map_client_subscription_data(client_chain_event: ClientEvent) -> Option<Subsc
             logs_bloom: header.inner.inner.logs_bloom,
             number: header.inner.inner.number,
         }),
+        ClientEvent::PoolLogObserved { .. }
+        | ClientEvent::Subscribed { .. }
+        | ClientEvent::Closed { .. } => None,
+    }
+}
+
+/// The raw per-log projection for the pool-events feed. Each provider connection maps into this;
+/// the consolidator ([`consolidate_pool_logs`]) then dedups and batches the burst before it reaches
+/// the kernel channel — so the debounce, not this mapper, decides delivery.
+fn map_pool_log_data(client_chain_event: ClientEvent) -> Option<(BlockHash, PoolLog)> {
+    match client_chain_event {
         ClientEvent::PoolLogObserved {
             block_hash, log, ..
-        } => Some(SubscriptionData::PoolLog { block_hash, log }),
-        ClientEvent::Subscribed { .. } => None,
-        ClientEvent::Closed { .. } => None,
+        } => Some((block_hash, log)),
+        ClientEvent::NewHead { .. }
+        | ClientEvent::Subscribed { .. }
+        | ClientEvent::Closed { .. } => None,
     }
 }
 
@@ -1105,8 +1182,14 @@ mod tests {
         );
 
         assert_eq!(
-            runtime.subscriptions().ws(ChainKey::Ethereum).expect("ethereum ws"),
-            "wss://example.invalid/ws"
+            runtime
+                .subscriptions()
+                .ws_endpoints(ChainKey::Ethereum)
+                .expect("ethereum ws")
+                .iter()
+                .map(|spec| spec.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wss://example.invalid/ws"]
         );
     }
 
@@ -2271,7 +2354,14 @@ mod tests {
     fn test_subscriptions() -> ChainSubscriptions {
         let mut ws = std::collections::BTreeMap::new();
         for &chain in client_evm::ACTIVE_CHAINS {
-            ws.insert(chain, "wss://example.invalid/ws".to_owned());
+            ws.insert(
+                chain,
+                vec![client_evm::EndpointSpec::new(
+                    "test",
+                    "wss://example.invalid/ws",
+                    1,
+                )],
+            );
         }
         ChainSubscriptions::new(ws).expect("test subscriptions")
     }

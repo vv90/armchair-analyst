@@ -2,8 +2,9 @@ use std::{
     collections::{HashMap, HashSet},
     net::TcpStream,
     str,
-    sync::mpsc::Sender,
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender},
     thread,
+    time::{Duration, Instant},
 };
 
 use alloy::{
@@ -26,6 +27,7 @@ use crate::{
 
 use super::{
     ClientEvent, ClientHead,
+    subscription::LogBatchBuffer,
     client_utils::{
         build_block_header_request, build_block_logs_request, build_block_number_request,
         build_finalized_block_header_request, build_new_heads_subscribe_request,
@@ -943,6 +945,50 @@ where
             },
             map_event,
         )?;
+    }
+}
+
+/// The fixed-interval debounce window for the pool-log feed: the raw per-log stream (fanned in from
+/// every provider) is accumulated for this long, then flushed as one consolidated, deduped batch per
+/// block. The single tuning knob — raise it to consolidate bigger bursts (fewer, larger kernel
+/// events) at the cost of latency; lower it for fresher streamed logs.
+pub const POOL_LOG_BATCH_WINDOW: Duration = Duration::from_millis(100);
+
+/// The impure debounce loop: consolidates the raw `(block_hash, log)` stream — fanned in from all
+/// provider connections for one chain — into per-block batches emitted once per `window`. Every
+/// decision (dedup by `log_index`, grouping, ordering) is delegated to the pure [`LogBatchBuffer`];
+/// this loop only owns the timer. Returns when the raw channel is disconnected (all providers gone),
+/// flushing whatever remains. `emit` forwards a finished batch toward the kernel channel.
+pub fn consolidate_pool_logs(
+    raw: &Receiver<(BlockHash, PoolLog)>,
+    window: Duration,
+    emit: impl Fn(BlockHash, Vec<PoolLog>),
+) {
+    let mut buffer = LogBatchBuffer::new();
+    let mut deadline = Instant::now() + window;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match raw.recv_timeout(remaining) {
+            Ok((block_hash, log)) => buffer.observe(block_hash, log),
+            Err(RecvTimeoutError::Timeout) => {
+                flush_batches(&mut buffer, &emit);
+                deadline = Instant::now() + window;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                flush_batches(&mut buffer, &emit);
+                return;
+            }
+        }
+    }
+}
+
+fn flush_batches(buffer: &mut LogBatchBuffer, emit: &impl Fn(BlockHash, Vec<PoolLog>)) {
+    if buffer.is_empty() {
+        return;
+    }
+    for (block_hash, logs) in buffer.flush() {
+        emit(block_hash, logs);
     }
 }
 

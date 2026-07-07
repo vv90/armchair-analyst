@@ -290,20 +290,28 @@ pub fn assemble_chain_endpoints(
     Ok(ChainEndpoints { pools })
 }
 
-/// The WebSocket subscription endpoint for each active chain. Unlike the HTTP [`ChainEndpoints`] pool,
-/// the live new-heads / pool-events streams use a single connection per chain (no failover), so this
-/// holds exactly one fully-resolved `wss://` URL per chain.
+/// The WebSocket subscription endpoints for each active chain. Like the HTTP [`ChainEndpoints`] pool,
+/// this holds *every* configured provider's `wss://` URL per chain, not just one: the live new-heads
+/// and pool-events streams are fanned out across all of them concurrently (redundancy — a single dead
+/// feed no longer blinds the chain). Unlike HTTP there is no in-connection failover; concurrent
+/// providers *are* the redundancy.
 #[derive(Debug)]
 pub struct ChainSubscriptions {
-    ws: BTreeMap<ChainKey, String>,
+    ws: BTreeMap<ChainKey, Vec<EndpointSpec>>,
 }
 
 impl ChainSubscriptions {
-    /// Builds the subscription set, requiring a WS URL for every [`ACTIVE_CHAINS`] chain — a chain with
-    /// none is a hard error, since the runtime seeds a new-heads subscription per active chain.
-    pub fn new(ws: BTreeMap<ChainKey, String>) -> Result<ChainSubscriptions, ClientEvmError> {
+    /// Builds the subscription set, requiring at least one WS endpoint for every [`ACTIVE_CHAINS`]
+    /// chain — a chain with none is a hard error, since the runtime seeds live subscriptions per
+    /// active chain.
+    pub fn new(
+        ws: BTreeMap<ChainKey, Vec<EndpointSpec>>,
+    ) -> Result<ChainSubscriptions, ClientEvmError> {
         for &chain in ACTIVE_CHAINS {
-            if !ws.get(&chain).is_some_and(|url| !url.trim().is_empty()) {
+            let has_endpoint = ws
+                .get(&chain)
+                .is_some_and(|specs| specs.iter().any(|spec| !spec.url.trim().is_empty()));
+            if !has_endpoint {
                 return Err(ClientEvmError::InvalidConfig {
                     scope: ConfigScope::Subscription,
                     reason: format!("no websocket endpoint configured for chain {chain:?}"),
@@ -314,22 +322,24 @@ impl ChainSubscriptions {
         Ok(ChainSubscriptions { ws })
     }
 
-    /// The WebSocket URL for a chain. `new` guarantees one exists for every active chain, but the lookup
-    /// still returns a `Result` so a stray non-active chain surfaces a clear error rather than panicking.
-    pub fn ws(&self, chain: ChainKey) -> Result<&str, ClientEvmError> {
+    /// Every WebSocket endpoint for a chain, in configuration order. `new` guarantees at least one
+    /// exists for every active chain, but the lookup still returns a `Result` so a stray non-active
+    /// chain surfaces a clear error rather than an empty fan-out.
+    pub fn ws_endpoints(&self, chain: ChainKey) -> Result<&[EndpointSpec], ClientEvmError> {
         self.ws
             .get(&chain)
-            .map(String::as_str)
+            .map(Vec::as_slice)
+            .filter(|specs| !specs.is_empty())
             .ok_or_else(|| ClientEvmError::InvalidConfig {
                 scope: ConfigScope::Subscription,
                 reason: format!("no websocket endpoint configured for chain {chain:?}"),
             })
     }
 
-    /// Builds a single-chain subscription set. Convenience for tests and minimal setups.
+    /// Builds a single-chain, single-endpoint subscription set. Convenience for tests and minimal setups.
     pub fn single(chain: ChainKey, url: impl Into<String>) -> ChainSubscriptions {
         let mut ws = BTreeMap::new();
-        ws.insert(chain, url.into());
+        ws.insert(chain, vec![EndpointSpec::new("single", url, 1)]);
         ChainSubscriptions { ws }
     }
 }
@@ -892,15 +902,69 @@ mod tests {
     fn chain_subscriptions_require_every_active_chain() {
         let mut ws = BTreeMap::new();
         for &chain in ACTIVE_CHAINS {
-            ws.insert(chain, "wss://lb.drpc.org/x/key".to_owned());
+            ws.insert(
+                chain,
+                vec![EndpointSpec::new("drpc", "wss://lb.drpc.org/x/key", 3)],
+            );
         }
         let subscriptions = ChainSubscriptions::new(ws.clone()).expect("complete set");
         assert_eq!(
-            subscriptions.ws(ChainKey::Ethereum).expect("ethereum ws"),
-            "wss://lb.drpc.org/x/key"
+            subscriptions
+                .ws_endpoints(ChainKey::Ethereum)
+                .expect("ethereum ws")
+                .iter()
+                .map(|spec| spec.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wss://lb.drpc.org/x/key"]
         );
 
         ws.remove(&ChainKey::Arbitrum);
+        assert!(matches!(
+            ChainSubscriptions::new(ws),
+            Err(ClientEvmError::InvalidConfig {
+                scope: ConfigScope::Subscription,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn chain_subscriptions_keep_every_provider_for_fan_out() {
+        let mut ws = BTreeMap::new();
+        for &chain in ACTIVE_CHAINS {
+            ws.insert(
+                chain,
+                vec![
+                    EndpointSpec::new("drpc", "wss://lb.drpc.org/x/key", 3),
+                    EndpointSpec::new("publicnode", "wss://ethereum-rpc.publicnode.com", 1),
+                ],
+            );
+        }
+
+        let subscriptions = ChainSubscriptions::new(ws).expect("complete set");
+
+        assert_eq!(
+            subscriptions
+                .ws_endpoints(ChainKey::Ethereum)
+                .expect("ethereum ws")
+                .iter()
+                .map(|spec| spec.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["drpc", "publicnode"]
+        );
+    }
+
+    #[test]
+    fn chain_subscriptions_reject_an_empty_endpoint_list() {
+        let mut ws = BTreeMap::new();
+        for &chain in ACTIVE_CHAINS {
+            ws.insert(
+                chain,
+                vec![EndpointSpec::new("drpc", "wss://lb.drpc.org/x/key", 3)],
+            );
+        }
+        ws.insert(ChainKey::Base, Vec::new());
+
         assert!(matches!(
             ChainSubscriptions::new(ws),
             Err(ClientEvmError::InvalidConfig {
