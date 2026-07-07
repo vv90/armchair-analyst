@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use alloy::primitives::{Address, BlockHash, Bloom};
+use alloy::primitives::{BlockHash, Bloom};
 
 pub(crate) mod pending_requests;
 pub(crate) mod pool_registry;
@@ -48,9 +48,8 @@ struct Blocks {
 }
 
 impl Blocks {
-    /// A fresh empty graph anchored at `finalized_hash` with the given finalized base — the graph analog of
-    /// `State::init`/`reset` (empty recent region, anchor = finalized). Used everywhere the legacy
-    /// `blocks` starts empty.
+    /// A fresh empty graph anchored at `finalized_hash` with the given finalized base (empty recent
+    /// region, anchor = finalized) — the `State::init` / test-constructor starting point.
     fn new(finalized_hash: BlockHash, finalized_snapshot: HashMap<PoolRef, PoolState>) -> Blocks {
         Blocks {
             graph: blocks_graph::BlocksGraph::new(finalized_hash),
@@ -174,7 +173,7 @@ impl State {
     /// `block_hash` is the fold frontier, the height the reserves are valid at; the dispatch gate
     /// and progress reporting key on it as they did on the legacy complete-block hash.
     pub(crate) fn optimization_update(&self, chain: ChainKey) -> OptimizationStateUpdate {
-        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
+        let v4_manager = uniswap_v4::pool_manager_address(chain);
         // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
         // discovered after bootstrap (the graph is registry-free; identity comes from here).
         let verified = self.pool_registry.verified_pools(chain);
@@ -264,14 +263,7 @@ impl State {
         mut self,
         f: impl FnOnce(blocks_graph::BlocksGraph) -> blocks_graph::BlocksGraph,
     ) -> State {
-        let Blocks {
-            graph,
-            finalized_snapshot,
-        } = self.blocks;
-        self.blocks = Blocks {
-            graph: f(graph),
-            finalized_snapshot,
-        };
+        self.blocks.graph = f(self.blocks.graph);
         self
     }
 
@@ -330,7 +322,7 @@ impl State {
     /// (c)/(d)), folding the now-final logs into the finalized snapshot and pruning everything
     /// that no longer descends from the new anchor.
     fn with_finalized_block_observed(mut self, chain: ChainKey, block_hash: BlockHash) -> State {
-        let v4_manager = uniswap_v4::pool_manager_address(chain).unwrap_or(Address::ZERO);
+        let v4_manager = uniswap_v4::pool_manager_address(chain);
         // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
         // discovered after bootstrap (the graph is registry-free; identity comes from here).
         let verified = self.pool_registry.verified_pools(chain);
@@ -447,24 +439,15 @@ pub enum Effect {
 /// Added so header connectivity automatically drives pool-affecting log discovery.
 fn schedule_unknown_canonical_log_requests(
     chain: ChainKey,
-    state: State,
+    mut state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
-    let State {
-        pending_requests,
-        pool_registry,
-        token_registry,
-        tick,
-        streamed_logs,
-        blocks,
-    } = state;
-
-    let pending_log_hashes = pending_requests.pending_block_log_hashes();
+    let pending_log_hashes = state.pending_requests.pending_block_log_hashes();
     // The bloom gate only fires once there is a verified pool whose log completeness to protect; with
-    // none, the per-block fetch is still the discovery channel and every bloom-bearing block is
-    // fetched. Capture that "gate active" decision from the verified set *before* adding the v4
-    // PoolManager discovery anchor, so warmup behavior is unchanged.
-    let mut trusted_addresses = pool_registry.verified_addresses(chain);
+    // none (`trusted: None`), the per-block fetch is still the discovery channel and every
+    // bloom-bearing block is fetched. Capture that "gate active" decision from the verified set
+    // *before* adding the v4 PoolManager discovery anchor, so warmup behavior is unchanged.
+    let mut trusted_addresses = state.pool_registry.verified_addresses(chain);
     let gate_active = !trusted_addresses.is_empty();
     if let Some(manager) = uniswap_v4::pool_manager_address(chain) {
         // Anchor on the singleton PoolManager so a block carrying only v4 activity is never
@@ -476,84 +459,62 @@ fn schedule_unknown_canonical_log_requests(
     // scheduler-owned trusted set above and deduped against in-flight fetches. The bloom has no
     // false negatives, so a trusted pool that did emit is never skipped, keeping trusted-pool log
     // completeness unchanged.
-    let mut pending_requests = pending_requests;
-    for block_hash in blocks.graph.unresolved_log_request_hashes(
-        &trusted_addresses,
-        gate_active,
-        &pending_log_hashes,
-    ) {
+    for block_hash in state
+        .blocks
+        .graph
+        .unresolved_log_request_hashes(gate_active.then_some(&trusted_addresses), &pending_log_hashes)
+    {
         let request_payload = GetBlockLogs { block_hash };
-        let (next_pending_requests, request_id) =
-            pending_requests.with_new_request(request_payload.clone(), tick);
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(request_payload.clone(), state.tick);
 
-        pending_requests = next_pending_requests;
+        state.pending_requests = pending_requests;
         effects.push(Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
             request_id,
             request_payload,
         })));
     }
 
-    (
-        State {
-            pending_requests,
-            pool_registry,
-            token_registry,
-            tick,
-            streamed_logs,
-            blocks,
-        },
-        effects,
-    )
+    (state, effects)
 }
 
 /// Emits pool metadata requests for unvalidated candidate addresses on the canonical path.
 /// Added to turn log emitters into verified/rejected registry entries before using them as pools.
 fn schedule_unknown_canonical_pool_metadata_requests(
     chain: ChainKey,
-    state: State,
+    candidates_from_head: &[(BlockHash, HashSet<ProtocolPoolKey>)],
+    mut state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
-    let State {
-        pending_requests,
-        pool_registry,
-        token_registry,
-        tick,
-        streamed_logs,
-        blocks,
-    } = state;
-
-    // Candidates are derived from the graph's stored logs: one request per
-    // present-chain block naming pools the registry has not yet validated, deduped across blocks
-    // newest-first and against in-flight validations — the same filtering the legacy walk applied.
-    let pending_candidates = pending_requests.pending_pool_metadata_candidates();
-    let mut unavailable_candidates = pending_candidates.clone();
-    let mut requests: Vec<(BlockHash, HashSet<ProtocolPoolKey>)> = Vec::new();
-    for (block_hash, candidates) in blocks.graph.pool_log_candidates_from_head() {
+    // Candidates are derived from the graph's stored logs (`candidates_from_head`, one present-chain
+    // walk shared with the token scheduler): one request per block naming pools the registry has not
+    // yet validated, deduped across blocks newest-first and against in-flight validations — the same
+    // filtering the legacy walk applied.
+    let mut unavailable_candidates = state.pending_requests.pending_pool_metadata_candidates();
+    for (block_hash, candidates) in candidates_from_head {
         let request_candidates = candidates
             .iter()
             .copied()
             .filter(|candidate| {
-                !pool_registry.is_known(chain, *candidate)
+                !state.pool_registry.is_known(chain, *candidate)
                     && !unavailable_candidates.contains(candidate)
             })
             .collect::<HashSet<_>>();
-
-        if !request_candidates.is_empty() {
-            unavailable_candidates.extend(request_candidates.iter().copied());
-            requests.push((block_hash, request_candidates));
+        if request_candidates.is_empty() {
+            continue;
         }
-    }
-    let mut pending_requests = pending_requests;
+        unavailable_candidates.extend(request_candidates.iter().copied());
 
-    for (block_hash, candidates) in requests {
         let request_payload = GetPoolMetadata {
-            at: block_hash,
-            candidates,
+            at: *block_hash,
+            candidates: request_candidates,
         };
-        let (next_pending_requests, request_id) =
-            pending_requests.with_new_request(request_payload.clone(), tick);
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(request_payload.clone(), state.tick);
 
-        pending_requests = next_pending_requests;
+        state.pending_requests = pending_requests;
         effects.push(Effect::Request(AnyIssuedRequest::PoolMetadata(
             IssuedRequest {
                 request_id,
@@ -562,72 +523,51 @@ fn schedule_unknown_canonical_pool_metadata_requests(
         )));
     }
 
-    (
-        State {
-            pending_requests,
-            pool_registry,
-            token_registry,
-            tick,
-            streamed_logs,
-            blocks,
-        },
-        effects,
-    )
+    (state, effects)
 }
 
 /// Emits token metadata requests for tokens referenced by verified canonical pools.
 /// Added so reserve projection can use known decimals and avoid guessing token scale.
 fn schedule_unknown_canonical_token_metadata_requests(
     chain: ChainKey,
-    state: State,
+    candidates_from_head: &[(BlockHash, HashSet<ProtocolPoolKey>)],
+    mut state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
-    let State {
-        pending_requests,
-        pool_registry,
-        token_registry,
-        tick,
-        streamed_logs,
-        blocks,
-    } = state;
-
-    // Token needs are derived from the graph's stored logs: each present-chain
-    // block's candidates map through the registry to their verified metadata's token pair, keeping
-    // only tokens the token registry does not know and no in-flight request already covers — the
-    // same mapping the legacy walk applied.
-    let pending_tokens = pending_requests.pending_token_metadata_tokens();
-    let mut unavailable_tokens = pending_tokens.clone();
-    let mut requests: Vec<(BlockHash, HashSet<TokenAddress>)> = Vec::new();
-    for (block_hash, candidates) in blocks.graph.pool_log_candidates_from_head() {
+    // Token needs are derived from the graph's stored logs (`candidates_from_head`, one present-chain
+    // walk shared with the pool scheduler): each block's candidates map through the registry to their
+    // verified metadata's token pair, keeping only tokens the token registry does not know and no
+    // in-flight request already covers — the same mapping the legacy walk applied.
+    let mut unavailable_tokens = state.pending_requests.pending_token_metadata_tokens();
+    for (block_hash, candidates) in candidates_from_head {
         let tokens = candidates
             .iter()
-            .filter_map(|candidate| pool_registry.verified_pool(chain, *candidate))
-            .filter_map(|pool| pool_registry.verified_metadata(pool))
+            .filter_map(|candidate| state.pool_registry.verified_pool(chain, *candidate))
+            .filter_map(|pool| state.pool_registry.verified_metadata(pool))
             .flat_map(|metadata| {
                 [
                     TokenAddress(metadata.token0, chain),
                     TokenAddress(metadata.token1, chain),
                 ]
             })
-            .filter(|token| !token_registry.is_known(*token) && !unavailable_tokens.contains(token))
+            .filter(|token| {
+                !state.token_registry.is_known(*token) && !unavailable_tokens.contains(token)
+            })
             .collect::<HashSet<_>>();
-
-        if !tokens.is_empty() {
-            unavailable_tokens.extend(tokens.iter().copied());
-            requests.push((block_hash, tokens));
+        if tokens.is_empty() {
+            continue;
         }
-    }
-    let mut pending_requests = pending_requests;
+        unavailable_tokens.extend(tokens.iter().copied());
 
-    for (block_hash, tokens) in requests {
         let request_payload = GetTokenMetadata {
-            at: block_hash,
+            at: *block_hash,
             tokens,
         };
-        let (next_pending_requests, request_id) =
-            pending_requests.with_new_request(request_payload.clone(), tick);
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(request_payload.clone(), state.tick);
 
-        pending_requests = next_pending_requests;
+        state.pending_requests = pending_requests;
         effects.push(Effect::Request(AnyIssuedRequest::TokenMetadata(
             IssuedRequest {
                 request_id,
@@ -636,17 +576,7 @@ fn schedule_unknown_canonical_token_metadata_requests(
         )));
     }
 
-    (
-        State {
-            pending_requests,
-            pool_registry,
-            token_registry,
-            tick,
-            streamed_logs,
-            blocks,
-        },
-        effects,
-    )
+    (state, effects)
 }
 
 // `GetPoolData` scheduling was deleted at Increment 4: the log-sourced graph stores no per-block pool
@@ -659,35 +589,15 @@ fn schedule_unknown_canonical_token_metadata_requests(
 /// admission-return-derived: any event that reaches the scheduling chain re-emits a dropped or
 /// still-unserved backfill, so recovery no longer depends on the next disconnected head arriving.
 /// Dedup against in-flight headers stays in [`request_missing_header`].
-fn schedule_missing_header_requests(state: State, mut effects: Vec<Effect>) -> (State, Vec<Effect>) {
-    let State {
-        pending_requests,
-        pool_registry,
-        token_registry,
-        tick,
-        streamed_logs,
-        blocks,
-    } = state;
-
-    let mut pending_requests = pending_requests;
-    for missing_hash in blocks.graph.missing_parents() {
-        let (next_pending_requests, new_effects) =
-            request_missing_header(pending_requests, tick, missing_hash);
-        pending_requests = next_pending_requests;
+fn schedule_missing_header_requests(mut state: State, mut effects: Vec<Effect>) -> (State, Vec<Effect>) {
+    for missing_hash in state.blocks.graph.missing_parents() {
+        let (pending_requests, new_effects) =
+            request_missing_header(state.pending_requests, state.tick, missing_hash);
+        state.pending_requests = pending_requests;
         effects.extend(new_effects);
     }
 
-    (
-        State {
-            pending_requests,
-            pool_registry,
-            token_registry,
-            tick,
-            streamed_logs,
-            blocks,
-        },
-        effects,
-    )
+    (state, effects)
 }
 
 /// Runs every canonical follow-up scheduler in the order needed for dependencies between requests.
@@ -701,8 +611,15 @@ fn schedule_unknown_canonical_requests(
     // `request_missing_header` calls they replace did.
     let (state, effects) = schedule_missing_header_requests(state, effects);
     let (state, effects) = schedule_unknown_canonical_log_requests(chain, state, effects);
-    let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(chain, state, effects);
-    schedule_unknown_canonical_token_metadata_requests(chain, state, effects)
+    // One present-chain candidate walk serves both metadata schedulers.
+    let candidates_from_head = state.blocks.graph.pool_log_candidates_from_head();
+    let (state, effects) = schedule_unknown_canonical_pool_metadata_requests(
+        chain,
+        &candidates_from_head,
+        state,
+        effects,
+    );
+    schedule_unknown_canonical_token_metadata_requests(chain, &candidates_from_head, state, effects)
 }
 
 /// Issues a block-header request for a missing ancestor, unless one for that hash is already in flight.
@@ -783,47 +700,34 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             // signal), refuse-and-keep on any bad input — see the `HeadObserved` arm.
             let state = state.with_log_header_received(hash, parent_hash, number, logs_bloom);
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
-
-            let retry_request_payload = match request_payload {
-                // found what we were looking for, no retry needed
-                Some(PendingPayload { payload, .. }) if payload.block_hash == hash => None,
-                // shouldn't happen, but something else was returned, still need the original request to succeed
-                Some(payload) => Some(payload),
-                // Unsolicited response, no matching request, ignore without retrying
-                None => None,
-            };
-
-            let new_state = State {
+            let mut state = State {
                 pending_requests,
                 ..state
             };
 
-            let (new_state, effects) = if let Some(PendingPayload {
-                payload: request_payload,
-                ..
-            }) = retry_request_payload
-            {
-                let (pending_requests, request_id) = new_state
-                    .pending_requests
-                    .with_new_request(request_payload.clone(), new_state.tick);
-
-                (
-                    State {
-                        pending_requests,
-                        ..new_state
-                    },
+            let effects = match request_payload {
+                // Mismatched response (shouldn't happen): something other than the requested block
+                // came back, so the original request must still succeed — reissue it. A matching
+                // response, or an unsolicited one with no pending payload, needs no retry.
+                Some(PendingPayload {
+                    payload: request_payload,
+                    ..
+                }) if request_payload.block_hash != hash => {
+                    let (pending_requests, request_id) = state
+                        .pending_requests
+                        .with_new_request(request_payload.clone(), state.tick);
+                    state.pending_requests = pending_requests;
                     vec![Effect::Request(AnyIssuedRequest::BlockHeader(
                         IssuedRequest {
                             request_id,
                             request_payload,
                         },
-                    ))],
-                )
-            } else {
-                (new_state, vec![])
+                    ))]
+                }
+                _ => vec![],
             };
 
-            schedule_unknown_canonical_requests(chain, new_state, effects)
+            schedule_unknown_canonical_requests(chain, state, effects)
         }
         Event::BlockHeaderNotFound { request_id } => {
             // Reorg-safety decision (e): refuse-and-keep, no reset. Drop the request only —
@@ -1205,7 +1109,7 @@ mod tests {
         state
             .blocks
             .graph
-            .unresolved_log_request_hashes(&HashSet::new(), false, &HashSet::new())
+            .unresolved_log_request_hashes(None, &HashSet::new())
     }
 
     /// Asserts every present canonical block with unknown logs has an active log request.

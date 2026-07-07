@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use alloy::primitives::{Address, BlockHash, Bloom, BloomInput};
@@ -84,54 +82,58 @@ struct PendingNode {
 /// snapshot: absolute pool state is folded on demand, never stored off the anchor.
 #[derive(Debug)]
 struct BlockData {
-    /// Header block number. The canonical chain is number-contiguous, so finalization's backfill
-    /// gate ([`BlocksGraph::missing_complete_ranges`]) coalesces unresolved blocks into numeric
-    /// `eth_getLogs` ranges from this.
+    /// Header block number. The canonical chain is number-contiguous, so the backfill query
+    /// ([`BlocksGraph::missing_complete_ranges`], the WS-primary ranged-getLogs substrate) coalesces
+    /// unresolved blocks into numeric `eth_getLogs` ranges from this.
     number: u64,
     /// Header `logsBloom` when the block entered from a header; `None` for header-less nodes.
     logs_bloom: Option<Bloom>,
     logs: BlockLogs,
 }
 
-/// Per-block decoded pool logs, keyed by intra-block index. The key is the ordering/dedup index; new
-/// logic reads it from the key and never from `PoolLog::log_index` (deprecated, removed at swap).
-// `Streamed`/`Complete` are constructed by the log-merge transition (invariant L5), a later
-// increment; only `Unknown` is reachable through `with_block` today.
+/// Per-block decoded pool logs, keyed by intra-block index. The key is the ordering/dedup index,
+/// populated from `PoolLog::log_index` at the ingestion boundary (L3); reads use the key.
+/// Authority is monotone `Unknown → Streamed → Complete` (invariant L5), advanced by
+/// [`BlocksGraph::with_streamed_logs`] / [`BlocksGraph::with_complete_logs`].
 #[derive(Debug)]
-#[allow(dead_code)]
 enum BlockLogs {
     Unknown,
     Streamed(BTreeMap<u64, PoolLog>),
     Complete(BTreeMap<u64, PoolLog>),
 }
 
-/// Why an admission was rejected. Every non-fatal variant hands the (unmodified) graph back, since
-/// `with_block` takes `self` by value. Mirrors the legacy `with_new_block` rejections, minus
-/// `CycleDetected`: a freshly inserted hash is a leaf nothing points to, so admission cannot create
-/// a cycle (self-parent — the one degenerate case — is rejected up front).
-// The returned graph is consumed by the kernel's call sites at the swap (Stage 4); until then the
-// tests only assert the rejection variant, not the recovered graph.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum NewBlockError {
-    /// `hash == parent`.
-    SelfParent(BlocksGraph),
-    /// `hash == anchor` — a re-announce of the finalized block (legacy `ExistingBlock`).
-    AnchorReadmit(BlocksGraph),
-    /// `hash` is already present with the same parent — an idempotent no-op (legacy `ExistingBlock`).
-    DuplicateBlock(BlocksGraph),
-    /// `hash` is already present with a *different* parent — a fatal conflict for the caller.
-    ConflictingParent(BlocksGraph),
-    /// The block would land `Pending` but the pending staging area is already at its cap
-    /// ([`MAX_PENDING_BLOCKS`]); the block is dropped and the graph handed back unchanged
-    /// (refuse-when-full, mirroring the legacy `MAX_STREAMED_LOG_BLOCKS` buffer). The authoritative
-    /// path / a later header re-observation, and ultimately finalization, recover it.
-    PendingBufferFull(BlocksGraph),
+/// The outcome of an admission. Returned *alongside* the graph (which admission hands back
+/// unchanged on any refusal — reorg-safety decision (b), refuse-and-keep), so no variant needs to
+/// carry state. Mirrors the legacy `with_new_block` rejections, minus `CycleDetected`: a freshly
+/// inserted hash is a leaf nothing points to, so admission cannot create a cycle (self-parent — the
+/// one degenerate case — is refused up front).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// The block entered the graph (connected or pending).
+    Admitted,
+    /// Refused: `hash == parent`.
+    SelfParent,
+    /// Refused: `hash == anchor` — a re-announce of the finalized block (legacy `ExistingBlock`).
+    AnchorReadmit,
+    /// Refused: `hash` is already present with the same parent — an idempotent no-op (legacy
+    /// `ExistingBlock`).
+    DuplicateBlock,
+    /// Refused: `hash` is already present with a *different* parent — provably bad data; the
+    /// first-seen block is kept.
+    ConflictingParent,
+    /// Refused: the block would land `Pending` but the pending staging area is already at its cap
+    /// ([`MAX_PENDING_BLOCKS`]); the block is dropped (refuse-when-full, mirroring the legacy
+    /// `MAX_STREAMED_LOG_BLOCKS` buffer). The authoritative path / a later header re-observation,
+    /// and ultimately finalization, recover it.
+    PendingBufferFull,
 }
 
-/// An inclusive range of block numbers to backfill authoritatively (`eth_getLogs`). Emitted by the
-/// finalization gate ([`BlocksGraph::missing_complete_ranges`]) for the runs of canonical blocks
-/// whose logs are not yet `Complete` but whose bloom may touch a tracked pool.
+/// An inclusive range of block numbers to backfill authoritatively (`eth_getLogs`). Emitted by
+/// [`BlocksGraph::missing_complete_ranges`] for the runs of canonical blocks whose logs are not yet
+/// `Complete` but whose bloom may touch a tracked pool.
+// Production consumer arrives with the WS-primary work (ranged-getLogs backfill scheduler); until
+// then only the query's own tests read it.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct BlockRange {
     from: u64,
@@ -148,15 +150,6 @@ enum Authority {
     /// `Streamed` (best-effort WS) blocks contribute too — the freshest-state path used by the
     /// optimization read.
     AllowStreamed,
-}
-
-/// Why a finalization re-root was refused. Hands the (unchanged) graph back like [`NewBlockError`],
-/// so the kernel can keep operating and schedule the backfill the ranges describe.
-#[derive(Debug)]
-enum ReanchorError {
-    /// The canonical path `anchor → new_anchor` is not fully foldable: these block-number ranges
-    /// must be fetched authoritatively (`eth_getLogs`) before the anchor can advance.
-    Incomplete(BlocksGraph, Vec<BlockRange>),
 }
 
 /// Caps the pending staging area (invariant B1), bounding it when blocks arrive whose parent never
@@ -232,13 +225,19 @@ fn connected_descends_from(
 /// Registry-free — identity comes from the pool key itself. Spans the whole `verified` tracked set,
 /// not just `base`: a pool whose absolute-state logs seed it into the fold ([`folded_overlay`]) must
 /// also be watched, so a bloom-touching block on its path is treated as a hole until it is foldable.
-fn watched_addresses(verified: &HashSet<PoolRef>, v4_manager: Address) -> HashSet<Address> {
+/// `v4_manager: None` means the chain deploys no PoolManager — a tracked v4 pool then contributes
+/// nothing (unreachable in practice: v4 pools are only ever discovered through the manager).
+fn watched_addresses(verified: &HashSet<PoolRef>, v4_manager: Option<Address>) -> HashSet<Address> {
     let mut watched = HashSet::new();
     for pool_ref in verified {
         match pool_ref.key {
-            ProtocolPoolKey::UniswapV3(address) => watched.insert(address),
-            ProtocolPoolKey::UniswapV4(_) => watched.insert(v4_manager),
-        };
+            ProtocolPoolKey::UniswapV3(address) => {
+                watched.insert(address);
+            }
+            ProtocolPoolKey::UniswapV4(_) => {
+                watched.extend(v4_manager);
+            }
+        }
     }
     watched
 }
@@ -284,17 +283,9 @@ impl BlocksGraph {
                     logs_bloom: None,
                     logs: BlockLogs::Complete(key_by_log_index(logs)),
                 };
-                match graph.with_data_capped(hash, parent, data, MAX_PENDING_BLOCKS) {
-                    Ok(graph) => graph,
-                    Err(error) => error.into_graph(),
-                }
+                graph.with_data_capped(hash, parent, data, MAX_PENDING_BLOCKS).0
             },
         )
-    }
-
-    /// True when no recent blocks are tracked yet — only the anchor exists.
-    fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
     }
 
     /// The connected node for `hash`, if present and connected. O(1), replacing the legacy
@@ -304,14 +295,6 @@ impl BlocksGraph {
             Some(Node::Connected(node)) => Some(node),
             _ => None,
         }
-    }
-
-    /// The per-block payload for `hash` regardless of connectivity.
-    fn get(&self, hash: BlockHash) -> Option<&BlockData> {
-        self.nodes.get(&hash).map(|node| match node {
-            Node::Connected(node) => &node.data,
-            Node::Pending(node) => &node.data,
-        })
     }
 
     /// How many blocks are currently `Pending` (the bounded staging area, invariant B1). O(n) over
@@ -331,16 +314,16 @@ impl BlocksGraph {
         parent: BlockHash,
         number: u64,
         bloom: Bloom,
-    ) -> Result<BlocksGraph, NewBlockError> {
+    ) -> (BlocksGraph, Admission) {
         self.with_block_capped(hash, parent, number, bloom, MAX_PENDING_BLOCKS)
     }
 
-    /// Kernel admission entry: [`with_block`], but every refusal keeps the (unchanged) graph rather
-    /// than surfacing an error. This is the reorg-safety decision (b) in
-    /// `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md` — a `ConflictingParent` (provably bad data) is refused
-    /// and the first-seen block kept, not reset; every other refusal (self-parent, anchor-readmit,
-    /// duplicate, pending-buffer-full) is already a benign no-op. The kernel is pure, so a refusal is
-    /// silently dropped (no telemetry channel); finalization ultimately prunes any poisoned fork.
+    /// Kernel admission entry: [`with_block`], discarding the outcome. Every refusal keeps the
+    /// (unchanged) graph — reorg-safety decision (b) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`: a
+    /// `ConflictingParent` (provably bad data) is refused and the first-seen block kept, not reset;
+    /// every other refusal (self-parent, anchor-readmit, duplicate, pending-buffer-full) is already
+    /// a benign no-op. The kernel is pure, so a refusal is silently dropped (no telemetry channel);
+    /// finalization ultimately prunes any poisoned fork.
     pub(crate) fn admitted(
         self,
         hash: BlockHash,
@@ -348,10 +331,7 @@ impl BlocksGraph {
         number: u64,
         bloom: Bloom,
     ) -> BlocksGraph {
-        match self.with_block(hash, parent, number, bloom) {
-            Ok(graph) => graph,
-            Err(error) => error.into_graph(),
-        }
+        self.with_block(hash, parent, number, bloom).0
     }
 
     /// Admit a block from a header. Classifies it as `Connected` (parent is the anchor or an
@@ -361,7 +341,7 @@ impl BlocksGraph {
     /// `with_observed_head`, mirroring the legacy `HeadObserved` path).
     ///
     /// `max_pending` bounds the pending staging area (B1): a block that would land `Pending` is
-    /// refused with [`NewBlockError::PendingBufferFull`] once `pending_count() >= max_pending`. The
+    /// refused with [`Admission::PendingBufferFull`] once `pending_count() >= max_pending`. The
     /// cap gates only the pending branch — a connecting admission (and the promotion it triggers,
     /// which only shrinks the pending set) is never refused. `with_block` calls this with
     /// [`MAX_PENDING_BLOCKS`]; tests drive it at a small cap.
@@ -372,7 +352,7 @@ impl BlocksGraph {
         number: u64,
         bloom: Bloom,
         max_pending: usize,
-    ) -> Result<BlocksGraph, NewBlockError> {
+    ) -> (BlocksGraph, Admission) {
         let data = BlockData {
             number,
             logs_bloom: Some(bloom),
@@ -390,23 +370,24 @@ impl BlocksGraph {
         parent: BlockHash,
         data: BlockData,
         max_pending: usize,
-    ) -> Result<BlocksGraph, NewBlockError> {
+    ) -> (BlocksGraph, Admission) {
         if hash == parent {
-            return Err(NewBlockError::SelfParent(self));
+            return (self, Admission::SelfParent);
         }
         if hash == self.anchor {
-            return Err(NewBlockError::AnchorReadmit(self));
+            return (self, Admission::AnchorReadmit);
         }
         if let Some(existing) = self.nodes.get(&hash) {
             let existing_parent = match existing {
                 Node::Connected(node) => connected_parent_hash(&node.parent, self.anchor),
                 Node::Pending(node) => node.parent,
             };
-            return if existing_parent == parent {
-                Err(NewBlockError::DuplicateBlock(self))
+            let admission = if existing_parent == parent {
+                Admission::DuplicateBlock
             } else {
-                Err(NewBlockError::ConflictingParent(self))
+                Admission::ConflictingParent
             };
+            return (self, admission);
         }
 
         // Connectivity is decided here, at insert time, rather than recomputed by a parent-walk.
@@ -417,7 +398,7 @@ impl BlocksGraph {
         // gates only this branch — a connecting admission (and its promotion, which only shrinks
         // pending) is never refused. The graph is handed back unchanged.
         if !connects && self.pending_count() >= max_pending {
-            return Err(NewBlockError::PendingBufferFull(self));
+            return (self, Admission::PendingBufferFull);
         }
 
         let BlocksGraph {
@@ -426,7 +407,7 @@ impl BlocksGraph {
             observed_head,
         } = self;
 
-        if connects {
+        let graph = if connects {
             let parent_ref = if parent == anchor {
                 AnchoredRef::Anchor
             } else {
@@ -434,11 +415,12 @@ impl BlocksGraph {
             };
             nodes.insert(hash, Node::Connected(ConnectedNode { parent: parent_ref, data }));
             // The new block may be the awaited parent of a pending subtree — connect it now (T6).
-            Ok(BlocksGraph { anchor, nodes, observed_head }.promote_reachable(ConnectedHash(hash)))
+            BlocksGraph { anchor, nodes, observed_head }.promote_reachable(ConnectedHash(hash))
         } else {
             nodes.insert(hash, Node::Pending(PendingNode { parent, data }));
-            Ok(BlocksGraph { anchor, nodes, observed_head })
-        }
+            BlocksGraph { anchor, nodes, observed_head }
+        };
+        (graph, Admission::Admitted)
     }
 
     /// Promotes every pending node now reachable through `newly_connected` — and transitively its
@@ -533,19 +515,9 @@ impl BlocksGraph {
     /// by T2, so the walk is total and gap-free; when it is the anchor, `Pending`, or absent, there is
     /// no foldable suffix yet and the chain is empty. Takes no `finalized_hash` — the anchor is owned.
     fn canonical_oldest_to_newest(&self) -> Vec<ConnectedHash> {
-        let mut chain = Vec::new();
-        let mut current = self.observed_head;
-        // Walks only while `current` is a connected node, so a pending/absent/anchor head yields an
-        // empty chain. Connected parents reach the anchor acyclically (T2), so the walk terminates.
-        while let Some(node) = self.connected(current) {
-            chain.push(ConnectedHash(current));
-            match node.parent {
-                AnchoredRef::Anchor => break,
-                AnchoredRef::Block(ConnectedHash(parent)) => current = parent,
-            }
-        }
-        chain.reverse();
-        chain
+        // The shared walk stops immediately on a non-connected start, so a pending/absent/anchor
+        // head yields an empty chain (the `ConnectedHash` here is a walk start, not an I1 proof).
+        self.connected_oldest_to_newest(ConnectedHash(self.observed_head))
     }
 
     /// The dangling ancestors still to backfill: the distinct, sorted set of `Pending` nodes' parent
@@ -619,16 +591,16 @@ impl BlocksGraph {
     ///
     /// The bloom gate mirrors the legacy scheduler, NOT the fold's `watched_addresses`: `trusted` is
     /// the scheduler-owned set (each verified pool's address plus the v4 PoolManager unconditionally —
-    /// the discovery anchor), and with `gate_active == false` (no verified pools yet) every block is
-    /// fetched because the per-block fetch is still the discovery channel. A bloom-clear block is
+    /// the discovery anchor). `None` means the gate is inactive (no verified pools yet): every block
+    /// is fetched because the per-block fetch is still the discovery channel — an active gate over an
+    /// empty set (fetch nothing) is thereby unrepresentable. A bloom-clear block is
     /// simply not fetched — no `Resolved`-promotion write exists here; the fold already skips
     /// bloom-clear non-`Complete` blocks, and unlike legacy's sticky promotion the gate re-evaluates
     /// against the *current* trusted set, so a block turns fetchable when a later-verified pool's
     /// address hits its bloom.
     pub(crate) fn unresolved_log_request_hashes(
         &self,
-        trusted: &HashSet<Address>,
-        gate_active: bool,
+        trusted: Option<&HashSet<Address>>,
         exclude: &HashSet<BlockHash>,
     ) -> Vec<BlockHash> {
         self.present_chain_from_head()
@@ -636,7 +608,7 @@ impl BlocksGraph {
             .filter(|(hash, data)| {
                 !matches!(data.logs, BlockLogs::Complete(_))
                     && !exclude.contains(hash)
-                    && (!gate_active || bloom_may_touch(data.logs_bloom, trusted))
+                    && trusted.is_none_or(|trusted| bloom_may_touch(data.logs_bloom, trusted))
             })
             .map(|(hash, _)| hash)
             .collect()
@@ -704,35 +676,32 @@ impl BlocksGraph {
         self.nodes.contains_key(&hash)
     }
 
-    /// The finalization backfill gate: the block-number ranges on the canonical path `anchor →
-    /// target` that must be fetched authoritatively before the anchor can advance to `target`.
+    /// The per-block payloads on the canonical path `anchor → target`, oldest→newest. `target` is
+    /// connected (the caller's [`ConnectedHash`] proof), so the walk reaches the anchor by T2.
+    fn connected_path_data(&self, target: ConnectedHash) -> Vec<&BlockData> {
+        // Every hash the shared walk yields is connected by construction, so the lookup resolves.
+        self.connected_oldest_to_newest(target)
+            .into_iter()
+            .filter_map(|ConnectedHash(hash)| self.connected(hash).map(|node| &node.data))
+            .collect()
+    }
+
+    /// The block-number ranges on the canonical path `anchor → target` whose logs must be fetched
+    /// authoritatively (`eth_getLogs`) before the path is fully foldable.
     ///
     /// Value-free (reads no pool state): a block is a *hole* iff its logs are not yet `Complete`
     /// **and** its `logs_bloom` may touch a `watched` address (a tracked pool's v3 contract address,
     /// or the v4 PoolManager). A header-less node (no bloom) is conservatively a hole. Consecutive
     /// hole block numbers are coalesced into inclusive [`BlockRange`]s (the canonical path is
     /// number-contiguous, but coalescing by numeric adjacency is correct regardless). An empty result
-    /// means the path is fully foldable and finalization may proceed.
+    /// means the path is fully foldable.
     ///
     /// `target` must be connected (caller holds the [`ConnectedHash`] proof); a target that is the
     /// anchor yields no ranges.
-    /// The per-block payloads on the canonical path `anchor → target`, oldest→newest. `target` is
-    /// connected (the caller's [`ConnectedHash`] proof), so the walk reaches the anchor by T2.
-    /// Shared by the finalization gate and fold.
-    fn connected_path_data(&self, target: ConnectedHash) -> Vec<&BlockData> {
-        let mut path: Vec<&BlockData> = Vec::new();
-        let mut current = target.0;
-        while let Some(node) = self.connected(current) {
-            path.push(&node.data);
-            match node.parent {
-                AnchoredRef::Anchor => break,
-                AnchoredRef::Block(ConnectedHash(parent)) => current = parent,
-            }
-        }
-        path.reverse();
-        path
-    }
-
+    // Finalization itself no longer needs this: `finalized_to` pre-selects a hole-free frontier via
+    // `foldable_frontier` (A4's single owner). The production consumer arrives with the WS-primary
+    // work — the ranged-getLogs backfill scheduler that fills these holes.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn missing_complete_ranges(
         &self,
         target: ConnectedHash,
@@ -883,12 +852,12 @@ impl BlocksGraph {
     /// full snapshot); this one never mutates and clones nothing beyond the changed pools.
     ///
     /// The production optimization read, called by `State::optimization_update`.
-    /// `v4_manager` is the chain's v4 PoolManager address, used for v4 bloom-touch checks.
+    /// `v4_manager` is the chain's v4 PoolManager address (`None` when the chain deploys none), used for v4 bloom-touch checks.
     pub(crate) fn optimization_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
         verified: &HashSet<PoolRef>,
-        v4_manager: Address,
+        v4_manager: Option<Address>,
     ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
         let watched = watched_addresses(verified, v4_manager);
         let frontier =
@@ -901,31 +870,25 @@ impl BlocksGraph {
     }
 
     /// Advances the anchor to `new_anchor`, folding the now-final logs into `base` and pruning every
-    /// block that no longer descends from the new anchor (A3). Owns the foldability gate (A4): the
-    /// canonical path `anchor → new_anchor` must be fully `Complete`/bloom-clear for the tracked pools,
-    /// else the graph is handed back via [`ReanchorError::Incomplete`] with the ranges to backfill —
-    /// nothing is mutated. On success returns the re-rooted graph and the advanced finalized snapshot.
+    /// block that no longer descends from the new anchor (A3), returning the re-rooted graph and the
+    /// advanced finalized snapshot.
     ///
-    /// `base` is borrowed (a fresh snapshot is returned), so an `Err` leaves the caller's snapshot
-    /// untouched. `v4_manager` is the chain's v4 PoolManager address, used for v4 bloom-clear checks.
+    /// Precondition (A4): the canonical path `anchor → new_anchor` is fully `Complete`/bloom-clear
+    /// for the tracked pools. The sole production caller, [`finalized_to`], guarantees this by
+    /// selecting `new_anchor` via [`foldable_frontier`] ([`Authority::RequireComplete`]) — the gate
+    /// lives there, not here.
+    ///
+    /// `base` is borrowed; a fresh snapshot is returned.
     fn reanchored_to(
         self,
         new_anchor: ConnectedHash,
         base: &HashMap<PoolRef, PoolState>,
         verified: &HashSet<PoolRef>,
-        v4_manager: Address,
-    ) -> Result<(BlocksGraph, HashMap<PoolRef, PoolState>), ReanchorError> {
+    ) -> (BlocksGraph, HashMap<PoolRef, PoolState>) {
         let new_anchor_hash = new_anchor.0;
         // Defensive: a ConnectedHash never names the anchor (I1), but the query is pure over any input.
         if new_anchor_hash == self.anchor {
-            return Ok((self, base.clone()));
-        }
-
-        // A4 gate first (value-free), so the consuming prune below is infallible.
-        let watched = watched_addresses(verified, v4_manager);
-        let ranges = self.missing_complete_ranges(ConnectedHash(new_anchor_hash), &watched);
-        if !ranges.is_empty() {
-            return Err(ReanchorError::Incomplete(self, ranges));
+            return (self, base.clone());
         }
 
         // Fold the now-final prefix (borrowed) before consuming self for the re-root.
@@ -983,14 +946,14 @@ impl BlocksGraph {
             new_anchor_hash
         };
 
-        Ok((
+        (
             BlocksGraph {
                 anchor: new_anchor_hash,
                 nodes,
                 observed_head,
             },
             new_snapshot,
-        ))
+        )
     }
 
     /// Kernel finalization entry: advance the anchor toward `target` (the observed finalized block) as
@@ -998,15 +961,16 @@ impl BlocksGraph {
     /// partial-compaction (reorg-safety decision (c) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`): it
     /// reanchors to the *latest complete connected block ≤ target*, so a hole short of `target`
     /// advances only to just before that hole (fold-on-demand), and an absent/pending/unconnected/
-    /// off-canonical `target` is a no-op. Infallible — the chosen sub-target is hole-free by construction, so the
-    /// inner [`reanchored_to`] never returns `Incomplete`; the returned snapshot replaces the caller's
-    /// finalized base only when the anchor actually advances.
+    /// off-canonical `target` is a no-op. Owns the A4 gate: the chosen sub-target is hole-free by
+    /// construction ([`foldable_frontier`], [`Authority::RequireComplete`]), satisfying
+    /// [`reanchored_to`]'s precondition. The returned snapshot replaces the caller's finalized base
+    /// only when the anchor actually advances.
     pub(crate) fn finalized_to(
         self,
         target: BlockHash,
         base: &HashMap<PoolRef, PoolState>,
         verified: &HashSet<PoolRef>,
-        v4_manager: Address,
+        v4_manager: Option<Address>,
     ) -> (BlocksGraph, HashMap<PoolRef, PoolState>) {
         // Only a connected target is finalizable; an absent/pending one has no foldable prefix yet.
         if self.connected(target).is_none() {
@@ -1030,17 +994,15 @@ impl BlocksGraph {
         // A frontier equal to the anchor means nothing is foldable yet.
         let frontier = self.foldable_frontier(ConnectedHash(target), &watched, Authority::RequireComplete);
 
-        match self.reanchored_to(frontier, base, verified, v4_manager) {
-            // A frontier at the anchor is `reanchored_to`'s base-clone no-op — nothing foldable, stay put.
-            Ok(pair) => pair,
-            // Hole-free by construction ⇒ unreachable; keep the graph and base if it ever fires.
-            Err(ReanchorError::Incomplete(graph, _)) => (graph, base.clone()),
-        }
+        // A frontier at the anchor is `reanchored_to`'s base-clone no-op — nothing foldable, stay put.
+        self.reanchored_to(frontier, base, verified)
     }
 
-    /// The canonical chain `anchor → target`, oldest→newest, as connected hashes. Like
-    /// [`connected_path_data`] but yielding the hashes (finalization needs the hash to reanchor).
-    /// `target` is connected (holds the [`ConnectedHash`] proof), so the walk reaches the anchor (T2).
+    /// The single connected-chain walk: the canonical chain `anchor → target`, oldest→newest, as
+    /// connected hashes. [`canonical_oldest_to_newest`] (from the head) and [`connected_path_data`]
+    /// (payload projection) both delegate here. When `target` is connected (the caller's
+    /// [`ConnectedHash`] proof), the walk reaches the anchor gap-free and acyclically (T2); a
+    /// non-connected start yields the empty chain.
     fn connected_oldest_to_newest(&self, target: ConnectedHash) -> Vec<ConnectedHash> {
         let mut chain = Vec::new();
         let mut current = target.0;
@@ -1056,20 +1018,6 @@ impl BlocksGraph {
     }
 }
 
-impl NewBlockError {
-    /// Recovers the (unchanged) graph every refusal hands back, so [`BlocksGraph::admitted`] can keep
-    /// the first-seen graph on any admission refusal (reorg-safety decision (b)).
-    fn into_graph(self) -> BlocksGraph {
-        match self {
-            NewBlockError::SelfParent(graph)
-            | NewBlockError::AnchorReadmit(graph)
-            | NewBlockError::DuplicateBlock(graph)
-            | NewBlockError::ConflictingParent(graph)
-            | NewBlockError::PendingBufferFull(graph) => graph,
-        }
-    }
-}
-
 /// Plain-`BlockHash` test accessors for the kernel's behavior tests. `ConnectedHash` is
 /// module-private (the connectivity proof must not cross the module boundary), so these project it
 /// away for assertions.
@@ -1077,6 +1025,19 @@ impl NewBlockError {
 impl BlocksGraph {
     pub(crate) fn observed_head_hash(&self) -> BlockHash {
         self.observed_head
+    }
+
+    /// True when no recent blocks are tracked yet — only the anchor exists.
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The per-block payload for `hash` regardless of connectivity.
+    fn get(&self, hash: BlockHash) -> Option<&BlockData> {
+        self.nodes.get(&hash).map(|node| match node {
+            Node::Connected(node) => &node.data,
+            Node::Pending(node) => &node.data,
+        })
     }
 
     /// The canonical chain hashes, oldest→newest (empty when the head is not connected).
@@ -1271,8 +1232,7 @@ mod tests {
         let mut graph = BlocksGraph::new(graph_hash(0));
         for &node in order {
             graph = graph
-                .with_block(graph_hash(node), graph_hash(plan.parents[node]), node as u64, Bloom::repeat_byte(0))
-                .expect("generated admission must succeed");
+                .with_block(graph_hash(node), graph_hash(plan.parents[node]), node as u64, Bloom::repeat_byte(0)).0;
         }
         graph
     }
@@ -1304,8 +1264,7 @@ mod tests {
             let mut graph = BlocksGraph::new(graph_hash(0));
             for &node in &plan.order_a {
                 graph = graph
-                    .with_block(graph_hash(node), graph_hash(plan.parents[node]), node as u64, Bloom::repeat_byte(0))
-                    .expect("generated admission must succeed");
+                    .with_block(graph_hash(node), graph_hash(plan.parents[node]), node as u64, Bloom::repeat_byte(0)).0;
                 assert_graph_invariants(&graph);
             }
             for &node in &plan.order_a {
@@ -1332,17 +1291,18 @@ mod tests {
             const MAX: usize = 3;
             let mut graph = BlocksGraph::new(graph_hash(0));
             for &node in &plan.order_a {
-                graph = match graph.with_block_capped(
+                let (next, admission) = graph.with_block_capped(
                     graph_hash(node),
                     graph_hash(plan.parents[node]),
                     node as u64,
                     Bloom::repeat_byte(0),
                     MAX,
-                ) {
-                    Ok(graph) => graph,
-                    Err(NewBlockError::PendingBufferFull(graph)) => graph,
-                    Err(other) => return Err(TestCaseError::fail(format!("unexpected error: {other:?}"))),
-                };
+                );
+                prop_assert!(
+                    matches!(admission, Admission::Admitted | Admission::PendingBufferFull),
+                    "unexpected admission outcome: {admission:?}"
+                );
+                graph = next;
                 prop_assert!(graph.pending_count() <= MAX);
                 assert_graph_invariants(&graph);
             }
@@ -1385,8 +1345,7 @@ mod tests {
             let mut graph = BlocksGraph::new(graph_hash(0));
             for &node in &plan.order_a {
                 graph = graph
-                    .with_block(graph_hash(node), graph_hash(plan.parents[node]), node as u64, Bloom::repeat_byte(0))
-                    .expect("generated admission must succeed");
+                    .with_block(graph_hash(node), graph_hash(plan.parents[node]), node as u64, Bloom::repeat_byte(0)).0;
                 let missing = graph.missing_parents();
 
                 // distinct + strictly ascending
@@ -1554,8 +1513,7 @@ mod tests {
         let block = graph_hash(2);
         let bloom = Bloom::repeat_byte(0x11);
         let graph = BlocksGraph::new(anchor)
-            .with_block(block, anchor, 0, bloom)
-            .expect("admitting a child of the anchor must succeed");
+            .with_block(block, anchor, 0, bloom).0;
         assert!(matches!(
             graph.nodes.get(&block),
             Some(Node::Connected(ConnectedNode {
@@ -1576,10 +1534,8 @@ mod tests {
         let parent = graph_hash(2);
         let child = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(parent, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(child, parent, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(parent, anchor, 0, Bloom::repeat_byte(0)).0
+            .with_block(child, parent, 0, Bloom::repeat_byte(0)).0;
         assert!(matches!(
             graph.nodes.get(&child),
             Some(Node::Connected(ConnectedNode {
@@ -1597,8 +1553,7 @@ mod tests {
         let absent_parent = graph_hash(2);
         let block = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(block, absent_parent, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(block, absent_parent, 0, Bloom::repeat_byte(0)).0;
         assert!(matches!(
             graph.nodes.get(&block),
             Some(Node::Pending(PendingNode { parent, .. })) if *parent == absent_parent
@@ -1614,10 +1569,8 @@ mod tests {
         let pending = graph_hash(3);
         let child = graph_hash(4);
         let graph = BlocksGraph::new(anchor)
-            .with_block(pending, absent, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(child, pending, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(pending, absent, 0, Bloom::repeat_byte(0)).0
+            .with_block(child, pending, 0, Bloom::repeat_byte(0)).0;
         assert!(matches!(
             graph.nodes.get(&child),
             Some(Node::Pending(PendingNode { parent, .. })) if *parent == pending
@@ -1634,10 +1587,8 @@ mod tests {
         let parent = graph_hash(2);
         let child = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(child, parent, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(parent, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(child, parent, 0, Bloom::repeat_byte(0)).0
+            .with_block(parent, anchor, 0, Bloom::repeat_byte(0)).0;
         assert!(matches!(
             graph.nodes.get(&child),
             Some(Node::Connected(ConnectedNode {
@@ -1656,12 +1607,9 @@ mod tests {
         let b3 = graph_hash(3);
         let b4 = graph_hash(4);
         let graph = BlocksGraph::new(anchor)
-            .with_block(b4, b3, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b3, b2, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b2, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(b4, b3, 0, Bloom::repeat_byte(0)).0
+            .with_block(b3, b2, 0, Bloom::repeat_byte(0)).0
+            .with_block(b2, anchor, 0, Bloom::repeat_byte(0)).0;
         assert!(graph.connected(b2).is_some());
         assert!(graph.connected(b3).is_some());
         assert!(graph.connected(b4).is_some());
@@ -1676,10 +1624,8 @@ mod tests {
         let b3 = graph_hash(3);
         let b4 = graph_hash(4);
         let graph = BlocksGraph::new(anchor)
-            .with_block(b4, b3, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b3, b2, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(b4, b3, 0, Bloom::repeat_byte(0)).0
+            .with_block(b3, b2, 0, Bloom::repeat_byte(0)).0;
         assert!(matches!(graph.nodes.get(&b3), Some(Node::Pending(_))));
         assert!(matches!(graph.nodes.get(&b4), Some(Node::Pending(_))));
         assert_graph_invariants(&graph);
@@ -1691,43 +1637,36 @@ mod tests {
     fn self_parent_is_rejected() {
         let anchor = graph_hash(1);
         let block = graph_hash(2);
-        let error = BlocksGraph::new(anchor)
-            .with_block(block, block, 0, Bloom::repeat_byte(0))
-            .unwrap_err();
-        assert!(matches!(error, NewBlockError::SelfParent(_)));
+        let (_, admission) = BlocksGraph::new(anchor).with_block(block, block, 0, Bloom::repeat_byte(0));
+        assert_eq!(admission, Admission::SelfParent);
     }
 
     #[test]
     fn anchor_readmit_is_rejected() {
         let anchor = graph_hash(1);
-        let error = BlocksGraph::new(anchor)
-            .with_block(anchor, graph_hash(2), 0, Bloom::repeat_byte(0))
-            .unwrap_err();
-        assert!(matches!(error, NewBlockError::AnchorReadmit(_)));
+        let (_, admission) =
+            BlocksGraph::new(anchor).with_block(anchor, graph_hash(2), 0, Bloom::repeat_byte(0));
+        assert_eq!(admission, Admission::AnchorReadmit);
     }
 
     #[test]
     fn exact_duplicate_is_noop() {
         let anchor = graph_hash(1);
         let block = graph_hash(2);
-        let error = BlocksGraph::new(anchor)
-            .with_block(block, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(block, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap_err();
-        assert!(matches!(error, NewBlockError::DuplicateBlock(_)));
+        let (_, admission) = BlocksGraph::new(anchor)
+            .with_block(block, anchor, 0, Bloom::repeat_byte(0)).0
+            .with_block(block, anchor, 0, Bloom::repeat_byte(0));
+        assert_eq!(admission, Admission::DuplicateBlock);
     }
 
     #[test]
     fn conflicting_parent_is_rejected() {
         let anchor = graph_hash(1);
         let block = graph_hash(3);
-        let error = BlocksGraph::new(anchor)
-            .with_block(block, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(block, graph_hash(2), 0, Bloom::repeat_byte(0))
-            .unwrap_err();
-        assert!(matches!(error, NewBlockError::ConflictingParent(_)));
+        let (_, admission) = BlocksGraph::new(anchor)
+            .with_block(block, anchor, 0, Bloom::repeat_byte(0)).0
+            .with_block(block, graph_hash(2), 0, Bloom::repeat_byte(0));
+        assert_eq!(admission, Admission::ConflictingParent);
     }
 
     // --- pending bound (B1) ---------------------------------------------------------------------
@@ -1742,8 +1681,7 @@ mod tests {
             let block = graph_hash(10 + index);
             let absent_parent = graph_hash(100 + index);
             graph = graph
-                .with_block_capped(block, absent_parent, 0, Bloom::repeat_byte(0), max)
-                .expect("admitting a disconnected block below the cap must succeed");
+                .with_block_capped(block, absent_parent, 0, Bloom::repeat_byte(0), max).0;
         }
         graph
     }
@@ -1758,12 +1696,9 @@ mod tests {
         assert_eq!(graph.pending_count(), max);
 
         let refused = graph_hash(50);
-        let error = graph
-            .with_block_capped(refused, graph_hash(200), 0, Bloom::repeat_byte(0), max)
-            .unwrap_err();
-        let NewBlockError::PendingBufferFull(graph) = error else {
-            panic!("expected PendingBufferFull, got {error:?}");
-        };
+        let (graph, admission) =
+            graph.with_block_capped(refused, graph_hash(200), 0, Bloom::repeat_byte(0), max);
+        assert_eq!(admission, Admission::PendingBufferFull);
         assert_eq!(graph.pending_count(), max);
         assert!(graph.get(refused).is_none());
         assert_graph_invariants(&graph);
@@ -1780,8 +1715,7 @@ mod tests {
 
         let child = graph_hash(2);
         let graph = graph
-            .with_block_capped(child, anchor, 0, Bloom::repeat_byte(0), max)
-            .expect("a connecting admission must not be refused by the pending cap");
+            .with_block_capped(child, anchor, 0, Bloom::repeat_byte(0), max).0;
         assert!(graph.connected(child).is_some());
         assert_eq!(graph.pending_count(), max);
         assert_graph_invariants(&graph);
@@ -1797,18 +1731,15 @@ mod tests {
         let child = graph_hash(3);
         // Fill to the cap with the child plus (max - 1) unrelated disconnected blocks.
         let mut graph = BlocksGraph::new(anchor)
-            .with_block_capped(child, parent, 0, Bloom::repeat_byte(0), max)
-            .unwrap();
+            .with_block_capped(child, parent, 0, Bloom::repeat_byte(0), max).0;
         for index in 0..(max - 1) {
             graph = graph
-                .with_block_capped(graph_hash(10 + index), graph_hash(100 + index), 0, Bloom::repeat_byte(0), max)
-                .unwrap();
+                .with_block_capped(graph_hash(10 + index), graph_hash(100 + index), 0, Bloom::repeat_byte(0), max).0;
         }
         assert_eq!(graph.pending_count(), max);
 
         let graph = graph
-            .with_block_capped(parent, anchor, 0, Bloom::repeat_byte(0), max)
-            .expect("admitting the awaited parent must not be refused by the pending cap");
+            .with_block_capped(parent, anchor, 0, Bloom::repeat_byte(0), max).0;
         assert!(graph.connected(parent).is_some());
         assert!(graph.connected(child).is_some());
         assert_eq!(graph.pending_count(), max - 1);
@@ -1831,8 +1762,7 @@ mod tests {
         let anchor = graph_hash(1);
         let child = graph_hash(2);
         let graph = BlocksGraph::new(anchor)
-            .with_block(child, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
+            .with_block(child, anchor, 0, Bloom::repeat_byte(0)).0
             .with_observed_head(child);
         assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![child]);
         assert_graph_invariants(&graph);
@@ -1845,10 +1775,8 @@ mod tests {
         let b2 = graph_hash(2);
         let b3 = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(b2, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b3, b2, 0, Bloom::repeat_byte(0))
-            .unwrap()
+            .with_block(b2, anchor, 0, Bloom::repeat_byte(0)).0
+            .with_block(b3, b2, 0, Bloom::repeat_byte(0)).0
             .with_observed_head(b3);
         assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![b2, b3]);
         assert_graph_invariants(&graph);
@@ -1861,8 +1789,7 @@ mod tests {
         let absent_parent = graph_hash(2);
         let head = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(head, absent_parent, 0, Bloom::repeat_byte(0))
-            .unwrap()
+            .with_block(head, absent_parent, 0, Bloom::repeat_byte(0)).0
             .with_observed_head(head);
         assert!(matches!(graph.nodes.get(&head), Some(Node::Pending(_))));
         assert!(graph.canonical_oldest_to_newest().is_empty());
@@ -1878,12 +1805,11 @@ mod tests {
         let parent = graph_hash(2);
         let head = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(head, parent, 0, Bloom::repeat_byte(0))
-            .unwrap()
+            .with_block(head, parent, 0, Bloom::repeat_byte(0)).0
             .with_observed_head(head);
         assert!(graph.canonical_oldest_to_newest().is_empty());
 
-        let graph = graph.with_block(parent, anchor, 0, Bloom::repeat_byte(0)).unwrap();
+        let graph = graph.with_block(parent, anchor, 0, Bloom::repeat_byte(0)).0;
         assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![parent, head]);
         assert_graph_invariants(&graph);
     }
@@ -1896,10 +1822,8 @@ mod tests {
         let fork_a = graph_hash(2);
         let fork_b = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(fork_a, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(fork_b, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
+            .with_block(fork_a, anchor, 0, Bloom::repeat_byte(0)).0
+            .with_block(fork_b, anchor, 0, Bloom::repeat_byte(0)).0
             .with_observed_head(fork_a);
         assert_eq!(chain_hashes(&graph.canonical_oldest_to_newest()), vec![fork_a]);
 
@@ -1935,10 +1859,8 @@ mod tests {
         let b2 = graph_hash(2);
         let b3 = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(b2, anchor, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b3, b2, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(b2, anchor, 0, Bloom::repeat_byte(0)).0
+            .with_block(b3, b2, 0, Bloom::repeat_byte(0)).0;
         assert!(graph.missing_parents().is_empty());
         assert_graph_invariants(&graph);
     }
@@ -1950,8 +1872,7 @@ mod tests {
         let absent_parent = graph_hash(2);
         let block = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(block, absent_parent, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(block, absent_parent, 0, Bloom::repeat_byte(0)).0;
         assert_eq!(graph.missing_parents(), vec![absent_parent]);
         assert_graph_invariants(&graph);
     }
@@ -1964,10 +1885,8 @@ mod tests {
         let b3 = graph_hash(3);
         let b4 = graph_hash(4);
         let graph = BlocksGraph::new(anchor)
-            .with_block(b3, shared_absent, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b4, shared_absent, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(b3, shared_absent, 0, Bloom::repeat_byte(0)).0
+            .with_block(b4, shared_absent, 0, Bloom::repeat_byte(0)).0;
         assert_eq!(graph.missing_parents(), vec![shared_absent]);
         assert_graph_invariants(&graph);
     }
@@ -1981,10 +1900,8 @@ mod tests {
         let b3 = graph_hash(3);
         let b4 = graph_hash(4);
         let graph = BlocksGraph::new(anchor)
-            .with_block(b4, b3, 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(b3, absent_root, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(b4, b3, 0, Bloom::repeat_byte(0)).0
+            .with_block(b3, absent_root, 0, Bloom::repeat_byte(0)).0;
         assert!(matches!(graph.nodes.get(&b3), Some(Node::Pending(_))));
         assert!(matches!(graph.nodes.get(&b4), Some(Node::Pending(_))));
         assert_eq!(graph.missing_parents(), vec![absent_root]);
@@ -1996,12 +1913,9 @@ mod tests {
         // Absent parents admitted out of order are returned strictly ascending.
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(10), graph_hash(30), 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(graph_hash(11), graph_hash(20), 0, Bloom::repeat_byte(0))
-            .unwrap()
-            .with_block(graph_hash(12), graph_hash(25), 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(graph_hash(10), graph_hash(30), 0, Bloom::repeat_byte(0)).0
+            .with_block(graph_hash(11), graph_hash(20), 0, Bloom::repeat_byte(0)).0
+            .with_block(graph_hash(12), graph_hash(25), 0, Bloom::repeat_byte(0)).0;
         assert_eq!(
             graph.missing_parents(),
             vec![graph_hash(20), graph_hash(25), graph_hash(30)]
@@ -2016,11 +1930,10 @@ mod tests {
         let parent = graph_hash(2);
         let child = graph_hash(3);
         let graph = BlocksGraph::new(anchor)
-            .with_block(child, parent, 0, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(child, parent, 0, Bloom::repeat_byte(0)).0;
         assert_eq!(graph.missing_parents(), vec![parent]);
 
-        let graph = graph.with_block(parent, anchor, 0, Bloom::repeat_byte(0)).unwrap();
+        let graph = graph.with_block(parent, anchor, 0, Bloom::repeat_byte(0)).0;
         assert!(graph.missing_parents().is_empty());
         assert_graph_invariants(&graph);
     }
@@ -2031,15 +1944,12 @@ mod tests {
     fn log_requests_walk_present_chain_newest_first() {
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
             .with_observed_head(graph_hash(4));
         assert_eq!(
-            graph.unresolved_log_request_hashes(&watched(), true, &HashSet::new()),
+            graph.unresolved_log_request_hashes(Some(&watched()), &HashSet::new()),
             vec![graph_hash(4), graph_hash(3), graph_hash(2)]
         );
         assert_graph_invariants(&graph);
@@ -2052,15 +1962,12 @@ mod tests {
         // the headers connect (mirrors the legacy tip walk, which broke at the first absent block).
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(5), graph_hash(4), 5, hit_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
+            .with_block(graph_hash(5), graph_hash(4), 5, hit_bloom()).0
             .with_observed_head(graph_hash(5));
         assert_eq!(
-            graph.unresolved_log_request_hashes(&watched(), true, &HashSet::new()),
+            graph.unresolved_log_request_hashes(Some(&watched()), &HashSet::new()),
             vec![graph_hash(5), graph_hash(4)]
         );
         assert_graph_invariants(&graph);
@@ -2073,18 +1980,15 @@ mod tests {
         // fetch (legacy `Partial` behaved the same).
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
             .with_complete_logs(graph_hash(2), Vec::new())
             .with_streamed_logs(graph_hash(3), Vec::new())
             .with_observed_head(graph_hash(4));
         let exclude = HashSet::from([graph_hash(4)]);
         assert_eq!(
-            graph.unresolved_log_request_hashes(&watched(), true, &exclude),
+            graph.unresolved_log_request_hashes(Some(&watched()), &exclude),
             vec![graph_hash(3)]
         );
         assert_graph_invariants(&graph);
@@ -2097,17 +2001,15 @@ mod tests {
         // non-Complete is fetched, bloom-clear included.
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, clear_bloom())
-            .unwrap()
-            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, clear_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_observed_head(graph_hash(3));
         assert_eq!(
-            graph.unresolved_log_request_hashes(&watched(), true, &HashSet::new()),
+            graph.unresolved_log_request_hashes(Some(&watched()), &HashSet::new()),
             vec![graph_hash(3)]
         );
         assert_eq!(
-            graph.unresolved_log_request_hashes(&watched(), false, &HashSet::new()),
+            graph.unresolved_log_request_hashes(None, &HashSet::new()),
             vec![graph_hash(3), graph_hash(2)]
         );
         assert_graph_invariants(&graph);
@@ -2119,12 +2021,9 @@ mod tests {
         let pool_b = v3_pool(0xB2);
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
-            .unwrap()
-            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
             .with_complete_logs(graph_hash(2), vec![pool_log(pool_a, sw(0))])
             .with_streamed_logs(graph_hash(3), vec![pool_log(pool_b, sw(1))])
             .with_observed_head(graph_hash(4));
@@ -2144,8 +2043,7 @@ mod tests {
         // A Complete block with no pool logs names no candidates — no empty entries downstream.
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, hit_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
             .with_complete_logs(graph_hash(2), Vec::new())
             .with_observed_head(graph_hash(2));
         assert!(graph.pool_log_candidates_from_head().is_empty());
@@ -2156,12 +2054,9 @@ mod tests {
     fn distance_from_head_counts_blocks_above_reference() {
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, clear_bloom())
-            .unwrap()
-            .with_block(graph_hash(3), graph_hash(2), 3, clear_bloom())
-            .unwrap()
-            .with_block(graph_hash(4), graph_hash(3), 4, clear_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, clear_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, clear_bloom()).0
+            .with_block(graph_hash(4), graph_hash(3), 4, clear_bloom()).0
             .with_observed_head(graph_hash(4));
         assert_eq!(graph.distance_from_head(graph_hash(4)), Some(0));
         assert_eq!(graph.distance_from_head(graph_hash(2)), Some(2));
@@ -2174,10 +2069,8 @@ mod tests {
         // A fork sibling is not on the head's parent chain.
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, clear_bloom())
-            .unwrap()
-            .with_block(graph_hash(3), anchor, 2, clear_bloom())
-            .unwrap()
+            .with_block(graph_hash(2), anchor, 2, clear_bloom()).0
+            .with_block(graph_hash(3), anchor, 2, clear_bloom()).0
             .with_observed_head(graph_hash(2));
         assert_eq!(graph.distance_from_head(graph_hash(3)), None);
 
@@ -2185,8 +2078,7 @@ mod tests {
         // through pending nodes and stops AT the reference, so the absent gap root itself is
         // reachable as a reference (mirrors the legacy flat parent-pointer walk exactly).
         let gapped = BlocksGraph::new(anchor)
-            .with_block(graph_hash(5), graph_hash(4), 5, clear_bloom())
-            .unwrap()
+            .with_block(graph_hash(5), graph_hash(4), 5, clear_bloom()).0
             .with_observed_head(graph_hash(5));
         assert_eq!(gapped.distance_from_head(anchor), None);
         assert_eq!(gapped.distance_from_head(graph_hash(5)), Some(0));
@@ -2533,8 +2425,7 @@ mod tests {
     /// A graph with a single connected block (`graph_hash(1)`) off the anchor, logs `Unknown`.
     fn one_block_graph() -> BlocksGraph {
         BlocksGraph::new(graph_hash(0))
-            .with_block(graph_hash(1), graph_hash(0), 1, hit_bloom())
-            .expect("admission succeeds")
+            .with_block(graph_hash(1), graph_hash(0), 1, hit_bloom()).0
     }
 
     #[test]
@@ -2594,8 +2485,7 @@ mod tests {
         // Parent `graph_hash(1)` is absent, so `graph_hash(2)` lands pending; logs still attach
         // (`BlockData` is shared across the connectivity split).
         let graph = BlocksGraph::new(graph_hash(0))
-            .with_block(graph_hash(2), graph_hash(1), 2, hit_bloom())
-            .expect("admission succeeds")
+            .with_block(graph_hash(2), graph_hash(1), 2, hit_bloom()).0
             .with_streamed_logs(graph_hash(2), logs_at(&[4]));
         assert!(matches!(graph.nodes.get(&graph_hash(2)), Some(Node::Pending(_))));
         assert_eq!(block_logs(&graph, graph_hash(2)), Some((false, vec![4])));
@@ -2823,13 +2713,13 @@ mod tests {
 
         // Streamed: the block is a hole under RequireComplete, so the anchor stays put and nothing seeds.
         let (graph, target) = fold_chain(vec![(2, streamed(vec![pool_log(new_pool, swap.clone())]))]);
-        let (graph, snapshot) = graph.finalized_to(target.0, &base, &verified, Address::ZERO);
+        let (graph, snapshot) = graph.finalized_to(target.0, &base, &verified, None);
         assert_eq!(graph.anchor, graph_hash(1));
         assert!(snapshot.is_empty());
 
         // Complete: the same block now folds — the anchor advances and the new pool is absolute-seeded.
         let (graph, target) = fold_chain(vec![(2, complete(vec![pool_log(new_pool, swap)]))]);
-        let (graph, snapshot) = graph.finalized_to(target.0, &base, &verified, Address::ZERO);
+        let (graph, snapshot) = graph.finalized_to(target.0, &base, &verified, None);
         assert_eq!(graph.anchor, graph_hash(2));
         assert_eq!(snapshot.get(&new_pool), Some(&ps(777, 9, 42)));
     }
@@ -2863,7 +2753,7 @@ mod tests {
             }),
         );
 
-        let (graph, snapshot) = graph.finalized_to(fork, &base, &verified_of(&base), Address::ZERO);
+        let (graph, snapshot) = graph.finalized_to(fork, &base, &verified_of(&base), None);
 
         assert_eq!(graph.anchor, graph_hash(1));
         assert_eq!(graph.observed_head, graph_hash(2));
@@ -2894,7 +2784,7 @@ mod tests {
         ]);
 
         let (graph, snapshot) =
-            graph.finalized_to(graph_hash(2), &base, &verified_of(&base), Address::ZERO);
+            graph.finalized_to(graph_hash(2), &base, &verified_of(&base), None);
 
         assert_eq!(graph.anchor, graph_hash(2));
         assert_eq!(graph.observed_head, graph_hash(3));
@@ -3043,7 +2933,7 @@ mod tests {
             (Some(hit_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph_hash(3));
         assert_graph_invariants(&graph);
@@ -3060,7 +2950,7 @@ mod tests {
             (Some(clear_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph_hash(4));
         assert_graph_invariants(&graph);
@@ -3076,7 +2966,7 @@ mod tests {
             Some(hit_bloom()),
             streamed(vec![pool_log(pool, swap_to(150, 3, 15))]),
         )]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(150, 3, 15))]));
         assert_eq!(frontier, graph_hash(2));
         assert_graph_invariants(&graph);
@@ -3093,7 +2983,7 @@ mod tests {
             (None, BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(100, 1, 10))]));
         assert_eq!(frontier, graph_hash(2));
         assert_graph_invariants(&graph);
@@ -3108,7 +2998,7 @@ mod tests {
             (Some(hit_bloom()), complete_swap(100, 1, 10)),
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph.observed_head);
         assert_eq!(frontier, graph_hash(3));
@@ -3121,7 +3011,7 @@ mod tests {
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let graph = BlocksGraph::new(graph_hash(0));
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert!(overlay.is_empty());
         assert_eq!(frontier, graph_hash(0));
     }
@@ -3133,11 +3023,10 @@ mod tests {
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let graph = BlocksGraph::new(graph_hash(0))
-            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom())
-            .expect("admission succeeds")
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_observed_head(graph_hash(3));
         assert!(matches!(graph.nodes.get(&graph_hash(3)), Some(Node::Pending(_))));
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert!(overlay.is_empty());
         assert_eq!(frontier, graph_hash(0));
         assert_graph_invariants(&graph);
@@ -3166,12 +3055,10 @@ mod tests {
     fn reanchor_to_anchor_is_noop() {
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
-            .with_block(graph_hash(2), anchor, 2, Bloom::repeat_byte(0))
-            .unwrap();
+            .with_block(graph_hash(2), anchor, 2, Bloom::repeat_byte(0)).0;
         let base = HashMap::from([(v3_pool(0xA1), ps(1, 1, 1))]);
-        let (graph, snapshot) = graph
-            .reanchored_to(ConnectedHash(anchor), &base, &verified_of(&base), Address::ZERO)
-            .expect("reanchor to the current anchor is a no-op");
+        // Reanchor to the current anchor is a base-clone no-op.
+        let (graph, snapshot) = graph.reanchored_to(ConnectedHash(anchor), &base, &verified_of(&base));
         assert_eq!(graph.anchor, anchor);
         assert!(graph.connected(graph_hash(2)).is_some());
         assert_eq!(snapshot, base);
@@ -3179,21 +3066,24 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_incomplete_path_returns_ranges_and_unchanged_graph() {
-        // A non-Complete block whose bloom hits a tracked pool blocks the advance; the graph and the
-        // caller's snapshot (borrowed) are untouched, and the range to backfill is reported.
+    fn finalization_refuses_unknown_bloom_hit_block() {
+        // A4: an Unknown-logs block whose bloom hits a tracked pool is a hole — finalization must
+        // not advance over it; the graph and the caller's snapshot (borrowed) are untouched, and the
+        // hole is exactly what `missing_complete_ranges` reports for the WS-primary backfill.
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let (graph, target) = fold_chain(vec![(7, BlockLogs::Unknown)]);
-        match graph.reanchored_to(target, &base, &verified_of(&base), Address::ZERO) {
-            Err(ReanchorError::Incomplete(graph, ranges)) => {
-                assert_eq!(ranges, vec![BlockRange { from: 7, to: 7 }]);
-                assert_eq!(graph.anchor, graph_hash(1));
-                assert!(graph.connected(graph_hash(2)).is_some());
-                assert_graph_invariants(&graph);
-            }
-            other => panic!("expected Incomplete, got {other:?}"),
-        }
+        let target_hash = target.0;
+        let watched = watched_addresses(&verified_of(&base), None);
+        assert_eq!(
+            graph.missing_complete_ranges(target, &watched),
+            vec![BlockRange { from: 7, to: 7 }]
+        );
+        let (graph, snapshot) = graph.finalized_to(target_hash, &base, &verified_of(&base), None);
+        assert_eq!(graph.anchor, graph_hash(1));
+        assert!(graph.connected(graph_hash(2)).is_some());
+        assert_eq!(snapshot, base);
+        assert_graph_invariants(&graph);
     }
 
     #[test]
@@ -3206,9 +3096,7 @@ mod tests {
             (4, complete(vec![])),
         ]);
         let (b2, b3, b4) = (graph_hash(2), graph_hash(3), graph_hash(4));
-        let (graph, snapshot) = graph
-            .reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new(), Address::ZERO)
-            .expect("a fully-Complete path folds");
+        let (graph, snapshot) = graph.reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new());
         assert!(snapshot.is_empty());
         assert_eq!(graph.anchor, b2);
         assert!(graph.nodes.get(&b2).is_none());
@@ -3244,9 +3132,7 @@ mod tests {
             nodes,
             observed_head: b4,
         };
-        let (graph, _) = graph
-            .reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new(), Address::ZERO)
-            .expect("clear path folds");
+        let (graph, _) = graph.reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new());
         assert_eq!(graph.anchor, b2);
         assert!(graph.nodes.get(&b3).is_none());
         assert!(graph.nodes.get(&b2).is_none());
@@ -3274,9 +3160,7 @@ mod tests {
             nodes,
             observed_head: b3,
         };
-        let (graph, _) = graph
-            .reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new(), Address::ZERO)
-            .expect("clear path folds");
+        let (graph, _) = graph.reanchored_to(ConnectedHash(b2), &HashMap::new(), &HashSet::new());
         assert_eq!(graph.observed_head, b2);
         assert_graph_invariants(&graph);
     }
@@ -3287,9 +3171,7 @@ mod tests {
         // the canonical chain is empty.
         let (graph, target) = fold_chain(vec![(2, complete(vec![])), (3, complete(vec![]))]);
         let b3 = graph_hash(3);
-        let (graph, _) = graph
-            .reanchored_to(target, &HashMap::new(), &HashSet::new(), Address::ZERO)
-            .expect("clear path folds");
+        let (graph, _) = graph.reanchored_to(target, &HashMap::new(), &HashSet::new());
         assert_eq!(graph.anchor, b3);
         assert!(graph.nodes.is_empty());
         assert_eq!(graph.observed_head, b3);
@@ -3313,9 +3195,7 @@ mod tests {
                 },
             )]),
         )]);
-        let (graph, snapshot) = graph
-            .reanchored_to(target, &base, &verified_of(&base), Address::ZERO)
-            .expect("a Complete block folds");
+        let (graph, snapshot) = graph.reanchored_to(target, &base, &verified_of(&base));
         assert_eq!(snapshot, HashMap::from([(pool, ps(777, 9, 42))]));
         assert_eq!(graph.anchor, graph_hash(2));
         assert!(graph.nodes.is_empty());
@@ -3353,9 +3233,8 @@ mod tests {
                 }
             }
 
-            let (regraphed, snapshot) = graph
-                .reanchored_to(ConnectedHash(new_anchor_hash), &HashMap::new(), &HashSet::new(), Address::ZERO)
-                .unwrap_or_else(|_| panic!("a clear-bloom graph with no tracked pools must fold"));
+            let (regraphed, snapshot) =
+                graph.reanchored_to(ConnectedHash(new_anchor_hash), &HashMap::new(), &HashSet::new());
             prop_assert!(snapshot.is_empty());
             prop_assert_eq!(regraphed.anchor, new_anchor_hash);
             assert_graph_invariants(&regraphed);
@@ -3451,7 +3330,7 @@ mod tests {
             .admitted(graph_hash(5), graph_hash(4), 5, clear_bloom())
             .with_observed_head(graph_hash(5));
         let (overlay, frontier) =
-            graph.optimization_pool_states(&base, &verified_of(&base), Address::ZERO);
+            graph.optimization_pool_states(&base, &verified_of(&base), None);
         assert_eq!(frontier, graph_hash(5));
         assert_eq!(overlay.get(&pool), Some(&ps(500, 5, 5_100)));
         assert_graph_invariants(&graph);
@@ -3468,7 +3347,7 @@ mod tests {
         let base = HashMap::from([(pool, ps(10, 0, 1_000))]);
         let (graph, snapshot) = seeded_graph()
             .with_observed_head(graph_hash(4))
-            .finalized_to(graph_hash(4), &base, &verified_of(&base), Address::ZERO);
+            .finalized_to(graph_hash(4), &base, &verified_of(&base), None);
         assert_eq!(graph.anchor, graph_hash(4));
         assert_eq!(snapshot.get(&pool), Some(&ps(500, 5, 5_100)));
         assert_graph_invariants(&graph);
@@ -3482,11 +3361,11 @@ mod tests {
         let base: HashMap<PoolRef, PoolState> = HashMap::new();
         let graph = seeded_graph().with_observed_head(graph_hash(4));
 
-        let (before, _) = graph.optimization_pool_states(&base, &HashSet::new(), Address::ZERO);
+        let (before, _) = graph.optimization_pool_states(&base, &HashSet::new(), None);
         assert!(before.is_empty(), "unverified pool must stay invisible");
 
         let (after, frontier) =
-            graph.optimization_pool_states(&base, &HashSet::from([pool]), Address::ZERO);
+            graph.optimization_pool_states(&base, &HashSet::from([pool]), None);
         assert_eq!(frontier, graph_hash(4));
         assert_eq!(after.get(&pool), Some(&ps(500, 5, 5_100)));
         assert_graph_invariants(&graph);

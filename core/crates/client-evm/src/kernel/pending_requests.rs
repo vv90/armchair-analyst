@@ -67,13 +67,6 @@ pub enum AnyIssuedRequest {
     TokenMetadata(IssuedRequest<GetTokenMetadata>),
 }
 
-// pub enum AnyPendingPayload {
-//     BlockHeader(PendingPayload<GetBlockHeader>),
-//     BlockLogs(PendingPayload<GetBlockLogs>),
-//     PoolMetadata(PendingPayload<GetPoolMetadata>),
-//     TokenMetadata(PendingPayload<GetTokenMetadata>),
-// }
-
 pub struct PendingRequests {
     request_ids: RequestIdSequence,
     block_logs: RequestCollection<GetBlockLogs>,
