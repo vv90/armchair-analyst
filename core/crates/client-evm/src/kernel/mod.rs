@@ -38,8 +38,9 @@ pub struct State {
 
 /// The log-sourced [`blocks_graph::BlocksGraph`] and its advancing finalized base snapshot. The
 /// graph's anchor is the finalized hash's sole home (invariant A1); the base holds the folded
-/// finalized pool states (fold-resident pools only — a verified pool with no absolute-log seed yet
-/// is absent, never stale: Blockers 1b/1c, deferred coverage follow-up).
+/// finalized pool states. A verified pool absent from the base is absent, never stale (Blockers
+/// 1b/1c); coverage grows via anchor-height seeding
+/// ([`schedule_finalized_pool_seed_requests`]) plus the fold's own absolute-log self-seeding.
 #[derive(Debug)]
 struct Blocks {
     graph: blocks_graph::BlocksGraph,
@@ -56,11 +57,40 @@ impl Blocks {
             finalized_snapshot,
         }
     }
+
+    /// Merges anchor-height pool-state reads into the finalized base, seeding pools that had no
+    /// foldable absolute state yet (Blockers 1b/1c). The base only ever holds states *at the anchor*,
+    /// so this is the one path — besides `finalized_to`'s fold — that mutates the snapshot.
+    ///
+    /// Stale-`at` guard (the correctness backstop; `retaining_block_targets` is the best-effort early
+    /// prune): a response whose target is no longer the anchor — finalization advanced while it was in
+    /// flight — is dropped wholesale rather than written at the wrong height. Failed per-pool reads are
+    /// skipped: the pool stays uncovered and is re-requested on a later idle scheduling round.
+    fn with_finalized_pool_seeds(
+        mut self,
+        at: BlockHash,
+        results: HashMap<PoolRef, PoolDataResult>,
+    ) -> Blocks {
+        if at != self.graph.anchor_hash() {
+            return self;
+        }
+        for (pool, result) in results {
+            if let Ok(pool_state) = result {
+                self.finalized_snapshot.insert(pool, pool_state);
+            }
+        }
+        self
+    }
 }
 
 /// Caps how many not-yet-known blocks can hold buffered subscription logs at once, bounding the
 /// staging map when observed logs for a block arrive but its head never does (e.g. a reorg).
 const MAX_STREAMED_LOG_BLOCKS: usize = 1024;
+
+/// Caps how many uncovered pools one finalized-pool-seed request names, so a chain starting with a
+/// large verified set (empty snapshot at bootstrap) drains over successive idle scheduling rounds
+/// instead of one oversized multicall. The single tuning knob for anchor-height seed throughput.
+const FINALIZED_POOL_SEED_CHUNK: usize = 100;
 
 impl State {
     /// Creates kernel state anchored at a finalized hash with no pending requests, recent blocks,
@@ -135,8 +165,9 @@ impl State {
     }
 
     /// Exposes the graph's finalized base to pure read models — the merge target for the
-    /// optimization overlay ([`Self::optimization_update`]). Holds fold-resident pools only:
-    /// a verified pool with no absolute-log seed yet is absent (Blocker 1b/1c — absent, never stale).
+    /// optimization overlay ([`Self::optimization_update`]). A verified pool not yet seeded (by the
+    /// anchor-height seed path or the fold's absolute-log self-seed) is absent, never stale
+    /// (Blocker 1b/1c).
     pub(crate) fn finalized_pool_snapshots(&self) -> &HashMap<PoolRef, PoolState> {
         &self.blocks.finalized_snapshot
     }
@@ -315,6 +346,17 @@ impl State {
         self.map_graph(move |graph| graph.with_complete_logs(block_hash, logs))
     }
 
+    /// `PoolDataReceived` feed: merge anchor-height pool reads into the finalized base
+    /// ([`Blocks::with_finalized_pool_seeds`], which owns the stale-`at` guard).
+    fn with_finalized_pool_seeds(
+        mut self,
+        at: BlockHash,
+        results: HashMap<PoolRef, PoolDataResult>,
+    ) -> State {
+        self.blocks = self.blocks.with_finalized_pool_seeds(at, results);
+        self
+    }
+
 
     /// Advances the finalized anchor from an observed finality signal, self-gated by the blocks
     /// graph: `finalized_to` no-ops on an absent/pending/unconnected/off-canonical target and
@@ -423,6 +465,11 @@ pub enum Event {
     TokenMetadataReceived {
         request_id: RequestId<GetTokenMetadata>,
         metadata: HashMap<TokenAddress, TokenMetadataResult>,
+    },
+    /// Anchor-height absolute pool reads seeding the finalized snapshot (Blockers 1b/1c coverage).
+    PoolDataReceived {
+        request_id: RequestId<GetPoolData>,
+        pools: HashMap<PoolRef, PoolDataResult>,
     },
     RequestFailed {
         request_id: AnyRequestId,
@@ -579,10 +626,60 @@ fn schedule_unknown_canonical_token_metadata_requests(
     (state, effects)
 }
 
-// `GetPoolData` scheduling was deleted at Increment 4: the log-sourced graph stores no per-block pool
-// snapshots (invariant L6), so tip-targeted pool-state reads have no sink. The deferred 1b/1c
-// coverage follow-up re-introduces an anchor-height variant whose results land in the graph's
-// `finalized_snapshot` — a different request shape, added fresh when that work starts.
+/// Emits an anchor-height pool-data seed request for verified pools still absent from the finalized
+/// snapshot. Fills the coverage hole (Blockers 1b/1c) where such a pool only materializes once its
+/// canonical path carries an absolute Swap/Initialize (`derive_pool_state(None, run)`); a Mint/Burn-
+/// only pool — and every pool at bootstrap, which starts with an empty snapshot — otherwise stays
+/// invisible. The read targets the finalized anchor so the result seeds the fold base directly; a
+/// tip-targeted read would have no sink (the graph stores no per-block snapshots, invariant L6).
+///
+/// Coverage/liveness only — per-block `eth_getLogs` stays the completeness authority. Idle-gated
+/// behind block-graph backfill (header/log fetches are latency-critical, seeding is not) and chunked,
+/// so a large uncovered set drains over successive scheduling rounds without starving the critical
+/// path or issuing an oversized multicall.
+fn schedule_finalized_pool_seed_requests(
+    chain: ChainKey,
+    mut state: State,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    if state.pending_requests.has_pending_block_backfill() {
+        return (state, effects);
+    }
+
+    // Verified pools with no finalized base yet, minus those an in-flight seed already covers.
+    let pending = state.pending_requests.pending_pool_data_pools();
+    let mut candidates = state
+        .pool_registry
+        .verified_pools(chain)
+        .into_iter()
+        .filter(|pool| {
+            !state.blocks.finalized_snapshot.contains_key(pool) && !pending.contains(pool)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return (state, effects);
+    }
+    // Sort before truncating so the chunk boundary is stable across rounds (a partially-drained set
+    // makes deterministic forward progress rather than re-rolling a random subset each time).
+    candidates.sort_unstable();
+    candidates.truncate(FINALIZED_POOL_SEED_CHUNK);
+
+    let request_payload = GetPoolData {
+        at: state.blocks.graph.anchor_hash(),
+        pools: candidates.into_iter().collect(),
+    };
+    let (pending_requests, request_id) = state
+        .pending_requests
+        .with_new_request(request_payload.clone(), state.tick);
+
+    state.pending_requests = pending_requests;
+    effects.push(Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+        request_id,
+        request_payload,
+    })));
+
+    (state, effects)
+}
 
 /// Issues header requests for every dangling pending-ancestor gap root in the blocks graph
 /// ([`blocks_graph::BlocksGraph::missing_parents`]). Scheduler-derived (Increment 4) rather than
@@ -619,7 +716,15 @@ fn schedule_unknown_canonical_requests(
         state,
         effects,
     );
-    schedule_unknown_canonical_token_metadata_requests(chain, &candidates_from_head, state, effects)
+    let (state, effects) = schedule_unknown_canonical_token_metadata_requests(
+        chain,
+        &candidates_from_head,
+        state,
+        effects,
+    );
+    // Lowest priority: anchor-height coverage seeding, self-gated to run only when the block graph
+    // is not mid-backfill.
+    schedule_finalized_pool_seed_requests(chain, state, effects)
 }
 
 /// Issues a block-header request for a missing ancestor, unless one for that hash is already in flight.
@@ -850,6 +955,30 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                         },
                         vec![],
                     )
+                }
+                None => (
+                    State {
+                        pending_requests,
+                        ..state
+                    },
+                    vec![],
+                ),
+            }
+        }
+        Event::PoolDataReceived { request_id, pools } => {
+            let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
+            match request_payload {
+                Some(PendingPayload {
+                    payload: GetPoolData { at, .. },
+                    ..
+                }) => {
+                    let state = State {
+                        pending_requests,
+                        ..state
+                    }
+                    .with_finalized_pool_seeds(at, pools);
+
+                    schedule_unknown_canonical_requests(chain, state, vec![])
                 }
                 None => (
                     State {
@@ -1208,6 +1337,18 @@ mod tests {
                     assert_eq!(pending_request.payload.at, request_payload.at);
                     assert_eq!(pending_request.payload.tokens, request_payload.tokens);
                 }
+                Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+                    request_id,
+                    request_payload,
+                })) => {
+                    let pending_request = state
+                        .pending_requests
+                        .get(request_id)
+                        .expect("emitted pool data request must be recorded as pending");
+
+                    assert_eq!(pending_request.payload.at, request_payload.at);
+                    assert_eq!(pending_request.payload.pools, request_payload.pools);
+                }
             }
         }
     }
@@ -1374,6 +1515,7 @@ mod tests {
             AnyRequestId::BlockLogs(request_id) => request_id.raw_for_test(),
             AnyRequestId::PoolMetadata(request_id) => request_id.raw_for_test(),
             AnyRequestId::TokenMetadata(request_id) => request_id.raw_for_test(),
+            AnyRequestId::PoolData(request_id) => request_id.raw_for_test(),
         }
     }
 
@@ -1465,6 +1607,7 @@ mod tests {
                 }
                 Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
+                Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
             }
         }
 
@@ -1550,6 +1693,7 @@ mod tests {
                 }
                 Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
+                Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
             }
         }
 
@@ -6690,6 +6834,7 @@ mod tests {
                     }
                     Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
                     Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
+                    Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                 }
             }
 
@@ -7074,4 +7219,258 @@ mod tests {
         }
     }
 
+    // --- anchor-height pool-data seeding (Blockers 1b/1c coverage) ---
+
+    /// Extracts the single expected pool-data seed request, returning its id, target anchor, and
+    /// named pools. Keeps the seeding tests strict about there being exactly one chunked request.
+    fn single_pool_data_request_effect(
+        effects: &[Effect],
+    ) -> (RequestId<GetPoolData>, BlockHash, HashSet<PoolRef>) {
+        let requests = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+                    request_id,
+                    request_payload: GetPoolData { at, pools },
+                })) => Some((*request_id, *at, pools.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(requests.len(), 1, "expected exactly one pool-data request effect");
+        requests.into_iter().next().expect("one pool-data request")
+    }
+
+    fn verified_registry(candidates: &[ProtocolPoolKey]) -> TrustedPoolRegistry {
+        let results = candidates
+            .iter()
+            .map(|candidate| (*candidate, Ok(pool_metadata(6, 7, UniswapV3Fee::Fee3000))))
+            .collect::<HashMap<_, _>>();
+        TrustedPoolRegistry::new().with_metadata_results(ChainKey::Ethereum, results)
+    }
+
+    #[test]
+    fn finalized_pool_seed_requests_target_verified_uncovered_pools_at_the_anchor() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry =
+            verified_registry(&[pool_candidate_address(4), pool_candidate_address(5)]);
+
+        let (_state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+
+        let (_id, at, pools) = single_pool_data_request_effect(&effects);
+        assert_eq!(at, finalized_hash);
+        assert_eq!(pools, HashSet::from([pool_address(4), pool_address(5)]));
+    }
+
+    #[test]
+    fn finalized_pool_seed_requests_skip_pools_already_in_the_snapshot() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry =
+            verified_registry(&[pool_candidate_address(4), pool_candidate_address(5)]);
+        state.blocks.finalized_snapshot = HashMap::from([(pool_address(4), pool_state(9))]);
+
+        let (_state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+
+        let (_id, _at, pools) = single_pool_data_request_effect(&effects);
+        assert_eq!(pools, HashSet::from([pool_address(5)]));
+    }
+
+    #[test]
+    fn finalized_pool_seed_requests_skip_pools_already_in_flight() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry =
+            verified_registry(&[pool_candidate_address(4), pool_candidate_address(5)]);
+        // pool 4 already covered by an in-flight seed request.
+        let (pending, _) = state.pending_requests.with_new_request(
+            GetPoolData {
+                at: finalized_hash,
+                pools: HashSet::from([pool_address(4)]),
+            },
+            tick(0),
+        );
+        state.pending_requests = pending;
+
+        let (_state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+
+        let (_id, _at, pools) = single_pool_data_request_effect(&effects);
+        assert_eq!(pools, HashSet::from([pool_address(5)]));
+    }
+
+    #[test]
+    fn finalized_pool_seed_requests_are_capped_at_the_chunk_size() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let candidates = (0u8..(FINALIZED_POOL_SEED_CHUNK as u8 + 30))
+            .map(pool_candidate_address)
+            .collect::<Vec<_>>();
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry = verified_registry(&candidates);
+
+        let (_state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+
+        let (_id, at, pools) = single_pool_data_request_effect(&effects);
+        assert_eq!(at, finalized_hash);
+        assert_eq!(pools.len(), FINALIZED_POOL_SEED_CHUNK);
+    }
+
+    #[test]
+    fn finalized_pool_seed_requests_are_deferred_while_block_backfill_is_pending() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry = verified_registry(&[pool_candidate_address(4)]);
+        // A header backfill in flight closes the idle gate.
+        let (pending, _) = state.pending_requests.with_new_request(
+            GetBlockHeader {
+                block_hash: BlockHash::with_last_byte(9),
+            },
+            tick(0),
+        );
+        state.pending_requests = pending;
+
+        let (_state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+
+        assert!(
+            effects.is_empty(),
+            "seeding must defer to latency-critical block backfill"
+        );
+    }
+
+    #[test]
+    fn finalized_pool_seed_requests_are_empty_when_every_verified_pool_is_covered() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry = verified_registry(&[pool_candidate_address(4)]);
+        state.blocks.finalized_snapshot = HashMap::from([(pool_address(4), pool_state(9))]);
+
+        let (_state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn pool_data_received_seeds_the_finalized_snapshot() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let seeded = pool_state(9);
+        let mut state = empty_state_at(finalized_hash);
+        state.pool_registry = verified_registry(&[pool_candidate_address(4)]);
+
+        let (state, effects) =
+            schedule_finalized_pool_seed_requests(ChainKey::Ethereum, state, vec![]);
+        let (request_id, _at, _pools) = single_pool_data_request_effect(&effects);
+
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::PoolDataReceived {
+                request_id,
+                pools: HashMap::from([(pool_address(4), Ok(seeded.clone()))]),
+            },
+        );
+
+        assert_eq!(
+            state.finalized_pool_snapshots(),
+            &HashMap::from([(pool_address(4), seeded)])
+        );
+    }
+
+    #[test]
+    fn with_finalized_pool_seeds_merges_ok_results_at_the_anchor() {
+        let anchor = BlockHash::with_last_byte(1);
+        let seeded = pool_state(9);
+
+        let blocks = Blocks::new(anchor, HashMap::new()).with_finalized_pool_seeds(
+            anchor,
+            HashMap::from([(pool_address(4), Ok(seeded.clone()))]),
+        );
+
+        assert_eq!(
+            blocks.finalized_snapshot,
+            HashMap::from([(pool_address(4), seeded)])
+        );
+    }
+
+    #[test]
+    fn with_finalized_pool_seeds_skips_failed_reads() {
+        let anchor = BlockHash::with_last_byte(1);
+
+        let blocks = Blocks::new(anchor, HashMap::new()).with_finalized_pool_seeds(
+            anchor,
+            HashMap::from([(
+                pool_address(4),
+                Err(PoolDataFailure::CallFailed(PoolDataCall::Slot0)),
+            )]),
+        );
+
+        assert!(blocks.finalized_snapshot.is_empty());
+    }
+
+    #[test]
+    fn with_finalized_pool_seeds_drops_a_stale_at_response() {
+        let anchor = BlockHash::with_last_byte(1);
+        let stale = BlockHash::with_last_byte(2);
+
+        let blocks = Blocks::new(anchor, HashMap::new()).with_finalized_pool_seeds(
+            stale,
+            HashMap::from([(pool_address(4), Ok(pool_state(9)))]),
+        );
+
+        assert!(
+            blocks.finalized_snapshot.is_empty(),
+            "a response for a superseded anchor must not be written"
+        );
+    }
+
+    proptest! {
+        /// The finalized base only ever gains states at the current anchor: an on-anchor response
+        /// merges exactly its `Ok` reads over the base (failures skipped); an off-anchor response is
+        /// dropped wholesale, whatever it carries.
+        #[test]
+        fn with_finalized_pool_seeds_only_writes_ok_reads_at_the_anchor(
+            anchor_byte in 0u8..8,
+            at_byte in 0u8..8,
+            base_pools in prop::collection::vec((0u8..32, 0u8..32), 0..6),
+            seed_pools in prop::collection::vec((0u8..32, any::<bool>(), 0u8..32), 0..6),
+        ) {
+            let anchor = BlockHash::with_last_byte(anchor_byte);
+            let at = BlockHash::with_last_byte(at_byte);
+            let base = base_pools
+                .into_iter()
+                .map(|(pool, state)| (pool_address(pool), pool_state(state)))
+                .collect::<HashMap<_, _>>();
+            let results = seed_pools
+                .into_iter()
+                .map(|(pool, ok, state)| {
+                    let result = if ok {
+                        Ok(pool_state(state))
+                    } else {
+                        Err(PoolDataFailure::CallFailed(PoolDataCall::Slot0))
+                    };
+                    (pool_address(pool), result)
+                })
+                .collect::<HashMap<_, _>>();
+
+            let blocks = Blocks::new(anchor, base.clone())
+                .with_finalized_pool_seeds(at, results.clone());
+
+            if at == anchor {
+                let mut expected = base;
+                for (pool, result) in &results {
+                    if let Ok(state) = result {
+                        expected.insert(*pool, state.clone());
+                    }
+                }
+                prop_assert_eq!(blocks.finalized_snapshot, expected);
+            } else {
+                prop_assert_eq!(blocks.finalized_snapshot, base);
+            }
+        }
+    }
 }

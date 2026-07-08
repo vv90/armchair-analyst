@@ -8,11 +8,12 @@ use client_evm::{
     ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
     OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
     POLYGON_USDC_TOKEN_ADDRESS,
-    GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog, PoolMetadata,
-    PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
+    GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
+    PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RequestId, TokenAddress,
+    TokenMetadataResult, WsSubscriptionEndpoint,
     bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_metadata,
-    fetch_token_metadata, fetch_v4_pool_metadata, kernel,
+    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
+    fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata, kernel,
     multi_chain_kernel::{
         ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, State,
         Subscription, SubscriptionData, transition,
@@ -627,6 +628,11 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             format_typed_request_id_log(request_id),
             metadata.len(),
         ),
+        kernel::Event::PoolDataReceived { request_id, pools } => format!(
+            "input chain={chain:?} pool_data_received request={} pools={}",
+            format_typed_request_id_log(request_id),
+            pools.len(),
+        ),
         kernel::Event::RequestFailed { request_id } => format!(
             "input chain={chain:?} request_failed request={}",
             format_request_id_log(request_id),
@@ -776,6 +782,9 @@ impl ClientEvmRuntime {
             |block_hash| fetch_block_logs(&self.agent, self.endpoints(), chain, block_hash),
             |at, candidates| self.cached_pool_metadata(chain, at, candidates),
             |at, tokens| self.cached_token_metadata(chain, at, tokens),
+            // Pool data is anchor-specific and the anchor moves, so — unlike immutable metadata —
+            // it is read live with no cache wrapper.
+            |at, pools| fetch_pool_data(&self.agent, self.endpoints(), chain, at, pools),
         )
     }
 }
@@ -971,6 +980,7 @@ fn execute_chain_effect_with<
     FetchBlockLogs,
     FetchPoolMetadata,
     FetchTokenMetadata,
+    FetchPoolData,
 >(
     chain: ChainKey,
     effect: kernel::Effect,
@@ -979,6 +989,7 @@ fn execute_chain_effect_with<
     fetch_block_logs: FetchBlockLogs,
     fetch_pool_metadata: FetchPoolMetadata,
     fetch_token_metadata: FetchTokenMetadata,
+    fetch_pool_data: FetchPoolData,
 ) -> Vec<Event>
 where
     FetchBlockHeader: FnOnce(BlockHash) -> Result<Option<ClientHead>, ClientEvmError>,
@@ -994,6 +1005,11 @@ where
             BlockHash,
             HashSet<TokenAddress>,
         ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError>,
+    FetchPoolData:
+        FnOnce(
+            BlockHash,
+            HashSet<PoolRef>,
+        ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
 {
     match effect {
         kernel::Effect::Request(request) => match request {
@@ -1099,6 +1115,28 @@ where
                     }
                 }
             }
+            AnyIssuedRequest::PoolData(request) => {
+                let request_id = request.request_id;
+                let at = request.request_payload.at;
+                let pools = request.request_payload.pools;
+
+                match fetch_pool_data(at, pools) {
+                    Ok(pools) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::PoolDataReceived { request_id, pools },
+                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::PoolData(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
+                }
+            }
         },
     }
 }
@@ -1106,7 +1144,7 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolMetadata,
+        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
         GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
         PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
         TokenMetadataResult, UniswapV3Fee,
@@ -1853,6 +1891,7 @@ mod tests {
             unexpected_block_logs_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -1892,6 +1931,7 @@ mod tests {
             unexpected_block_logs_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -1923,6 +1963,7 @@ mod tests {
             unexpected_block_logs_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -1954,6 +1995,7 @@ mod tests {
             },
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -1991,6 +2033,7 @@ mod tests {
             },
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -2025,6 +2068,7 @@ mod tests {
                 Ok(HashMap::new())
             },
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -2064,6 +2108,7 @@ mod tests {
                 })
             },
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -2098,6 +2143,7 @@ mod tests {
                 assert_eq!(requested_tokens, HashSet::from([token]));
                 Ok(HashMap::new())
             },
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -2137,6 +2183,7 @@ mod tests {
                     reason: "bad config".to_owned(),
                 })
             },
+            unexpected_pool_data_fetch,
         );
 
         assert!(matches!(
@@ -2222,6 +2269,94 @@ mod tests {
         )
     }
 
+    fn pool_data_request_effect(
+        at: BlockHash,
+        pools: HashSet<PoolRef>,
+    ) -> (kernel::Effect, RequestId<GetPoolData>) {
+        let request_id = RequestId::from_raw_for_test(11);
+        (
+            kernel::Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+                request_id,
+                request_payload: GetPoolData { at, pools },
+            })),
+            request_id,
+        )
+    }
+
+    #[test]
+    fn pool_data_request_success_maps_to_chain_event() {
+        let chain = ChainKey::Ethereum;
+        let at = hash(2);
+        let pool = pool_address(3);
+        let (effect, expected_request_id) = pool_data_request_effect(at, HashSet::from([pool]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            |requested_at, requested_pools| {
+                assert_eq!(requested_at, at);
+                assert_eq!(requested_pools, HashSet::from([pool]));
+                Ok(HashMap::new())
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::PoolDataReceived {
+                        request_id,
+                        pools,
+                    },
+            }] if *event_chain == chain
+                && *request_id == expected_request_id
+                && pools.is_empty()
+        ));
+    }
+
+    #[test]
+    fn pool_data_request_failure_maps_to_request_failed_event() {
+        let chain = ChainKey::Ethereum;
+        let at = hash(2);
+        let pool = pool_address(3);
+        let (effect, expected_request_id) = pool_data_request_effect(at, HashSet::from([pool]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            |requested_at, requested_pools| {
+                assert_eq!(requested_at, at);
+                assert_eq!(requested_pools, HashSet::from([pool]));
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::RequestFailed {
+                        request_id: client_evm::AnyRequestId::PoolData(request_id),
+                    },
+            }] if *event_chain == chain && *request_id == expected_request_id
+        ));
+    }
+
     fn unexpected_block_header_fetch(
         _block_hash: BlockHash,
     ) -> Result<Option<ClientHead>, ClientEvmError> {
@@ -2244,6 +2379,13 @@ mod tests {
         _tokens: HashSet<TokenAddress>,
     ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
         panic!("token metadata fetch must not be called")
+    }
+
+    fn unexpected_pool_data_fetch(
+        _at: BlockHash,
+        _pools: HashSet<PoolRef>,
+    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError> {
+        panic!("pool data fetch must not be called")
     }
 
     fn pool_candidate_address(last_byte: u8) -> ProtocolPoolKey {

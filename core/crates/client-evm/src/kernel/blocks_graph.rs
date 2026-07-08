@@ -743,9 +743,11 @@ impl BlocksGraph {
     ///
     /// **Seeding.** A `verified` pool absent from `base` (discovered after bootstrap) is seeded from
     /// its own path logs via `derive_pool_state(None, run)`: it yields a state iff the run begins with
-    /// an absolute event (Swap/Initialize) — a Mint/Burn-only run stays underivable and absent (its
-    /// anchor-height seeding is the deferred 1b/1c follow-up). Only `verified` keys are ever seeded, so
-    /// topic-spoofing non-pools never enter and every seeded pool already has registry metadata.
+    /// an absolute event (Swap/Initialize). A Mint/Burn-only run stays underivable here and instead
+    /// gains its base from the anchor-height seed path (`schedule_finalized_pool_seed_requests` →
+    /// `finalized_snapshot`, Blockers 1b/1c), after which it folds through the `base` branch. Only
+    /// `verified` keys are ever seeded, so topic-spoofing non-pools never enter and every seeded pool
+    /// already has registry metadata.
     fn folded_overlay(
         &self,
         base: &HashMap<PoolRef, PoolState>,
@@ -2672,7 +2674,8 @@ mod tests {
     #[test]
     fn fold_does_not_seed_verified_pool_from_delta_only_run() {
         // A verified new pool whose only log is a Mint has no absolute anchor, so
-        // `derive_pool_state(None, [Mint])` is `None`: it stays unseeded (awaits the anchor-height seeding follow-up).
+        // `derive_pool_state(None, [Mint])` is `None`: the fold leaves it unseeded here — its base
+        // comes from the anchor-height seed path (`schedule_finalized_pool_seed_requests`) instead.
         let new_pool = v3_pool(0xC1);
         let base: HashMap<PoolRef, PoolState> = HashMap::new();
         let verified = HashSet::from([new_pool]);

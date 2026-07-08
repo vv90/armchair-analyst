@@ -409,8 +409,9 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     verified,
                 } if taken.is_some() => {
                     // Activation no longer blocks on a pool-state snapshot: hand the kernel an empty
-                    // finalized snapshot and let its live dirty-pool / backfill paths fetch state at
-                    // the tip after activation, prioritizing frontier freshness over a complete set.
+                    // finalized snapshot and let its idle-gated anchor-height seed scheduler
+                    // (`schedule_finalized_pool_seed_requests`) fill the finalized base after
+                    // activation, prioritizing frontier freshness over a complete set at startup.
                     let outcome = BootstrapOutcome {
                         anchor,
                         pool_snapshots: HashMap::new(),

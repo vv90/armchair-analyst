@@ -35,7 +35,7 @@ pub use endpoints::{
 };
 pub use error::{ClientEvmError, ConfigScope};
 pub use kernel::pending_requests::{
-    AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetPoolMetadata,
+    AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
     GetTokenMetadata, IssuedRequest, RequestId,
 };
 pub use kernel::pool_registry::{
