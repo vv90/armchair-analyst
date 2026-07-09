@@ -9,11 +9,12 @@ use client_evm::{
     OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
     POLYGON_USDC_TOKEN_ADDRESS,
     GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
-    PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RequestId, TokenAddress,
-    TokenMetadataResult, WsSubscriptionEndpoint,
+    PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RangeLogBlock, RequestId,
+    TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
     bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
-    fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata, kernel,
+    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
+    kernel,
     multi_chain_kernel::{
         ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, State,
         Subscription, SubscriptionData, transition,
@@ -550,13 +551,14 @@ fn format_gauge_log(observations: &[(ChainKey, ChainObservation)]) -> String {
                 verified_pools,
                 blocks_behind_tip,
                 in_flight_requests,
+                ws_misses,
             }) => {
                 let behind = match blocks_behind_tip {
                     Some(distance) => distance.to_string(),
                     None => "?".to_owned(),
                 };
                 format!(
-                    "{chain:?}=active behind={behind} pools={verified_pools} inflight={in_flight_requests}"
+                    "{chain:?}=active behind={behind} pools={verified_pools} inflight={in_flight_requests} ws_miss={ws_misses}"
                 )
             }
         })
@@ -607,6 +609,11 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             "input chain={chain:?} block_logs_received request={} pools={}",
             format_typed_request_id_log(request_id),
             logs.len(),
+        ),
+        kernel::Event::BlockLogsRangeReceived { request_id, blocks } => format!(
+            "input chain={chain:?} block_logs_range_received request={} blocks={}",
+            format_typed_request_id_log(request_id),
+            blocks.len(),
         ),
         kernel::Event::LogObserved { block_hash, logs } => format!(
             "input chain={chain:?} log_observed block={block_hash} pools={}",
@@ -785,6 +792,7 @@ impl ClientEvmRuntime {
             // Pool data is anchor-specific and the anchor moves, so — unlike immutable metadata —
             // it is read live with no cache wrapper.
             |at, pools| fetch_pool_data(&self.agent, self.endpoints(), chain, at, pools),
+            |from, to| fetch_pool_logs_in_range(&self.agent, self.endpoints(), chain, from, to),
         )
     }
 }
@@ -981,6 +989,7 @@ fn execute_chain_effect_with<
     FetchPoolMetadata,
     FetchTokenMetadata,
     FetchPoolData,
+    FetchLogsRange,
 >(
     chain: ChainKey,
     effect: kernel::Effect,
@@ -990,6 +999,7 @@ fn execute_chain_effect_with<
     fetch_pool_metadata: FetchPoolMetadata,
     fetch_token_metadata: FetchTokenMetadata,
     fetch_pool_data: FetchPoolData,
+    fetch_logs_range: FetchLogsRange,
 ) -> Vec<Event>
 where
     FetchBlockHeader: FnOnce(BlockHash) -> Result<Option<ClientHead>, ClientEvmError>,
@@ -1010,6 +1020,7 @@ where
             BlockHash,
             HashSet<PoolRef>,
         ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
+    FetchLogsRange: FnOnce(u64, u64) -> Result<Vec<RangeLogBlock>, ClientEvmError>,
 {
     match effect {
         kernel::Effect::Request(request) => match request {
@@ -1137,6 +1148,34 @@ where
                     }
                 }
             }
+            AnyIssuedRequest::LogsRange(request) => {
+                let request_id = request.request_id;
+                let from = request.request_payload.from;
+                let to = request.request_payload.to;
+
+                match fetch_logs_range(from, to) {
+                    Ok(blocks) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::BlockLogsRangeReceived {
+                            request_id,
+                            blocks: blocks
+                                .into_iter()
+                                .map(|block| (block.hash, block.logs))
+                                .collect(),
+                        },
+                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::LogsRange(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
+                }
+            }
         },
     }
 }
@@ -1144,8 +1183,8 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
-        GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
+        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetLogsRange, GetPoolData,
+        GetPoolMetadata, GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
         PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
         TokenMetadataResult, UniswapV3Fee,
     };
@@ -1188,6 +1227,7 @@ mod tests {
                     verified_pools: 37,
                     blocks_behind_tip: Some(4),
                     in_flight_requests: 12,
+                    ws_misses: 2,
                 }),
             ),
             (ChainKey::Base, ChainObservation::Initializing),
@@ -1197,14 +1237,15 @@ mod tests {
                     verified_pools: 0,
                     blocks_behind_tip: None,
                     in_flight_requests: 0,
+                    ws_misses: 0,
                 }),
             ),
         ];
 
         assert_eq!(
             format_gauge_log(&observations),
-            "gauge Ethereum=active behind=4 pools=37 inflight=12  Base=init  \
-             Arbitrum=active behind=? pools=0 inflight=0"
+            "gauge Ethereum=active behind=4 pools=37 inflight=12 ws_miss=2  Base=init  \
+             Arbitrum=active behind=? pools=0 inflight=0 ws_miss=0"
         );
     }
 
@@ -1892,6 +1933,7 @@ mod tests {
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1932,6 +1974,7 @@ mod tests {
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1964,6 +2007,7 @@ mod tests {
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1996,6 +2040,7 @@ mod tests {
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2034,6 +2079,7 @@ mod tests {
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2069,6 +2115,7 @@ mod tests {
             },
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2109,6 +2156,7 @@ mod tests {
             },
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2144,6 +2192,7 @@ mod tests {
                 Ok(HashMap::new())
             },
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2184,6 +2233,7 @@ mod tests {
                 })
             },
             unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2283,6 +2333,98 @@ mod tests {
         )
     }
 
+    fn logs_range_request_effect(
+        from: u64,
+        to: u64,
+        covered: HashSet<BlockHash>,
+    ) -> (kernel::Effect, RequestId<GetLogsRange>) {
+        let request_id = RequestId::from_raw_for_test(12);
+        (
+            kernel::Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
+                request_id,
+                request_payload: GetLogsRange { from, to, covered },
+            })),
+            request_id,
+        )
+    }
+
+    #[test]
+    fn logs_range_request_success_maps_to_chain_event_grouped_by_hash() {
+        let chain = ChainKey::Ethereum;
+        let block_hash = hash(7);
+        let (effect, expected_request_id) =
+            logs_range_request_effect(20, 21, HashSet::from([block_hash]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            |from, to| {
+                assert_eq!(from, 20);
+                assert_eq!(to, 21);
+                Ok(vec![RangeLogBlock {
+                    number: 20,
+                    hash: block_hash,
+                    logs: Vec::new(),
+                }])
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::BlockLogsRangeReceived {
+                        request_id,
+                        blocks,
+                    },
+            }] if *event_chain == chain
+                && *request_id == expected_request_id
+                && blocks.as_slice() == [(block_hash, Vec::new())]
+        ));
+    }
+
+    #[test]
+    fn logs_range_request_failure_maps_to_request_failed_event() {
+        let chain = ChainKey::Ethereum;
+        let (effect, expected_request_id) =
+            logs_range_request_effect(20, 21, HashSet::from([hash(7)]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            |_from, _to| {
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::RequestFailed {
+                        request_id: client_evm::AnyRequestId::LogsRange(request_id),
+                    },
+            }] if *event_chain == chain && *request_id == expected_request_id
+        ));
+    }
+
     #[test]
     fn pool_data_request_success_maps_to_chain_event() {
         let chain = ChainKey::Ethereum;
@@ -2303,6 +2445,7 @@ mod tests {
                 assert_eq!(requested_pools, HashSet::from([pool]));
                 Ok(HashMap::new())
             },
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2343,6 +2486,7 @@ mod tests {
                     reason: "bad config".to_owned(),
                 })
             },
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2386,6 +2530,13 @@ mod tests {
         _pools: HashSet<PoolRef>,
     ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError> {
         panic!("pool data fetch must not be called")
+    }
+
+    fn unexpected_logs_range_fetch(
+        _from: u64,
+        _to: u64,
+    ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
+        panic!("ranged logs fetch must not be called")
     }
 
     fn pool_candidate_address(last_byte: u8) -> ProtocolPoolKey {

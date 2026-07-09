@@ -34,6 +34,13 @@ pub struct State {
     /// The log-sourced blocks graph and its finalized base — the sole chain-state authority since
     /// Increment 4 (the legacy graph is deleted). See [`Blocks`].
     blocks: Blocks,
+    /// How often an authoritative log set diverged from the streamed set it replaced
+    /// ([`blocks_graph::BlocksGraph::streamed_log_mismatch`]) — the permanent WS-miss metric of the
+    /// WS-primary trust flip. The stream is trusted at the tip, so every divergence the
+    /// finalization ranged verification (or the tip-hole backstop) uncovers is a moment the
+    /// optimizer ran on wrong data; the gauge surfaces the cumulative count per chain. An observed
+    /// aggregate of transient inputs, not derivable from retained state.
+    ws_miss_count: u64,
 }
 
 /// The log-sourced [`blocks_graph::BlocksGraph`] and its advancing finalized base snapshot. The
@@ -87,6 +94,14 @@ impl Blocks {
 /// staging map when observed logs for a block arrive but its head never does (e.g. a reorg).
 const MAX_STREAMED_LOG_BLOCKS: usize = 1024;
 
+/// How many blocks below the observed head a canonical block with no streamed logs must sit before
+/// the per-block `GetBlockLogs` backstop fetches it — the WS stream's grace window. Deeper `Unknown`
+/// bloom-touching blocks are *holes*: the stream evidently delivered nothing for them, so the
+/// backstop resolves them rather than letting them block the optimization frontier. One global
+/// constant for now; per-chain tuning (block times span 0.25s–12s) is a possible follow-up.
+/// `pub(crate)` so sibling-module tests can pad chains past the window.
+pub(crate) const STREAM_SETTLE_DEPTH: usize = 2;
+
 /// Caps how many uncovered pools one finalized-pool-seed request names, so a chain starting with a
 /// large verified set (empty snapshot at bootstrap) drains over successive idle scheduling rounds
 /// instead of one oversized multicall. The single tuning knob for anchor-height seed throughput.
@@ -104,6 +119,7 @@ impl State {
             token_registry: TokenRegistry::new(),
             tick: Tick::initial(),
             streamed_logs: HashMap::new(),
+            ws_miss_count: 0,
         }
     }
 
@@ -159,6 +175,7 @@ impl State {
             token_registry,
             tick,
             streamed_logs: HashMap::new(),
+            ws_miss_count: 0,
         };
 
         (state, effects)
@@ -194,6 +211,12 @@ impl State {
     /// Added so read models can surface per-chain fetch backlog without reaching into the request store.
     pub(crate) fn in_flight_request_count(&self) -> usize {
         self.pending_requests.len()
+    }
+
+    /// Cumulative streamed-vs-authoritative log divergences (see the `ws_miss_count` field) for
+    /// the per-chain gauge: `ws_miss=0` means the WS feeds have never been caught wrong.
+    pub(crate) fn ws_miss_count(&self) -> u64 {
+        self.ws_miss_count
     }
 
     /// The production optimization read: the blocks graph's best-effort fold over its finalized
@@ -245,6 +268,7 @@ impl State {
             token_registry,
             tick: Tick::initial(),
             streamed_logs: HashMap::new(),
+            ws_miss_count: 0,
         }
     }
 
@@ -341,8 +365,14 @@ impl State {
         self.map_graph(move |graph| graph.with_streamed_logs(block_hash, logs))
     }
 
-    /// `BlockLogsReceived` feed: authoritative complete logs (replaces any streamed set).
-    fn with_log_complete(self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
+    /// `BlockLogsReceived`/`BlockLogsRangeReceived` feed: authoritative complete logs (replaces any
+    /// streamed set). Reads the WS-miss query first: a `Streamed` set whose `log_index` keys differ
+    /// from the authoritative replacement is a stream delivery the flip trusted wrongly — counted,
+    /// then corrected by the replace.
+    fn with_log_complete(mut self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
+        if self.blocks.graph.streamed_log_mismatch(block_hash, &logs) {
+            self.ws_miss_count += 1;
+        }
         self.map_graph(move |graph| graph.with_complete_logs(block_hash, logs))
     }
 
@@ -453,6 +483,12 @@ pub enum Event {
         request_id: RequestId<GetBlockLogs>,
         logs: Vec<PoolLog>,
     },
+    /// Authoritative logs for a number-ranged window ([`GetLogsRange`]), grouped per block hash —
+    /// the finalization-time verification of WS-streamed logs.
+    BlockLogsRangeReceived {
+        request_id: RequestId<GetLogsRange>,
+        blocks: Vec<(BlockHash, Vec<PoolLog>)>,
+    },
     /// Best-effort logs from the live subscription: provisional (`Partial`), not authoritative.
     LogObserved {
         block_hash: BlockHash,
@@ -482,35 +518,36 @@ pub enum Effect {
 }
 
 
-/// Emits log-fetch requests for present canonical blocks whose logs are unknown.
-/// Added so header connectivity automatically drives pool-affecting log discovery.
+/// Emits per-block log-fetch requests for tip-side *holes*: present-chain blocks the WS stream
+/// delivered nothing for (`Unknown`), bloom-touching, and deeper than [`STREAM_SETTLE_DEPTH`].
+/// The rare-hole backstop of the WS-primary flip — streamed blocks are trusted here and verified
+/// at finalization instead ([`schedule_missing_log_range_requests`]).
 fn schedule_unknown_canonical_log_requests(
     chain: ChainKey,
     mut state: State,
     mut effects: Vec<Effect>,
 ) -> (State, Vec<Effect>) {
     let pending_log_hashes = state.pending_requests.pending_block_log_hashes();
-    // The bloom gate only fires once there is a verified pool whose log completeness to protect; with
-    // none (`trusted: None`), the per-block fetch is still the discovery channel and every
-    // bloom-bearing block is fetched. Capture that "gate active" decision from the verified set
-    // *before* adding the v4 PoolManager discovery anchor, so warmup behavior is unchanged.
     let mut trusted_addresses = state.pool_registry.verified_addresses(chain);
-    let gate_active = !trusted_addresses.is_empty();
     if let Some(manager) = uniswap_v4::pool_manager_address(chain) {
         // Anchor on the singleton PoolManager so a block carrying only v4 activity is never
         // bloom-skipped; otherwise, once any v3 pool is verified, new v4 pools would never be found.
         trusted_addresses.insert(manager);
     }
 
-    // Blocks on the graph's present chain still lacking authoritative logs, bloom-gated with the
-    // scheduler-owned trusted set above and deduped against in-flight fetches. The bloom has no
-    // false negatives, so a trusted pool that did emit is never skipped, keeping trusted-pool log
-    // completeness unchanged.
-    for block_hash in state
-        .blocks
-        .graph
-        .unresolved_log_request_hashes(gate_active.then_some(&trusted_addresses), &pending_log_hashes)
-    {
+    // WS-primary trust flip: the per-block fetch is a rare-hole *backstop*, no longer the every-block
+    // authority. Only `Unknown` bloom-touching blocks deeper than the settle window are fetched — a
+    // `Streamed` block is trusted at the tip (never re-fetched; finalization's ranged verification is
+    // its authoritative check), and blocks inside the window are left for the stream to deliver. The
+    // hash-keyed fetch is fork-proof in the unfinalized region, which is why the backstop stays
+    // per-block rather than ranged. The pre-flip "gate inactive when nothing verified → fetch every
+    // block" discovery warmup is retired: with an empty trusted set nothing blooms, and discovery
+    // rides the topic-filtered WS stream plus the bootstrap range scan.
+    for block_hash in state.blocks.graph.unknown_log_hole_hashes(
+        &trusted_addresses,
+        &pending_log_hashes,
+        STREAM_SETTLE_DEPTH,
+    ) {
         let request_payload = GetBlockLogs { block_hash };
         let (pending_requests, request_id) = state
             .pending_requests
@@ -518,6 +555,48 @@ fn schedule_unknown_canonical_log_requests(
 
         state.pending_requests = pending_requests;
         effects.push(Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
+            request_id,
+            request_payload,
+        })));
+    }
+
+    (state, effects)
+}
+
+/// Emits the ranged-getLogs verification for the finalization holes on `anchor → target` — the
+/// authoritative check of WS-streamed logs, and the sole remaining bulk log-fetch path after the
+/// trust flip. Rides the `FinalizedBlockObserved` signal whose fold the holes just stalled:
+/// [`blocks_graph::BlocksGraph::missing_complete_ranges_to`] mirrors `finalized_to`'s guards, so a
+/// target the finalization no-ops on (absent/pending/side-fork) schedules nothing, and a
+/// fully-advanced target — now the anchor, no longer a node — is the quiet no-hole case. Every
+/// covered block is ≤ an observed finalized block, hence immutable: fork-safe by construction.
+/// Deduped by block number against in-flight ranges (an excluded number splits a range).
+fn schedule_missing_log_range_requests(
+    chain: ChainKey,
+    target: BlockHash,
+    mut state: State,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    let v4_manager = uniswap_v4::pool_manager_address(chain);
+    let verified = state.pool_registry.verified_pools(chain);
+    let exclude_numbers = state.pending_requests.pending_log_range_numbers();
+    for range in
+        state
+            .blocks
+            .graph
+            .missing_complete_ranges_to(target, &verified, v4_manager, &exclude_numbers)
+    {
+        let request_payload = GetLogsRange {
+            from: range.from,
+            to: range.to,
+            covered: range.hashes.into_iter().collect(),
+        };
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(request_payload.clone(), state.tick);
+
+        state.pending_requests = pending_requests;
+        effects.push(Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
             request_id,
             request_payload,
         })));
@@ -790,10 +869,14 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                 schedule_unknown_canonical_requests(chain, state, vec![])
             }
         }
-        Event::FinalizedBlockObserved { block_hash } => (
-            state.with_finalized_block_observed(chain, block_hash),
-            vec![],
-        ),
+        Event::FinalizedBlockObserved { block_hash } => {
+            let state = state.with_finalized_block_observed(chain, block_hash);
+            // WS-primary: any hole short of the target just stalled the fold — issue its
+            // authoritative ranged verification now. The anchor then advances on a later finality
+            // observation (the refresh predicate re-fires every retry stride) once the responses
+            // complete the holes; a fully-advanced target schedules nothing.
+            schedule_missing_log_range_requests(chain, block_hash, state, vec![])
+        }
         Event::BlockHeaderReceived {
             request_id,
             hash,
@@ -862,6 +945,46 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                         ..state
                     }
                     .with_log_complete(block_hash, logs);
+
+                    schedule_unknown_canonical_requests(chain, state, vec![])
+                }
+                None => (
+                    State {
+                        pending_requests,
+                        ..state
+                    },
+                    vec![],
+                ),
+            }
+        }
+        Event::BlockLogsRangeReceived { request_id, blocks } => {
+            let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
+            match request_payload {
+                Some(PendingPayload {
+                    payload: GetLogsRange { covered, .. },
+                    ..
+                }) => {
+                    let mut state = State {
+                        pending_requests,
+                        ..state
+                    };
+                    // Response blocks apply by hash (`with_log_complete` no-ops on a hash the
+                    // graph no longer holds, so a response racing a re-root is inert).
+                    let mut responded: HashSet<BlockHash> = HashSet::new();
+                    for (block_hash, logs) in blocks {
+                        responded.insert(block_hash);
+                        state = state.with_log_complete(block_hash, logs);
+                    }
+                    // A covered block absent from the topics-only response is proven log-free:
+                    // every covered hash is an ancestor of an observed finalized block, so the
+                    // provider's canonical chain includes it and absence means emptiness. Only
+                    // `covered` blocks earn this — never whatever else shares the number range.
+                    for block_hash in covered {
+                        if !responded.contains(&block_hash) && state.blocks.graph.contains(block_hash)
+                        {
+                            state = state.with_log_complete(block_hash, Vec::new());
+                        }
+                    }
 
                     schedule_unknown_canonical_requests(chain, state, vec![])
                 }
@@ -1070,6 +1193,17 @@ mod tests {
         RequestFailed {
             request_id: u8,
         },
+        /// Arbitrary finality signals: drives reanchor/prune plus the WS-primary ranged-log
+        /// scheduling against targets in any state (absent/pending/side-fork/canonical).
+        FinalizedObserved {
+            hash_index: usize,
+        },
+        /// Arbitrary (necessarily unsolicited here) ranged-log responses: the handler must drop
+        /// them without touching state, whatever payload they carry.
+        BlockLogsRangeReceived {
+            request_id: u8,
+            hash_index: usize,
+        },
         Tick,
     }
 
@@ -1161,6 +1295,13 @@ mod tests {
             },),
             (0u8..16).prop_map(|request_id| GeneratedEvent::BlockHeaderNotFound { request_id }),
             (0u8..16).prop_map(|request_id| GeneratedEvent::RequestFailed { request_id }),
+            (0usize..16).prop_map(|hash_index| GeneratedEvent::FinalizedObserved { hash_index }),
+            (0u8..16, 0usize..16).prop_map(|(request_id, hash_index)| {
+                GeneratedEvent::BlockLogsRangeReceived {
+                    request_id,
+                    hash_index,
+                }
+            }),
             Just(GeneratedEvent::Tick),
         ]
     }
@@ -1232,23 +1373,33 @@ mod tests {
         );
     }
 
-    /// Every present-chain block whose logs are not yet authoritative (`Complete`), regardless of
-    /// bloom: the gate-inactive query form enumerates them all.
+    /// The tip-side holes the log scheduler must cover, mirroring its candidate derivation exactly
+    /// (trusted = verified addresses ∪ v4 PoolManager; `Unknown` + bloom-touching + depth ≥
+    /// [`STREAM_SETTLE_DEPTH`]). Rewritten at the WS-primary trust flip: the pre-flip form
+    /// enumerated *every* non-`Complete` present-chain block because the per-block fetch was the
+    /// every-block authority; post-flip, `Streamed` blocks and the settle window are intentionally
+    /// left to the stream, so only genuine holes may demand a request.
     fn unresolved_present_chain_hashes(state: &State) -> Vec<BlockHash> {
+        let mut trusted = state.pool_registry.verified_addresses(ChainKey::Ethereum);
+        if let Some(manager) = uniswap_v4::pool_manager_address(ChainKey::Ethereum) {
+            trusted.insert(manager);
+        }
         state
             .blocks
             .graph
-            .unresolved_log_request_hashes(None, &HashSet::new())
+            .unknown_log_hole_hashes(&trusted, &HashSet::new(), STREAM_SETTLE_DEPTH)
     }
 
-    /// Asserts every present canonical block with unknown logs has an active log request.
-    /// This protects the log scheduler from leaving canonical blocks permanently unqueried.
+    /// Asserts every tip-side hole (see [`unresolved_present_chain_hashes`]) has an active log
+    /// request. This protects the log scheduler from leaving canonical blocks permanently
+    /// unqueried — the post-flip liveness guarantee: whatever the stream fails to deliver, the
+    /// backstop must be fetching.
     fn assert_canonical_unknown_logs_are_pending(state: &State) {
         let pending_log_hashes = state.pending_requests.pending_block_log_hashes();
         for block_hash in unresolved_present_chain_hashes(state) {
             assert!(
                 pending_log_hashes.contains(&block_hash),
-                "canonical block without complete logs must have a pending log request"
+                "canonical hole block must have a pending log request"
             );
         }
     }
@@ -1268,12 +1419,16 @@ mod tests {
         }
     }
 
-    /// Asserts every present canonical block has authoritative logs after log-draining helpers run.
-    /// Properties use it to distinguish incomplete draining from scheduler bugs.
+    /// Asserts no tip-side hole remains after log-draining helpers run. Properties use it to
+    /// distinguish incomplete draining from scheduler bugs. Rewritten (not dropped) at the
+    /// WS-primary trust flip: pre-flip this demanded every present canonical block be `Complete`;
+    /// post-flip, `Streamed` blocks and the settle window below the head are *intentionally*
+    /// non-`Complete` at the tip — authoritative completeness is a finalization-time property owned
+    /// by the ranged verification path — so draining must only eliminate genuine holes.
     fn assert_present_canonical_logs_are_resolved(state: &State) {
         assert!(
             unresolved_present_chain_hashes(state).is_empty(),
-            "present canonical block logs must be complete"
+            "present canonical hole blocks must be drained"
         );
     }
 
@@ -1349,6 +1504,19 @@ mod tests {
                     assert_eq!(pending_request.payload.at, request_payload.at);
                     assert_eq!(pending_request.payload.pools, request_payload.pools);
                 }
+                Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
+                    request_id,
+                    request_payload,
+                })) => {
+                    let pending_request = state
+                        .pending_requests
+                        .get(request_id)
+                        .expect("emitted logs-range request must be recorded as pending");
+
+                    assert_eq!(pending_request.payload.from, request_payload.from);
+                    assert_eq!(pending_request.payload.to, request_payload.to);
+                    assert_eq!(pending_request.payload.covered, request_payload.covered);
+                }
             }
         }
     }
@@ -1373,8 +1541,9 @@ mod tests {
 
     /// Test-only block number recovered from a block hash's trailing byte. These tests encode block
     /// identity/height in `BlockHash::with_last_byte(_)`, so this yields a per-hash-stable,
-    /// height-ordered number for the log-sourced graph's block-admission entry. There is no
-    /// production consumer of the plumbed `number` yet (see `Event::HeadObserved`).
+    /// height-ordered number for the log-sourced graph's block-admission entry. The plumbed
+    /// `number` feeds the finalization ranged-getLogs verification (`GetLogsRange` windows
+    /// coalesce by it), so height-ordering matters here.
     fn block_number_for(hash: BlockHash) -> u64 {
         hash.0[31] as u64
     }
@@ -1410,6 +1579,16 @@ mod tests {
                 request_id: AnyRequestId::BlockHeader(RequestId::from_raw_for_test(u64::from(
                     request_id,
                 ))),
+            },
+            GeneratedEvent::FinalizedObserved { hash_index } => Event::FinalizedBlockObserved {
+                block_hash: hash_for_node(hash_index),
+            },
+            GeneratedEvent::BlockLogsRangeReceived {
+                request_id,
+                hash_index,
+            } => Event::BlockLogsRangeReceived {
+                request_id: RequestId::from_raw_for_test(u64::from(request_id)),
+                blocks: vec![(hash_for_node(hash_index), Vec::new())],
             },
             GeneratedEvent::Tick => Event::Tick,
         }
@@ -1516,6 +1695,7 @@ mod tests {
             AnyRequestId::PoolMetadata(request_id) => request_id.raw_for_test(),
             AnyRequestId::TokenMetadata(request_id) => request_id.raw_for_test(),
             AnyRequestId::PoolData(request_id) => request_id.raw_for_test(),
+            AnyRequestId::LogsRange(request_id) => request_id.raw_for_test(),
         }
     }
 
@@ -1608,6 +1788,7 @@ mod tests {
                 Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
+                Effect::Request(AnyIssuedRequest::LogsRange(_)) => {}
             }
         }
 
@@ -1694,6 +1875,7 @@ mod tests {
                 Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
+                Effect::Request(AnyIssuedRequest::LogsRange(_)) => {}
             }
         }
 
@@ -1710,6 +1892,7 @@ mod tests {
             token_registry: TokenRegistry::new(),
             tick: tick(0),
             streamed_logs: HashMap::new(),
+            ws_miss_count: 0,
         }
     }
 
@@ -1734,6 +1917,39 @@ mod tests {
             parent_hash = hash;
         }
         state
+    }
+
+    /// Observes `STREAM_SETTLE_DEPTH` bloom-clear padding heads above `parent_hash`, sinking the
+    /// blocks under test past the stream's settle window so the per-block backstop may fetch them
+    /// (WS-primary: a hole is only fetched at depth ≥ the window). Bloom-clear padding is never a
+    /// hole itself, so it adds no log work of its own. Returns the state and the *last* padding
+    /// transition's effects — where the newly-uncovered holes' log requests surface. Padding hashes
+    /// derive from `first_byte` (callers pick a byte range clear of their own fixtures).
+    fn observe_clear_padding(
+        state: State,
+        parent_hash: BlockHash,
+        first_byte: u8,
+    ) -> (State, Vec<Effect>) {
+        let mut state = state;
+        let mut parent_hash = parent_hash;
+        let mut effects = Vec::new();
+        for offset in 0..STREAM_SETTLE_DEPTH {
+            let hash = BlockHash::with_last_byte(first_byte + offset as u8);
+            let (next_state, next_effects) = transition(
+                ChainKey::Ethereum,
+                state,
+                Event::HeadObserved {
+                    number: block_number_for(hash),
+                    logs_bloom: Bloom::default(),
+                    hash,
+                    parent_hash,
+                },
+            );
+            state = next_state;
+            effects = next_effects;
+            parent_hash = hash;
+        }
+        (state, effects)
     }
 
     /// Mirrors a directly-planted linear chain into the blocks graph through its production
@@ -1905,6 +2121,42 @@ mod tests {
 
         assert_eq!(request_ids.len(), 1);
         request_ids[0]
+    }
+
+    /// Extracts the single expected ranged-log verification request ([`GetLogsRange`]), pinning
+    /// its window bounds and covered hole set exactly.
+    fn assert_single_logs_range_request_effect(
+        effects: &[Effect],
+        from: u64,
+        to: u64,
+        covered: &HashSet<BlockHash>,
+    ) -> RequestId<GetLogsRange> {
+        let request_ids = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
+                    request_id,
+                    request_payload,
+                })) if request_payload.from == from
+                    && request_payload.to == to
+                    && request_payload.covered == *covered =>
+                {
+                    Some(*request_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(request_ids.len(), 1);
+        request_ids[0]
+    }
+
+    /// Asserts no ranged-log verification request was emitted at all.
+    fn assert_no_logs_range_request_effect(effects: &[Effect]) {
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Request(AnyIssuedRequest::LogsRange(_))
+        )));
     }
 
     /// Asserts no authoritative block-log request was emitted for `block_hash`.
@@ -2403,24 +2655,17 @@ mod tests {
             },
         );
 
-        // The seeded block already has resolved logs, so no log request targets it.
-        let seed_log_requests = effects
-            .iter()
-            .filter(|effect| {
-                matches!(
-                    effect,
-                    Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
-                        request_payload: GetBlockLogs { block_hash },
-                        ..
-                    })) if *block_hash == seed_hash
-                )
-            })
-            .count();
-        assert_eq!(seed_log_requests, 0);
-
-        // Only the new head needs its logs fetched.
-        assert_single_block_log_request_effect(&effects, new_head);
+        // The seeded block already has resolved logs, so no log request targets it — and the new
+        // head is inside the stream's settle window, so no fetch targets it either (WS-primary).
+        assert_no_block_log_request_effect(&effects, seed_hash);
+        assert_no_block_log_request_effect(&effects, new_head);
         assert_eq!(state.blocks.graph.observed_head_hash(), new_head);
+
+        // Sunk past the window, the Complete seed still needs nothing; the Unknown head has become
+        // the hole the backstop fetches.
+        let (state, effects) = observe_clear_padding(state, new_head, 0xE1);
+        assert_no_block_log_request_effect(&effects, seed_hash);
+        assert_single_block_log_request_effect(&effects, new_head);
         assert_state_invariants(&state);
     }
 
@@ -3112,15 +3357,17 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Observes a head directly on finalized.
-    // This ensures connected canonical heads immediately start block-log discovery.
+    // Observes a head directly on finalized. WS-primary trust flip: the head is inside the stream's
+    // settle window, so NO log fetch fires at observation (pre-flip it did — the fetch was the
+    // every-block authority); once padding heads sink it past the window and it is still `Unknown`,
+    // the per-block backstop fetches it. Pins both halves of the new tip behavior.
     #[test]
-    fn connected_head_observed_requests_logs_for_head() {
+    fn connected_head_observed_defers_logs_to_stream_then_backstop_fetches() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let head_hash = BlockHash::with_last_byte(2);
         let state = empty_state_at(finalized_hash);
 
-        let (next_state, effects) = transition(
+        let (state, effects) = transition(
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
@@ -3131,15 +3378,22 @@ mod tests {
             },
         );
 
+        // Inside the settle window: the stream owns the head's logs, nothing is fetched.
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
+
+        let (next_state, effects) = observe_clear_padding(state, head_hash, 0xE1);
+
+        // Past the window and still Unknown: the backstop fetches exactly the sunk head.
         assert_request_hashes(&effects, HashSet::new(), HashSet::from([head_hash]));
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
     }
 
-    // Observes a head with an unknown parent.
-    // This ensures the kernel fetches both head logs and the missing parent header.
+    // Observes a head with an unknown parent. The missing-parent header fetch fires immediately
+    // (header backfill is latency-critical and untouched by the flip); the head's logs are the
+    // stream's inside the settle window, so no log fetch accompanies it.
     #[test]
-    fn disconnected_head_observed_requests_head_logs_and_missing_parent_header() {
+    fn disconnected_head_observed_requests_missing_parent_header_only() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let missing_parent_hash = BlockHash::with_last_byte(2);
         let head_hash = BlockHash::with_last_byte(3);
@@ -3159,7 +3413,7 @@ mod tests {
         assert_request_hashes(
             &effects,
             HashSet::from([missing_parent_hash]),
-            HashSet::from([head_hash]),
+            HashSet::new(),
         );
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
@@ -3199,12 +3453,9 @@ mod tests {
             },
         );
 
-        // Second observation reuses the in-flight request: it schedules the head's logs but no header.
-        assert_request_hashes(
-            &second_effects,
-            HashSet::new(),
-            HashSet::from([second_head]),
-        );
+        // Second observation reuses the in-flight request: no new header — and no log fetch either,
+        // the head being inside the stream's settle window.
+        assert_request_hashes(&second_effects, HashSet::new(), HashSet::new());
         assert_eq!(
             pending_header_hashes(&next_state),
             HashSet::from([shared_missing_parent])
@@ -3253,11 +3504,12 @@ mod tests {
             },
         );
 
-        // A different missing parent is not suppressed by the unrelated in-flight header.
+        // A different missing parent is not suppressed by the unrelated in-flight header (the head
+        // itself gets no log fetch — it is inside the stream's settle window).
         assert_request_hashes(
             &second_effects,
             HashSet::from([second_missing_parent]),
-            HashSet::from([second_head]),
+            HashSet::new(),
         );
         assert_eq!(
             pending_header_hashes(&next_state),
@@ -3272,9 +3524,14 @@ mod tests {
     // This ensures newly connected ancestors enter log discovery.
     #[test]
     fn missing_parent_header_received_requests_logs_for_parent() {
+        // A backfilled header still drives log discovery — but post-flip only once the connected
+        // ancestor sits past the stream's settle window. The two-deep ancestry gap puts the last
+        // backfilled header at depth 2, so its connection carries the backstop log fetch (and the
+        // next missing-parent header fetch fires at each step, untouched by the flip).
         let finalized_hash = BlockHash::with_last_byte(1);
-        let missing_parent_hash = BlockHash::with_last_byte(2);
-        let head_hash = BlockHash::with_last_byte(3);
+        let deep_parent_hash = BlockHash::with_last_byte(2);
+        let missing_parent_hash = BlockHash::with_last_byte(3);
+        let head_hash = BlockHash::with_last_byte(4);
         let state = empty_state_at(finalized_hash);
 
         let (state, effects) = transition(
@@ -3290,7 +3547,7 @@ mod tests {
         let header_request_id =
             assert_single_block_header_request_effect(&effects, missing_parent_hash);
 
-        let (next_state, effects) = transition(
+        let (state, effects) = transition(
             ChainKey::Ethereum,
             state,
             Event::BlockHeaderReceived {
@@ -3298,23 +3555,35 @@ mod tests {
                 logs_bloom: bloom_matching_any(),
                 request_id: header_request_id,
                 hash: missing_parent_hash,
+                parent_hash: deep_parent_hash,
+            },
+        );
+        // Depth 1: still the stream's window — only the next missing header is fetched.
+        let header_request_id = assert_single_block_header_request_effect(&effects, deep_parent_hash);
+
+        let (next_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockHeaderReceived {
+                number: block_number_for(deep_parent_hash),
+                logs_bloom: bloom_matching_any(),
+                request_id: header_request_id,
+                hash: deep_parent_hash,
                 parent_hash: finalized_hash,
             },
         );
 
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 2: the freshly-connected ancestor is a hole the backstop must fetch.
+        assert_request_hashes(&effects, HashSet::new(), HashSet::from([deep_parent_hash]));
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
     }
 
     // Starts with a fully present canonical chain whose logs are unknown.
-    // This ensures the scheduler backfills log requests for every present canonical block.
+    // This ensures the scheduler backfills log requests for the holes past the settle window
+    // (WS-primary: blocks inside the window are the stream's, never the backstop's).
     #[test]
-    fn present_canonical_prefix_schedules_logs_for_all_unknown_blocks() {
+    fn present_canonical_prefix_schedules_logs_for_unknown_blocks_past_settle_window() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let grandparent_hash = BlockHash::with_last_byte(2);
         let parent_hash = BlockHash::with_last_byte(3);
@@ -3338,11 +3607,9 @@ mod tests {
             },
         );
 
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([head_hash, parent_hash, grandparent_hash]),
-        );
+        // Post-flip only the block past the settle window is fetched: head (0) and parent (1) are
+        // the stream's; the grandparent (2) is a hole the backstop must cover.
+        assert_request_hashes(&effects, HashSet::new(), HashSet::from([grandparent_hash]));
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
     }
@@ -3379,7 +3646,8 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert_request_hashes(&effects, HashSet::new(), HashSet::from([parent_hash]));
+        // The connected parent sits at depth 1 — inside the settle window, so no log fetch.
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
 
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
@@ -3694,7 +3962,13 @@ mod tests {
     // A subscription log on a known block records a provisional (`Partial`) snapshot — enough to
     // skip the pool-data read — while still scheduling the authoritative `GetBlockLogs`.
     #[test]
-    fn log_observed_on_known_block_is_provisional_and_still_fetches_authoritative_logs() {
+    fn log_observed_on_known_block_is_trusted_and_never_refetched() {
+        // THE core behavioral pin of the WS-primary trust flip (this test previously asserted the
+        // opposite — `..._is_provisional_and_still_fetches_authoritative_logs`): a block the stream
+        // delivered logs for is `Streamed`, trusted at the tip, and gets NO per-block `GetBlockLogs`
+        // — not at observation, and not after sinking past the settle window either (a Streamed
+        // block is not a hole; its authoritative check is finalization's ranged verification).
+        // Candidates stay visible for discovery exactly as before.
         let finalized = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let candidate = pool_candidate_address(3);
@@ -3705,7 +3979,7 @@ mod tests {
         plant_chain(&mut state, finalized, &[block_hash]);
 
         let derived = pool_state(7);
-        let (next_state, effects) = transition(
+        let (state, effects) = transition(
             ChainKey::Ethereum,
             state,
             Event::LogObserved {
@@ -3714,23 +3988,20 @@ mod tests {
             },
         );
 
-        // The streamed logs merged provisionally (not authoritative), so the authoritative fetch
-        // is still scheduled and the candidate is visible for discovery.
+        // Merged provisionally (not authoritative), candidate visible — and no fetch.
         assert_eq!(
-            next_state
-                .blocks
-                .graph
-                .has_complete_logs_for_test(block_hash),
+            state.blocks.graph.has_complete_logs_for_test(block_hash),
             Some(false)
         );
         assert_eq!(
-            next_state
-                .blocks
-                .graph
-                .log_candidates_for_test(block_hash),
+            state.blocks.graph.log_candidates_for_test(block_hash),
             Some(HashSet::from([candidate]))
         );
-        assert_single_block_log_request_effect(&effects, block_hash);
+        assert_no_block_log_request_effect(&effects, block_hash);
+
+        // Sunk past the settle window it is still Streamed, not a hole: the backstop stays quiet.
+        let (next_state, effects) = observe_clear_padding(state, block_hash, 0xE1);
+        assert_no_block_log_request_effect(&effects, block_hash);
         assert_state_invariants(&next_state);
     }
 
@@ -4140,7 +4411,18 @@ mod tests {
                 graph.with_complete_logs(block_hash, candidate_logs(candidates))
             }
         };
-        state.blocks.graph = graph.with_observed_head(block_hash);
+        // WS-primary: the backstop only fetches holes deeper than the settle window, so sink the
+        // block under test to `STREAM_SETTLE_DEPTH` with bloom-clear padding heads above it —
+        // bloom-clear padding is never a hole itself, so it adds no log work of its own and the
+        // gate decision under test stays the block's alone.
+        let mut graph = graph;
+        let mut parent_hash = block_hash;
+        for offset in 0..STREAM_SETTLE_DEPTH {
+            let padding_hash = BlockHash::with_last_byte(0xE1 + offset as u8);
+            graph = graph.admitted(padding_hash, parent_hash, (offset + 2) as u64, Bloom::default());
+            parent_hash = padding_hash;
+        }
+        state.blocks.graph = graph.with_observed_head(parent_hash);
 
         (state, candidate.uniswap_v3_address().expect("v3 pool"))
     }
@@ -4292,29 +4574,37 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // With no verified pools there is nothing whose completeness to protect, but the per-block fetch
-    // is still the discovery channel during warmup, so a bloom-bearing block is fetched, not skipped.
+    // WS-primary trust flip: the pre-flip warmup fetched every block while no pool was verified
+    // (the per-block fetch doubled as the discovery channel). Post-flip that channel is the
+    // topic-filtered WS stream plus the bootstrap range scan, so with no verified pools the gate is
+    // simply the v4 PoolManager anchor — a block whose bloom names neither is never fetched, even
+    // deep below the settle window. (Replaces `bloom_clear_block_with_no_trusted_pools_still_requests_logs`,
+    // the deleted warmup pin.)
     #[test]
-    fn bloom_clear_block_with_no_trusted_pools_still_requests_logs() {
+    fn no_trusted_pools_issues_no_log_requests_for_unrelated_blocks() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let block_hash = BlockHash::with_last_byte(2);
         let mut state = empty_state_at(finalized_hash);
-        // A block with an unrelated-address bloom — with no verified pools the gate is inactive,
-        // so it must be fetched regardless.
-        state.blocks.graph = Blocks::new(finalized_hash, HashMap::new())
-            .graph
-            .admitted(
-                block_hash,
-                finalized_hash,
-                1,
-                bloom_containing(&[Address::with_last_byte(9)]),
-            )
-            .with_observed_head(block_hash);
+        // A deep block with an unrelated-address bloom: below the settle window, so only the gate
+        // decides — and nothing trusted blooms here.
+        let mut graph = Blocks::new(finalized_hash, HashMap::new()).graph.admitted(
+            block_hash,
+            finalized_hash,
+            1,
+            bloom_containing(&[Address::with_last_byte(9)]),
+        );
+        let mut parent_hash = block_hash;
+        for offset in 0..STREAM_SETTLE_DEPTH {
+            let padding_hash = BlockHash::with_last_byte(0xE1 + offset as u8);
+            graph = graph.admitted(padding_hash, parent_hash, (offset + 2) as u64, Bloom::default());
+            parent_hash = padding_hash;
+        }
+        state.blocks.graph = graph.with_observed_head(parent_hash);
 
         let (next_state, effects) =
             schedule_unknown_canonical_requests(ChainKey::Ethereum, state, vec![]);
 
-        let _ = assert_single_block_log_request_effect(&effects, block_hash);
+        assert_no_block_log_request_effect(&effects, block_hash);
         assert_effects_are_well_formed(&next_state, &effects);
         assert_state_invariants(&next_state);
     }
@@ -4594,7 +4884,11 @@ mod tests {
 
     /// Drives one head + its authoritative (possibly empty) log response through `transition`,
     /// returning the next state — the event-driven builder for finalization tests that need a
-    /// fully-`Complete` block on the canonical chain.
+    /// fully-`Complete` block on the canonical chain. WS-primary: the fetch no longer fires at
+    /// observation (the head is the stream's inside the settle window), so bloom-clear padding
+    /// heads sink the block to the backstop first; the padding lands on a side fork keyed off the
+    /// block's own trailing byte, so repeated calls never collide, and the caller's next real head
+    /// re-takes the canonical chain from `hash`.
     fn observe_complete_block(
         state: State,
         hash: BlockHash,
@@ -4611,6 +4905,9 @@ mod tests {
                 parent_hash,
             },
         );
+        assert_no_block_log_request_effect(&effects, hash);
+        let padding_first_byte = 0xB0 + hash.0[31].wrapping_mul(STREAM_SETTLE_DEPTH as u8);
+        let (state, effects) = observe_clear_padding(state, hash, padding_first_byte);
         let request_id = assert_single_block_log_request_effect(&effects, hash);
         let (state, _effects) = transition(
             ChainKey::Ethereum,
@@ -4726,7 +5023,15 @@ mod tests {
             },
         );
 
-        assert!(effects.is_empty());
+        // WS-primary: the partial advance leaves the two unresolved blocks as finalization holes,
+        // and their coalesced ranged verification rides the same finality signal.
+        let _ = assert_single_logs_range_request_effect(
+            &effects,
+            block_number_for(incomplete_hash),
+            block_number_for(target_hash),
+            &HashSet::from([incomplete_hash, target_hash]),
+        );
+        assert_effects_are_well_formed(&state, &effects);
         let graph = &state.blocks.graph;
         assert_eq!(graph.anchor_hash(), complete_hash);
         assert_eq!(
@@ -4762,11 +5067,11 @@ mod tests {
         state
     }
 
-    // Leaves state unchanged when no block past the current finalized anchor is complete. A pool
-    // must be verified for the unresolved block to be a fold blocker — with nothing watched, no
-    // block's logs are ever needed and the anchor would advance freely.
+    // Leaves the anchor unchanged when no block past it is complete — but (WS-primary) the very
+    // hole that stalled the fold now drives its authoritative ranged verification: the observed
+    // finality signal doubles as the fetch trigger, and the anchor advances on a later poll.
     #[test]
-    fn finalized_block_observed_with_only_finalized_complete_is_noop() {
+    fn finalized_block_observed_stalled_on_a_hole_schedules_its_ranged_verification() {
         let finalized_hash = BlockHash::with_last_byte(1);
         let target_hash = BlockHash::with_last_byte(2);
         let mut state = state_with_observed_chain(finalized_hash, &[target_hash]);
@@ -4780,7 +5085,13 @@ mod tests {
             },
         );
 
-        assert!(effects.is_empty());
+        let _ = assert_single_logs_range_request_effect(
+            &effects,
+            block_number_for(target_hash),
+            block_number_for(target_hash),
+            &HashSet::from([target_hash]),
+        );
+        assert_effects_are_well_formed(&state, &effects);
         let graph = &state.blocks.graph;
         assert_eq!(graph.anchor_hash(), finalized_hash);
         assert!(graph.contains(target_hash));
@@ -4869,7 +5180,7 @@ mod tests {
 
         // A complete target with a retained (still-unresolved) child on top.
         let state = observe_complete_block(state, target_hash, finalized_hash, Vec::new());
-        let (state, effects) = transition(
+        let (state, _effects) = transition(
             ChainKey::Ethereum,
             state,
             Event::HeadObserved {
@@ -4879,6 +5190,9 @@ mod tests {
                 parent_hash: target_hash,
             },
         );
+        // Sink the retained block past the settle window so the backstop issues its log request
+        // (WS-primary: no fetch fires at observation).
+        let (state, effects) = observe_clear_padding(state, retained_hash, 0xC8);
         let retained_logs_id = assert_single_block_log_request_effect(&effects, retained_hash);
         let mut state = state;
 
@@ -5139,11 +5453,9 @@ mod tests {
         assert_single_block_with_parent(&next_state, head_hash, missing_parent_hash);
         assert_single_unknown_block(&next_state, missing_parent_hash, finalized_hash);
         assert!(!next_state.pending_requests.contains(&request_id));
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // The connected parent sits at depth 1 — inside the settle window, so no log fetch rides
+        // the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         assert_state_invariants(&next_state);
     }
 
@@ -5291,11 +5603,8 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 1: inside the settle window, no log fetch rides the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(
@@ -6060,11 +6369,8 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 1: inside the settle window, no log fetch rides the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(
@@ -6123,11 +6429,8 @@ mod tests {
             },
         );
 
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 1: inside the settle window, no log fetch rides the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         let next_state = drain_block_log_effects(next_state, &effects);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&retry_request_id));
@@ -6177,11 +6480,8 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 1: inside the settle window, no log fetch rides the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(
@@ -6232,11 +6532,8 @@ mod tests {
                 parent_hash: finalized_hash,
             },
         );
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 1: inside the settle window, no log fetch rides the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         let state = drain_block_log_effects(state, &effects);
 
         let (next_state, effects) = transition(ChainKey::Ethereum, state, Event::Tick);
@@ -6335,11 +6632,8 @@ mod tests {
             },
         );
 
-        assert_request_hashes(
-            &effects,
-            HashSet::new(),
-            HashSet::from([missing_parent_hash]),
-        );
+        // Depth 1: inside the settle window, no log fetch rides the header response (WS-primary).
+        assert_request_hashes(&effects, HashSet::new(), HashSet::new());
         let next_state = drain_block_log_effects(next_state, &effects);
         assert_eq!(next_state.pending_requests.len_for_test(), 1);
         assert!(next_state.pending_requests.contains(&retry_request_id));
@@ -6502,7 +6796,9 @@ mod tests {
             let finalized_hash = hash_for_node(0);
             let tip_hash = hash_for_node(chain_len);
             let tip_parent_hash = hash_for_node(chain_len - 1);
-            let expected_log_hashes = (1..=chain_len)
+            // WS-primary: only blocks past the settle window are holes the backstop fetches — the
+            // newest STREAM_SETTLE_DEPTH blocks are the stream's.
+            let expected_log_hashes = (1..=chain_len.saturating_sub(STREAM_SETTLE_DEPTH))
                 .map(hash_for_node)
                 .collect::<HashSet<_>>();
             let mut state = empty_state_at(finalized_hash);
@@ -6525,7 +6821,7 @@ mod tests {
                 expected_log_hashes.clone()
             );
             prop_assert!(header_request_hashes_from_effects(&effects).is_empty());
-            prop_assert_eq!(state.pending_requests.len_for_test(), chain_len);
+            prop_assert_eq!(state.pending_requests.len_for_test(), expected_log_hashes.len());
             prop_assert_eq!(
                 state.pending_requests.pending_block_log_hashes(),
                 expected_log_hashes.clone()
@@ -6544,7 +6840,10 @@ mod tests {
             );
 
             prop_assert!(effects.is_empty());
-            prop_assert_eq!(next_state.pending_requests.len_for_test(), chain_len);
+            prop_assert_eq!(
+                next_state.pending_requests.len_for_test(),
+                next_state.pending_requests.pending_block_log_hashes().len()
+            );
             prop_assert_eq!(
                 next_state.pending_requests.pending_block_log_hashes(),
                 expected_log_hashes
@@ -6745,11 +7044,12 @@ mod tests {
                     state.blocks.graph.parent_hash_for_test(hash),
                     Some(parent_hash)
                 );
-                prop_assert_eq!(
-                    state.blocks.graph.has_complete_logs_for_test(hash),
-                    Some(true)
-                );
             }
+            // WS-primary: completeness is no longer an every-block property — blocks inside the
+            // settle window (and side-fork blocks off the final present chain) are the stream's,
+            // so after draining, the guarantee is exactly "no hole remains": every present-chain
+            // block past the window is Complete (nothing streams here, so no Streamed escape).
+            assert_present_canonical_logs_are_resolved(&state);
 
             let last_observed_head = chain
                 .observed_heads
@@ -6835,6 +7135,7 @@ mod tests {
                     Effect::Request(AnyIssuedRequest::PoolMetadata(_)) => {}
                     Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                     Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
+                    Effect::Request(AnyIssuedRequest::LogsRange(_)) => {}
                 }
             }
 
@@ -7171,7 +7472,10 @@ mod tests {
         // Generates arbitrary event sequences.
         // This broad state-machine property keeps safety invariants true across unexpected event orderings.
         #[test]
-        fn arbitrary_header_result_failure_not_found_and_tick_events_preserve_state_safety(
+        // Coverage extended at the WS-primary flip (never relaxed): arbitrary finality signals
+        // (reanchor/prune + ranged-log scheduling against any target) and unsolicited ranged-log
+        // responses joined the generated vocabulary.
+        fn arbitrary_event_sequences_preserve_state_safety(
             generated_events in generated_event_sequence_strategy(),
         ) {
             let finalized_hash = hash_for_node(0);
@@ -7472,5 +7776,281 @@ mod tests {
                 prop_assert_eq!(blocks.finalized_snapshot, base);
             }
         }
+    }
+
+    // --- WS-primary finalization ranges + ws-miss metric ---
+
+    #[test]
+    fn range_verification_completes_holes_then_the_next_poll_advances_the_anchor() {
+        // The full WS-primary finalization loop: a streamed block (trusted at tip, never
+        // per-block-fetched) and an unknown block stall the fold; the finality signal issues ONE
+        // coalesced ranged verification; a duplicate poll dedups against it; the authoritative
+        // response replaces the streamed set (counting the divergence as a ws-miss), proves the
+        // covered-absent block empty, and releases the seed scheduler's idle gate; the next poll
+        // advances the anchor over the now-verified path.
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let streamed_hash = BlockHash::with_last_byte(2);
+        let unknown_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let pool = pool_address(4);
+        let state = state_with_observed_chain(finalized_hash, &[streamed_hash, unknown_hash]);
+
+        let (mut state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::LogObserved {
+                block_hash: streamed_hash,
+                logs: vec![swap_log(candidate, 0, &pool_state(7))],
+            },
+        );
+        // Verify the pool only now — after the last quiet scheduling pass — so the anchor-height
+        // seed it needs can only be issued by a later pass, making the range idle-gate observable.
+        state.pool_registry = registry_verifying(candidate);
+
+        // First poll: the fold stalls at the streamed hole; both unresolved blocks coalesce into
+        // one range whose covered set names them exactly.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: unknown_hash,
+            },
+        );
+        let request_id = assert_single_logs_range_request_effect(
+            &effects,
+            block_number_for(streamed_hash),
+            block_number_for(unknown_hash),
+            &HashSet::from([streamed_hash, unknown_hash]),
+        );
+        assert_eq!(state.blocks.graph.anchor_hash(), finalized_hash);
+
+        // A duplicate poll while the range is on the wire schedules nothing new (number dedup).
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: unknown_hash,
+            },
+        );
+        assert_no_logs_range_request_effect(&effects);
+        assert_eq!(state.blocks.graph.anchor_hash(), finalized_hash);
+
+        // While the range pends, the seed scheduler stays idle-gated: a scheduling pass (duplicate
+        // head) emits no anchor-height seed even though the verified pool is uncovered.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                number: block_number_for(unknown_hash),
+                logs_bloom: bloom_matching_any(),
+                hash: unknown_hash,
+                parent_hash: streamed_hash,
+            },
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Request(AnyIssuedRequest::PoolData(_))
+        )));
+
+        // Authoritative response: the streamed block's true set carries an extra log — a ws-miss,
+        // counted then corrected by the replace; the covered-absent block is proven empty.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsRangeReceived {
+                request_id,
+                blocks: vec![(
+                    streamed_hash,
+                    vec![
+                        swap_log(candidate, 0, &pool_state(7)),
+                        swap_log(candidate, 1, &pool_state(9)),
+                    ],
+                )],
+            },
+        );
+        assert_eq!(
+            state.blocks.graph.has_complete_logs_for_test(streamed_hash),
+            Some(true)
+        );
+        assert_eq!(
+            state.blocks.graph.has_complete_logs_for_test(unknown_hash),
+            Some(true)
+        );
+        assert_eq!(state.ws_miss_count(), 1);
+        // The taken range released the idle gate: the uncovered verified pool's anchor-height
+        // seed request rides the same scheduling pass.
+        let (_seed_id, seed_at, seed_pools) = single_pool_data_request_effect(&effects);
+        assert_eq!(seed_at, finalized_hash);
+        assert_eq!(seed_pools, HashSet::from([pool]));
+
+        // Second poll: the verified path folds — the anchor advances to the target and the
+        // absolute swap self-seeds the pool at its latest state.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: unknown_hash,
+            },
+        );
+        assert_no_logs_range_request_effect(&effects);
+        assert_eq!(state.blocks.graph.anchor_hash(), unknown_hash);
+        assert_eq!(
+            state.blocks.finalized_snapshot,
+            HashMap::from([(pool, pool_state(9))])
+        );
+        assert_state_invariants(&state);
+    }
+
+    #[test]
+    fn range_response_applies_by_hash_and_only_covered_blocks_complete_empty() {
+        // Fork/reorg safety of the response handler: a response block hash the graph does not hold
+        // materializes nothing; a covered block absent from the response is proven empty; an
+        // uncovered present block never earns complete-empty, whatever numbers the range spanned.
+        // Neither an off-graph application nor an Unknown-block empty replace is a ws-miss.
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let covered_hash = BlockHash::with_last_byte(2);
+        let uncovered_hash = BlockHash::with_last_byte(3);
+        let pruned_hash = BlockHash::with_last_byte(9);
+        let candidate = pool_candidate_address(4);
+        let mut state = state_with_observed_chain(finalized_hash, &[covered_hash, uncovered_hash]);
+
+        let (pending_requests, request_id) = state.pending_requests.with_new_request(
+            GetLogsRange {
+                from: block_number_for(covered_hash),
+                to: block_number_for(uncovered_hash),
+                covered: HashSet::from([covered_hash, pruned_hash]),
+            },
+            tick(0),
+        );
+        state.pending_requests = pending_requests;
+
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsRangeReceived {
+                request_id,
+                blocks: vec![(pruned_hash, vec![swap_log(candidate, 0, &pool_state(7))])],
+            },
+        );
+
+        assert!(!state.blocks.graph.contains(pruned_hash));
+        assert_eq!(
+            state.blocks.graph.has_complete_logs_for_test(covered_hash),
+            Some(true)
+        );
+        assert_eq!(
+            state.blocks.graph.has_complete_logs_for_test(uncovered_hash),
+            Some(false)
+        );
+        assert_eq!(state.ws_miss_count(), 0);
+        assert_state_invariants(&state);
+    }
+
+    #[test]
+    fn unsolicited_range_response_is_dropped() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(4);
+        let state = state_with_observed_chain(finalized_hash, &[block_hash]);
+
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsRangeReceived {
+                request_id: RequestId::from_raw_for_test(77),
+                blocks: vec![(block_hash, vec![swap_log(candidate, 0, &pool_state(7))])],
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.blocks.graph.has_complete_logs_for_test(block_hash),
+            Some(false)
+        );
+        assert_eq!(state.ws_miss_count(), 0);
+        assert_state_invariants(&state);
+    }
+
+    #[test]
+    fn ws_miss_counts_only_key_set_divergence() {
+        // The metric fires exactly when an authoritative set's log_index keys differ from the
+        // streamed set it replaces — an agreeing replacement (whatever the payloads) is silent.
+        // Exercised through the per-block backstop path; the ranged path shares with_log_complete.
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let agreeing_hash = BlockHash::with_last_byte(2);
+        let divergent_hash = BlockHash::with_last_byte(3);
+        let candidate = pool_candidate_address(4);
+        let mut state = state_with_observed_chain(finalized_hash, &[agreeing_hash, divergent_hash]);
+
+        for (block_hash, log_index) in [(agreeing_hash, 0), (divergent_hash, 0)] {
+            let (next_state, _effects) = transition(
+                ChainKey::Ethereum,
+                state,
+                Event::LogObserved {
+                    block_hash,
+                    logs: vec![swap_log(candidate, log_index, &pool_state(7))],
+                },
+            );
+            state = next_state;
+        }
+
+        let (pending_requests, agreeing_id) = state.pending_requests.with_new_request(
+            GetBlockLogs {
+                block_hash: agreeing_hash,
+            },
+            tick(0),
+        );
+        let (pending_requests, divergent_id) = pending_requests.with_new_request(
+            GetBlockLogs {
+                block_hash: divergent_hash,
+            },
+            tick(0),
+        );
+        state.pending_requests = pending_requests;
+
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id: agreeing_id,
+                logs: vec![swap_log(candidate, 0, &pool_state(8))],
+            },
+        );
+        assert_eq!(state.ws_miss_count(), 0);
+
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockLogsReceived {
+                request_id: divergent_id,
+                logs: vec![
+                    swap_log(candidate, 0, &pool_state(7)),
+                    swap_log(candidate, 1, &pool_state(9)),
+                ],
+            },
+        );
+        assert_eq!(state.ws_miss_count(), 1);
+        assert_state_invariants(&state);
+    }
+
+    #[test]
+    fn finality_with_nothing_watched_schedules_no_ranges() {
+        // With no verified pools nothing blooms, so the whole path folds untouched: the anchor
+        // advances to the target and there is no hole to verify — the quiet no-range case.
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let target_hash = BlockHash::with_last_byte(2);
+        let state = state_with_observed_chain(finalized_hash, &[target_hash]);
+
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: target_hash,
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.blocks.graph.anchor_hash(), target_hash);
+        assert_state_invariants(&state);
     }
 }

@@ -76,7 +76,12 @@ snapshots. Absolute pool state is reconstructed by fold-on-demand.
 
 **Why L5 is sound:** for a fixed block hash the canonical log set is *immutable* (same hash ⇒ same
 block ⇒ same logs). So streamed logs accumulate toward a fixed truth, never conflict, and `Complete`
-is a terminal authoritative superset.
+is a terminal authoritative superset. Since the WS-primary trust flip (2026-07-09), `Complete ⊇
+Streamed` is an *expectation whose violation is measured*, not an assumption the code relies on: a
+feed could deliver a spurious/orphan-tagged log the authority does not contain. The replace
+semantics of `with_complete_logs` stays the authority either way, and every divergence increments
+the permanent per-chain `ws_miss` counter (`streamed_log_mismatch`, read immediately before the
+replace).
 
 ---
 
@@ -87,12 +92,15 @@ is a terminal authoritative superset.
 | A1 | The finalized hash is held in exactly one place (`anchor`) | **Structural** since the Stage-4 swap (2026-07-06): `FinalizedState` is deleted, no other field can hold the finalized hash, so duplication is unrepresentable | none |
 | A2 | `reanchored_to(new)` targets a connected descendant of the current anchor | **Runtime** — `ConnectedHash` gives shape (runtime referent, I1); descendant relation is a runtime check | reorg test |
 | A3 | After reanchor, every surviving `connected` node descends from the new anchor; non-descendant forks and now-unreachable `pending` are pruned | **Runtime** — the prune step | reorg test + post-state invariant check |
-| A4 | **Finalization safety gate:** the anchor advances to `new` only if the path old-anchor→`new` is fully *foldable* for every tracked pool (each block `Complete`, or bloom-clear for that pool). Otherwise backfill (getLogs) first | **Runtime** — single owner: frontier selection in `finalized_to` (`foldable_frontier`, `RequireComplete`) picks a hole-free sub-target, satisfying `reanchored_to`'s documented precondition. `missing_complete_ranges` is the backfill *query* (reserved for the WS-primary ranged-getLogs scheduler), not a second gate | tests: finalization refuses Streamed/Unknown bloom-touching holes; partial-compaction family |
+| A4 | **Finalization safety gate:** the anchor advances to `new` only if the path old-anchor→`new` is fully *foldable* for every tracked pool (each block `Complete`, or bloom-clear for that pool). Otherwise backfill (getLogs) first | **Runtime** — single owner: frontier selection in `finalized_to` (`foldable_frontier`, `RequireComplete`) picks a hole-free sub-target, satisfying `reanchored_to`'s documented precondition. `missing_complete_ranges_to` is the backfill *query* (production consumer since the WS-primary flip: `schedule_missing_log_range_requests` rides the same `FinalizedBlockObserved` whose fold the holes stalled), not a second gate | tests: finalization refuses Streamed/Unknown bloom-touching holes; partial-compaction family; stalled-fold-schedules-range + two-poll advance |
 
 A4 is the critical correctness gate of the whole refactor: the anchor snapshot is authoritative and
 permanent, so a fold may never cross a merely-`Streamed` (best-effort WS) block. This is exactly
-where `eth_getLogs` is retained — as the authoritative verification/backfill path, not the per-block
-driver.
+where `eth_getLogs` is retained — as the authoritative verification/backfill path (number-ranged
+`GetLogsRange` at finalization, plus the per-block tip-hole backstop), not the per-block driver.
+The ranged response may complete-empty only the blocks its request's `covered` hash set named —
+every one an ancestor of an observed finalized block, hence immutable — so absence from the
+topics-only response proves emptiness without trusting the provider's fork choice.
 
 ---
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use alloy::primitives::{Address, BlockHash, Bloom, BloomInput};
 
@@ -83,8 +83,8 @@ struct PendingNode {
 #[derive(Debug)]
 struct BlockData {
     /// Header block number. The canonical chain is number-contiguous, so the backfill query
-    /// ([`BlocksGraph::missing_complete_ranges`], the WS-primary ranged-getLogs substrate) coalesces
-    /// unresolved blocks into numeric `eth_getLogs` ranges from this.
+    /// ([`BlocksGraph::missing_complete_ranges_to`], the finalization ranged-getLogs verification)
+    /// coalesces unresolved blocks into numeric `eth_getLogs` ranges from this.
     number: u64,
     /// Header `logsBloom` when the block entered from a header; `None` for header-less nodes.
     logs_bloom: Option<Bloom>,
@@ -128,16 +128,18 @@ enum Admission {
     PendingBufferFull,
 }
 
-/// An inclusive range of block numbers to backfill authoritatively (`eth_getLogs`). Emitted by
-/// [`BlocksGraph::missing_complete_ranges`] for the runs of canonical blocks whose logs are not yet
-/// `Complete` but whose bloom may touch a tracked pool.
-// Production consumer arrives with the WS-primary work (ranged-getLogs backfill scheduler); until
-// then only the query's own tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct BlockRange {
-    from: u64,
-    to: u64,
+/// An inclusive range of block numbers to backfill authoritatively (ranged `eth_getLogs`). Emitted
+/// by [`BlocksGraph::missing_complete_ranges_to`] for the runs of canonical blocks whose logs are
+/// not yet `Complete` but whose bloom may touch a tracked pool. `hashes` snapshots exactly the hole
+/// blocks the range coalesced from (ascending, matching `from..=to` minus excluded numbers): the
+/// scheduler carries them in the request so the response handler can complete-empty a covered block
+/// absent from the (topics-only) response — absence proves emptiness only for blocks the request
+/// demonstrably covered, never for whatever the provider's fork happened to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MissingRange {
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    pub(crate) hashes: Vec<BlockHash>,
 }
 
 /// Which per-block log authority the fold ([`BlocksGraph::folded_pool_states`]) is allowed to read.
@@ -510,6 +512,31 @@ impl BlocksGraph {
         self
     }
 
+    /// Whether an incoming authoritative log set *diverges* from the streamed set a present block
+    /// holds: true iff the block is `Streamed` and the `log_index` key-sets differ (a missed or
+    /// spurious stream delivery). The WS-miss metric — the kernel reads this immediately before the
+    /// [`with_complete_logs`] replacement to count how often the trusted-at-tip stream was wrong
+    /// (`Complete ⊇ Streamed` is an expectation *measured* here, not assumed; replace semantics stays
+    /// the authority). `Unknown` (nothing streamed — the hole/backstop path) and `Complete`
+    /// (idempotent re-receive) blocks never count, nor does an absent block. A pure query: the graph
+    /// stays write-monotone.
+    pub(crate) fn streamed_log_mismatch(&self, hash: BlockHash, logs: &[PoolLog]) -> bool {
+        let Some(node) = self.nodes.get(&hash) else {
+            return false;
+        };
+        let data = match node {
+            Node::Connected(connected) => &connected.data,
+            Node::Pending(pending) => &pending.data,
+        };
+        match &data.logs {
+            BlockLogs::Streamed(existing) => {
+                let incoming: BTreeSet<u64> = logs.iter().map(|log| log.log_index).collect();
+                existing.keys().copied().collect::<BTreeSet<u64>>() != incoming
+            }
+            BlockLogs::Unknown | BlockLogs::Complete(_) => false,
+        }
+    }
+
     /// The canonical chain from oldest (child of the anchor) to newest (`observed_head`), derived on
     /// demand — never stored. When `observed_head` is `Connected`, its parent chain reaches the anchor
     /// by T2, so the walk is total and gap-free; when it is the anchor, `Pending`, or absent, there is
@@ -585,32 +612,38 @@ impl BlocksGraph {
         chain
     }
 
-    /// The blocks still needing an authoritative `GetBlockLogs`, newest→oldest: present-chain blocks
-    /// whose logs are not yet `Complete` (`Streamed` is provisional and still fetched), minus
-    /// `exclude` (the in-flight request set — the graph is pure and holds no request state).
+    /// The tip-side *holes* still needing a per-block `GetBlockLogs` backstop, newest→oldest:
+    /// present-chain blocks whose logs are `Unknown` (the WS stream delivered nothing — a `Streamed`
+    /// block is trusted at the tip and never re-fetched; authoritative verification is
+    /// finalization's ranged fetch), whose bloom may touch a `trusted` address, at depth ≥
+    /// `min_depth` below the observed head (giving the stream time to deliver before falling back
+    /// to RPC), minus `exclude` (the in-flight request set — the graph is pure and holds no request
+    /// state).
     ///
     /// The bloom gate mirrors the legacy scheduler, NOT the fold's `watched_addresses`: `trusted` is
     /// the scheduler-owned set (each verified pool's address plus the v4 PoolManager unconditionally —
-    /// the discovery anchor). `None` means the gate is inactive (no verified pools yet): every block
-    /// is fetched because the per-block fetch is still the discovery channel — an active gate over an
-    /// empty set (fetch nothing) is thereby unrepresentable. A bloom-clear block is
-    /// simply not fetched — no `Resolved`-promotion write exists here; the fold already skips
-    /// bloom-clear non-`Complete` blocks, and unlike legacy's sticky promotion the gate re-evaluates
-    /// against the *current* trusted set, so a block turns fetchable when a later-verified pool's
-    /// address hits its bloom.
-    pub(crate) fn unresolved_log_request_hashes(
+    /// the discovery anchor). An empty `trusted` set yields no holes ([`bloom_may_touch`]) — the
+    /// WS-primary trust flip retired the gate-inactive fetch-everything warmup; discovery rides the
+    /// topic-filtered stream and the bootstrap range scan. The gate re-evaluates against the
+    /// *current* trusted set, so a block turns fetchable when a later-verified pool's address hits
+    /// its bloom. `present_chain_from_head` walks newest→oldest, so the enumeration index *is* the
+    /// depth below the head (0 = the head itself).
+    pub(crate) fn unknown_log_hole_hashes(
         &self,
-        trusted: Option<&HashSet<Address>>,
+        trusted: &HashSet<Address>,
         exclude: &HashSet<BlockHash>,
+        min_depth: usize,
     ) -> Vec<BlockHash> {
         self.present_chain_from_head()
             .into_iter()
-            .filter(|(hash, data)| {
-                !matches!(data.logs, BlockLogs::Complete(_))
+            .enumerate()
+            .filter(|(depth, (hash, data))| {
+                *depth >= min_depth
+                    && matches!(data.logs, BlockLogs::Unknown)
                     && !exclude.contains(hash)
-                    && trusted.is_none_or(|trusted| bloom_may_touch(data.logs_bloom, trusted))
+                    && bloom_may_touch(data.logs_bloom, trusted)
             })
-            .map(|(hash, _)| hash)
+            .map(|(_, (hash, _))| hash)
             .collect()
     }
 
@@ -687,42 +720,81 @@ impl BlocksGraph {
     }
 
     /// The block-number ranges on the canonical path `anchor → target` whose logs must be fetched
-    /// authoritatively (`eth_getLogs`) before the path is fully foldable.
+    /// authoritatively (ranged `eth_getLogs`) before the path is fully foldable — the finalization
+    /// verification query behind [`missing_complete_ranges_to`].
     ///
     /// Value-free (reads no pool state): a block is a *hole* iff its logs are not yet `Complete`
     /// **and** its `logs_bloom` may touch a `watched` address (a tracked pool's v3 contract address,
-    /// or the v4 PoolManager). A header-less node (no bloom) is conservatively a hole. Consecutive
-    /// hole block numbers are coalesced into inclusive [`BlockRange`]s (the canonical path is
-    /// number-contiguous, but coalescing by numeric adjacency is correct regardless). An empty result
-    /// means the path is fully foldable.
+    /// or the v4 PoolManager) **and** its number is not in `exclude_numbers` (numbers already covered
+    /// by an in-flight ranged request — the graph is pure and holds no request state; an excluded
+    /// number splits a would-be range like any non-hole). A header-less node (no bloom) is
+    /// conservatively a hole. Consecutive hole block numbers are coalesced into inclusive
+    /// [`MissingRange`]s carrying their hole hashes (the canonical path is number-contiguous, but
+    /// coalescing by numeric adjacency is correct regardless). An empty result means the path is
+    /// fully foldable.
     ///
     /// `target` must be connected (caller holds the [`ConnectedHash`] proof); a target that is the
     /// anchor yields no ranges.
-    // Finalization itself no longer needs this: `finalized_to` pre-selects a hole-free frontier via
-    // `foldable_frontier` (A4's single owner). The production consumer arrives with the WS-primary
-    // work — the ranged-getLogs backfill scheduler that fills these holes.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn missing_complete_ranges(
         &self,
         target: ConnectedHash,
         watched: &HashSet<Address>,
-    ) -> Vec<BlockRange> {
-        let mut ranges: Vec<BlockRange> = Vec::new();
-        for data in self.connected_path_data(target) {
+        exclude_numbers: &HashSet<u64>,
+    ) -> Vec<MissingRange> {
+        let mut ranges: Vec<MissingRange> = Vec::new();
+        for ConnectedHash(hash) in self.connected_oldest_to_newest(target) {
+            // Every hash the shared walk yields is connected by construction, so the lookup resolves.
+            let Some(node) = self.connected(hash) else {
+                break;
+            };
+            let data = &node.data;
             let is_hole = !matches!(data.logs, BlockLogs::Complete(_))
-                && bloom_may_touch(data.logs_bloom, watched);
+                && bloom_may_touch(data.logs_bloom, watched)
+                && !exclude_numbers.contains(&data.number);
             if !is_hole {
                 continue;
             }
             match ranges.last_mut() {
-                Some(last) if data.number == last.to + 1 => last.to = data.number,
-                _ => ranges.push(BlockRange {
+                Some(last) if data.number == last.to + 1 => {
+                    last.to = data.number;
+                    last.hashes.push(hash);
+                }
+                _ => ranges.push(MissingRange {
                     from: data.number,
                     to: data.number,
+                    hashes: vec![hash],
                 }),
             }
         }
         ranges
+    }
+
+    /// Kernel entry for the finalization-time ranged-getLogs verification (the WS-primary
+    /// counterpart of [`finalized_to`], which pre-selects a hole-free frontier and therefore stalls
+    /// at these very holes): the [`MissingRange`]s on the canonical path `anchor → target`, or empty
+    /// when `target` is absent/pending/unconnected or off the canonical chain — mirroring
+    /// [`finalized_to`]'s guards (same `verified`/`v4_manager` watched-set inputs), so a target the
+    /// finalization no-ops on schedules no fetches either (and a fully-advanced target, no longer a
+    /// node, yields nothing: today's quiet case).
+    pub(crate) fn missing_complete_ranges_to(
+        &self,
+        target: BlockHash,
+        verified: &HashSet<PoolRef>,
+        v4_manager: Option<Address>,
+        exclude_numbers: &HashSet<u64>,
+    ) -> Vec<MissingRange> {
+        if self.connected(target).is_none() {
+            return Vec::new();
+        }
+        if !self
+            .canonical_oldest_to_newest()
+            .iter()
+            .any(|ConnectedHash(hash)| *hash == target)
+        {
+            return Vec::new();
+        }
+        let watched = watched_addresses(verified, v4_manager);
+        self.missing_complete_ranges(ConnectedHash(target), &watched, exclude_numbers)
     }
 
     /// The per-pool **overlay** of the canonical path `anchor → target` folded over `base`: only pools
@@ -1943,7 +2015,7 @@ mod tests {
     // --- scheduling queries (present-chain walk from the head) ---------------------------------
 
     #[test]
-    fn log_requests_walk_present_chain_newest_first() {
+    fn log_holes_walk_present_chain_newest_first() {
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
             .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
@@ -1951,14 +2023,14 @@ mod tests {
             .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
             .with_observed_head(graph_hash(4));
         assert_eq!(
-            graph.unresolved_log_request_hashes(Some(&watched()), &HashSet::new()),
+            graph.unknown_log_hole_hashes(&watched(), &HashSet::new(), 0),
             vec![graph_hash(4), graph_hash(3), graph_hash(2)]
         );
         assert_graph_invariants(&graph);
     }
 
     #[test]
-    fn log_requests_reach_pending_suffix_and_stop_at_gap() {
+    fn log_holes_reach_pending_suffix_and_stop_at_gap() {
         // b4/b5 are pending above the absent b3: the walk fetches their logs in parallel with the
         // header backfill, and stops at the gap — the connected b2 below it is not reached until
         // the headers connect (mirrors the legacy tip walk, which broke at the first absent block).
@@ -1969,17 +2041,18 @@ mod tests {
             .with_block(graph_hash(5), graph_hash(4), 5, hit_bloom()).0
             .with_observed_head(graph_hash(5));
         assert_eq!(
-            graph.unresolved_log_request_hashes(Some(&watched()), &HashSet::new()),
+            graph.unknown_log_hole_hashes(&watched(), &HashSet::new(), 0),
             vec![graph_hash(5), graph_hash(4)]
         );
         assert_graph_invariants(&graph);
     }
 
     #[test]
-    fn log_requests_skip_complete_and_in_flight_but_fetch_streamed() {
+    fn log_holes_skip_complete_streamed_and_in_flight() {
         // Complete is authoritative (never refetched); an in-flight request is deduped by the
-        // caller-supplied exclude set; Streamed is provisional and still needs the authoritative
-        // fetch (legacy `Partial` behaved the same).
+        // caller-supplied exclude set; and — the WS-primary trust flip — a Streamed block is trusted
+        // at the tip and NOT re-fetched (pre-flip behavior fetched it; finalization's ranged
+        // verification is now its authoritative check).
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
             .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
@@ -1988,33 +2061,98 @@ mod tests {
             .with_complete_logs(graph_hash(2), Vec::new())
             .with_streamed_logs(graph_hash(3), Vec::new())
             .with_observed_head(graph_hash(4));
-        let exclude = HashSet::from([graph_hash(4)]);
         assert_eq!(
-            graph.unresolved_log_request_hashes(Some(&watched()), &exclude),
-            vec![graph_hash(3)]
+            graph.unknown_log_hole_hashes(&watched(), &HashSet::new(), 0),
+            vec![graph_hash(4)]
+        );
+        let exclude = HashSet::from([graph_hash(4)]);
+        assert!(
+            graph
+                .unknown_log_hole_hashes(&watched(), &exclude, 0)
+                .is_empty()
         );
         assert_graph_invariants(&graph);
     }
 
     #[test]
-    fn log_requests_bloom_gate_only_fires_when_active() {
-        // Gate active: a bloom-clear block is provably untouched and skipped. Gate inactive (no
-        // verified pools yet — the per-block fetch is still the discovery channel): everything
-        // non-Complete is fetched, bloom-clear included.
+    fn log_holes_respect_the_depth_gate() {
+        // min_depth leaves the newest blocks to the WS stream: depth counts down from the head
+        // (head = 0), so with min_depth 2 only b2 (depth 2) qualifies.
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
+            .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
+            .with_observed_head(graph_hash(4));
+        assert_eq!(
+            graph.unknown_log_hole_hashes(&watched(), &HashSet::new(), 2),
+            vec![graph_hash(2)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn log_holes_bloom_clear_and_empty_trusted_yield_nothing() {
+        // A bloom-clear block is provably untouched and skipped. An empty trusted set yields no
+        // holes at all: the WS-primary flip retired the gate-inactive fetch-everything warmup
+        // (discovery rides the topic-filtered stream and the bootstrap range scan).
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
             .with_block(graph_hash(2), anchor, 2, clear_bloom()).0
             .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_observed_head(graph_hash(3));
         assert_eq!(
-            graph.unresolved_log_request_hashes(Some(&watched()), &HashSet::new()),
+            graph.unknown_log_hole_hashes(&watched(), &HashSet::new(), 0),
             vec![graph_hash(3)]
         );
-        assert_eq!(
-            graph.unresolved_log_request_hashes(None, &HashSet::new()),
-            vec![graph_hash(3), graph_hash(2)]
+        assert!(
+            graph
+                .unknown_log_hole_hashes(&HashSet::new(), &HashSet::new(), 0)
+                .is_empty()
         );
         assert_graph_invariants(&graph);
+    }
+
+    proptest! {
+        /// The tip-hole query never names a block that has any streamed/complete logs, sits above
+        /// the depth gate, or fails the bloom gate — the WS-primary "streamed is never re-fetched"
+        /// pin at the graph level.
+        #[test]
+        fn log_holes_are_only_unknown_bloom_hit_blocks_at_depth(
+            specs in prop::collection::vec((0u8..3, any::<bool>()), 1..12),
+            min_depth in 0usize..6,
+        ) {
+            let anchor = graph_hash(1);
+            let mut graph = BlocksGraph::new(anchor);
+            let mut parent = anchor;
+            for (index, (logs_kind, bloom_hit)) in specs.iter().enumerate() {
+                let hash = graph_hash(index + 2);
+                let bloom = if *bloom_hit { hit_bloom() } else { clear_bloom() };
+                graph = graph.with_block(hash, parent, (index + 2) as u64, bloom).0;
+                graph = match logs_kind {
+                    0 => graph,
+                    1 => graph.with_streamed_logs(hash, Vec::new()),
+                    _ => graph.with_complete_logs(hash, Vec::new()),
+                };
+                parent = hash;
+            }
+            let graph = graph.with_observed_head(parent);
+
+            let holes = graph.unknown_log_hole_hashes(&watched(), &HashSet::new(), min_depth);
+
+            // Independently expected: Unknown + bloom-hit blocks at depth ≥ min_depth, newest first.
+            let expected: Vec<BlockHash> = specs
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, (logs_kind, bloom_hit))| {
+                    let depth = specs.len() - 1 - index;
+                    (*logs_kind == 0 && *bloom_hit && depth >= min_depth)
+                        .then(|| graph_hash(index + 2))
+                })
+                .collect();
+            prop_assert_eq!(holes, expected);
+        }
     }
 
     #[test]
@@ -2147,10 +2285,28 @@ mod tests {
         (graph, ConnectedHash(last))
     }
 
+    /// Shorthand for the expected [`MissingRange`] of a contiguous hole run: `gate_chain` gives
+    /// block number `n` the hash `graph_hash(n)`, so the covered hashes follow from the bounds.
+    fn missing_range(from: u64, to: u64) -> MissingRange {
+        MissingRange {
+            from,
+            to,
+            hashes: (from..=to).map(|number| graph_hash(number as usize)).collect(),
+        }
+    }
+
+    fn no_excludes() -> HashSet<u64> {
+        HashSet::new()
+    }
+
     #[test]
     fn gate_all_complete_yields_no_ranges() {
         let (graph, target) = gate_chain(&[(2, Some(hit_bloom()), true), (3, Some(hit_bloom()), true)]);
-        assert!(graph.missing_complete_ranges(target, &watched()).is_empty());
+        assert!(
+            graph
+                .missing_complete_ranges(target, &watched(), &no_excludes())
+                .is_empty()
+        );
         assert_graph_invariants(&graph);
     }
 
@@ -2162,8 +2318,8 @@ mod tests {
             (4, Some(hit_bloom()), true),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched()),
-            vec![BlockRange { from: 3, to: 3 }]
+            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            vec![missing_range(3, 3)]
         );
         assert_graph_invariants(&graph);
     }
@@ -2174,7 +2330,11 @@ mod tests {
         // though its logs are not Complete.
         let (graph, target) =
             gate_chain(&[(2, Some(clear_bloom()), false), (3, Some(clear_bloom()), false)]);
-        assert!(graph.missing_complete_ranges(target, &watched()).is_empty());
+        assert!(
+            graph
+                .missing_complete_ranges(target, &watched(), &no_excludes())
+                .is_empty()
+        );
         assert_graph_invariants(&graph);
     }
 
@@ -2186,8 +2346,8 @@ mod tests {
             (4, Some(hit_bloom()), true),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched()),
-            vec![BlockRange { from: 2, to: 3 }]
+            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            vec![missing_range(2, 3)]
         );
         assert_graph_invariants(&graph);
     }
@@ -2200,8 +2360,24 @@ mod tests {
             (4, Some(hit_bloom()), false),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched()),
-            vec![BlockRange { from: 2, to: 2 }, BlockRange { from: 4, to: 4 }]
+            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            vec![missing_range(2, 2), missing_range(4, 4)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn gate_excluded_number_splits_a_range() {
+        // A number already covered by an in-flight ranged request is not re-requested, and it
+        // splits the coalesced run around it exactly like a non-hole.
+        let (graph, target) = gate_chain(&[
+            (2, Some(hit_bloom()), false),
+            (3, Some(hit_bloom()), false),
+            (4, Some(hit_bloom()), false),
+        ]);
+        assert_eq!(
+            graph.missing_complete_ranges(target, &watched(), &HashSet::from([3])),
+            vec![missing_range(2, 2), missing_range(4, 4)]
         );
         assert_graph_invariants(&graph);
     }
@@ -2211,8 +2387,39 @@ mod tests {
         // No bloom ⇒ we cannot prove the block is clear, so (with pools watched) it must be fetched.
         let (graph, target) = gate_chain(&[(2, None, false)]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched()),
-            vec![BlockRange { from: 2, to: 2 }]
+            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            vec![missing_range(2, 2)]
+        );
+        assert_graph_invariants(&graph);
+    }
+
+    #[test]
+    fn gate_wrapper_guards_mirror_finalization() {
+        // The kernel-facing wrapper no-ops exactly where `finalized_to` does: an absent target has
+        // no foldable prefix, and a connected side-fork target must not drive fetches for a path
+        // finalization would refuse to fold. A canonical mid-path target works. Watched-set inputs
+        // are `finalized_to`'s own (verified pools + v4 manager), derived internally.
+        let verified = HashSet::from([watched_pool()]);
+        let anchor = graph_hash(1);
+        let graph = BlocksGraph::new(anchor)
+            .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
+            // Side fork off b2, connected but not canonical once the head sits on b3.
+            .with_block(graph_hash(9), graph_hash(2), 3, hit_bloom()).0
+            .with_observed_head(graph_hash(3));
+        assert!(
+            graph
+                .missing_complete_ranges_to(graph_hash(7), &verified, None, &no_excludes())
+                .is_empty()
+        );
+        assert!(
+            graph
+                .missing_complete_ranges_to(graph_hash(9), &verified, None, &no_excludes())
+                .is_empty()
+        );
+        assert_eq!(
+            graph.missing_complete_ranges_to(graph_hash(2), &verified, None, &no_excludes()),
+            vec![missing_range(2, 2)]
         );
         assert_graph_invariants(&graph);
     }
@@ -2240,8 +2447,12 @@ mod tests {
             observed_head: block,
         };
         assert_eq!(
-            graph.missing_complete_ranges(ConnectedHash(block), &watched()),
-            vec![BlockRange { from: 2, to: 2 }]
+            graph.missing_complete_ranges(ConnectedHash(block), &watched(), &no_excludes()),
+            vec![MissingRange {
+                from: 2,
+                to: 2,
+                hashes: vec![block]
+            }]
         );
         assert_graph_invariants(&graph);
     }
@@ -2252,7 +2463,7 @@ mod tests {
         let (graph, target) = gate_chain(&[(2, Some(hit_bloom()), false), (3, None, false)]);
         assert!(
             graph
-                .missing_complete_ranges(target, &HashSet::new())
+                .missing_complete_ranges(target, &HashSet::new(), &no_excludes())
                 .is_empty()
         );
         assert_graph_invariants(&graph);
@@ -2279,7 +2490,7 @@ mod tests {
                 })
                 .collect();
             let (graph, target) = gate_chain(&chain);
-            let ranges = graph.missing_complete_ranges(target, &watched());
+            let ranges = graph.missing_complete_ranges(target, &watched(), &no_excludes());
 
             // Independently expected hole block numbers (ascending, since numbers are contiguous).
             let holes: Vec<u64> = chain
@@ -2297,6 +2508,10 @@ mod tests {
             for range in &ranges {
                 prop_assert!(range.from <= range.to);
                 covered.extend(range.from..=range.to);
+                // The covered hashes name exactly the range's blocks (gate_chain keys hash by number).
+                let expected_hashes: Vec<BlockHash> =
+                    (range.from..=range.to).map(|number| graph_hash(number as usize)).collect();
+                prop_assert_eq!(&range.hashes, &expected_hashes);
             }
             // Exact match ⇒ sound (only holes covered) and complete (every hole covered).
             prop_assert_eq!(covered, holes);
@@ -2492,6 +2707,31 @@ mod tests {
         assert!(matches!(graph.nodes.get(&graph_hash(2)), Some(Node::Pending(_))));
         assert_eq!(block_logs(&graph, graph_hash(2)), Some((false, vec![4])));
         assert_graph_invariants(&graph);
+    }
+
+    // --- WS-miss detection (streamed vs authoritative divergence) -------------------------------
+
+    #[test]
+    fn streamed_mismatch_fires_only_on_key_set_divergence() {
+        // The metric counts a streamed set whose `log_index` keys differ from the incoming
+        // authoritative set — missing a log or carrying a spurious one both count; agreement does
+        // not, whatever the payloads (dedup/authority is keyed, L3).
+        let graph = one_block_graph().with_streamed_logs(graph_hash(1), logs_at(&[3, 5]));
+        assert!(!graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3, 5])));
+        assert!(graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3]))); // spurious stream log
+        assert!(graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3, 5, 7]))); // missed log
+        assert!(graph.streamed_log_mismatch(graph_hash(1), &[])); // non-empty stream vs empty truth
+    }
+
+    #[test]
+    fn streamed_mismatch_ignores_unknown_complete_and_absent_blocks() {
+        // Unknown = nothing streamed (the hole/backstop path, not a stream miss); Complete = an
+        // idempotent authoritative re-receive; absent = pruned/never admitted. None are misses.
+        let graph = one_block_graph();
+        assert!(!graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3])));
+        let graph = graph.with_complete_logs(graph_hash(1), logs_at(&[3]));
+        assert!(!graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3, 4])));
+        assert!(!graph.streamed_log_mismatch(graph_hash(9), &logs_at(&[3])));
     }
 
     #[derive(Debug, Clone)]
@@ -3072,15 +3312,19 @@ mod tests {
     fn finalization_refuses_unknown_bloom_hit_block() {
         // A4: an Unknown-logs block whose bloom hits a tracked pool is a hole — finalization must
         // not advance over it; the graph and the caller's snapshot (borrowed) are untouched, and the
-        // hole is exactly what `missing_complete_ranges` reports for the WS-primary backfill.
+        // hole is exactly what `missing_complete_ranges` reports for the finalization backfill.
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let (graph, target) = fold_chain(vec![(7, BlockLogs::Unknown)]);
         let target_hash = target.0;
         let watched = watched_addresses(&verified_of(&base), None);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched),
-            vec![BlockRange { from: 7, to: 7 }]
+            graph.missing_complete_ranges(target, &watched, &no_excludes()),
+            vec![MissingRange {
+                from: 7,
+                to: 7,
+                hashes: vec![target_hash]
+            }]
         );
         let (graph, snapshot) = graph.finalized_to(target_hash, &base, &verified_of(&base), None);
         assert_eq!(graph.anchor, graph_hash(1));

@@ -30,6 +30,10 @@ pub struct ChainProgress {
     /// RPC requests currently in flight for the chain (dispatched, not yet answered): the per-chain
     /// fetch-backlog gauge.
     pub in_flight_requests: usize,
+    /// Cumulative WS-miss count: how often an authoritative log fetch diverged from the streamed
+    /// set it replaced. The trust gauge of the WS-primary flip — ~0 means the feeds have never
+    /// been caught wrong.
+    pub ws_misses: u64,
 }
 
 /// A render snapshot of one chain: lifecycle phase plus metrics that exist only while active.
@@ -246,6 +250,7 @@ fn observe_chain(
             blocks_behind_tip: last_optimized_block
                 .and_then(|reference| chain_state.blocks_behind(reference)),
             in_flight_requests: chain_state.in_flight_request_count(),
+            ws_misses: chain_state.ws_miss_count(),
         }),
     }
 }
@@ -1226,6 +1231,7 @@ mod tests {
                     verified_pools: 1,
                     blocks_behind_tip: None,
                     in_flight_requests: 0,
+                    ws_misses: 0,
                 })
             )]
         );
@@ -1256,6 +1262,7 @@ mod tests {
                     verified_pools: 1,
                     blocks_behind_tip: Some(0),
                     in_flight_requests: 0,
+                    ws_misses: 0,
                 })
             )]
         );
@@ -1287,7 +1294,7 @@ mod tests {
 
         assert_eq!(state.status(chain), Some(ChainStatus::Active));
 
-        let (_state, effects) = transition(
+        let (state, _effects) = transition(
             state,
             Event::ChainEvent {
                 chain,
@@ -1299,6 +1306,8 @@ mod tests {
                 },
             },
         );
+        // WS-primary: the backstop log fetch fires once the block sinks past the settle window.
+        let (_state, effects) = observe_clear_padding(state, chain, child_hash, 0xE1);
         assert_single_log_request_chain_effect(&effects, chain, child_hash);
     }
 
@@ -1442,10 +1451,12 @@ mod tests {
         let policy = finalized_refresh_policy(chain);
         let state = active_state_at(chain, finalized_hash);
         let (state, effects) = drive_connected_heads(state, chain, policy.target_len);
+        // WS-primary: the last head observation carries the backstop fetch for the block that just
+        // crossed the settle window, not for the head itself.
         let request_id = assert_single_log_request_chain_effect(
             &effects,
             chain,
-            hash_for_index(policy.target_len),
+            hash_for_index(policy.target_len - kernel::STREAM_SETTLE_DEPTH),
         );
 
         let (_state, effects) = transition(
@@ -1569,7 +1580,7 @@ mod tests {
         let compacted_hash = hash(2);
         let old_branch_hash = hash(3);
         let state = active_state_at(chain, finalized_hash);
-        let (state, effects) = transition(
+        let (state, _effects) = transition(
             state,
             Event::ChainEvent {
                 chain,
@@ -1581,6 +1592,8 @@ mod tests {
                 },
             },
         );
+        // WS-primary: sink the block past the settle window so the backstop issues its log fetch.
+        let (state, effects) = observe_clear_padding(state, chain, compacted_hash, 0xE1);
         let log_request_id =
             assert_single_log_request_chain_effect(&effects, chain, compacted_hash);
         let (state, effects) = transition(
@@ -2575,6 +2588,40 @@ mod tests {
                 },
             },
         )
+    }
+
+    /// Observes `STREAM_SETTLE_DEPTH` bloom-clear padding heads above `parent_hash`, sinking the
+    /// blocks under test past the stream's settle window so the per-block backstop may fetch them
+    /// (WS-primary — see the kernel tests' twin helper). Returns the state and the *last* padding
+    /// transition's effects, where the uncovered holes' log requests surface.
+    fn observe_clear_padding(
+        state: State,
+        chain: ChainKey,
+        parent_hash: BlockHash,
+        first_byte: u8,
+    ) -> (State, Vec<Effect>) {
+        let mut state = state;
+        let mut parent_hash = parent_hash;
+        let mut effects = Vec::new();
+        for offset in 0..kernel::STREAM_SETTLE_DEPTH {
+            let padding_hash = hash(first_byte + offset as u8);
+            let (next_state, next_effects) = transition(
+                state,
+                Event::ChainEvent {
+                    chain,
+                    event: kernel::Event::HeadObserved {
+                        hash: padding_hash,
+                        parent_hash,
+                        logs_bloom: crate::Bloom::default(),
+                        number: block_number_for(padding_hash),
+                    },
+                },
+            );
+            state = next_state;
+            effects = next_effects;
+            parent_hash = padding_hash;
+        }
+        (state, effects)
     }
 
     fn hash_for_index(index: usize) -> BlockHash {

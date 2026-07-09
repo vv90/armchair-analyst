@@ -285,6 +285,46 @@ pub fn fetch_pool_candidates_in_range(
     Ok(blocks)
 }
 
+/// Fetches the pool logs of the inclusive block-number window `[from_block, to_block]` — the
+/// executor of the kernel's `GetLogsRange` finalization verification (WS-primary: the ranged fetch
+/// is the authoritative check of streamed logs; per-block `fetch_block_logs` remains only as the
+/// tip-hole backstop). Same paging/failover discipline as [`fetch_pool_candidates_in_range`], but
+/// with an explicit upper bound (the kernel derives it from the canonical graph — every block in
+/// the window is at or below an observed finalized block) and no tip resolution. Topics-only, so
+/// completeness is independent of the pool set.
+pub fn fetch_pool_logs_in_range(
+    agent: &ureq::Agent,
+    endpoints: &ChainEndpoints,
+    chain: ChainKey,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
+    let pool = endpoints.pool(chain)?;
+    if to_block < from_block {
+        return Ok(Vec::new());
+    }
+
+    let chunk = crate::chain::pool_candidate_block_range_chunk(chain);
+    let mut blocks: Vec<RangeLogBlock> = Vec::new();
+    let mut cursor = from_block;
+    loop {
+        let window_end = cursor.saturating_add(chunk - 1).min(to_block);
+        let request = build_pool_logs_range_request(HTTP_REQUEST_ID, cursor, window_end);
+        let window = pool.with_failover(|endpoint| {
+            let response_value = send_rpc_request(agent, endpoint, &request)?;
+            parse_pool_logs_range_response(&response_value, HTTP_REQUEST_ID)
+        })?;
+        blocks.extend(window);
+
+        if window_end >= to_block {
+            break;
+        }
+        cursor = window_end + 1;
+    }
+
+    Ok(blocks)
+}
+
 /// Reads the chain's current tip block number (`eth_blockNumber`), used to bound the paged
 /// pool-candidate scan.
 pub fn fetch_block_number(
@@ -932,8 +972,7 @@ where
             continue;
         };
 
-        // Drop logs we cannot attribute to a block or that are not state-relevant pool events.
-        let (Some(block_hash), Some(pool_log)) = (log.block_hash, decode_pool_log(&log)) else {
+        let Some((block_hash, pool_log)) = admit_pool_log_frame(&log) else {
             continue;
         };
 
@@ -946,6 +985,22 @@ where
             },
             map_event,
         )?;
+    }
+}
+
+/// The per-frame admission decision of the pool-log stream. Drops reorg retractions outright: a
+/// `removed` frame re-announces the log under its ORPHANED block hash, and the kernel's graph owns
+/// reorgs (an orphaned block's log set is simply never canonical), so there is nothing to reverse —
+/// but there is also nothing to add, and folding it as a fresh delivery would be wrong if a
+/// provider ever tagged it with the replacing block. Also drops logs that cannot be attributed to
+/// a block or are not state-relevant pool events.
+fn admit_pool_log_frame(log: &Log) -> Option<(BlockHash, PoolLog)> {
+    if log.removed {
+        return None;
+    }
+    match (log.block_hash, decode_pool_log(log)) {
+        (Some(block_hash), Some(pool_log)) => Some((block_hash, pool_log)),
+        _ => None,
     }
 }
 
@@ -2768,6 +2823,46 @@ mod tests {
         serde_json::to_value(&log).expect("log serializes to json")
     }
 
+    #[test]
+    fn admit_pool_log_frame_drops_removed_frames_and_admits_live_ones() {
+        // A `removed: true` reorg retraction is dropped at ingestion even when perfectly
+        // decodable; the identical live frame is admitted with its block attribution.
+        use alloy::primitives::{I256, U160, aliases::I24};
+        use alloy::sol_types::SolEvent;
+
+        use crate::uniswap_v3::Swap;
+
+        let event = Swap {
+            sender: Address::with_last_byte(9),
+            recipient: Address::with_last_byte(10),
+            amount0: I256::ZERO,
+            amount1: I256::ZERO,
+            sqrtPriceX96: U160::from(1u128),
+            liquidity: 1,
+            tick: I24::ZERO,
+        };
+        let block_hash = B256::with_last_byte(7);
+        let mut log = Log {
+            inner: alloy::primitives::Log {
+                address: Address::with_last_byte(1),
+                data: event.encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(4),
+            log_index: Some(7),
+            removed: true,
+            ..Default::default()
+        };
+
+        assert_eq!(admit_pool_log_frame(&log), None);
+
+        log.removed = false;
+        let (admitted_hash, pool_log) =
+            admit_pool_log_frame(&log).expect("live decodable frame must be admitted");
+        assert_eq!(admitted_hash, block_hash);
+        assert_eq!(pool_log.log_index, 7);
+    }
+
     /// Extracts an `eth_getLogs` filter field (e.g. `fromBlock`/`toBlock`) from a captured request.
     fn range_filter(body: &Value, key: &str) -> Value {
         body.get("params")
@@ -2842,6 +2937,71 @@ mod tests {
 
         let blocks = fetch_pool_candidates_in_range(&agent, &endpoints, ChainKey::Ethereum, 100)
             .expect("scan must succeed");
+
+        assert!(blocks.is_empty());
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_logs_in_range_pages_the_bounded_window_without_tip_resolution() {
+        // The explicit `[from, to]` bound comes from the kernel's canonical graph, so no
+        // `eth_blockNumber` round-trip precedes the windows; a bound one chunk past `from` forces
+        // two contiguous topics-only pages.
+        let chain = ChainKey::Ethereum;
+        let chunk = crate::chain::pool_candidate_block_range_chunk(chain);
+        let to_block = chunk + 50;
+
+        let window_one = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [log_result(Address::with_last_byte(1), B256::with_last_byte(7))]
+        });
+        let window_two = json!({ "jsonrpc": "2.0", "id": 1, "result": [] });
+
+        let (http_url, received, server) =
+            spawn_json_rpc_server_sequence(vec![window_one, window_two]);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let blocks = fetch_pool_logs_in_range(&agent, &endpoints, chain, 0, to_block)
+            .expect("paged range fetch must succeed");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].number, 4);
+        assert_eq!(blocks[0].hash, B256::with_last_byte(7));
+
+        // The FIRST request is already a getLogs window — no tip resolution.
+        let first = received.recv().expect("first window request");
+        assert_eq!(first.body.get("method"), Some(&json!("eth_getLogs")));
+        assert_eq!(range_filter(&first.body, "fromBlock"), json!("0x0"));
+        assert_eq!(
+            range_filter(&first.body, "toBlock"),
+            json!(format!("0x{:x}", chunk - 1))
+        );
+
+        let second = received.recv().expect("second window request");
+        assert_eq!(second.body.get("method"), Some(&json!("eth_getLogs")));
+        assert_eq!(
+            range_filter(&second.body, "fromBlock"),
+            json!(format!("0x{chunk:x}"))
+        );
+        assert_eq!(
+            range_filter(&second.body, "toBlock"),
+            json!(format!("0x{to_block:x}"))
+        );
+
+        server.join().expect("server thread must complete");
+    }
+
+    #[test]
+    fn fetch_pool_logs_in_range_with_inverted_bounds_issues_no_requests() {
+        // A degenerate window is answered locally; the server would panic on any request.
+        let (http_url, _received, server) = spawn_json_rpc_server_sequence(vec![]);
+        let endpoints = endpoints_for(&http_url);
+        let agent = ureq::Agent::new_with_defaults();
+
+        let blocks = fetch_pool_logs_in_range(&agent, &endpoints, ChainKey::Ethereum, 100, 99)
+            .expect("degenerate range must succeed");
 
         assert!(blocks.is_empty());
         server.join().expect("server thread must complete");

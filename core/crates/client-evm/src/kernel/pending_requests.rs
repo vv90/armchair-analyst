@@ -45,6 +45,20 @@ pub struct GetPoolData {
     pub pools: HashSet<PoolRef>,
 }
 
+/// Ranged `eth_getLogs` over the inclusive block-number window `[from, to]` — the finalization-time
+/// authoritative verification of WS-streamed logs (per-block `GetBlockLogs` remains only as the
+/// rare tip-hole backstop). `covered` snapshots the exact canonical hole hashes the range coalesced
+/// from — every one an ancestor of an observed *finalized* block, hence immutable — so the response
+/// handler may complete-empty a covered block absent from the (topics-only) response: absence
+/// proves emptiness only for blocks the request demonstrably covered, never for whatever fork the
+/// provider answered from.
+#[derive(Clone)]
+pub struct GetLogsRange {
+    pub from: u64,
+    pub to: u64,
+    pub covered: HashSet<BlockHash>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnyRequestId {
     BlockHeader(RequestId<GetBlockHeader>),
@@ -52,6 +66,7 @@ pub enum AnyRequestId {
     PoolMetadata(RequestId<GetPoolMetadata>),
     TokenMetadata(RequestId<GetTokenMetadata>),
     PoolData(RequestId<GetPoolData>),
+    LogsRange(RequestId<GetLogsRange>),
 }
 
 impl fmt::Debug for AnyRequestId {
@@ -68,6 +83,7 @@ impl fmt::Debug for AnyRequestId {
                 write!(formatter, "token_metadata#{request_id:?}")
             }
             AnyRequestId::PoolData(request_id) => write!(formatter, "pool_data#{request_id:?}"),
+            AnyRequestId::LogsRange(request_id) => write!(formatter, "logs_range#{request_id:?}"),
         }
     }
 }
@@ -78,6 +94,7 @@ pub enum AnyIssuedRequest {
     PoolMetadata(IssuedRequest<GetPoolMetadata>),
     TokenMetadata(IssuedRequest<GetTokenMetadata>),
     PoolData(IssuedRequest<GetPoolData>),
+    LogsRange(IssuedRequest<GetLogsRange>),
 }
 
 pub struct PendingRequests {
@@ -87,6 +104,7 @@ pub struct PendingRequests {
     pool_metadata: RequestCollection<GetPoolMetadata>,
     token_metadata: RequestCollection<GetTokenMetadata>,
     pool_data: RequestCollection<GetPoolData>,
+    logs_range: RequestCollection<GetLogsRange>,
 }
 
 impl PendingRequests {
@@ -98,6 +116,7 @@ impl PendingRequests {
             pool_metadata: RequestCollection::new(),
             token_metadata: RequestCollection::new(),
             pool_data: RequestCollection::new(),
+            logs_range: RequestCollection::new(),
         }
     }
     pub fn take<R>(self, request_id: &RequestId<R>) -> (Self, Option<PendingPayload<R>>)
@@ -131,6 +150,11 @@ impl PendingRequests {
                     .into_iter()
                     .map(AnyRequestId::PoolData),
             )
+            .chain(
+                expired_request_ids::<Self, GetLogsRange>(self, tick)
+                    .into_iter()
+                    .map(AnyRequestId::LogsRange),
+            )
             .collect()
     }
 
@@ -151,6 +175,7 @@ impl PendingRequests {
             + self.pool_metadata.values().count()
             + self.token_metadata.values().count()
             + self.pool_data.values().count()
+            + self.logs_range.values().count()
     }
 
     pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
@@ -192,11 +217,24 @@ impl PendingRequests {
             .collect()
     }
 
-    /// Reports whether any latency-critical block-graph backfill (header or log) is in flight.
-    /// The finalized-pool-seed scheduler idle-gates on this: coverage seeding is deferred while the
-    /// graph is still completing so it never competes with the critical path for the RPC budget.
+    /// The block numbers covered by every in-flight ranged-log request, so the range scheduler
+    /// never re-requests a number already on the wire (an excluded number splits a would-be range).
+    /// Bounded by the retention window's worth of canonical blocks.
+    pub(crate) fn pending_log_range_numbers(&self) -> HashSet<u64> {
+        self.logs_range
+            .values()
+            .flat_map(|request| request.payload.from..=request.payload.to)
+            .collect()
+    }
+
+    /// Reports whether any latency-critical block-graph backfill (header, log, or ranged-log
+    /// verification) is in flight. The finalized-pool-seed scheduler idle-gates on this: coverage
+    /// seeding is deferred while the graph is still completing so it never competes with the
+    /// critical path for the RPC budget.
     pub(crate) fn has_pending_block_backfill(&self) -> bool {
-        self.block_headers.values().next().is_some() || self.block_logs.values().next().is_some()
+        self.block_headers.values().next().is_some()
+            || self.block_logs.values().next().is_some()
+            || self.logs_range.values().next().is_some()
     }
 
     pub(crate) fn retaining_block_targets(self, retained_blocks: &HashSet<BlockHash>) -> Self {
@@ -220,6 +258,16 @@ impl PendingRequests {
         requests
             .pool_data
             .retain(|_, request| retained_blocks.contains(&request.payload.at));
+        // A ranged-log verification survives as long as ANY covered hole is still a node — a
+        // partial prune leaves work the response can still apply (by hash, no-op on the pruned
+        // rest); only a range whose every covered block is gone is fully superseded.
+        requests.logs_range.retain(|_, request| {
+            request
+                .payload
+                .covered
+                .iter()
+                .any(|hash| retained_blocks.contains(hash))
+        });
 
         requests
     }
@@ -252,6 +300,9 @@ impl PendingRequests {
             }
             AnyRequestId::PoolData(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::PoolData)
+            }
+            AnyRequestId::LogsRange(request_id) => {
+                self.retry_typed(request_id, tick, AnyIssuedRequest::LogsRange)
             }
         }
     }
@@ -306,6 +357,7 @@ impl PendingRequests {
             AnyRequestId::PoolMetadata(request_id) => self.contains(&request_id),
             AnyRequestId::TokenMetadata(request_id) => self.contains(&request_id),
             AnyRequestId::PoolData(request_id) => self.contains(&request_id),
+            AnyRequestId::LogsRange(request_id) => self.contains(&request_id),
         }
     }
 
@@ -352,6 +404,11 @@ impl PendingRequests {
             )
             .chain(
                 self.pool_data
+                    .values()
+                    .map(|request| request.dispatched_at),
+            )
+            .chain(
+                self.logs_range
                     .values()
                     .map(|request| request.dispatched_at),
             )
@@ -415,6 +472,16 @@ impl RequestStore<GetPoolData> for PendingRequests {
     }
 }
 
+impl RequestStore<GetLogsRange> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetLogsRange> {
+        &self.logs_range
+    }
+
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetLogsRange> {
+        &mut self.logs_range
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +524,63 @@ mod tests {
 
         assert!(!pending.contains(&seed_id), "stale-anchor seed must be dropped");
         assert!(pending.contains(&log_id), "a request for a retained block survives");
+    }
+
+    #[test]
+    fn retaining_block_targets_keeps_a_logs_range_while_any_covered_block_survives() {
+        let pruned = BlockHash::with_last_byte(1);
+        let retained = BlockHash::with_last_byte(2);
+
+        let (pending, partial_id) = PendingRequests::new().with_new_request(
+            GetLogsRange {
+                from: 10,
+                to: 11,
+                covered: HashSet::from([pruned, retained]),
+            },
+            Tick::initial(),
+        );
+        let (pending, superseded_id) = pending.with_new_request(
+            GetLogsRange {
+                from: 12,
+                to: 12,
+                covered: HashSet::from([pruned]),
+            },
+            Tick::initial(),
+        );
+
+        let pending = pending.retaining_block_targets(&HashSet::from([retained]));
+
+        assert!(
+            pending.contains(&partial_id),
+            "a range with a surviving covered block still has applicable work"
+        );
+        assert!(
+            !pending.contains(&superseded_id),
+            "a range whose every covered block was pruned is superseded"
+        );
+    }
+
+    #[test]
+    fn logs_range_gates_the_backfill_and_reports_its_numbers() {
+        let pending = PendingRequests::new();
+        assert!(!pending.has_pending_block_backfill());
+        assert!(pending.pending_log_range_numbers().is_empty());
+
+        let (pending, request_id) = pending.with_new_request(
+            GetLogsRange {
+                from: 5,
+                to: 7,
+                covered: HashSet::from([BlockHash::with_last_byte(5)]),
+            },
+            Tick::initial(),
+        );
+
+        // An in-flight range is latency-critical backfill (the seed scheduler must stay idle) and
+        // covers every number in its window for the range scheduler's dedup.
+        assert!(pending.has_pending_block_backfill());
+        assert_eq!(pending.pending_log_range_numbers(), HashSet::from([5, 6, 7]));
+
+        let (pending, _) = pending.take(&request_id);
+        assert!(!pending.has_pending_block_backfill());
     }
 }

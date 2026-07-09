@@ -126,13 +126,25 @@ deliverable — see Stage 0.)
 > `canonical_tip`, the reset paths, and the tip-targeted `GetPoolData` plumbing are deleted; the
 > log-sourced graph is the kernel's sole chain-state authority (schedulers, finalization, lag
 > metrics, optimization reads). Ordering deviation from the plan above: Stage 3 (multi-provider WS)
-> was deliberately deferred — it hardens the streamed-log input but adds no correctness invariant —
-> so per-block `eth_getLogs` REMAINS the completeness/discovery driver until the WS-primary work
-> lands (it must land before production runs); "drop per-block getLogs" pairs with that later work.
+> was deliberately deferred — it hardens the streamed-log input but adds no correctness invariant.
 > The Stage-2 differential proptest and the shadow-parity suite were deleted with the legacy graph,
-> as planned. The anchor-height `GetPoolData` seeding for un-baseable pools (Blockers 1b/1c) is a
-> deferred coverage/liveness follow-up (`KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`, case (d)); the
-> retained RPC reader is `client_effects::fetch_pool_data`.
+> as planned.
+>
+> **STATUS (2026-07-09): Stage 4 is COMPLETE — per-block getLogs is dropped as the every-block
+> driver (the WS-primary trust flip).** Prerequisites landed first: Stage 3's multi-provider WS
+> fan-out + debounce, and the anchor-height `GetPoolData` seeding (Blockers 1b/1c). Post-flip:
+> - **Tip:** the WS stream is primary. `Streamed` blocks are trusted and never re-fetched; the
+>   per-block `GetBlockLogs` survives only as the rare-hole **backstop** — `Unknown` bloom-touching
+>   canonical blocks deeper than `STREAM_SETTLE_DEPTH` below the head (hash-keyed, hence fork-proof
+>   in the unfinalized region). The gate-inactive "fetch every block during warmup" discovery
+>   channel is retired (discovery = topic-filtered WS stream + bootstrap range scan).
+> - **Finalization:** authoritative verification moved here. A `FinalizedBlockObserved` whose fold
+>   stalls on holes schedules number-ranged `GetLogsRange` requests
+>   (`missing_complete_ranges_to`); the payload's `covered` hash set bounds which absent blocks may
+>   be proven empty. The anchor advances on the next finality re-poll (stride-bounded).
+> - **Trust metric:** every authoritative replace of a divergent `Streamed` set increments the
+>   permanent per-chain `ws_miss` counter (gauge + view) — the shadow comparison of the original
+>   Stage 3, made permanent instead of temporary.
 
 ---
 
