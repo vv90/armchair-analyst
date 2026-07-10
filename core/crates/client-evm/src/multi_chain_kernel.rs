@@ -28,6 +28,12 @@ pub struct ChainProgress {
     /// Canonical blocks the tip is ahead of the chain's last dispatched optimization block.
     /// `None` while no optimization has been dispatched or the reference is off the current path.
     pub blocks_behind_tip: Option<usize>,
+    /// Connected canonical path length from the finalized anchor to the tip — the window every
+    /// optimization overlay recompute folds over. Growth past the chain's finalized-refresh
+    /// target is the early signature of finalization not advancing (e.g. a wrong provisional
+    /// finality constant), visible here before it shows up as CPU or memory. `None` while the
+    /// tip is not yet connected to the anchor.
+    pub canonical_window: Option<usize>,
     /// RPC requests currently in flight for the chain (dispatched, not yet answered): the per-chain
     /// fetch-backlog gauge.
     pub in_flight_requests: usize,
@@ -41,7 +47,9 @@ pub struct ChainProgress {
 /// Added as the single read model `observe` returns, keeping `ChainStatus` a pure lifecycle indicator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainObservation {
-    Initializing,
+    /// Still bootstrapping. `buffered_events` counts the live subscription deliveries queued for
+    /// replay at activation, so the size of the activation burst is visible while it accumulates.
+    Initializing { buffered_events: usize },
     Active(ChainProgress),
 }
 
@@ -256,11 +264,14 @@ fn observe_chain(
     last_optimized_block: Option<BlockHash>,
 ) -> ChainObservation {
     match chain_state {
-        ChainLifecycle::Bootstrapping(..) => ChainObservation::Initializing,
+        ChainLifecycle::Bootstrapping(_, buffered) => ChainObservation::Initializing {
+            buffered_events: buffered.len(),
+        },
         ChainLifecycle::Active(chain_state) => ChainObservation::Active(ChainProgress {
             verified_pools: chain_state.verified_pool_count(),
             blocks_behind_tip: last_optimized_block
                 .and_then(|reference| chain_state.blocks_behind(reference)),
+            canonical_window: chain_state.canonical_path_len_from_finalized(),
             in_flight_requests: chain_state.in_flight_request_count(),
             ws_misses: chain_state.ws_miss_count(),
         }),
@@ -833,6 +844,12 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
             // (`Err`) chain retries this block next event. The dispatched input is then re-derived
             // across *all* active chains, so a slow chain rides along with its current state and a
             // fast chain never stalls waiting for it.
+            //
+            // A persistent `Err(PoolReserveProjectionError)` is deliberately silent here (this is
+            // pure code — no logger to hand it to): the chain simply never dispatches. Its runtime
+            // signature is `behind=?` never resolving in the gauge/view while `pools`/`inflight`
+            // look healthy. If a live run ever shows that, surface the error through the
+            // observation read model rather than threading a logger in here.
             if changed
                 && matches!(
                     pool_reserves_for_optimization(&state, chain, &update),
@@ -1007,7 +1024,8 @@ mod tests {
             assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
             assert!(
                 observations.iter().any(|(observed_chain, observation)| {
-                    *observed_chain == chain && *observation == ChainObservation::Initializing
+                    *observed_chain == chain
+                        && matches!(observation, ChainObservation::Initializing { .. })
                 }),
                 "active chain {chain:?} should be seeded as initializing"
             );
@@ -1121,7 +1139,37 @@ mod tests {
 
         assert_eq!(
             state.observe(),
-            vec![(chain, ChainObservation::Initializing)]
+            vec![(
+                chain,
+                ChainObservation::Initializing { buffered_events: 0 }
+            )]
+        );
+    }
+
+    #[test]
+    fn observe_counts_subscription_data_buffered_during_bootstrap() {
+        let chain = ChainKey::Ethereum;
+        let (state, _effects) = State::init(&[chain]);
+
+        let (state, _effects) = transition(
+            state,
+            Event::SubscriptionData {
+                chain,
+                data: SubscriptionData::NewHead {
+                    hash: hash(2),
+                    parent_hash: hash(1),
+                    logs_bloom: Bloom::ZERO,
+                    number: 2,
+                },
+            },
+        );
+
+        assert_eq!(
+            state.observe(),
+            vec![(
+                chain,
+                ChainObservation::Initializing { buffered_events: 1 }
+            )]
         );
     }
 
@@ -1146,6 +1194,7 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 1,
                     blocks_behind_tip: None,
+                    canonical_window: Some(0),
                     in_flight_requests: 0,
                     ws_misses: 0,
                 })
@@ -1177,11 +1226,33 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 1,
                     blocks_behind_tip: Some(0),
+                    canonical_window: Some(0),
                     in_flight_requests: 0,
                     ws_misses: 0,
                 })
             )]
         );
+    }
+
+    #[test]
+    fn observe_reports_the_canonical_window_growing_with_connected_heads() {
+        let chain = ChainKey::Ethereum;
+        let state = active_state_at(chain, hash(0));
+
+        let (state, _effects) = drive_connected_heads(state, chain, 3);
+
+        // Three connected heads above the anchor: the fold window the gauge surfaces is exactly
+        // the canonical path length.
+        assert!(matches!(
+            state.observe().as_slice(),
+            [(
+                observed_chain,
+                ChainObservation::Active(ChainProgress {
+                    canonical_window: Some(3),
+                    ..
+                })
+            )] if *observed_chain == chain
+        ));
     }
 
     #[test]

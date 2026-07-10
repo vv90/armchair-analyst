@@ -8,7 +8,7 @@ use client_evm::{
     ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
     OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
     POLYGON_USDC_TOKEN_ADDRESS,
-    GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
+    GetLogsRange, GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
     PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RangeLogBlock, RequestId,
     TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
     bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
@@ -28,7 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{Sender, channel},
     },
@@ -59,6 +59,20 @@ pub(crate) struct ClientEvmRuntime {
     /// Wall-clock millis of the last emitted gauge line, throttling it to roughly once per second so
     /// the per-chain backlog snapshot lands in the log without per-transition spam.
     last_gauge_millis: AtomicU64,
+    /// Monotonic base for the transition timing fields below.
+    started: time::Instant,
+    /// Micros since `started` when the current input was dequeued (`log_input` runs just before the
+    /// transition, `observe_state` just after, both on the single transition thread — so their
+    /// difference is the pure transition duration, and plain interior mutability suffices).
+    last_input_micros: AtomicU64,
+    /// The current input's formatted log line, echoed into the slow-transition warning so the
+    /// culprit is on the warning line itself (adjacent lines can interleave with effect threads).
+    last_input_line: Mutex<String>,
+    /// Transitions processed since the last gauge line (`events=` on the gauge): with the 1/s gauge
+    /// cadence this is the event-loop throughput, the saturation gauge for the single fold thread.
+    transitions_since_gauge: AtomicU64,
+    /// Slowest transition since the last gauge line, in micros (`max_ms=` on the gauge).
+    max_transition_micros: AtomicU64,
 }
 
 impl ClientEvmRuntime {
@@ -80,7 +94,17 @@ impl ClientEvmRuntime {
             view,
             logger,
             last_gauge_millis: AtomicU64::new(0),
+            started: time::Instant::now(),
+            last_input_micros: AtomicU64::new(0),
+            last_input_line: Mutex::new(String::new()),
+            transitions_since_gauge: AtomicU64::new(0),
+            max_transition_micros: AtomicU64::new(0),
         }
+    }
+
+    /// Micros since runtime construction: the monotonic clock the transition timing reads.
+    fn elapsed_micros(&self) -> u64 {
+        self.started.elapsed().as_micros() as u64
     }
 
     /// Per-chain WebSocket endpoints used by the new-heads / pool-events subscription channel (single
@@ -262,7 +286,13 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     }
 
     fn log_input(&self, input: &<ClientEvmApp as Application>::Input) {
-        self.logger.log(&format_input_log(input));
+        let line = format_input_log(input);
+        self.logger.log(&line);
+        self.last_input_micros
+            .store(self.elapsed_micros(), Ordering::Relaxed);
+        if let Ok(mut last_line) = self.last_input_line.lock() {
+            *last_line = line;
+        }
     }
 
     fn log_error(&self, error: ApplicationError<<ClientEvmApp as Application>::Input>) {
@@ -277,6 +307,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     }
 
     fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
+        self.record_transition_duration();
         self.view.render(state);
         self.log_gauge(state);
     }
@@ -294,6 +325,20 @@ const EFFECT_POOL_SIZE: usize = 64;
 /// Minimum gap between gauge lines. `observe_state` runs on every transition, so without this the
 /// gauge would be emitted thousands of times a second.
 const GAUGE_INTERVAL_MILLIS: u64 = 1000;
+
+/// A single transition at or above this earns its own `warn slow_transition` line. Sized against
+/// the fastest tracked block cadence (Arbitrum ~250ms): one event routinely eating a tenth of
+/// that budget on the single transition thread deserves a trace before the backlog does.
+const SLOW_TRANSITION_WARN_MILLIS: u64 = 25;
+
+/// The `warn slow_transition` line for a transition that ran `elapsed_micros`, or `None` below the
+/// [`SLOW_TRANSITION_WARN_MILLIS`] threshold. Echoes the input's own log line so the culprit event
+/// is on the warning itself. Pure so the threshold gate is unit-tested without a runtime.
+fn slow_transition_log(elapsed_micros: u64, input_line: &str) -> Option<String> {
+    let millis = elapsed_micros / 1000;
+    (millis >= SLOW_TRANSITION_WARN_MILLIS)
+        .then(|| format!("warn slow_transition ms={millis} {input_line}"))
+}
 
 /// First wait after a subscription drops, and the value the backoff resets to after a healthy run.
 const RECONNECT_BASE: time::Duration = time::Duration::from_millis(250);
@@ -447,9 +492,28 @@ impl ClientEvmRuntime {
         endpoints
     }
 
-    /// Emits a single per-chain backlog snapshot (`behind` / `pools` / `inflight`) to the log, at most
-    /// once per [`GAUGE_INTERVAL_MILLIS`]. Runs on the single transition thread, so the throttle needs
-    /// no synchronization beyond interior mutability.
+    /// Measures the transition that just ran (`log_input` stamped its start on this same thread),
+    /// feeds the per-gauge-interval counters, and warns on a single transition slow enough to
+    /// threaten the event loop's cadence — the direct probe for the per-event overlay-fold cost.
+    fn record_transition_duration(&self) {
+        let elapsed_micros = self
+            .elapsed_micros()
+            .saturating_sub(self.last_input_micros.load(Ordering::Relaxed));
+        self.transitions_since_gauge.fetch_add(1, Ordering::Relaxed);
+        self.max_transition_micros
+            .fetch_max(elapsed_micros, Ordering::Relaxed);
+
+        if let Ok(last_line) = self.last_input_line.lock() {
+            if let Some(warning) = slow_transition_log(elapsed_micros, &last_line) {
+                self.logger.log(&warning);
+            }
+        }
+    }
+
+    /// Emits a single per-chain backlog snapshot (`behind` / `window` / `pools` / `inflight`) plus
+    /// the interval's event-loop counters to the log, at most once per [`GAUGE_INTERVAL_MILLIS`].
+    /// Runs on the single transition thread, so the throttle needs no synchronization beyond
+    /// interior mutability.
     fn log_gauge(&self, state: &State) {
         let now = now_millis();
         if now.saturating_sub(self.last_gauge_millis.load(Ordering::Relaxed)) < GAUGE_INTERVAL_MILLIS
@@ -457,7 +521,10 @@ impl ClientEvmRuntime {
             return;
         }
         self.last_gauge_millis.store(now, Ordering::Relaxed);
-        self.logger.log(&format_gauge_log(&state.observe()));
+        let events = self.transitions_since_gauge.swap(0, Ordering::Relaxed);
+        let max_transition_millis = self.max_transition_micros.swap(0, Ordering::Relaxed) / 1000;
+        self.logger
+            .log(&format_gauge_log(&state.observe(), events, max_transition_millis));
     }
 
     fn send_optimization_input(&self, input: OptimizationPoolReserves) {
@@ -539,40 +606,61 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Renders one `gauge` line: a per-chain backlog snapshot. Active chains carry `behind`/`pools`/
-/// `inflight`; bootstrapping chains render as `init`. Pure so it can be unit-tested off a synthetic
-/// observation set.
-fn format_gauge_log(observations: &[(ChainKey, ChainObservation)]) -> String {
+/// Renders one `gauge` line: a per-chain backlog snapshot plus the interval's event-loop counters.
+/// Active chains carry `behind`/`window`/`pools`/`inflight`/`ws_miss`; bootstrapping chains render
+/// as `init` with their replay-buffer depth. `events` is the transitions processed since the last
+/// gauge line and `max_transition_millis` the slowest of them — together the saturation gauge for
+/// the single transition thread. Pure so it can be unit-tested off a synthetic observation set.
+fn format_gauge_log(
+    observations: &[(ChainKey, ChainObservation)],
+    events: u64,
+    max_transition_millis: u64,
+) -> String {
     let segments = observations
         .iter()
         .map(|(chain, observation)| match observation {
-            ChainObservation::Initializing => format!("{chain:?}=init"),
+            ChainObservation::Initializing { buffered_events } => {
+                format!("{chain:?}=init buffered={buffered_events}")
+            }
             ChainObservation::Active(ChainProgress {
                 verified_pools,
                 blocks_behind_tip,
+                canonical_window,
                 in_flight_requests,
                 ws_misses,
             }) => {
-                let behind = match blocks_behind_tip {
-                    Some(distance) => distance.to_string(),
-                    None => "?".to_owned(),
-                };
+                let behind = format_block_count(*blocks_behind_tip);
+                let window = format_block_count(*canonical_window);
                 format!(
-                    "{chain:?}=active behind={behind} pools={verified_pools} inflight={in_flight_requests} ws_miss={ws_misses}"
+                    "{chain:?}=active behind={behind} window={window} pools={verified_pools} inflight={in_flight_requests} ws_miss={ws_misses}"
                 )
             }
         })
         .collect::<Vec<_>>()
         .join("  ");
 
-    format!("gauge {segments}")
+    format!("gauge {segments}  events={events} max_ms={max_transition_millis}")
+}
+
+/// Renders an optional block count with `?` for the not-yet-measurable case (no dispatch reference
+/// yet, or a tip not connected to the anchor).
+fn format_block_count(count: Option<usize>) -> String {
+    match count {
+        Some(count) => count.to_string(),
+        None => "?".to_owned(),
+    }
 }
 
 fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> String {
     match data {
         SubscriptionData::NewHead {
-            hash, parent_hash, ..
-        } => format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}"),
+            hash,
+            parent_hash,
+            number,
+            ..
+        } => format!(
+            "input chain={chain:?} head_observed hash={hash} parent={parent_hash} number={number}"
+        ),
         SubscriptionData::PoolLog { block_hash, logs } => {
             format!(
                 "input chain={chain:?} log_observed block={block_hash} pools={}",
@@ -585,10 +673,13 @@ fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> Str
 fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
     match event {
         kernel::Event::HeadObserved {
-            hash, parent_hash, ..
-        } => {
-            format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}")
-        }
+            hash,
+            parent_hash,
+            number,
+            ..
+        } => format!(
+            "input chain={chain:?} head_observed hash={hash} parent={parent_hash} number={number}"
+        ),
         kernel::Event::FinalizedBlockObserved { block_hash } => {
             format!("input chain={chain:?} finalized_block_observed hash={block_hash}")
         }
@@ -596,9 +687,10 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             request_id,
             hash,
             parent_hash,
+            number,
             ..
         } => format!(
-            "input chain={chain:?} block_header_received request={} hash={hash} parent={parent_hash}",
+            "input chain={chain:?} block_header_received request={} hash={hash} parent={parent_hash} number={number}",
             format_typed_request_id_log(request_id),
         ),
         kernel::Event::BlockHeaderNotFound { request_id } => format!(
@@ -675,6 +767,21 @@ fn format_bootstrap_event_log(chain: ChainKey, event: &bootstrap::Event) -> Stri
 
 fn format_typed_request_id_log<R>(request_id: &RequestId<R>) -> String {
     format!("{request_id:?}")
+}
+
+/// One line per issued ranged-getLogs fetch, mirroring the response line's request id so
+/// issue → response/failure pairs up in the log.
+fn format_logs_range_effect_log(
+    chain: ChainKey,
+    request_id: &RequestId<GetLogsRange>,
+    from: u64,
+    to: u64,
+    covered: usize,
+) -> String {
+    format!(
+        "effect logs_range chain={chain:?} request={} from={from} to={to} covered={covered}",
+        format_typed_request_id_log(request_id),
+    )
 }
 
 fn format_request_id_log(request_id: &AnyRequestId) -> String {
@@ -1152,6 +1259,15 @@ where
                 let request_id = request.request_id;
                 let from = request.request_payload.from_block();
                 let to = request.request_payload.to_block();
+                // The rare authoritative path (finalization verification / hole backstop) is worth
+                // a line at issuance — otherwise it is only visible when it fails.
+                logger.log(&format_logs_range_effect_log(
+                    chain,
+                    &request_id,
+                    from,
+                    to,
+                    request.request_payload.covered().len(),
+                ));
 
                 match fetch_logs_range(from, to) {
                     Ok(blocks) => vec![Event::ChainEvent {
@@ -1226,16 +1342,21 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 37,
                     blocks_behind_tip: Some(4),
+                    canonical_window: Some(70),
                     in_flight_requests: 12,
                     ws_misses: 2,
                 }),
             ),
-            (ChainKey::Base, ChainObservation::Initializing),
+            (
+                ChainKey::Base,
+                ChainObservation::Initializing { buffered_events: 9 },
+            ),
             (
                 ChainKey::Arbitrum,
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 0,
                     blocks_behind_tip: None,
+                    canonical_window: None,
                     in_flight_requests: 0,
                     ws_misses: 0,
                 }),
@@ -1243,9 +1364,27 @@ mod tests {
         ];
 
         assert_eq!(
-            format_gauge_log(&observations),
-            "gauge Ethereum=active behind=4 pools=37 inflight=12 ws_miss=2  Base=init  \
-             Arbitrum=active behind=? pools=0 inflight=0 ws_miss=0"
+            format_gauge_log(&observations, 153, 31),
+            "gauge Ethereum=active behind=4 window=70 pools=37 inflight=12 ws_miss=2  \
+             Base=init buffered=9  \
+             Arbitrum=active behind=? window=? pools=0 inflight=0 ws_miss=0  \
+             events=153 max_ms=31"
+        );
+    }
+
+    #[test]
+    fn slow_transition_log_fires_at_the_threshold_and_echoes_the_input_line() {
+        let threshold_micros = SLOW_TRANSITION_WARN_MILLIS * 1000;
+
+        assert_eq!(
+            slow_transition_log(threshold_micros, "input chain=Arbitrum tick"),
+            Some(format!(
+                "warn slow_transition ms={SLOW_TRANSITION_WARN_MILLIS} input chain=Arbitrum tick"
+            ))
+        );
+        assert_eq!(
+            slow_transition_log(threshold_micros - 1, "input chain=Arbitrum tick"),
+            None
         );
     }
 
@@ -1435,7 +1574,9 @@ mod tests {
                     number: 1,
                 },
             }),
-            format!("input chain=Ethereum head_observed hash={block_hash} parent={parent_hash}")
+            format!(
+                "input chain=Ethereum head_observed hash={block_hash} parent={parent_hash} number=1"
+            )
         );
         assert_eq!(
             format_input_log(&Event::ChainEvent {
@@ -1449,7 +1590,7 @@ mod tests {
                 },
             }),
             format!(
-                "input chain=Ethereum block_header_received request=7 hash={block_hash} parent={parent_hash}"
+                "input chain=Ethereum block_header_received request=7 hash={block_hash} parent={parent_hash} number=1"
             )
         );
         assert_eq!(
@@ -1520,6 +1661,16 @@ mod tests {
                 },
             }),
             "input chain=Ethereum request_failed request=block_header#7"
+        );
+    }
+
+    #[test]
+    fn logs_range_effect_log_carries_the_request_id_and_window() {
+        let request_id = RequestId::<GetLogsRange>::from_raw_for_test(9);
+
+        assert_eq!(
+            format_logs_range_effect_log(ChainKey::Arbitrum, &request_id, 100, 164, 3),
+            "effect logs_range chain=Arbitrum request=9 from=100 to=164 covered=3"
         );
     }
 
