@@ -1150,8 +1150,8 @@ where
             }
             AnyIssuedRequest::LogsRange(request) => {
                 let request_id = request.request_id;
-                let from = request.request_payload.from;
-                let to = request.request_payload.to;
+                let from = request.request_payload.from_block();
+                let to = request.request_payload.to_block();
 
                 match fetch_logs_range(from, to) {
                     Ok(blocks) => vec![Event::ChainEvent {
@@ -2342,7 +2342,8 @@ mod tests {
         (
             kernel::Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
                 request_id,
-                request_payload: GetLogsRange { from, to, covered },
+                request_payload: GetLogsRange::new(from, to, covered)
+                    .expect("test window is ordered"),
             })),
             request_id,
         )

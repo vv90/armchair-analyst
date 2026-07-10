@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     time::Duration,
 };
 
@@ -63,12 +64,23 @@ enum ChainLifecycle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FinalizedRefreshPolicy {
     target_len: usize,
-    retry_stride: usize,
+    /// Non-zero by type: the refresh predicate's bucket arithmetic divides by the stride, so a
+    /// zero would be a build error here, not a runtime guard downstream.
+    retry_stride: NonZeroUsize,
+}
+
+/// Compile-time-checked stride literal: a zero fails const evaluation (a build error), never the
+/// runtime — every use below is a `const` item.
+const fn nonzero_stride(value: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(value) {
+        Some(stride) => stride,
+        None => panic!("finalized-refresh retry stride must be non-zero"),
+    }
 }
 
 const ETHEREUM_APPROX_FINALIZED_BLOCK_AGE: usize = 64;
 const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
-const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(8);
 
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 4;
@@ -81,7 +93,7 @@ const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // for the activation chunk.
 const ARBITRUM_APPROX_FINALIZED_BLOCK_AGE: usize = 1_000;
 const ARBITRUM_FINALIZED_RETENTION_MARGIN: usize = 64;
-const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
+const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(32);
 
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ARBITRUM_BOOTSTRAP_TIP_TRIM: usize = 8;
@@ -94,13 +106,13 @@ const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // depth; revisit against observed reorg depth.
 const BASE_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
 const BASE_FINALIZED_RETENTION_MARGIN: usize = 32;
-const BASE_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const BASE_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const BASE_BOOTSTRAP_TIP_TRIM: usize = 8;
 const BASE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 const OPTIMISM_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
 const OPTIMISM_FINALIZED_RETENTION_MARGIN: usize = 32;
-const OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const OPTIMISM_BOOTSTRAP_TIP_TRIM: usize = 8;
 const OPTIMISM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
@@ -108,21 +120,21 @@ const OPTIMISM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // set, so its retention/look-back windows are the largest.
 const POLYGON_APPROX_FINALIZED_BLOCK_AGE: usize = 400;
 const POLYGON_FINALIZED_RETENTION_MARGIN: usize = 64;
-const POLYGON_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
+const POLYGON_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(32);
 const POLYGON_BOOTSTRAP_TIP_TRIM: usize = 16;
 const POLYGON_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — BNB Chain (~3s blocks) has fast finality with occasional short reorgs.
 const BNB_APPROX_FINALIZED_BLOCK_AGE: usize = 150;
 const BNB_FINALIZED_RETENTION_MARGIN: usize = 32;
-const BNB_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const BNB_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const BNB_BOOTSTRAP_TIP_TRIM: usize = 12;
 const BNB_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — Avalanche C-Chain (~2s blocks) has near-instant finality, so the smallest window.
 const AVALANCHE_APPROX_FINALIZED_BLOCK_AGE: usize = 80;
 const AVALANCHE_FINALIZED_RETENTION_MARGIN: usize = 16;
-const AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+const AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(8);
 const AVALANCHE_BOOTSTRAP_TIP_TRIM: usize = 6;
 const AVALANCHE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
@@ -585,6 +597,27 @@ fn optimization_step_completed(
     )
 }
 
+/// Runs `f` on `chain`'s lifecycle entry (removed for ownership; reinserted unless `f` returns
+/// `None`, which drops the chain), leaving every other `State` field untouched. The per-chain
+/// handlers that neither read nor write the optimization fields all route through here, so the
+/// remove/reinsert/rebuild dance has a single owner. An absent chain is a no-op.
+fn with_chain_lifecycle(
+    mut state: State,
+    chain: ChainKey,
+    f: impl FnOnce(ChainLifecycle) -> (Option<ChainLifecycle>, Vec<Effect>),
+) -> (State, Vec<Effect>) {
+    match state.chains.remove(&chain) {
+        Some(lifecycle) => {
+            let (lifecycle, effects) = f(lifecycle);
+            if let Some(lifecycle) = lifecycle {
+                state.chains.insert(chain, lifecycle);
+            }
+            (state, effects)
+        }
+        None => (state, Vec::new()),
+    }
+}
+
 /// Advances an active chain's finalized boundary from a refreshed finalized header.
 /// Added so the finalized-header refresh feed can drive each inner kernel's compaction; bootstrapping
 /// chains fetch their own anchor and ignore this feed.
@@ -593,52 +626,23 @@ fn finalized_header_received(
     chain: ChainKey,
     block_hash: BlockHash,
 ) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
-        Some(ChainLifecycle::Active(chain_state)) => {
+    with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
+        ChainLifecycle::Active(chain_state) => {
             let (chain_state, effects) = kernel::transition(
                 chain,
                 chain_state,
                 kernel::Event::FinalizedBlockObserved { block_hash },
             );
-            chains.insert(chain, ChainLifecycle::Active(chain_state));
             (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
+                Some(ChainLifecycle::Active(chain_state)),
                 effects
                     .into_iter()
                     .map(|effect| Effect::ChainEffect { chain, effect })
                     .collect(),
             )
         }
-        Some(other) => {
-            chains.insert(chain, other);
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                Vec::new(),
-            )
-        }
-        None => (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            Vec::new(),
-        ),
-    }
+        other => (Some(other), Vec::new()),
+    })
 }
 
 /// Ignores an unavailable finalized-header refresh.
@@ -652,47 +656,12 @@ fn finalized_header_unavailable(state: State, _chain: ChainKey) -> (State, Vec<E
 /// Added so bootstrap responses advance the phase machine, activate the inner kernel on completion,
 /// or drop the chain when the anchor can never be obtained.
 fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
-        Some(ChainLifecycle::Bootstrapping(bootstrap_state, buffered)) => {
-            let (lifecycle, effects) = advance_bootstrap(chain, bootstrap_state, buffered, event);
-            if let Some(lifecycle) = lifecycle {
-                chains.insert(chain, lifecycle);
-            }
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                effects,
-            )
+    with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
+        ChainLifecycle::Bootstrapping(bootstrap_state, buffered) => {
+            advance_bootstrap(chain, bootstrap_state, buffered, event)
         }
-        Some(other) => {
-            chains.insert(chain, other);
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                Vec::new(),
-            )
-        }
-        None => (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            Vec::new(),
-        ),
-    }
+        other => (Some(other), Vec::new()),
+    })
 }
 
 /// Runs one bootstrap transition and maps its completion onto the chain lifecycle.
@@ -809,46 +778,24 @@ fn buffer_subscription_data(
     chain: ChainKey,
     data: SubscriptionData,
 ) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
-        Some(ChainLifecycle::Bootstrapping(bootstrap_state, mut buffered)) => {
+    with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
+        ChainLifecycle::Bootstrapping(bootstrap_state, mut buffered) => {
             buffered.push(data);
-            chains.insert(
-                chain,
-                ChainLifecycle::Bootstrapping(bootstrap_state, buffered),
-            );
+            (
+                Some(ChainLifecycle::Bootstrapping(bootstrap_state, buffered)),
+                Vec::new(),
+            )
         }
-        Some(other) => {
-            chains.insert(chain, other);
-        }
-        None => {}
-    }
-
-    (
-        State {
-            chains,
-            latest_optimization_result,
-            last_optimized_block,
-        },
-        Vec::new(),
-    )
+        other => (Some(other), Vec::new()),
+    })
 }
 
 /// Forwards an inner kernel event to an active chain and wraps its effects with the chain key.
 /// Added to preserve chain isolation while letting callers drive per-chain kernel events through one wrapper.
-fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
+fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (State, Vec<Effect>) {
+    // Not `with_chain_lifecycle`: this is the one handler that reads and writes the optimization
+    // fields (`last_optimized_block`, the merged dispatch) around the reinserted chain.
+    match state.chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
             let before_len = chain_state.canonical_path_len_from_finalized();
             let (chain_state, effects) = kernel::transition(chain, chain_state, event);
@@ -878,13 +825,7 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
             // not a bottleneck.
             let update = chain_state.optimization_update(chain);
 
-            chains.insert(chain, ChainLifecycle::Active(chain_state));
-
-            let mut state = State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            };
+            state.chains.insert(chain, ChainLifecycle::Active(chain_state));
 
             let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
             // Dispatch only when *this* chain's fold frontier advanced and its own projection is
@@ -908,37 +849,18 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
             (state, effects)
         }
         Some(existing_chain) => {
-            chains.insert(chain, existing_chain);
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                Vec::new(),
-            )
+            state.chains.insert(chain, existing_chain);
+            (state, Vec::new())
         }
-        None => (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            Vec::new(),
-        ),
+        None => (state, Vec::new()),
     }
 }
 
 /// Advances active and bootstrapping chains and forwards any retry or scheduler effects they produce.
 /// Added so a single global tick can drive request TTL handling for active kernels and the bootstrap
 /// retry/deadline timers for chains still warming up.
-fn tick(state: State) -> (State, Vec<Effect>) {
-    let State {
-        chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-    let (chains, effects) = chains.into_iter().fold(
+fn tick(mut state: State) -> (State, Vec<Effect>) {
+    let (chains, effects) = std::mem::take(&mut state.chains).into_iter().fold(
         (BTreeMap::new(), Vec::new()),
         |(mut chains, mut effects), (chain, chain_state)| {
             match chain_state {
@@ -965,15 +887,9 @@ fn tick(state: State) -> (State, Vec<Effect>) {
             (chains, effects)
         },
     );
+    state.chains = chains;
 
-    (
-        State {
-            chains,
-            latest_optimization_result,
-            last_optimized_block,
-        },
-        effects,
-    )
+    (state, effects)
 }
 
 fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
@@ -1481,7 +1397,7 @@ mod tests {
         let state = active_state_at(chain, finalized_hash);
         let (mut state, _effects) = drive_connected_heads(state, chain, policy.target_len);
 
-        for block_index in policy.target_len + 1..policy.target_len + policy.retry_stride {
+        for block_index in policy.target_len + 1..policy.target_len + policy.retry_stride.get() {
             let (next_state, effects) = observe_head(
                 state,
                 chain,
@@ -1504,7 +1420,7 @@ mod tests {
         let mut state = state;
         let mut refresh_count = 0usize;
 
-        for block_index in policy.target_len + 1..=policy.target_len + policy.retry_stride {
+        for block_index in policy.target_len + 1..=policy.target_len + policy.retry_stride.get() {
             let (next_state, effects) = observe_head(
                 state,
                 chain,

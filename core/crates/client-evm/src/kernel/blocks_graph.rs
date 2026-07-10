@@ -108,7 +108,7 @@ enum BlockLogs {
 /// inserted hash is a leaf nothing points to, so admission cannot create a cycle (self-parent — the
 /// one degenerate case — is refused up front).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
+pub(crate) enum Admission {
     /// The block entered the graph (connected or pending).
     Admitted,
     /// Refused: `hash == parent`.
@@ -180,7 +180,9 @@ fn bloom_may_touch(bloom: Option<Bloom>, watched: &HashSet<Address>) -> bool {
 /// This ingestion boundary is the one place `PoolLog::log_index` is read: the external index becomes
 /// the map key here, and all downstream logic orders/dedups by the key alone. Positional keying
 /// would be wrong — streamed fragments would each restart at 0 and collide on union.
-fn key_by_log_index(logs: Vec<PoolLog>) -> BTreeMap<u64, PoolLog> {
+/// `pub(crate)` so the kernel's pre-head staging buffer applies the same conversion at *its*
+/// ingestion boundary (duplicate multi-provider deliveries dedup at arrival, not at drain).
+pub(crate) fn key_by_log_index(logs: Vec<PoolLog>) -> BTreeMap<u64, PoolLog> {
     logs.into_iter().map(|log| (log.log_index, log)).collect()
 }
 
@@ -299,6 +301,14 @@ impl BlocksGraph {
         }
     }
 
+    /// The honest [`ConnectedHash`] mint for a hash whose connectivity is *not* already proven:
+    /// `Some` iff `hash` is a connected node right now. Keeps the proof newtype meaning exactly
+    /// one thing — every walk/fold entry takes a genuine proof, never a "walk start" that happens
+    /// to share the type.
+    fn connected_hash(&self, hash: BlockHash) -> Option<ConnectedHash> {
+        self.connected(hash).map(|_| ConnectedHash(hash))
+    }
+
     /// How many blocks are currently `Pending` (the bounded staging area, invariant B1). O(n) over
     /// the node set; bounded, so a cached count is a possible later optimization, not needed now.
     fn pending_count(&self) -> usize {
@@ -309,8 +319,11 @@ impl BlocksGraph {
     }
 
     /// Admit a block from a header (production entry point), bounding the pending staging area at
-    /// [`MAX_PENDING_BLOCKS`]. See [`BlocksGraph::with_block_capped`] for the semantics.
-    fn with_block(
+    /// [`MAX_PENDING_BLOCKS`]. Returns the [`Admission`] outcome so callers that branch on it (the
+    /// kernel's head path routes `SelfParent` to a direct header fetch) match the type instead of
+    /// re-deriving the refusal from raw fields. See [`BlocksGraph::with_block_capped`] for the
+    /// semantics.
+    pub(crate) fn with_block(
         self,
         hash: BlockHash,
         parent: BlockHash,
@@ -320,12 +333,13 @@ impl BlocksGraph {
         self.with_block_capped(hash, parent, number, bloom, MAX_PENDING_BLOCKS)
     }
 
-    /// Kernel admission entry: [`with_block`], discarding the outcome. Every refusal keeps the
-    /// (unchanged) graph — reorg-safety decision (b) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`: a
-    /// `ConflictingParent` (provably bad data) is refused and the first-seen block kept, not reset;
-    /// every other refusal (self-parent, anchor-readmit, duplicate, pending-buffer-full) is already
-    /// a benign no-op. The kernel is pure, so a refusal is silently dropped (no telemetry channel);
-    /// finalization ultimately prunes any poisoned fork.
+    /// Kernel admission entry for callers that don't branch on the outcome: [`with_block`],
+    /// discarding the [`Admission`]. Every refusal keeps the (unchanged) graph — reorg-safety
+    /// decision (b) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`: a `ConflictingParent` (provably bad
+    /// data) is refused and the first-seen block kept, not reset; every other refusal
+    /// (self-parent, anchor-readmit, duplicate, pending-buffer-full) is already a benign no-op.
+    /// The kernel is pure, so a refusal is silently dropped (no telemetry channel); finalization
+    /// ultimately prunes any poisoned fork.
     pub(crate) fn admitted(
         self,
         hash: BlockHash,
@@ -505,22 +519,30 @@ impl BlocksGraph {
     /// supersedes any prior `Unknown`/`Streamed` (replace semantics — `Complete` is the authoritative
     /// full set). Idempotent on an already-`Complete` block (same hash ⇒ same logs) and a no-op when
     /// the block is absent. Keys the logs by `log_index` (L3) via [`key_by_log_index`].
-    pub(crate) fn with_complete_logs(mut self, hash: BlockHash, logs: Vec<PoolLog>) -> BlocksGraph {
+    ///
+    /// Also returns the WS-miss flag ([`streamed_log_mismatch`](Self::streamed_log_mismatch)
+    /// against the set being replaced), so every authoritative replace is measured by
+    /// construction — a caller cannot forget the metric read that used to be a separate query.
+    pub(crate) fn with_complete_logs(
+        mut self,
+        hash: BlockHash,
+        logs: Vec<PoolLog>,
+    ) -> (BlocksGraph, bool) {
+        let ws_miss = self.streamed_log_mismatch(hash, &logs);
         if let Some(data) = self.block_data_mut(hash) {
             data.logs = BlockLogs::Complete(key_by_log_index(logs));
         }
-        self
+        (self, ws_miss)
     }
 
     /// Whether an incoming authoritative log set *diverges* from the streamed set a present block
     /// holds: true iff the block is `Streamed` and the `log_index` key-sets differ (a missed or
-    /// spurious stream delivery). The WS-miss metric — the kernel reads this immediately before the
-    /// [`with_complete_logs`] replacement to count how often the trusted-at-tip stream was wrong
-    /// (`Complete ⊇ Streamed` is an expectation *measured* here, not assumed; replace semantics stays
-    /// the authority). `Unknown` (nothing streamed — the hole/backstop path) and `Complete`
-    /// (idempotent re-receive) blocks never count, nor does an absent block. A pure query: the graph
-    /// stays write-monotone.
-    pub(crate) fn streamed_log_mismatch(&self, hash: BlockHash, logs: &[PoolLog]) -> bool {
+    /// spurious stream delivery). The WS-miss metric, evaluated inside [`with_complete_logs`]
+    /// against the state being replaced (`Complete ⊇ Streamed` is an expectation *measured*, not
+    /// assumed; replace semantics stays the authority). `Unknown` (nothing streamed — the
+    /// hole/backstop path) and `Complete` (idempotent re-receive) blocks never count, nor does an
+    /// absent block. A pure query: the graph stays write-monotone.
+    fn streamed_log_mismatch(&self, hash: BlockHash, logs: &[PoolLog]) -> bool {
         let Some(node) = self.nodes.get(&hash) else {
             return false;
         };
@@ -542,9 +564,11 @@ impl BlocksGraph {
     /// by T2, so the walk is total and gap-free; when it is the anchor, `Pending`, or absent, there is
     /// no foldable suffix yet and the chain is empty. Takes no `finalized_hash` — the anchor is owned.
     fn canonical_oldest_to_newest(&self) -> Vec<ConnectedHash> {
-        // The shared walk stops immediately on a non-connected start, so a pending/absent/anchor
-        // head yields an empty chain (the `ConnectedHash` here is a walk start, not an I1 proof).
-        self.connected_oldest_to_newest(ConnectedHash(self.observed_head))
+        // A pending/absent/anchor head has no foldable suffix yet — the empty chain.
+        match self.connected_hash(self.observed_head) {
+            Some(head) => self.connected_oldest_to_newest(head),
+            None => Vec::new(),
+        }
     }
 
     /// The dangling ancestors still to backfill: the distinct, sorted set of `Pending` nodes' parent
@@ -772,10 +796,10 @@ impl BlocksGraph {
     /// Kernel entry for the finalization-time ranged-getLogs verification (the WS-primary
     /// counterpart of [`finalized_to`], which pre-selects a hole-free frontier and therefore stalls
     /// at these very holes): the [`MissingRange`]s on the canonical path `anchor → target`, or empty
-    /// when `target` is absent/pending/unconnected or off the canonical chain — mirroring
-    /// [`finalized_to`]'s guards (same `verified`/`v4_manager` watched-set inputs), so a target the
-    /// finalization no-ops on schedules no fetches either (and a fully-advanced target, no longer a
-    /// node, yields nothing: today's quiet case).
+    /// when `target` is absent/pending/unconnected or off the canonical chain — the guard *shared*
+    /// with [`finalized_to`] ([`canonical_connected_target`], same `verified`/`v4_manager`
+    /// watched-set inputs), so a target the finalization no-ops on schedules no fetches either
+    /// (and a fully-advanced target, no longer a node, yields nothing: today's quiet case).
     pub(crate) fn missing_complete_ranges_to(
         &self,
         target: BlockHash,
@@ -783,18 +807,26 @@ impl BlocksGraph {
         v4_manager: Option<Address>,
         exclude_numbers: &HashSet<u64>,
     ) -> Vec<MissingRange> {
-        if self.connected(target).is_none() {
+        let Some(target) = self.canonical_connected_target(target) else {
             return Vec::new();
-        }
-        if !self
-            .canonical_oldest_to_newest()
-            .iter()
-            .any(|ConnectedHash(hash)| *hash == target)
-        {
-            return Vec::new();
-        }
+        };
         let watched = watched_addresses(verified, v4_manager);
-        self.missing_complete_ranges(ConnectedHash(target), &watched, exclude_numbers)
+        self.missing_complete_ranges(target, &watched, exclude_numbers)
+    }
+
+    /// The guard shared by [`finalized_to`] and [`missing_complete_ranges_to`]: `target` as a
+    /// [`ConnectedHash`] proof iff it is a connected node *on the canonical chain*
+    /// (anchor → observed_head). `None` for an absent/pending/unconnected target (no foldable
+    /// prefix yet) and — decision (d) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md` — for a connected
+    /// side-fork target: finalizing it would prune the head branch, so both consumers no-op and
+    /// wait for the head to catch up. One owner keeps the pair structurally in agreement: a
+    /// target the finalization no-ops on schedules no fetches either.
+    fn canonical_connected_target(&self, target: BlockHash) -> Option<ConnectedHash> {
+        // Short-circuit the walk for an absent/pending target (the common fully-advanced case).
+        self.connected(target)?;
+        self.canonical_oldest_to_newest()
+            .into_iter()
+            .find(|ConnectedHash(hash)| *hash == target)
     }
 
     /// The per-pool **overlay** of the canonical path `anchor → target` folded over `base`: only pools
@@ -933,9 +965,13 @@ impl BlocksGraph {
         verified: &HashSet<PoolRef>,
         v4_manager: Option<Address>,
     ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
+        // A pending/absent/anchor head has no foldable suffix: the overlay is empty and the
+        // reserves are valid at the anchor (matching the empty-walk behavior downstream).
+        let Some(head) = self.connected_hash(self.observed_head) else {
+            return (HashMap::new(), self.anchor);
+        };
         let watched = watched_addresses(verified, v4_manager);
-        let frontier =
-            self.foldable_frontier(ConnectedHash(self.observed_head), &watched, Authority::AllowStreamed);
+        let frontier = self.foldable_frontier(head, &watched, Authority::AllowStreamed);
         let frontier_hash = frontier.0;
         (
             self.folded_overlay(base, verified, frontier, Authority::AllowStreamed),
@@ -1046,27 +1082,18 @@ impl BlocksGraph {
         verified: &HashSet<PoolRef>,
         v4_manager: Option<Address>,
     ) -> (BlocksGraph, HashMap<PoolRef, PoolState>) {
-        // Only a connected target is finalizable; an absent/pending one has no foldable prefix yet.
-        if self.connected(target).is_none() {
+        // Only a connected target on the canonical chain is finalizable — the guard shared with
+        // the ranged-verification query (see `canonical_connected_target`).
+        let Some(target) = self.canonical_connected_target(target) else {
             return (self, base.clone());
-        }
-        // Decision (d) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`: only a target on the canonical
-        // chain (anchor → observed_head) may finalize — a connected side-fork target would prune
-        // the head branch; no-op and wait for the head to catch up instead.
-        if !self
-            .canonical_oldest_to_newest()
-            .iter()
-            .any(|ConnectedHash(hash)| *hash == target)
-        {
-            return (self, base.clone());
-        }
+        };
         let watched = watched_addresses(verified, v4_manager);
 
         // The latest complete connected block whose prefix `anchor → it` is entirely foldable —
         // legacy's "latest complete ≤ target". `RequireComplete` makes a non-`Complete` bloom-touching
         // block a blocker (the finalization "hole"), so the shared frontier walk stops just before it.
         // A frontier equal to the anchor means nothing is foldable yet.
-        let frontier = self.foldable_frontier(ConnectedHash(target), &watched, Authority::RequireComplete);
+        let frontier = self.foldable_frontier(target, &watched, Authority::RequireComplete);
 
         // A frontier at the anchor is `reanchored_to`'s base-clone no-op — nothing foldable, stay put.
         self.reanchored_to(frontier, base, verified)
@@ -2058,7 +2085,7 @@ mod tests {
             .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
             .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
-            .with_complete_logs(graph_hash(2), Vec::new())
+            .with_complete_logs(graph_hash(2), Vec::new()).0
             .with_streamed_logs(graph_hash(3), Vec::new())
             .with_observed_head(graph_hash(4));
         assert_eq!(
@@ -2132,7 +2159,7 @@ mod tests {
                 graph = match logs_kind {
                     0 => graph,
                     1 => graph.with_streamed_logs(hash, Vec::new()),
-                    _ => graph.with_complete_logs(hash, Vec::new()),
+                    _ => graph.with_complete_logs(hash, Vec::new()).0,
                 };
                 parent = hash;
             }
@@ -2164,7 +2191,7 @@ mod tests {
             .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
             .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_block(graph_hash(4), graph_hash(3), 4, hit_bloom()).0
-            .with_complete_logs(graph_hash(2), vec![pool_log(pool_a, sw(0))])
+            .with_complete_logs(graph_hash(2), vec![pool_log(pool_a, sw(0))]).0
             .with_streamed_logs(graph_hash(3), vec![pool_log(pool_b, sw(1))])
             .with_observed_head(graph_hash(4));
         // b4 is Unknown (no logs yet), so it contributes no candidate entry.
@@ -2184,7 +2211,7 @@ mod tests {
         let anchor = graph_hash(1);
         let graph = BlocksGraph::new(anchor)
             .with_block(graph_hash(2), anchor, 2, hit_bloom()).0
-            .with_complete_logs(graph_hash(2), Vec::new())
+            .with_complete_logs(graph_hash(2), Vec::new()).0
             .with_observed_head(graph_hash(2));
         assert!(graph.pool_log_candidates_from_head().is_empty());
         assert_graph_invariants(&graph);
@@ -2470,17 +2497,19 @@ mod tests {
     }
 
     proptest! {
-        /// The gate's ranges cover exactly the canonical-path blocks that are not `Complete` and may
-        /// touch a watched pool — coalesced, ascending, and non-adjacent. Compared against an
-        /// independent recompute over the generated chain.
+        /// The gate's ranges cover exactly the canonical-path blocks that are not `Complete`, may
+        /// touch a watched pool, and are not excluded — coalesced, ascending, and non-adjacent,
+        /// with each range's `hashes` in bijection with its numbers (an excluded number splits a
+        /// range, so no range ever spans one). Compared against an independent recompute over the
+        /// generated chain.
         #[test]
         fn gate_ranges_exactly_cover_unresolved_bloom_hit_blocks(
-            specs in prop::collection::vec((any::<bool>(), 0u8..3), 1..12),
+            specs in prop::collection::vec((any::<bool>(), 0u8..3, any::<bool>()), 1..12),
         ) {
             let chain: Vec<(u64, Option<Bloom>, bool)> = specs
                 .iter()
                 .enumerate()
-                .map(|(index, (complete, kind))| {
+                .map(|(index, (complete, kind, _excluded))| {
                     let bloom = match kind {
                         0 => Some(hit_bloom()),
                         1 => Some(clear_bloom()),
@@ -2489,8 +2518,13 @@ mod tests {
                     ((index + 2) as u64, bloom, *complete)
                 })
                 .collect();
+            let excludes: HashSet<u64> = specs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, _, excluded))| excluded.then_some((index + 2) as u64))
+                .collect();
             let (graph, target) = gate_chain(&chain);
-            let ranges = graph.missing_complete_ranges(target, &watched(), &no_excludes());
+            let ranges = graph.missing_complete_ranges(target, &watched(), &excludes);
 
             // Independently expected hole block numbers (ascending, since numbers are contiguous).
             let holes: Vec<u64> = chain
@@ -2500,7 +2534,7 @@ mod tests {
                         Some(bloom) => bloom.contains_input(BloomInput::Raw(watched_addr().as_slice())),
                         None => true,
                     };
-                    (!complete && touches).then_some(*number)
+                    (!complete && touches && !excludes.contains(number)).then_some(*number)
                 })
                 .collect();
 
@@ -2666,7 +2700,8 @@ mod tests {
         // Replace semantics (chosen over union): `Complete` is authoritative and self-sufficient.
         let graph = one_block_graph()
             .with_streamed_logs(graph_hash(1), logs_at(&[2, 5]))
-            .with_complete_logs(graph_hash(1), logs_at(&[7]));
+            .with_complete_logs(graph_hash(1), logs_at(&[7]))
+            .0;
         assert_eq!(block_logs(&graph, graph_hash(1)), Some((true, vec![7])));
     }
 
@@ -2675,6 +2710,7 @@ mod tests {
         // L5: never step backward off the authoritative `Complete`.
         let graph = one_block_graph()
             .with_complete_logs(graph_hash(1), logs_at(&[7]))
+            .0
             .with_streamed_logs(graph_hash(1), logs_at(&[2]));
         assert_eq!(block_logs(&graph, graph_hash(1)), Some((true, vec![7])));
     }
@@ -2683,7 +2719,9 @@ mod tests {
     fn complete_logs_are_idempotent() {
         let graph = one_block_graph()
             .with_complete_logs(graph_hash(1), logs_at(&[7, 9]))
-            .with_complete_logs(graph_hash(1), logs_at(&[7, 9]));
+            .0
+            .with_complete_logs(graph_hash(1), logs_at(&[7, 9]))
+            .0;
         assert_eq!(block_logs(&graph, graph_hash(1)), Some((true, vec![7, 9])));
     }
 
@@ -2691,7 +2729,8 @@ mod tests {
     fn logs_on_an_absent_block_are_a_noop() {
         let graph = one_block_graph()
             .with_streamed_logs(graph_hash(9), logs_at(&[1]))
-            .with_complete_logs(graph_hash(9), logs_at(&[1]));
+            .with_complete_logs(graph_hash(9), logs_at(&[1]))
+            .0;
         assert_eq!(block_logs(&graph, graph_hash(1)), None); // admitted block untouched
         assert!(graph.get(graph_hash(9)).is_none()); // absent hash never materialized
         assert_graph_invariants(&graph);
@@ -2729,7 +2768,7 @@ mod tests {
         // idempotent authoritative re-receive; absent = pruned/never admitted. None are misses.
         let graph = one_block_graph();
         assert!(!graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3])));
-        let graph = graph.with_complete_logs(graph_hash(1), logs_at(&[3]));
+        let graph = graph.with_complete_logs(graph_hash(1), logs_at(&[3])).0;
         assert!(!graph.streamed_log_mismatch(graph_hash(1), &logs_at(&[3, 4])));
         assert!(!graph.streamed_log_mismatch(graph_hash(9), &logs_at(&[3])));
     }
@@ -2757,6 +2796,36 @@ mod tests {
     }
 
     proptest! {
+        /// The WS-miss predicate is *exactly* `log_index` key-set inequality on a `Streamed`
+        /// block — and constant `false` for `Unknown`, `Complete`, and absent blocks, whatever
+        /// the incoming authoritative set.
+        #[test]
+        fn streamed_mismatch_is_key_set_inequality_on_streamed_only(
+            streamed in prop::collection::vec(0u64..8, 0..5),
+            incoming in prop::collection::vec(0u64..8, 0..5),
+        ) {
+            let incoming_logs = logs_at(&incoming);
+            let streamed_keys: BTreeSet<u64> = streamed.iter().copied().collect();
+            let incoming_keys: BTreeSet<u64> = incoming.iter().copied().collect();
+
+            // Unknown (nothing streamed) and absent (pruned/never admitted) blocks never count.
+            let unknown = one_block_graph();
+            prop_assert!(!unknown.streamed_log_mismatch(graph_hash(1), &incoming_logs));
+            prop_assert!(!unknown.streamed_log_mismatch(graph_hash(9), &incoming_logs));
+
+            // Streamed: mismatch ⇔ the key sets differ (payloads are irrelevant, L3 keys decide).
+            let streamed_graph = unknown.with_streamed_logs(graph_hash(1), logs_at(&streamed));
+            prop_assert_eq!(
+                streamed_graph.streamed_log_mismatch(graph_hash(1), &incoming_logs),
+                streamed_keys != incoming_keys
+            );
+
+            // Complete: an idempotent authoritative re-receive is never a miss.
+            let complete_graph =
+                streamed_graph.with_complete_logs(graph_hash(1), logs_at(&streamed)).0;
+            prop_assert!(!complete_graph.streamed_log_mismatch(graph_hash(1), &incoming_logs));
+        }
+
         /// L5 on the merge op: over any sequence of streamed/complete merges the authority is
         /// monotone (`Unknown → Streamed → Complete`, never backward), `Streamed` only grows, and
         /// `Complete` replaces (the chosen rule). The graph's logs match the reference model at
@@ -2781,7 +2850,7 @@ mod tests {
                 };
                 graph = match op {
                     LogOp::Streamed(idx) => graph.with_streamed_logs(graph_hash(1), logs_at(&idx)),
-                    LogOp::Complete(idx) => graph.with_complete_logs(graph_hash(1), logs_at(&idx)),
+                    LogOp::Complete(idx) => graph.with_complete_logs(graph_hash(1), logs_at(&idx)).0,
                 };
 
                 let actual = match &graph.get(graph_hash(1)).unwrap().logs {

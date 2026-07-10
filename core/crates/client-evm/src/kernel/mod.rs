@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use alloy::primitives::{BlockHash, Bloom};
 
@@ -27,16 +27,19 @@ pub struct State {
     pool_registry: TrustedPoolRegistry,
     token_registry: TokenRegistry,
     tick: Tick,
-    /// Subscription-observed logs for blocks not yet in the graph, keyed by block hash. Drained
-    /// into the block when it enters via a head/header observation. Bounded by
-    /// [`MAX_STREAMED_LOG_BLOCKS`]; raw input staging only, safe to drop.
-    streamed_logs: HashMap<BlockHash, Vec<PoolLog>>,
+    /// Subscription-observed logs for blocks not yet in the graph, keyed by block hash and — like
+    /// the graph's own per-block storage — by intra-block `log_index` within a block
+    /// ([`blocks_graph::key_by_log_index`] at arrival), so a duplicate multi-provider delivery is
+    /// unrepresentable and each entry is bounded by the block's true log count. Drained into the
+    /// block when it enters via a head/header observation. Bounded to
+    /// [`MAX_STREAMED_LOG_BLOCKS`] distinct blocks; raw input staging only, safe to drop.
+    streamed_logs: HashMap<BlockHash, BTreeMap<u64, PoolLog>>,
     /// The log-sourced blocks graph and its finalized base — the sole chain-state authority since
     /// Increment 4 (the legacy graph is deleted). See [`Blocks`].
     blocks: Blocks,
-    /// How often an authoritative log set diverged from the streamed set it replaced
-    /// ([`blocks_graph::BlocksGraph::streamed_log_mismatch`]) — the permanent WS-miss metric of the
-    /// WS-primary trust flip. The stream is trusted at the tip, so every divergence the
+    /// How often an authoritative log set diverged from the streamed set it replaced (the
+    /// WS-miss flag [`blocks_graph::BlocksGraph::with_complete_logs`] reports) — the permanent
+    /// WS-miss metric of the WS-primary trust flip. The stream is trusted at the tip, so every divergence the
     /// finalization ranged verification (or the tip-hole backstop) uncovers is a moment the
     /// optimizer ran on wrong data; the gauge surfaces the cumulative count per chain. An observed
     /// aggregate of transient inputs, not derivable from retained state.
@@ -281,9 +284,11 @@ impl State {
     }
 
 
-    /// Stages subscription logs for a block not yet in the graph. Bounded by
-    /// [`MAX_STREAMED_LOG_BLOCKS`]: once full, logs for further new blocks are dropped (the
-    /// authoritative `GetBlockLogs` still covers them once the block arrives).
+    /// Stages subscription logs for a block not yet in the graph, keyed by `log_index` at arrival
+    /// (the same boundary conversion the graph applies), so repeated deliveries of the same logs
+    /// merge instead of accumulating. Bounded by [`MAX_STREAMED_LOG_BLOCKS`]: once full, logs for
+    /// further new blocks are dropped (the authoritative `GetBlockLogs` still covers them once
+    /// the block arrives).
     fn with_streamed_logs_buffered(mut self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
         if self.streamed_logs.len() >= MAX_STREAMED_LOG_BLOCKS
             && !self.streamed_logs.contains_key(&block_hash)
@@ -294,7 +299,7 @@ impl State {
         self.streamed_logs
             .entry(block_hash)
             .or_default()
-            .extend(logs);
+            .extend(blocks_graph::key_by_log_index(logs));
         self
     }
 
@@ -306,7 +311,7 @@ impl State {
             return self;
         }
         match self.streamed_logs.remove(&block_hash) {
-            Some(logs) => self.with_log_streamed(block_hash, logs),
+            Some(logs) => self.with_log_streamed(block_hash, logs.into_values().collect()),
             None => self,
         }
     }
@@ -324,26 +329,25 @@ impl State {
 
     /// `HeadObserved` feed: admit the block (refuse-and-keep, decision (b)) and mark it the
     /// observed head, then drain any streamed logs staged before the head arrived so a
-    /// log-before-head ordering does not lose data.
+    /// log-before-head ordering does not lose data. Returns the [`Admission`] so the transition
+    /// arm can route a `SelfParent` refusal (which needs a direct header fetch) by matching the
+    /// outcome the graph already decided, instead of re-deriving it from the raw hashes.
     fn with_log_head_observed(
-        self,
+        mut self,
         hash: BlockHash,
         parent_hash: BlockHash,
         number: u64,
         bloom: Bloom,
-    ) -> State {
-        self.map_graph(move |graph| {
-            let graph = graph.admitted(hash, parent_hash, number, bloom);
-            // A self-parent observation is garbage input and leaves the head unchanged; every
-            // other outcome — admit, duplicate, anchor-readmit — advances the head, which
-            // `with_observed_head` matches (it updates only for a present or anchor hash).
-            if hash == parent_hash {
-                graph
-            } else {
-                graph.with_observed_head(hash)
-            }
-        })
-        .with_streamed_logs_drained(hash)
+    ) -> (State, blocks_graph::Admission) {
+        let (graph, admission) = self.blocks.graph.with_block(hash, parent_hash, number, bloom);
+        // A self-parent observation is garbage input and leaves the head unchanged; every other
+        // outcome — admit, duplicate, anchor-readmit — advances the head, which
+        // `with_observed_head` matches (it updates only for a present or anchor hash).
+        self.blocks.graph = match admission {
+            blocks_graph::Admission::SelfParent => graph,
+            _ => graph.with_observed_head(hash),
+        };
+        (self.with_streamed_logs_drained(hash), admission)
     }
 
     /// `BlockHeaderReceived` feed: admit without advancing the observed head (a backfilled header
@@ -366,14 +370,16 @@ impl State {
     }
 
     /// `BlockLogsReceived`/`BlockLogsRangeReceived` feed: authoritative complete logs (replaces any
-    /// streamed set). Reads the WS-miss query first: a `Streamed` set whose `log_index` keys differ
-    /// from the authoritative replacement is a stream delivery the flip trusted wrongly — counted,
-    /// then corrected by the replace.
+    /// streamed set). The replace itself reports the WS-miss flag — a `Streamed` set whose
+    /// `log_index` keys differ from the authoritative replacement is a stream delivery the flip
+    /// trusted wrongly: counted, then corrected.
     fn with_log_complete(mut self, block_hash: BlockHash, logs: Vec<PoolLog>) -> State {
-        if self.blocks.graph.streamed_log_mismatch(block_hash, &logs) {
+        let (graph, ws_miss) = self.blocks.graph.with_complete_logs(block_hash, logs);
+        self.blocks.graph = graph;
+        if ws_miss {
             self.ws_miss_count += 1;
         }
-        self.map_graph(move |graph| graph.with_complete_logs(block_hash, logs))
+        self
     }
 
     /// `PoolDataReceived` feed: merge anchor-height pool reads into the finalized base
@@ -431,7 +437,7 @@ pub(crate) fn should_fetch_finalized_header(
     before_len: Option<usize>,
     after_len: Option<usize>,
     target_len: usize,
-    retry_stride: usize,
+    retry_stride: std::num::NonZeroUsize,
 ) -> bool {
     let Some(after_len) = after_len else {
         return false;
@@ -451,11 +457,11 @@ pub(crate) fn should_fetch_finalized_header(
     }
 }
 
-fn finalized_refresh_bucket(len: usize, target_len: usize, retry_stride: usize) -> usize {
-    if retry_stride == 0 {
-        return 0;
-    }
-
+fn finalized_refresh_bucket(
+    len: usize,
+    target_len: usize,
+    retry_stride: std::num::NonZeroUsize,
+) -> usize {
     len.saturating_sub(target_len) / retry_stride
 }
 
@@ -586,11 +592,7 @@ fn schedule_missing_log_range_requests(
             .graph
             .missing_complete_ranges_to(target, &verified, v4_manager, &exclude_numbers)
     {
-        let request_payload = GetLogsRange {
-            from: range.from,
-            to: range.to,
-            covered: range.hashes.into_iter().collect(),
-        };
+        let request_payload = GetLogsRange::from(range);
         let (pending_requests, request_id) = state
             .pending_requests
             .with_new_request(request_payload.clone(), state.tick);
@@ -851,22 +853,25 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             // connected forest, and nothing resets. The scheduling chain then derives all
             // follow-up work — header backfill, log fetches, candidate/token validation — from
             // the graph itself.
-            let state = state.with_log_head_observed(hash, parent_hash, number, logs_bloom);
-            if hash == parent_hash {
-                // A self-parent head is provably-garbage input (a hash commits to its parent);
-                // nothing was admitted, so instead of the scheduling chain (which cannot see the
-                // refused block) fetch the true header directly to continue from honest data.
-                let (pending_requests, effects) =
-                    request_missing_header(state.pending_requests, state.tick, hash);
-                (
-                    State {
-                        pending_requests,
-                        ..state
-                    },
-                    effects,
-                )
-            } else {
-                schedule_unknown_canonical_requests(chain, state, vec![])
+            let (state, admission) =
+                state.with_log_head_observed(hash, parent_hash, number, logs_bloom);
+            match admission {
+                blocks_graph::Admission::SelfParent => {
+                    // A self-parent head is provably-garbage input (a hash commits to its
+                    // parent); nothing was admitted, so instead of the scheduling chain (which
+                    // cannot see the refused block) fetch the true header directly to continue
+                    // from honest data.
+                    let (pending_requests, effects) =
+                        request_missing_header(state.pending_requests, state.tick, hash);
+                    (
+                        State {
+                            pending_requests,
+                            ..state
+                        },
+                        effects,
+                    )
+                }
+                _ => schedule_unknown_canonical_requests(chain, state, vec![]),
             }
         }
         Event::FinalizedBlockObserved { block_hash } => {
@@ -960,10 +965,8 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
         Event::BlockLogsRangeReceived { request_id, blocks } => {
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
             match request_payload {
-                Some(PendingPayload {
-                    payload: GetLogsRange { covered, .. },
-                    ..
-                }) => {
+                Some(PendingPayload { payload, .. }) => {
+                    let covered = payload.into_covered();
                     let mut state = State {
                         pending_requests,
                         ..state
@@ -979,9 +982,10 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     // every covered hash is an ancestor of an observed finalized block, so the
                     // provider's canonical chain includes it and absence means emptiness. Only
                     // `covered` blocks earn this — never whatever else shares the number range.
+                    // (A covered hash pruned since the request is inert here for the same reason
+                    // as above: the complete-empty applies by hash and no-ops on an absent block.)
                     for block_hash in covered {
-                        if !responded.contains(&block_hash) && state.blocks.graph.contains(block_hash)
-                        {
+                        if !responded.contains(&block_hash) {
                             state = state.with_log_complete(block_hash, Vec::new());
                         }
                     }
@@ -1204,6 +1208,22 @@ mod tests {
             request_id: u8,
             hash_index: usize,
         },
+        /// Arbitrary per-block (backstop) log responses: a request id colliding with an in-flight
+        /// `GetBlockLogs` completes that block authoritatively — the path that replaces `Streamed`
+        /// sets and drives the ws-miss counter — while a non-colliding id must be dropped.
+        BlockLogsReceived {
+            request_id: u8,
+            log_index: u8,
+            empty: bool,
+        },
+        /// Best-effort streamed (WS) logs against arbitrary blocks — the feed the trust flip made
+        /// primary: a present block merges provisionally (`Unknown → Streamed`), an absent one
+        /// stages in the bounded pre-head buffer (exercising the buffer/graph disjointness
+        /// invariant and, via later authoritative replaces, the ws-miss counter).
+        LogObserved {
+            hash_index: usize,
+            log_index: u8,
+        },
         Tick,
     }
 
@@ -1302,6 +1322,19 @@ mod tests {
                     hash_index,
                 }
             }),
+            (0usize..16, 0u8..4).prop_map(|(hash_index, log_index)| {
+                GeneratedEvent::LogObserved {
+                    hash_index,
+                    log_index,
+                }
+            }),
+            (0u8..16, 0u8..4, any::<bool>()).prop_map(|(request_id, log_index, empty)| {
+                GeneratedEvent::BlockLogsReceived {
+                    request_id,
+                    log_index,
+                    empty,
+                }
+            }),
             Just(GeneratedEvent::Tick),
         ]
     }
@@ -1352,6 +1385,15 @@ mod tests {
             head == graph.anchor_hash() || graph.contains(head),
             "observed head must be the anchor or a present node"
         );
+        // The staging buffer holds logs ONLY for blocks not yet admitted; admission drains the
+        // entry (`with_streamed_logs_drained`). A hash in both places would double-apply its logs
+        // on the next drain.
+        for block_hash in state.streamed_logs.keys() {
+            assert!(
+                !graph.contains(*block_hash),
+                "staged streamed logs must be disjoint from admitted blocks"
+            );
+        }
     }
 
     /// Asserts no two in-flight header requests target the same block hash.
@@ -1513,9 +1555,12 @@ mod tests {
                         .get(request_id)
                         .expect("emitted logs-range request must be recorded as pending");
 
-                    assert_eq!(pending_request.payload.from, request_payload.from);
-                    assert_eq!(pending_request.payload.to, request_payload.to);
-                    assert_eq!(pending_request.payload.covered, request_payload.covered);
+                    assert_eq!(
+                        pending_request.payload.from_block(),
+                        request_payload.from_block()
+                    );
+                    assert_eq!(pending_request.payload.to_block(), request_payload.to_block());
+                    assert_eq!(pending_request.payload.covered(), request_payload.covered());
                 }
             }
         }
@@ -1590,6 +1635,33 @@ mod tests {
                 request_id: RequestId::from_raw_for_test(u64::from(request_id)),
                 blocks: vec![(hash_for_node(hash_index), Vec::new())],
             },
+            GeneratedEvent::LogObserved {
+                hash_index,
+                log_index,
+            } => Event::LogObserved {
+                block_hash: hash_for_node(hash_index),
+                logs: vec![swap_log(
+                    pool_candidate_address(3),
+                    u64::from(log_index),
+                    &pool_state(7),
+                )],
+            },
+            GeneratedEvent::BlockLogsReceived {
+                request_id,
+                log_index,
+                empty,
+            } => Event::BlockLogsReceived {
+                request_id: RequestId::from_raw_for_test(u64::from(request_id)),
+                logs: if empty {
+                    Vec::new()
+                } else {
+                    vec![swap_log(
+                        pool_candidate_address(3),
+                        u64::from(log_index),
+                        &pool_state(7),
+                    )]
+                },
+            },
             GeneratedEvent::Tick => Event::Tick,
         }
     }
@@ -1615,6 +1687,11 @@ mod tests {
     /// This keeps timing scenarios readable while staying behind the test-only Tick constructor.
     fn tick(value: u64) -> Tick {
         Tick::from_raw_for_test(value)
+    }
+
+    /// A non-zero refresh stride for the finalized-refresh predicate tests.
+    fn stride(value: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(value).expect("test stride is non-zero")
     }
 
     /// Wraps a header request id in a request-failed event.
@@ -1984,6 +2061,7 @@ mod tests {
             .graph
             .admitted(block_hash, finalized_hash, 1, bloom_matching_any())
             .with_complete_logs(block_hash, logs)
+            .0
             .with_observed_head(block_hash);
     }
 
@@ -2137,9 +2215,9 @@ mod tests {
                 Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
                     request_id,
                     request_payload,
-                })) if request_payload.from == from
-                    && request_payload.to == to
-                    && request_payload.covered == *covered =>
+                })) if request_payload.from_block() == from
+                    && request_payload.to_block() == to
+                    && *request_payload.covered() == *covered =>
                 {
                     Some(*request_id)
                 }
@@ -3707,6 +3785,7 @@ mod tests {
             .graph
             .admitted(head_hash, finalized_hash, 1, bloom_matching_any())
             .with_complete_logs(head_hash, Vec::new())
+            .0
             .with_observed_head(head_hash);
 
         let (next_state, effects) = transition(
@@ -4061,6 +4140,41 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
+    // A multi-provider fan-out redelivers the same logs for a block whose head has not arrived:
+    // the staging buffer keys by `log_index` at arrival, so duplicates merge instead of
+    // accumulating (the entry is bounded by the block's true log count, however often the feed
+    // repeats itself).
+    #[test]
+    fn duplicate_pre_head_log_deliveries_do_not_grow_the_staging_buffer() {
+        let finalized = BlockHash::with_last_byte(1);
+        let block_hash = BlockHash::with_last_byte(2);
+        let candidate = pool_candidate_address(3);
+        let mut state = empty_state_at(finalized);
+        state.pool_registry = registry_verifying(candidate);
+
+        let derived = pool_state(7);
+        for _ in 0..3 {
+            let (next_state, _effects) = transition(
+                ChainKey::Ethereum,
+                state,
+                Event::LogObserved {
+                    block_hash,
+                    logs: vec![swap_log(candidate, 0, &derived)],
+                },
+            );
+            state = next_state;
+        }
+
+        assert_eq!(
+            state
+                .streamed_logs
+                .get(&block_hash)
+                .map(|staged| staged.len()),
+            Some(1),
+            "identical redeliveries must merge on log_index, not accumulate"
+        );
+        assert_state_invariants(&state);
+    }
 
     // Resolves the same unknown candidate on multiple blocks.
     // This suppresses duplicate validation RPC while one metadata request is pending.
@@ -4408,7 +4522,7 @@ mod tests {
                 graph.with_streamed_logs(block_hash, candidate_logs(candidates))
             }
             PlantedLogs::Complete(candidates) => {
-                graph.with_complete_logs(block_hash, candidate_logs(candidates))
+                graph.with_complete_logs(block_hash, candidate_logs(candidates)).0
             }
         };
         // WS-primary: the backstop only fetches holes deeper than the settle window, so sink the
@@ -4820,65 +4934,112 @@ mod tests {
     // This avoids early finalized-header fetches while the graph is still short.
     #[test]
     fn finalized_refresh_predicate_does_not_trigger_below_target() {
-        assert!(!should_fetch_finalized_header(Some(70), Some(71), 72, 8));
+        assert!(!should_fetch_finalized_header(Some(70), Some(71), 72, stride(8)));
     }
 
     // Checks the initial crossing into the refresh target.
     // This is the first point at which the graph should ask for a newer finalized anchor.
     #[test]
     fn finalized_refresh_predicate_triggers_when_crossing_target() {
-        assert!(should_fetch_finalized_header(Some(71), Some(72), 72, 8));
+        assert!(should_fetch_finalized_header(Some(71), Some(72), 72, stride(8)));
     }
 
     // Checks duplicate suppression at a stable target length.
     // This prevents same-block events from dispatching repeated finalized fetches.
     #[test]
     fn finalized_refresh_predicate_does_not_trigger_without_length_change_at_target() {
-        assert!(!should_fetch_finalized_header(Some(72), Some(72), 72, 8));
+        assert!(!should_fetch_finalized_header(Some(72), Some(72), 72, stride(8)));
     }
 
     // Checks duplicate suppression within the first retry bucket.
     // This allows non-boundary head growth without repeated finalized fetches.
     #[test]
     fn finalized_refresh_predicate_does_not_trigger_within_same_retry_bucket() {
-        assert!(!should_fetch_finalized_header(Some(72), Some(73), 72, 8));
-        assert!(!should_fetch_finalized_header(Some(79), Some(79), 72, 8));
+        assert!(!should_fetch_finalized_header(Some(72), Some(73), 72, stride(8)));
+        assert!(!should_fetch_finalized_header(Some(79), Some(79), 72, stride(8)));
     }
 
     // Checks the next retry boundary above the target.
     // This provides bounded retries if compaction or finalized-header fetches lag.
     #[test]
     fn finalized_refresh_predicate_triggers_when_crossing_retry_bucket() {
-        assert!(should_fetch_finalized_header(Some(79), Some(80), 72, 8));
-        assert!(should_fetch_finalized_header(Some(87), Some(88), 72, 8));
+        assert!(should_fetch_finalized_header(Some(79), Some(80), 72, stride(8)));
+        assert!(should_fetch_finalized_header(Some(87), Some(88), 72, stride(8)));
     }
 
     // Checks duplicate suppression after a retry boundary.
     // This keeps every retry bucket to a single dispatch.
     #[test]
     fn finalized_refresh_predicate_does_not_trigger_inside_later_retry_bucket() {
-        assert!(!should_fetch_finalized_header(Some(80), Some(87), 72, 8));
+        assert!(!should_fetch_finalized_header(Some(80), Some(87), 72, stride(8)));
     }
 
     // Checks reconnecting ancestry directly into the target range.
     // This lets a completed parent chain request a finalized refresh once.
     #[test]
     fn finalized_refresh_predicate_triggers_when_disconnected_path_becomes_long_enough() {
-        assert!(should_fetch_finalized_header(None, Some(72), 72, 8));
+        assert!(should_fetch_finalized_header(None, Some(72), 72, stride(8)));
     }
 
     // Checks disconnected paths below the target.
     // This avoids refresh requests for paths that are newly connected but still short.
     #[test]
     fn finalized_refresh_predicate_does_not_trigger_when_reconnected_path_is_short() {
-        assert!(!should_fetch_finalized_header(None, Some(71), 72, 8));
+        assert!(!should_fetch_finalized_header(None, Some(71), 72, stride(8)));
     }
 
     // Checks transitions from connected to disconnected ancestry.
     // This avoids treating missing ancestry as a retry boundary.
     #[test]
     fn finalized_refresh_predicate_does_not_trigger_when_path_becomes_disconnected() {
-        assert!(!should_fetch_finalized_header(Some(80), None, 72, 8));
+        assert!(!should_fetch_finalized_header(Some(80), None, 72, stride(8)));
+    }
+
+    proptest! {
+        /// The edge-trigger law generalizing the boundary examples above: walking any monotone
+        /// canonical-length sequence, the predicate fires exactly once per stride bucket visited
+        /// at/above the target (never below it, never twice in a bucket, and not for the bucket
+        /// the walk already started in).
+        #[test]
+        fn finalized_refresh_fires_exactly_once_per_bucket_over_monotone_growth(
+            start_len in 0usize..40,
+            start_known in proptest::prelude::any::<bool>(),
+            increments in prop::collection::vec(0usize..4, 1..24),
+            target_len in 0usize..30,
+            retry_stride in 1usize..6,
+        ) {
+            let retry_stride = stride(retry_stride);
+            // The walked lengths: monotone, possibly repeating (a same-length event must not
+            // re-fire). `start_known = false` models bootstrap (no previous length).
+            let mut lens = Vec::new();
+            let mut len = start_len;
+            for step in increments {
+                len += step;
+                lens.push(len);
+            }
+
+            let mut fires = 0usize;
+            let mut previous = start_known.then_some(start_len);
+            for after in &lens {
+                if should_fetch_finalized_header(previous, Some(*after), target_len, retry_stride) {
+                    fires += 1;
+                }
+                previous = Some(*after);
+            }
+
+            // Independent model: a length at/above the target belongs to bucket
+            // (len − target) / stride; the walk owes exactly one fire per distinct bucket it
+            // visits, minus the bucket it started in (already dispatched before the walk).
+            let bucket =
+                |len: usize| (len >= target_len).then(|| (len - target_len) / retry_stride);
+            let pre_occupied = if start_known { bucket(start_len) } else { None };
+            let visited: HashSet<usize> = lens.iter().filter_map(|len| bucket(*len)).collect();
+            let expected = visited
+                .iter()
+                .filter(|visited_bucket| Some(**visited_bucket) != pre_occupied)
+                .count();
+            prop_assert_eq!(fires, expected);
+        }
     }
 
 
@@ -6985,7 +7146,8 @@ mod tests {
                         (block_index + 1) as u64,
                         bloom_matching_any(),
                     )
-                    .with_complete_logs(block_hash, planted_logs);
+                    .with_complete_logs(block_hash, planted_logs)
+                    .0;
 
                 last_hash = block_hash;
                 parent_hash = block_hash;
@@ -7488,6 +7650,7 @@ mod tests {
 
             for generated_event in generated_events {
                 let previous_tick = state.tick;
+                let previous_ws_miss = state.ws_miss_count;
                 let is_tick = matches!(generated_event, GeneratedEvent::Tick);
                 match &generated_event {
                     GeneratedEvent::BlockHeaderNotFound { .. } => backfill_deferred = true,
@@ -7509,6 +7672,9 @@ mod tests {
                 } else {
                     prop_assert!(next_state.tick == previous_tick);
                 }
+
+                // The WS-miss gauge is an observed aggregate: transitions may only ever add to it.
+                prop_assert!(next_state.ws_miss_count >= previous_ws_miss);
 
                 assert_state_invariants(&next_state);
                 assert_canonical_unknown_logs_are_pending(&next_state);
@@ -7915,11 +8081,12 @@ mod tests {
         let mut state = state_with_observed_chain(finalized_hash, &[covered_hash, uncovered_hash]);
 
         let (pending_requests, request_id) = state.pending_requests.with_new_request(
-            GetLogsRange {
-                from: block_number_for(covered_hash),
-                to: block_number_for(uncovered_hash),
-                covered: HashSet::from([covered_hash, pruned_hash]),
-            },
+            GetLogsRange::new(
+                block_number_for(covered_hash),
+                block_number_for(uncovered_hash),
+                HashSet::from([covered_hash, pruned_hash]),
+            )
+            .expect("test window is ordered"),
             tick(0),
         );
         state.pending_requests = pending_requests;

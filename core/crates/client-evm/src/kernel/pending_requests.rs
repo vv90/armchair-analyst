@@ -2,6 +2,7 @@ use std::{collections::HashSet, fmt};
 
 use alloy::primitives::BlockHash;
 
+use super::blocks_graph::MissingRange;
 use super::token_registry::TokenAddress;
 pub use crate::request_tracking::{IssuedRequest, PendingPayload, RequestId};
 use crate::{
@@ -52,11 +53,55 @@ pub struct GetPoolData {
 /// handler may complete-empty a covered block absent from the (topics-only) response: absence
 /// proves emptiness only for blocks the request demonstrably covered, never for whatever fork the
 /// provider answered from.
+///
+/// Fields are private so `from ≤ to` holds by construction: [`pending_log_range_numbers`]
+/// (`from..=to`) and the executor's paging both iterate the window and would run away on an
+/// inverted one. Production windows convert from [`MissingRange`] (ordered by construction, so
+/// the conversion is total); everything else goes through the checked [`GetLogsRange::new`].
+///
+/// [`pending_log_range_numbers`]: PendingRequests::pending_log_range_numbers
 #[derive(Clone)]
 pub struct GetLogsRange {
-    pub from: u64,
-    pub to: u64,
-    pub covered: HashSet<BlockHash>,
+    from: u64,
+    to: u64,
+    covered: HashSet<BlockHash>,
+}
+
+impl GetLogsRange {
+    /// A checked window: `Some` iff `from <= to`.
+    pub fn new(from: u64, to: u64, covered: HashSet<BlockHash>) -> Option<GetLogsRange> {
+        (from <= to).then_some(GetLogsRange { from, to, covered })
+    }
+
+    pub fn from_block(&self) -> u64 {
+        self.from
+    }
+
+    pub fn to_block(&self) -> u64 {
+        self.to
+    }
+
+    pub fn covered(&self) -> &HashSet<BlockHash> {
+        &self.covered
+    }
+
+    /// Consumes the request into its covered hole hashes (the response handler's complete-empty
+    /// entitlement).
+    pub fn into_covered(self) -> HashSet<BlockHash> {
+        self.covered
+    }
+}
+
+/// The one production construction path: a [`MissingRange`] is emitted with ordered bounds and
+/// number-matching hashes by construction, so the conversion is total (no `Option` to re-check).
+impl From<MissingRange> for GetLogsRange {
+    fn from(range: MissingRange) -> GetLogsRange {
+        GetLogsRange {
+            from: range.from,
+            to: range.to,
+            covered: range.hashes.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -558,6 +603,140 @@ mod tests {
             !pending.contains(&superseded_id),
             "a range whose every covered block was pruned is superseded"
         );
+    }
+
+    fn hash_of(byte: u8) -> BlockHash {
+        BlockHash::with_last_byte(byte)
+    }
+
+    /// One generated request per type, carrying only its block target(s) — the sole input the
+    /// retention rule reads.
+    #[derive(Debug, Clone)]
+    enum GeneratedRequest {
+        Header(u8),
+        Logs(u8),
+        PoolMetadata(u8),
+        TokenMetadata(u8),
+        PoolData(u8),
+        LogsRange(Vec<u8>),
+    }
+
+    impl GeneratedRequest {
+        /// The retention rule stated independently of the implementation: a request survives iff
+        /// at least one of its block targets is retained.
+        fn survives(&self, retained: &HashSet<BlockHash>) -> bool {
+            match self {
+                GeneratedRequest::Header(byte)
+                | GeneratedRequest::Logs(byte)
+                | GeneratedRequest::PoolMetadata(byte)
+                | GeneratedRequest::TokenMetadata(byte)
+                | GeneratedRequest::PoolData(byte) => retained.contains(&hash_of(*byte)),
+                GeneratedRequest::LogsRange(bytes) => {
+                    bytes.iter().any(|byte| retained.contains(&hash_of(*byte)))
+                }
+            }
+        }
+    }
+
+    fn generated_request_strategy() -> impl proptest::strategy::Strategy<Value = GeneratedRequest> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0u8..8).prop_map(GeneratedRequest::Header),
+            (0u8..8).prop_map(GeneratedRequest::Logs),
+            (0u8..8).prop_map(GeneratedRequest::PoolMetadata),
+            (0u8..8).prop_map(GeneratedRequest::TokenMetadata),
+            (0u8..8).prop_map(GeneratedRequest::PoolData),
+            proptest::collection::vec(0u8..8, 1..4).prop_map(GeneratedRequest::LogsRange),
+        ]
+    }
+
+    proptest::proptest! {
+        /// `retaining_block_targets` keeps a request iff at least one of its block targets is
+        /// retained — parametric over every request type (single target for five of them; a
+        /// ranged request's targets are its `covered` hashes), so the next request type added to
+        /// the store lands inside this pin, not beside it.
+        #[test]
+        fn retention_keeps_exactly_requests_with_a_surviving_target(
+            requests in proptest::collection::vec(generated_request_strategy(), 0..12),
+            retained_bytes in proptest::collection::hash_set(0u8..8, 0..8),
+        ) {
+            let retained: HashSet<BlockHash> = retained_bytes.iter().map(|byte| hash_of(*byte)).collect();
+
+            let mut pending = PendingRequests::new();
+            let mut issued: Vec<(AnyRequestId, bool)> = Vec::new();
+            for request in &requests {
+                let expected = request.survives(&retained);
+                let request_id = match request.clone() {
+                    GeneratedRequest::Header(byte) => {
+                        let (next, id) = pending.with_new_request(
+                            GetBlockHeader { block_hash: hash_of(byte) },
+                            Tick::initial(),
+                        );
+                        pending = next;
+                        AnyRequestId::BlockHeader(id)
+                    }
+                    GeneratedRequest::Logs(byte) => {
+                        let (next, id) = pending.with_new_request(
+                            GetBlockLogs { block_hash: hash_of(byte) },
+                            Tick::initial(),
+                        );
+                        pending = next;
+                        AnyRequestId::BlockLogs(id)
+                    }
+                    GeneratedRequest::PoolMetadata(byte) => {
+                        let (next, id) = pending.with_new_request(
+                            GetPoolMetadata { at: hash_of(byte), candidates: HashSet::new() },
+                            Tick::initial(),
+                        );
+                        pending = next;
+                        AnyRequestId::PoolMetadata(id)
+                    }
+                    GeneratedRequest::TokenMetadata(byte) => {
+                        let (next, id) = pending.with_new_request(
+                            GetTokenMetadata { at: hash_of(byte), tokens: HashSet::new() },
+                            Tick::initial(),
+                        );
+                        pending = next;
+                        AnyRequestId::TokenMetadata(id)
+                    }
+                    GeneratedRequest::PoolData(byte) => {
+                        let (next, id) = pending.with_new_request(
+                            GetPoolData { at: hash_of(byte), pools: HashSet::new() },
+                            Tick::initial(),
+                        );
+                        pending = next;
+                        AnyRequestId::PoolData(id)
+                    }
+                    GeneratedRequest::LogsRange(bytes) => {
+                        let (next, id) = pending.with_new_request(
+                            GetLogsRange {
+                                from: 10,
+                                to: 10,
+                                covered: bytes.iter().map(|byte| hash_of(*byte)).collect(),
+                            },
+                            Tick::initial(),
+                        );
+                        pending = next;
+                        AnyRequestId::LogsRange(id)
+                    }
+                };
+                issued.push((request_id, expected));
+            }
+
+            let survivors = issued.iter().filter(|(_, expected)| *expected).count();
+            let pending = pending.retaining_block_targets(&retained);
+
+            for (request_id, expected) in &issued {
+                proptest::prop_assert_eq!(
+                    pending.contains_any_for_test(*request_id),
+                    *expected,
+                    "request {:?} retention mismatch",
+                    request_id
+                );
+            }
+            // No unaccounted request appears or vanishes.
+            proptest::prop_assert_eq!(pending.len_for_test(), survivors);
+        }
     }
 
     #[test]
