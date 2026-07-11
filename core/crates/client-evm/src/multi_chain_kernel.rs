@@ -2463,6 +2463,8 @@ mod tests {
             AnyIssuedRequest::PoolCandidates(issued) => bootstrap::Event::PoolCandidatesReceived {
                 request_id: issued.request_id,
                 blocks: Vec::new(),
+                scan_tip: 0,
+                next_from: None,
             },
             AnyIssuedRequest::PoolMetadata(issued) => bootstrap::Event::PoolMetadataReceived {
                 request_id: issued.request_id,

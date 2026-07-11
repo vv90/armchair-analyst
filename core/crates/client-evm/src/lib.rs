@@ -25,7 +25,7 @@ pub use chain::{ACTIVE_CHAINS, ChainKey, chain_key_for_network_path, drpc_networ
 pub use client::{
     ClientEvent, ClientHead, MetadataCache, MetadataCacheError, POOL_LOG_BATCH_WINDOW,
     RangeLogBlock, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
+    fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, plan_ws_subscriptions,
     subscribe_new_heads, subscribe_pool_events, WsSubscriptionEndpoint,
 };

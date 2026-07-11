@@ -12,7 +12,7 @@ use client_evm::{
     PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RangeLogBlock, RequestId,
     TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
     bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_in_range, fetch_pool_data,
+    fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
     kernel,
     multi_chain_kernel::{
@@ -820,9 +820,23 @@ impl ClientEvmRuntime {
             bootstrap::AnyIssuedRequest::PoolCandidates(request) => {
                 let request_id = request.request_id;
                 let from_block = request.request_payload.from_block;
+                let scan_tip = request.request_payload.scan_tip;
 
-                match fetch_pool_candidates_in_range(&self.agent, endpoints, chain, from_block) {
-                    Ok(blocks) => bootstrap::Event::PoolCandidatesReceived { request_id, blocks },
+                match fetch_pool_candidates_window(
+                    &self.agent,
+                    endpoints,
+                    chain,
+                    from_block,
+                    scan_tip,
+                ) {
+                    Ok((blocks, scan_tip, next_from)) => {
+                        bootstrap::Event::PoolCandidatesReceived {
+                            request_id,
+                            blocks,
+                            scan_tip,
+                            next_from,
+                        }
+                    }
                     Err(error) => {
                         let request_id = bootstrap::AnyRequestId::PoolCandidates(request_id);
                         self.logger.log(&format!(

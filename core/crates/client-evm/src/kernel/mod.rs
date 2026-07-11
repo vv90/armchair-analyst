@@ -3002,6 +3002,8 @@ mod tests {
                 bootstrap::Event::PoolCandidatesReceived {
                     request_id: request.request_id,
                     blocks: window.to_vec(),
+                    scan_tip: window.last().map(|block| block.number).unwrap_or_default(),
+                    next_from: None,
                 }
             }
             bootstrap::AnyIssuedRequest::PoolMetadata(request) => {
@@ -7891,11 +7893,17 @@ mod tests {
                 match &generated_event {
                     GeneratedEvent::BlockHeaderNotFound { .. } => backfill_deferred = true,
                     // A self-parent head is garbage input handled without the scheduling chain,
-                    // so it does not clear a deferred backfill.
+                    // and a duplicate of the current tip is an `Inert` no-op (fix-1b) that likewise
+                    // skips it — neither re-emits the dropped backfill, so neither clears the
+                    // deferral. Only a head that actually runs the scheduling chain does.
                     GeneratedEvent::HeadObserved {
                         hash_index,
                         parent_index,
-                    } if hash_index != parent_index => backfill_deferred = false,
+                    } if hash_index != parent_index
+                        && hash_for_node(*hash_index) != state.blocks.graph.observed_head_hash() =>
+                    {
+                        backfill_deferred = false
+                    }
                     GeneratedEvent::BlockHeaderReceived { .. } => backfill_deferred = false,
                     _ => {}
                 }

@@ -77,8 +77,9 @@ fn filler_hash(lower: BlockHash, upper: BlockHash) -> BlockHash {
 impl GraphSeed {
     /// Infers the `finalized..tip` block graph from a ranged-logs snapshot.
     ///
-    /// A single `eth_getLogs` response is one canonical view, so consecutive retained blocks are
-    /// parent-linked by number adjacency. No-log blocks are absent from the response, leaving gaps;
+    /// The concatenated `eth_getLogs` windows form one canonical view (deduped by number), so
+    /// consecutive retained blocks are parent-linked by number adjacency. No-log blocks are absent
+    /// from the responses, leaving gaps;
     /// rather than dropping the blocks above a gap (which would force a per-block header walk to
     /// reconnect them), each gap is bridged by a single synthetic [`filler_hash`] block whose only
     /// role is connectivity. Every retained block — and the run anchored above the finalized block —
@@ -202,6 +203,10 @@ enum Phase {
     AnchoringChain,
     Discovering {
         anchor: FinalizedAnchor,
+        /// Candidate blocks accumulated across the windows returned so far. The scan is paged one
+        /// window per request; each `PoolCandidatesReceived` extends this, and it feeds the seed
+        /// (and, on timeout, the best-effort degraded seed) once the scan reaches the tip.
+        blocks: Vec<RangeLogBlock>,
     },
     ValidatingPools {
         anchor: FinalizedAnchor,
@@ -232,6 +237,12 @@ pub enum Event {
     PoolCandidatesReceived {
         request_id: RequestId<GetPoolCandidatesInRange>,
         blocks: Vec<RangeLogBlock>,
+        /// The frozen scan ceiling the executor used for this window (resolved on the first
+        /// window, echoed on every continuation). Threaded into the next window's request.
+        scan_tip: u64,
+        /// `Some(n)` ⇒ the window stopped below `scan_tip`; page the next window from block `n`.
+        /// `None` ⇒ the window reached the tip; the paged scan is complete.
+        next_from: Option<u64>,
     },
     PoolMetadataReceived {
         request_id: RequestId<GetPoolMetadata>,
@@ -302,15 +313,21 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                     // Scan only `finalized..tip`: the seed graph already discards every block at or
                     // below the anchor, and the historical pool set below finalized is owned by the
                     // persistent metadata cache (unioned into the candidate set by the runtime).
+                    // The scan is paged one window per request; the first window carries no frozen
+                    // tip, so the executor resolves and reports it.
                     let payload = GetPoolCandidatesInRange {
                         from_block: anchor.number,
+                        scan_tip: None,
                     };
                     let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
 
                     (
                         rebuild(
                             pending,
-                            Phase::Discovering { anchor },
+                            Phase::Discovering {
+                                anchor,
+                                blocks: Vec::new(),
+                            },
                             policy,
                             started_at,
                             tick,
@@ -328,33 +345,79 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                 ),
             }
         }
-        Event::PoolCandidatesReceived { request_id, blocks } => {
+        Event::PoolCandidatesReceived {
+            request_id,
+            blocks,
+            scan_tip,
+            next_from,
+        } => {
             let (pending, taken) = pending.take(&request_id);
             match phase {
-                Phase::Discovering { anchor } if taken.is_some() => {
-                    let seed = GraphSeed::from_window(&blocks, anchor, policy.tip_trim);
-                    // Candidate keys derive from the decoded logs (registry-free emitter identity),
-                    // exactly as the live path derives them from a getLogs response.
-                    let candidates = blocks
-                        .into_iter()
-                        .flat_map(|block| block.logs.into_iter().map(|log| log.pool))
-                        .collect();
-                    let payload = GetPoolMetadata {
-                        at: anchor.hash,
-                        candidates,
-                    };
-                    let (pending, request_id) = pending.with_new_request(payload.clone(), tick);
+                Phase::Discovering {
+                    anchor,
+                    blocks: mut accumulated,
+                } if taken.is_some() => {
+                    accumulated.extend(blocks);
+                    match next_from {
+                        // The window stopped below the frozen tip; page the next one, carrying the
+                        // frozen `scan_tip` so the scan targets a fixed `finalized..tip` range.
+                        Some(from_block) => {
+                            let payload = GetPoolCandidatesInRange {
+                                from_block,
+                                scan_tip: Some(scan_tip),
+                            };
+                            let (pending, request_id) =
+                                pending.with_new_request(payload.clone(), tick);
 
-                    (
-                        rebuild(
-                            pending,
-                            Phase::ValidatingPools { anchor, seed },
-                            policy,
-                            started_at,
-                            tick,
-                        ),
-                        vec![issued(AnyIssuedRequest::PoolMetadata, request_id, payload)],
-                    )
+                            (
+                                rebuild(
+                                    pending,
+                                    Phase::Discovering {
+                                        anchor,
+                                        blocks: accumulated,
+                                    },
+                                    policy,
+                                    started_at,
+                                    tick,
+                                ),
+                                vec![issued(
+                                    AnyIssuedRequest::PoolCandidates,
+                                    request_id,
+                                    payload,
+                                )],
+                            )
+                        }
+                        // The scan reached the tip; build the seed and candidate set from every
+                        // accumulated window and move on to metadata validation.
+                        None => {
+                            let seed =
+                                GraphSeed::from_window(&accumulated, anchor, policy.tip_trim);
+                            // Candidate keys derive from the decoded logs (registry-free emitter
+                            // identity), exactly as the live path derives them from a getLogs
+                            // response.
+                            let candidates = accumulated
+                                .into_iter()
+                                .flat_map(|block| block.logs.into_iter().map(|log| log.pool))
+                                .collect();
+                            let payload = GetPoolMetadata {
+                                at: anchor.hash,
+                                candidates,
+                            };
+                            let (pending, request_id) =
+                                pending.with_new_request(payload.clone(), tick);
+
+                            (
+                                rebuild(
+                                    pending,
+                                    Phase::ValidatingPools { anchor, seed },
+                                    policy,
+                                    started_at,
+                                    tick,
+                                ),
+                                vec![issued(AnyIssuedRequest::PoolMetadata, request_id, payload)],
+                            )
+                        }
+                    }
                 }
                 phase => (
                     rebuild(pending, phase, policy, started_at, tick),
@@ -451,7 +514,13 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
 
             if tick.elapsed_since(started_at) >= policy.deadline_ticks {
                 return (
-                    rebuild(pending, degraded(chain, phase), policy, started_at, tick),
+                    rebuild(
+                        pending,
+                        degraded(chain, phase, policy.tip_trim),
+                        policy,
+                        started_at,
+                        tick,
+                    ),
                     Vec::new(),
                 );
             }
@@ -495,15 +564,17 @@ fn issued<R>(
 
 /// Builds the best-effort terminal phase when the deadline is reached, carrying exactly the
 /// facts the current phase has accumulated. The pre-anchor case cannot activate, so it abandons.
-fn degraded(chain: ChainKey, phase: Phase) -> Phase {
+fn degraded(chain: ChainKey, phase: Phase, tip_trim: usize) -> Phase {
     match phase {
         Phase::AnchoringChain => Phase::Abandoned,
-        Phase::Discovering { anchor } => Phase::Ready(BootstrapOutcome {
+        // A scan that timed out mid-paging still activates with the pools it did discover: build
+        // the seed from whatever windows accumulated rather than dropping them.
+        Phase::Discovering { anchor, blocks } => Phase::Ready(BootstrapOutcome {
             anchor,
             pool_snapshots: HashMap::new(),
             pool_registry: TrustedPoolRegistry::new(),
             token_registry: TokenRegistry::new(),
-            seed_blocks: Vec::new(),
+            seed_blocks: GraphSeed::from_window(&blocks, anchor, tip_trim).into_blocks(),
         }),
         Phase::ValidatingPools { anchor, seed } => Phase::Ready(BootstrapOutcome {
             anchor,
@@ -960,6 +1031,8 @@ mod tests {
             Event::PoolCandidatesReceived {
                 request_id: candidates_id,
                 blocks: vec![window_block(11, 11), window_block(12, 12)],
+                scan_tip: 12,
+                next_from: None,
             },
         )
     }
@@ -1052,6 +1125,8 @@ mod tests {
             Event::PoolCandidatesReceived {
                 request_id: bogus_id,
                 blocks: vec![window_block(11, 11)],
+                scan_tip: 12,
+                next_from: None,
             },
         );
         assert!(effects.is_empty());
@@ -1063,6 +1138,8 @@ mod tests {
             Event::PoolCandidatesReceived {
                 request_id: real_candidates_id,
                 blocks: vec![window_block(11, 11)],
+                scan_tip: 12,
+                next_from: None,
             },
         );
         assert!(matches!(
@@ -1102,6 +1179,160 @@ mod tests {
         );
     }
 
+    /// Drives Anchoring → Discovering and returns the state plus the first candidates request id.
+    fn drive_to_discovering() -> (State, RequestId<GetPoolCandidatesInRange>) {
+        let (state, effects) = init(test_policy());
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedHeaderReceived {
+                request_id: finalized_request_id(&effects),
+                anchor: test_anchor(),
+            },
+        );
+        let first = candidates_request(&effects);
+        // The first window carries no frozen tip (the executor resolves it) and starts at the anchor.
+        assert_eq!(first.request_payload.from_block, test_anchor().number);
+        assert_eq!(first.request_payload.scan_tip, None);
+        (state, first.request_id)
+    }
+
+    #[test]
+    fn discovery_pages_multiple_windows_before_validating_pools() {
+        let (state, first_id) = drive_to_discovering();
+
+        // First window stops below the frozen tip (20): more to scan from block 15.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::PoolCandidatesReceived {
+                request_id: first_id,
+                blocks: vec![window_block(11, 11)],
+                scan_tip: 20,
+                next_from: Some(15),
+            },
+        );
+
+        // Still discovering; the continuation carries the frozen tip and resumes at block 15.
+        assert!(completion(&state).is_none());
+        let second = candidates_request(&effects);
+        assert_eq!(second.request_payload.from_block, 15);
+        assert_eq!(second.request_payload.scan_tip, Some(20));
+        let second_id = second.request_id;
+
+        // Second window reaches the tip (next_from None): advance to metadata validation with the
+        // union of both windows' pool candidates.
+        let (_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::PoolCandidatesReceived {
+                request_id: second_id,
+                blocks: vec![window_block(16, 16)],
+                scan_tip: 20,
+                next_from: None,
+            },
+        );
+        let metadata = pool_metadata_request(&effects);
+        assert_eq!(metadata.request_payload.candidates.len(), 2);
+    }
+
+    #[test]
+    fn discovery_ignores_a_window_delivered_after_its_request_was_reissued() {
+        // Regression for the stale-drop that stranded Base: a window that expired (its request
+        // reissued under a new id) no longer strands the scan — the reissued window completes it.
+        let (state, first_id) = drive_to_discovering();
+
+        // The first window's request expires and is reissued with a new id (same payload).
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::RequestFailed {
+                request_id: AnyRequestId::PoolCandidates(first_id),
+            },
+        );
+        let reissued = candidates_request(&effects);
+        let reissued_id = reissued.request_id;
+        assert_ne!(reissued_id.raw_for_test(), first_id.raw_for_test());
+
+        // A late delivery under the stale id is dropped (no advance, no effects) — but harmlessly,
+        // because the reissued window covers the same range.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::PoolCandidatesReceived {
+                request_id: first_id,
+                blocks: vec![window_block(11, 11)],
+                scan_tip: 20,
+                next_from: None,
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(completion(&state).is_none());
+
+        // The reissued window completes the scan and advances to metadata validation.
+        let (_state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::PoolCandidatesReceived {
+                request_id: reissued_id,
+                blocks: vec![window_block(11, 11)],
+                scan_tip: 20,
+                next_from: None,
+            },
+        );
+        assert!(matches!(
+            single_request(&effects),
+            AnyIssuedRequest::PoolMetadata(_)
+        ));
+    }
+
+    #[test]
+    fn deadline_mid_discovery_degrades_with_a_seed_from_the_accumulated_windows() {
+        // A scan that times out mid-paging still activates with the pools it did discover: the
+        // degraded outcome carries a seed built from the windows accumulated so far, not an empty one.
+        let policy = BootstrapPolicy {
+            tip_trim: 0,
+            deadline_ticks: 3,
+        };
+        let (state, effects) = init(policy);
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedHeaderReceived {
+                request_id: finalized_request_id(&effects),
+                anchor: test_anchor(),
+            },
+        );
+        let candidates_id = candidates_request(&effects).request_id;
+
+        // One window arrives but the scan is not done (next_from Some), so the phase stays in
+        // Discovering with the window accumulated.
+        let (mut state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::PoolCandidatesReceived {
+                request_id: candidates_id,
+                blocks: vec![window_block(11, 11)],
+                scan_tip: 20,
+                next_from: Some(15),
+            },
+        );
+        assert!(completion(&state).is_none());
+
+        for _ in 0..policy.deadline_ticks {
+            let (next, _effects) = transition(ChainKey::Ethereum, state, Event::Tick);
+            state = next;
+        }
+
+        let outcome = match completion(&state) {
+            Some(Completion::Ready(outcome)) => outcome,
+            other => panic!("expected ready, got {other:?}"),
+        };
+        assert_eq!(outcome.anchor, test_anchor());
+        // The accumulated window seeds the graph (block 11 linked to the anchor hash 200).
+        assert_eq!(outcome.seed_blocks, vec![seed_block(11, 200)]);
+    }
+
     #[test]
     fn deadline_after_anchor_degrades_to_ready_with_seed_and_empty_snapshot() {
         let policy = BootstrapPolicy {
@@ -1124,6 +1355,8 @@ mod tests {
             Event::PoolCandidatesReceived {
                 request_id: candidates_id,
                 blocks: vec![window_block(11, 11), window_block(12, 12)],
+                scan_tip: 12,
+                next_from: None,
             },
         );
 
@@ -1186,6 +1419,8 @@ mod tests {
             Event::PoolCandidatesReceived {
                 request_id: candidates_id,
                 blocks: vec![window_block(11, 11), window_block(12, 12)],
+                scan_tip: 12,
+                next_from: None,
             },
         );
         let metadata_id = pool_metadata_request(&effects).request_id;
@@ -1240,6 +1475,8 @@ mod tests {
             AnyIssuedRequest::PoolCandidates(request) => Event::PoolCandidatesReceived {
                 request_id: request.request_id,
                 blocks: vec![window_block(11, 11), window_block(12, 12)],
+                scan_tip: 12,
+                next_from: None,
             },
             AnyIssuedRequest::PoolMetadata(request) => Event::PoolMetadataReceived {
                 request_id: request.request_id,
