@@ -489,6 +489,13 @@ impl BlocksGraph {
         }
     }
 
+    /// The latest observed head hash. The kernel's `HeadObserved` arm compares it against the
+    /// incoming hash to recognize a fan-out re-delivery of the current tip — the one duplicate
+    /// case that provably changes nothing and may skip the scheduling walk.
+    pub(crate) fn observed_head_hash(&self) -> BlockHash {
+        self.observed_head
+    }
+
     /// A present block's mutable payload, regardless of its connectivity — the log-merge transitions
     /// write here so promotion never has to move logs. `None` when the hash is absent (pruned/never
     /// admitted); the anchor has no node and so is never returned.
@@ -1124,10 +1131,6 @@ impl BlocksGraph {
 /// away for assertions.
 #[cfg(test)]
 impl BlocksGraph {
-    pub(crate) fn observed_head_hash(&self) -> BlockHash {
-        self.observed_head
-    }
-
     /// True when no recent blocks are tracked yet — only the anchor exists.
     fn is_empty(&self) -> bool {
         self.nodes.is_empty()

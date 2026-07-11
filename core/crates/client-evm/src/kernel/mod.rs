@@ -853,6 +853,7 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
             // connected forest, and nothing resets. The scheduling chain then derives all
             // follow-up work — header backfill, log fetches, candidate/token validation — from
             // the graph itself.
+            let head_before = state.blocks.graph.observed_head_hash();
             let (state, admission) =
                 state.with_log_head_observed(hash, parent_hash, number, logs_bloom);
             match admission {
@@ -870,6 +871,17 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                         },
                         effects,
                     )
+                }
+                // A fan-out re-delivery of the block that is already the observed head is a
+                // total no-op on state: admission refused (refuse-and-keep), the head write is
+                // idempotent, and the staged-logs drain is empty for a present block (staging
+                // invariant). The derived schedule is therefore identical to the previous
+                // event's — skip the O(window) scheduling walk instead of re-deriving it. A
+                // duplicate whose hash is NOT the current head still moved the head (stale
+                // out-of-order delivery, or a reorg onto a backfilled fork) and falls through
+                // to the full pass below.
+                blocks_graph::Admission::DuplicateBlock if hash == head_before => {
+                    (state, vec![])
                 }
                 _ => schedule_unknown_canonical_requests(chain, state, vec![]),
             }
@@ -3369,6 +3381,120 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
+    // Interposes a fan-out re-delivery of the current tip before another event and compares the
+    // schedules. The duplicate-of-tip early-out claims the re-delivery leaves state bit-identical,
+    // so whatever the next event derives must be exactly what it would have derived anyway.
+    #[test]
+    fn interposed_duplicate_of_tip_head_does_not_change_next_events_schedule() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let head_hash = BlockHash::with_last_byte(2);
+        let missing_parent_hash = BlockHash::with_last_byte(3);
+        let next_head_hash = BlockHash::with_last_byte(4);
+        let follow_up = || Event::HeadObserved {
+            number: block_number_for(next_head_hash),
+            logs_bloom: Bloom::default(),
+            hash: next_head_hash,
+            parent_hash: missing_parent_hash,
+        };
+
+        let (_, direct_effects) = transition(
+            ChainKey::Ethereum,
+            state_with_observed_chain(finalized_hash, &[head_hash]),
+            follow_up(),
+        );
+
+        let (interposed_state, duplicate_effects) = transition(
+            ChainKey::Ethereum,
+            state_with_observed_chain(finalized_hash, &[head_hash]),
+            Event::HeadObserved {
+                number: block_number_for(head_hash),
+                logs_bloom: bloom_matching_any(),
+                hash: head_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+        assert!(duplicate_effects.is_empty());
+        let (interposed_next_state, interposed_effects) =
+            transition(ChainKey::Ethereum, interposed_state, follow_up());
+
+        assert_eq!(direct_effects.len(), interposed_effects.len());
+        assert_eq!(
+            assert_single_block_header_request_effect(&direct_effects, missing_parent_hash),
+            assert_single_block_header_request_effect(&interposed_effects, missing_parent_hash),
+        );
+        assert_eq!(
+            interposed_next_state.blocks.graph.observed_head_hash(),
+            next_head_hash
+        );
+        assert_state_invariants(&interposed_next_state);
+    }
+
+    // A duplicate delivery whose hash is NOT the current tip still moves the observed head (stale
+    // out-of-order fan-out delivery, or a reorg onto a backfilled fork) and must keep running the
+    // scheduling chain: it is one of the "later events" the `BlockHeaderNotFound` refuse-and-keep
+    // recovery relies on to re-emit a dropped fetch. Only the tip re-delivery is the no-op.
+    #[test]
+    fn duplicate_head_that_moves_the_head_reruns_scheduling_but_tip_duplicate_does_not() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let connected_hash = BlockHash::with_last_byte(2);
+        let missing_parent_hash = BlockHash::with_last_byte(3);
+        let pending_head_hash = BlockHash::with_last_byte(4);
+        let state = state_with_observed_chain(finalized_hash, &[connected_hash]);
+
+        // A pending head above a missing parent schedules the parent's header fetch...
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                number: block_number_for(pending_head_hash),
+                logs_bloom: Bloom::default(),
+                hash: pending_head_hash,
+                parent_hash: missing_parent_hash,
+            },
+        );
+        let request_id = assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        // ...which a not-found response drops without rescheduling (recovery rides later events).
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::BlockHeaderNotFound { request_id },
+        );
+        assert!(effects.is_empty());
+
+        // Re-delivering the tip changes nothing: the early-out must not re-emit the dropped fetch.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                number: block_number_for(pending_head_hash),
+                logs_bloom: Bloom::default(),
+                hash: pending_head_hash,
+                parent_hash: missing_parent_hash,
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.blocks.graph.observed_head_hash(),
+            pending_head_hash
+        );
+
+        // Re-delivering the older connected block is refused as a duplicate but moves the head,
+        // so the full scheduling pass runs and re-emits the dropped header fetch.
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                number: block_number_for(connected_hash),
+                logs_bloom: bloom_matching_any(),
+                hash: connected_hash,
+                parent_hash: finalized_hash,
+            },
+        );
+        assert_single_block_header_request_effect(&effects, missing_parent_hash);
+        assert_eq!(state.blocks.graph.observed_head_hash(), connected_hash);
+        assert_state_invariants(&state);
+    }
+
     // Observes heads whose raw parents reference each other — a pending-pending cycle, provably
     // fabricated data. Reorg-safety decision (a): such a cycle is representable only among pending
     // nodes, is never followed by any walk, and is bounded — nothing resets, and no scheduling
@@ -3657,9 +3783,11 @@ mod tests {
         assert_state_invariants(&next_state);
     }
 
-    // Starts with a fully present canonical chain whose logs are unknown.
-    // This ensures the scheduler backfills log requests for the holes past the settle window
-    // (WS-primary: blocks inside the window are the stream's, never the backstop's).
+    // Starts with a present canonical prefix whose logs are unknown and observes a fresh head
+    // above it. This ensures the scheduler backfills log requests for the holes past the settle
+    // window (WS-primary: blocks inside the window are the stream's, never the backstop's). The
+    // head is a genuine admission — a re-delivery of the planted tip would be the duplicate-of-tip
+    // no-op and schedule nothing.
     #[test]
     fn present_canonical_prefix_schedules_logs_for_unknown_blocks_past_settle_window() {
         let finalized_hash = BlockHash::with_last_byte(1);
@@ -3668,11 +3796,7 @@ mod tests {
         let head_hash = BlockHash::with_last_byte(4);
         let mut state = empty_state_at(finalized_hash);
 
-        plant_chain(
-            &mut state,
-            finalized_hash,
-            &[grandparent_hash, parent_hash, head_hash],
-        );
+        plant_chain(&mut state, finalized_hash, &[grandparent_hash, parent_hash]);
 
         let (next_state, effects) = transition(
             ChainKey::Ethereum,
@@ -6948,8 +7072,10 @@ mod tests {
             assert_no_active_request_is_expired(&next_state);
         }
 
-        // Generates linear canonical prefixes and reobserves their tip.
-        // This catches duplicate log scheduling across variable chain lengths.
+        // Generates linear canonical prefixes, observes a fresh tip above them, then reobserves
+        // that tip. This catches duplicate log scheduling across variable chain lengths: the first
+        // observation is a genuine admission that schedules the deep holes, the second is a
+        // duplicate-of-tip that must add nothing.
         #[test]
         fn duplicate_head_observation_does_not_duplicate_pending_log_requests(
             chain_len in 1usize..16,
@@ -6964,7 +7090,7 @@ mod tests {
                 .collect::<HashSet<_>>();
             let mut state = empty_state_at(finalized_hash);
 
-            let planted: Vec<BlockHash> = (1..=chain_len).map(hash_for_node).collect();
+            let planted: Vec<BlockHash> = (1..chain_len).map(hash_for_node).collect();
             plant_chain(&mut state, finalized_hash, &planted);
 
             let (state, effects) = transition(ChainKey::Ethereum,
@@ -7494,7 +7620,10 @@ mod tests {
         }
 
         // Generates a linear chain, forces a not-found reset, then reobserves heads.
-        // This proves reconstruction proceeds after a not-found dropped the backfill request.
+        // This proves reconstruction proceeds after a not-found dropped the backfill request. The
+        // dropped fetch re-emits on the next event that runs the scheduling chain — a fan-out
+        // re-delivery of the current tip is the duplicate-of-tip no-op and is NOT such an event
+        // (pinned below); the next genuine head is, and every chain keeps producing them.
         #[test]
         fn chain_reconstructs_after_not_found_and_reobservation(
             chain in generated_linear_chain_strategy(),
@@ -7519,7 +7648,7 @@ mod tests {
             let request_id = assert_single_block_header_request_effect(&effects, first_parent_hash);
             let state = drain_block_log_effects(state, &effects);
 
-            let (mut state, effects) =
+            let (state, effects) =
                 transition(ChainKey::Ethereum, state, Event::BlockHeaderNotFound { request_id });
 
             // Decision (e): the pending head survives the not-found; only the request is gone.
@@ -7527,6 +7656,34 @@ mod tests {
             prop_assert!(state.blocks.graph.contains(first_head_hash));
             prop_assert_eq!(state.blocks.graph.observed_head_hash(), first_head_hash);
             prop_assert!(state.pending_requests.is_empty_for_test());
+
+            // A fan-out re-delivery of the tip changes nothing and must not re-emit the dropped
+            // fetch (duplicate-of-tip early-out).
+            let (state, effects) = transition(ChainKey::Ethereum,
+                state,
+                Event::HeadObserved {
+                    number: block_number_for(first_head_hash),
+                    logs_bloom: bloom_matching_any(),
+                    hash: first_head_hash,
+                    parent_hash: first_parent_hash,
+                },
+            );
+            prop_assert!(effects.is_empty());
+
+            // The next genuine head is the recovery kick: its admission runs the scheduling chain,
+            // which re-emits the dropped backfill and reconstruction proceeds. Bloom-clear so the
+            // kick itself adds no log work; hash outside the generated node space.
+            let kick_hash = BlockHash::with_last_byte(0xEE);
+            let mut state = apply_event_and_drain_block_headers(
+                state,
+                &chain,
+                Event::HeadObserved {
+                    number: block_number_for(kick_hash),
+                    logs_bloom: Bloom::default(),
+                    hash: kick_hash,
+                    parent_hash: first_head_hash,
+                },
+            );
 
             for head_index in &chain.observed_heads {
                 let hash = hash_for_node(*head_index);
@@ -7539,8 +7696,16 @@ mod tests {
                 );
             }
 
+            // The generated closure plus the recovery-kick block above it.
             let expected_blocks = expected_observed_ancestor_closure(&chain);
-            prop_assert_eq!(state.blocks.graph.node_hashes().len(), expected_blocks.len());
+            prop_assert_eq!(
+                state.blocks.graph.node_hashes().len(),
+                expected_blocks.len() + 1
+            );
+            prop_assert_eq!(
+                state.blocks.graph.parent_hash_for_test(kick_hash),
+                Some(first_head_hash)
+            );
 
             for (hash, parent_hash) in expected_blocks {
                 prop_assert_eq!(
