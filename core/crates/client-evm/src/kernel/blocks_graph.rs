@@ -160,18 +160,39 @@ enum Authority {
 /// `MAX_STREAMED_LOG_BLOCKS` subscription buffer.
 const MAX_PENDING_BLOCKS: usize = 1024;
 
-/// Whether a block's `logs_bloom` may carry a log from any `watched` address. The block bloom is a
-/// consensus field with no false negatives, so a clear result *proves* the block is untouched. A
-/// header-less block (no bloom) cannot be cleared, so it conservatively "may touch". With nothing
-/// watched, no block is ever needed. Mirrors the legacy `block_may_touch_trusted_pool`.
-fn bloom_may_touch(bloom: Option<Bloom>, watched: &HashSet<Address>) -> bool {
-    if watched.is_empty() {
+/// The bloom bit patterns of a watched address set, precomputed once per walk.
+/// `Bloom::contains_input` keccak-hashes its input on *every* call, so a per-block gate that
+/// re-derives each address's pattern costs `path × addresses` hashes per walk — the dominant
+/// transition cost on a deep-window chain. Deriving each pattern once here makes the per-block
+/// check ([`bloom_may_touch`]) a pure bitwise subset test with identical verdicts.
+struct BloomPatterns(Vec<Bloom>);
+
+impl BloomPatterns {
+    fn of(addresses: &HashSet<Address>) -> Self {
+        Self(
+            addresses
+                .iter()
+                .map(|address| {
+                    let mut pattern = Bloom::default();
+                    pattern.accrue(BloomInput::Raw(address.as_slice()));
+                    pattern
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Whether a block's `logs_bloom` may carry a log from any watched address (as precomputed
+/// [`BloomPatterns`]). The block bloom is a consensus field with no false negatives, so a clear
+/// result *proves* the block is untouched. A header-less block (no bloom) cannot be cleared, so it
+/// conservatively "may touch". With nothing watched, no block is ever needed. Mirrors the legacy
+/// `block_may_touch_trusted_pool`.
+fn bloom_may_touch(bloom: Option<Bloom>, watched: &BloomPatterns) -> bool {
+    if watched.0.is_empty() {
         return false;
     }
     match bloom {
-        Some(bloom) => watched
-            .iter()
-            .any(|address| bloom.contains_input(BloomInput::Raw(address.as_slice()))),
+        Some(bloom) => watched.0.iter().any(|pattern| bloom.contains(pattern)),
         None => true,
     }
 }
@@ -665,6 +686,7 @@ impl BlocksGraph {
         exclude: &HashSet<BlockHash>,
         min_depth: usize,
     ) -> Vec<BlockHash> {
+        let trusted = BloomPatterns::of(trusted);
         self.present_chain_from_head()
             .into_iter()
             .enumerate()
@@ -672,7 +694,7 @@ impl BlocksGraph {
                 *depth >= min_depth
                     && matches!(data.logs, BlockLogs::Unknown)
                     && !exclude.contains(hash)
-                    && bloom_may_touch(data.logs_bloom, trusted)
+                    && bloom_may_touch(data.logs_bloom, &trusted)
             })
             .map(|(_, (hash, _))| hash)
             .collect()
@@ -769,7 +791,7 @@ impl BlocksGraph {
     fn missing_complete_ranges(
         &self,
         target: ConnectedHash,
-        watched: &HashSet<Address>,
+        watched: &BloomPatterns,
         exclude_numbers: &HashSet<u64>,
     ) -> Vec<MissingRange> {
         let mut ranges: Vec<MissingRange> = Vec::new();
@@ -817,7 +839,7 @@ impl BlocksGraph {
         let Some(target) = self.canonical_connected_target(target) else {
             return Vec::new();
         };
-        let watched = watched_addresses(verified, v4_manager);
+        let watched = BloomPatterns::of(&watched_addresses(verified, v4_manager));
         self.missing_complete_ranges(target, &watched, exclude_numbers)
     }
 
@@ -930,7 +952,7 @@ impl BlocksGraph {
     fn foldable_frontier(
         &self,
         target: ConnectedHash,
-        watched: &HashSet<Address>,
+        watched: &BloomPatterns,
         authority: Authority,
     ) -> ConnectedHash {
         let mut frontier = ConnectedHash(self.anchor);
@@ -974,16 +996,73 @@ impl BlocksGraph {
     ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
         // A pending/absent/anchor head has no foldable suffix: the overlay is empty and the
         // reserves are valid at the anchor (matching the empty-walk behavior downstream).
-        let Some(head) = self.connected_hash(self.observed_head) else {
+        let Some(frontier) = self.optimization_fold_frontier(verified, v4_manager) else {
             return (HashMap::new(), self.anchor);
         };
-        let watched = watched_addresses(verified, v4_manager);
-        let frontier = self.foldable_frontier(head, &watched, Authority::AllowStreamed);
         let frontier_hash = frontier.0;
         (
             self.folded_overlay(base, verified, frontier, Authority::AllowStreamed),
             frontier_hash,
         )
+    }
+
+    /// The optimization fold frontier as a connected proof — the shared prologue of the
+    /// frontier/overlay pair (connected head → watched set → `AllowStreamed` frontier walk), so
+    /// the frontier-only gate and the full fold cannot diverge. `None` when `observed_head` is
+    /// the anchor, `Pending`, or absent (no foldable suffix; both consumers read the anchor).
+    fn optimization_fold_frontier(
+        &self,
+        verified: &HashSet<PoolRef>,
+        v4_manager: Option<Address>,
+    ) -> Option<ConnectedHash> {
+        let head = self.connected_hash(self.observed_head)?;
+        let watched = BloomPatterns::of(&watched_addresses(verified, v4_manager));
+        Some(self.foldable_frontier(head, &watched, Authority::AllowStreamed))
+    }
+
+    /// The optimization frontier hash alone — [`optimization_pool_states`]'s `BlockHash` without
+    /// the fold. The differential surface pinning the dispatch gate: the kernel invariant tests
+    /// hold it equal to the full read's frontier and to the one-walk gated read's verdict
+    /// ([`optimization_pool_states_if_changed`], the production dispatch path).
+    #[cfg(test)]
+    pub(crate) fn optimization_frontier(
+        &self,
+        verified: &HashSet<PoolRef>,
+        v4_manager: Option<Address>,
+    ) -> BlockHash {
+        self.optimization_fold_frontier(verified, v4_manager)
+            .map(|ConnectedHash(hash)| hash)
+            .unwrap_or(self.anchor)
+    }
+
+    /// The one-walk dispatch read: [`optimization_pool_states`] gated on its own frontier —
+    /// `None` when the frontier still equals `last_dispatched` (the fold's result would be
+    /// discarded: most log deliveries and scheduler-progressing responses), the folded overlay
+    /// and frontier otherwise. One frontier walk decides the gate *and* feeds the fold, so the
+    /// dispatch path never walks the canonical chain twice; the differential pins hold it equal
+    /// to gating on [`optimization_frontier`] and folding separately.
+    pub(crate) fn optimization_pool_states_if_changed(
+        &self,
+        base: &HashMap<PoolRef, PoolState>,
+        verified: &HashSet<PoolRef>,
+        v4_manager: Option<Address>,
+        last_dispatched: Option<BlockHash>,
+    ) -> Option<(HashMap<PoolRef, PoolState>, BlockHash)> {
+        let frontier = self.optimization_fold_frontier(verified, v4_manager);
+        let frontier_hash = frontier
+            .as_ref()
+            .map(|ConnectedHash(hash)| *hash)
+            .unwrap_or(self.anchor);
+        if last_dispatched == Some(frontier_hash) {
+            return None;
+        }
+        let overlay = match frontier {
+            Some(frontier) => {
+                self.folded_overlay(base, verified, frontier, Authority::AllowStreamed)
+            }
+            None => HashMap::new(),
+        };
+        Some((overlay, frontier_hash))
     }
 
     /// Advances the anchor to `new_anchor`, folding the now-final logs into `base` and pruning every
@@ -1094,7 +1173,7 @@ impl BlocksGraph {
         let Some(target) = self.canonical_connected_target(target) else {
             return (self, base.clone());
         };
-        let watched = watched_addresses(verified, v4_manager);
+        let watched = BloomPatterns::of(&watched_addresses(verified, v4_manager));
 
         // The latest complete connected block whose prefix `anchor → it` is entirely foldable —
         // legacy's "latest complete ≤ target". `RequireComplete` makes a non-`Complete` bloom-touching
@@ -2265,6 +2344,10 @@ mod tests {
         HashSet::from([watched_addr()])
     }
 
+    fn watched_patterns() -> BloomPatterns {
+        BloomPatterns::of(&watched())
+    }
+
     /// A bloom that hits the watched address (so a non-`Complete` block carrying it is a hole).
     fn hit_bloom() -> Bloom {
         let mut bloom = Bloom::default();
@@ -2334,7 +2417,7 @@ mod tests {
         let (graph, target) = gate_chain(&[(2, Some(hit_bloom()), true), (3, Some(hit_bloom()), true)]);
         assert!(
             graph
-                .missing_complete_ranges(target, &watched(), &no_excludes())
+                .missing_complete_ranges(target, &watched_patterns(), &no_excludes())
                 .is_empty()
         );
         assert_graph_invariants(&graph);
@@ -2348,7 +2431,7 @@ mod tests {
             (4, Some(hit_bloom()), true),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            graph.missing_complete_ranges(target, &watched_patterns(), &no_excludes()),
             vec![missing_range(3, 3)]
         );
         assert_graph_invariants(&graph);
@@ -2362,7 +2445,7 @@ mod tests {
             gate_chain(&[(2, Some(clear_bloom()), false), (3, Some(clear_bloom()), false)]);
         assert!(
             graph
-                .missing_complete_ranges(target, &watched(), &no_excludes())
+                .missing_complete_ranges(target, &watched_patterns(), &no_excludes())
                 .is_empty()
         );
         assert_graph_invariants(&graph);
@@ -2376,7 +2459,7 @@ mod tests {
             (4, Some(hit_bloom()), true),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            graph.missing_complete_ranges(target, &watched_patterns(), &no_excludes()),
             vec![missing_range(2, 3)]
         );
         assert_graph_invariants(&graph);
@@ -2390,7 +2473,7 @@ mod tests {
             (4, Some(hit_bloom()), false),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            graph.missing_complete_ranges(target, &watched_patterns(), &no_excludes()),
             vec![missing_range(2, 2), missing_range(4, 4)]
         );
         assert_graph_invariants(&graph);
@@ -2406,7 +2489,7 @@ mod tests {
             (4, Some(hit_bloom()), false),
         ]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched(), &HashSet::from([3])),
+            graph.missing_complete_ranges(target, &watched_patterns(), &HashSet::from([3])),
             vec![missing_range(2, 2), missing_range(4, 4)]
         );
         assert_graph_invariants(&graph);
@@ -2417,7 +2500,7 @@ mod tests {
         // No bloom ⇒ we cannot prove the block is clear, so (with pools watched) it must be fetched.
         let (graph, target) = gate_chain(&[(2, None, false)]);
         assert_eq!(
-            graph.missing_complete_ranges(target, &watched(), &no_excludes()),
+            graph.missing_complete_ranges(target, &watched_patterns(), &no_excludes()),
             vec![missing_range(2, 2)]
         );
         assert_graph_invariants(&graph);
@@ -2477,7 +2560,11 @@ mod tests {
             observed_head: block,
         };
         assert_eq!(
-            graph.missing_complete_ranges(ConnectedHash(block), &watched(), &no_excludes()),
+            graph.missing_complete_ranges(
+                ConnectedHash(block),
+                &watched_patterns(),
+                &no_excludes()
+            ),
             vec![MissingRange {
                 from: 2,
                 to: 2,
@@ -2493,7 +2580,11 @@ mod tests {
         let (graph, target) = gate_chain(&[(2, Some(hit_bloom()), false), (3, None, false)]);
         assert!(
             graph
-                .missing_complete_ranges(target, &HashSet::new(), &no_excludes())
+                .missing_complete_ranges(
+                    target,
+                    &BloomPatterns::of(&HashSet::new()),
+                    &no_excludes()
+                )
                 .is_empty()
         );
         assert_graph_invariants(&graph);
@@ -2527,7 +2618,7 @@ mod tests {
                 .filter_map(|(index, (_, _, excluded))| excluded.then_some((index + 2) as u64))
                 .collect();
             let (graph, target) = gate_chain(&chain);
-            let ranges = graph.missing_complete_ranges(target, &watched(), &excludes);
+            let ranges = graph.missing_complete_ranges(target, &watched_patterns(), &excludes);
 
             // Independently expected hole block numbers (ascending, since numbers are contiguous).
             let holes: Vec<u64> = chain
@@ -3347,6 +3438,209 @@ mod tests {
         assert_graph_invariants(&graph);
     }
 
+    // --- optimization read: frontier-only gate ---------------------------------------------------
+
+    #[test]
+    fn optimization_frontier_is_anchor_for_non_connected_head() {
+        // A Pending observed head has no foldable suffix: the frontier-only read returns the
+        // anchor, exactly like the full read's frontier.
+        let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
+        let verified = verified_of(&base);
+        let graph = BlocksGraph::new(graph_hash(0))
+            .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
+            .with_observed_head(graph_hash(3));
+        assert_eq!(graph.optimization_frontier(&verified, None), graph_hash(0));
+        assert_eq!(
+            graph.optimization_frontier(&verified, None),
+            graph.optimization_pool_states(&base, &verified, None).1
+        );
+    }
+
+    #[test]
+    fn optimization_frontier_is_anchor_when_first_block_blocks() {
+        // [Unknown+hit][good]: the first canonical block already blocks the fold, so the frontier
+        // is the anchor — for both the frontier-only and the full read.
+        let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
+        let verified = verified_of(&base);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), BlockLogs::Unknown),
+            (Some(hit_bloom()), complete_swap(999, 9, 99)),
+        ]);
+        assert_eq!(graph.optimization_frontier(&verified, None), graph_hash(1));
+        assert_eq!(
+            graph.optimization_frontier(&verified, None),
+            graph.optimization_pool_states(&base, &verified, None).1
+        );
+    }
+
+    #[test]
+    fn optimization_frontier_reaches_head_on_fully_readable_path() {
+        // Every block readable: the frontier is the observed head, matching the full read.
+        let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
+        let verified = verified_of(&base);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), complete_swap(100, 1, 10)),
+            (Some(hit_bloom()), complete_swap(200, 2, 20)),
+        ]);
+        assert_eq!(
+            graph.optimization_frontier(&verified, None),
+            graph.observed_head
+        );
+        assert_eq!(
+            graph.optimization_frontier(&verified, None),
+            graph.optimization_pool_states(&base, &verified, None).1
+        );
+    }
+
+    #[test]
+    fn gated_optimization_read_is_none_when_frontier_unchanged() {
+        // The caller's last dispatched block is still the fold frontier: the gate holds and no
+        // fold runs — the majority case the one-walk read exists for.
+        let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
+        let verified = verified_of(&base);
+        let graph = opt_chain(vec![
+            (Some(hit_bloom()), complete_swap(100, 1, 10)),
+            (Some(hit_bloom()), BlockLogs::Unknown),
+        ]);
+        let (_, frontier) = graph.optimization_pool_states(&base, &verified, None);
+        assert_eq!(
+            graph.optimization_pool_states_if_changed(&base, &verified, None, Some(frontier)),
+            None
+        );
+    }
+
+    #[test]
+    fn gated_optimization_read_folds_on_first_dispatch() {
+        // Nothing dispatched yet (`None`): the gate opens and the result is the full read's.
+        let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
+        let verified = verified_of(&base);
+        let graph = opt_chain(vec![(Some(hit_bloom()), complete_swap(100, 1, 10))]);
+        assert_eq!(
+            graph.optimization_pool_states_if_changed(&base, &verified, None, None),
+            Some(graph.optimization_pool_states(&base, &verified, None))
+        );
+    }
+
+    #[test]
+    fn gated_optimization_read_folds_when_last_dispatched_differs() {
+        // The frontier moved past the last dispatched block: the gate opens.
+        let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
+        let verified = verified_of(&base);
+        let graph = opt_chain(vec![(Some(hit_bloom()), complete_swap(100, 1, 10))]);
+        assert_eq!(
+            graph.optimization_pool_states_if_changed(&base, &verified, None, Some(graph_hash(99))),
+            Some(graph.optimization_pool_states(&base, &verified, None))
+        );
+    }
+
+    proptest! {
+        /// The frontier-only read never diverges from the full fold's frontier: for any per-block
+        /// mix of bloom (absent/clear/hit) and log authority (Unknown/Streamed/Complete) along a
+        /// canonical chain, `optimization_frontier` equals `optimization_pool_states`'s hash. The
+        /// differential pin behind the multi-chain wrapper's cheap dispatch gate.
+        #[test]
+        fn optimization_frontier_equals_pool_states_frontier(
+            blocks in prop::collection::vec((0u8..3, 0u8..3), 0..12),
+        ) {
+            let pool = watched_pool();
+            let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+            let verified = verified_of(&base);
+            let blocks = blocks
+                .into_iter()
+                .map(|(bloom_case, logs_case)| {
+                    let bloom = match bloom_case {
+                        0 => None,
+                        1 => Some(clear_bloom()),
+                        _ => Some(hit_bloom()),
+                    };
+                    let logs = match logs_case {
+                        0 => BlockLogs::Unknown,
+                        1 => streamed(vec![pool_log(pool, swap_to(150, 3, 15))]),
+                        _ => complete_swap(200, 2, 20),
+                    };
+                    (bloom, logs)
+                })
+                .collect();
+            let graph = opt_chain(blocks);
+            let (_, expected) = graph.optimization_pool_states(&base, &verified, None);
+            prop_assert_eq!(graph.optimization_frontier(&verified, None), expected);
+        }
+
+        /// The one-walk gated read never diverges from gating and folding separately: for any
+        /// graph and any `last_dispatched` (never dispatched / the current frontier / a stale
+        /// hash), it is `None` exactly when the frontier is unchanged and the full read's result
+        /// otherwise. The differential pin behind the dispatch path's single frontier walk.
+        #[test]
+        fn gated_optimization_read_matches_ungated(
+            blocks in prop::collection::vec((0u8..3, 0u8..3), 0..12),
+            gate in 0u8..3,
+        ) {
+            let pool = watched_pool();
+            let base = HashMap::from([(pool, ps(10, 5, 1000))]);
+            let verified = verified_of(&base);
+            let blocks = blocks
+                .into_iter()
+                .map(|(bloom_case, logs_case)| {
+                    let bloom = match bloom_case {
+                        0 => None,
+                        1 => Some(clear_bloom()),
+                        _ => Some(hit_bloom()),
+                    };
+                    let logs = match logs_case {
+                        0 => BlockLogs::Unknown,
+                        1 => streamed(vec![pool_log(pool, swap_to(150, 3, 15))]),
+                        _ => complete_swap(200, 2, 20),
+                    };
+                    (bloom, logs)
+                })
+                .collect();
+            let graph = opt_chain(blocks);
+            let (overlay, frontier) = graph.optimization_pool_states(&base, &verified, None);
+            let last_dispatched = match gate {
+                0 => None,
+                1 => Some(frontier),
+                _ => Some(graph_hash(99)),
+            };
+            let expected = (last_dispatched != Some(frontier)).then_some((overlay, frontier));
+            prop_assert_eq!(
+                graph.optimization_pool_states_if_changed(&base, &verified, None, last_dispatched),
+                expected
+            );
+        }
+
+        /// Differential pin for the bloom-pattern hoist: precomputing each watched address's bloom
+        /// pattern once and testing bitwise subset ([`bloom_may_touch`]) returns the exact verdict
+        /// of keccak-hashing every address per check (`Bloom::contains_input`), for any watched set
+        /// and any block bloom — including the header-less (`None`) and empty-set fast paths.
+        #[test]
+        fn bloom_patterns_match_per_address_hashing(
+            watched in prop::collection::hash_set(any::<[u8; 20]>(), 0..24),
+            noise in prop::collection::vec(any::<[u8; 20]>(), 0..8),
+            accrue_watched in 0usize..4,
+            header in any::<bool>(),
+        ) {
+            let watched: HashSet<Address> = watched.into_iter().map(Address::from).collect();
+            let bloom = header.then(|| {
+                let mut bloom = Bloom::default();
+                for bytes in &noise {
+                    bloom.accrue(BloomInput::Raw(bytes));
+                }
+                for address in watched.iter().take(accrue_watched) {
+                    bloom.accrue(BloomInput::Raw(address.as_slice()));
+                }
+                bloom
+            });
+            let expected = match (bloom, watched.is_empty()) {
+                (_, true) => false,
+                (None, false) => true,
+                (Some(bloom), false) => watched
+                    .iter()
+                    .any(|address| bloom.contains_input(BloomInput::Raw(address.as_slice()))),
+            };
+            prop_assert_eq!(bloom_may_touch(bloom, &BloomPatterns::of(&watched)), expected);
+        }
+    }
+
     // --- finalization re-root (reanchored_to) ---------------------------------------------------
 
     /// A tracked pool whose v3 address is the watched address, so [`hit_bloom`] marks its blocks.
@@ -3389,7 +3683,7 @@ mod tests {
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let (graph, target) = fold_chain(vec![(7, BlockLogs::Unknown)]);
         let target_hash = target.0;
-        let watched = watched_addresses(&verified_of(&base), None);
+        let watched = BloomPatterns::of(&watched_addresses(&verified_of(&base), None));
         assert_eq!(
             graph.missing_complete_ranges(target, &watched, &no_excludes()),
             vec![MissingRange {

@@ -338,7 +338,16 @@ pub fn pool_reserves_for_optimization(
 /// `&State`: each call re-projects from the authoritative per-chain states rather than reading any
 /// cached reserves, so the merge can never serve stale or drifted data. Chains that are still
 /// bootstrapping or fail projection simply contribute nothing this round.
-fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
+///
+/// The one exception to re-projection: `precomputed` is the triggering chain's projection the
+/// caller just computed from this same `state` (the dispatch gate needed it anyway), spliced in
+/// verbatim so that chain's fold + projection is not immediately recomputed — a pure substitution
+/// of an identical recomputation, never a cache.
+fn merged_optimization_reserves(
+    state: &State,
+    precomputed_chain: ChainKey,
+    precomputed: &ChainPoolReserves,
+) -> OptimizationPoolReserves {
     let mut block_hashes = BTreeMap::new();
     let mut reserves = Vec::new();
 
@@ -346,6 +355,11 @@ fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
         let ChainLifecycle::Active(chain_state) = lifecycle else {
             continue;
         };
+        if chain == precomputed_chain {
+            block_hashes.insert(chain, precomputed.block_hash);
+            reserves.extend(precomputed.reserves.iter().copied());
+            continue;
+        }
         let update = chain_state.optimization_update(chain);
         if let Ok(Some(chain_reserves)) = pool_reserves_for_optimization(state, chain, &update) {
             block_hashes.insert(chain, chain_reserves.block_hash);
@@ -843,18 +857,21 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
-            // Re-derives the optimization overlay on every progressed chain event: the blocks graph folds its
-            // canonical unfinalized path over the finalized base, cloning only the pools that path
-            // touched — O(unfinalized-path × its logs), cheap at block cadence next to the
-            // downstream reserve projection (the O(N log N) sort over all tracked pools) and the
-            // optimization backend's work. Caching the overlay is intentionally avoided: keeping a
-            // cached overlay valid across reorgs is complex and error-prone, and the recompute is
-            // not a bottleneck.
-            let update = chain_state.optimization_update(chain);
+            // Gate the optimization fold on its frontier: the fold's result is consumed only
+            // when the frontier advanced past the last dispatched block, so on every other
+            // event — most log deliveries and scheduler-progressing responses — folding would be
+            // wasted work. One walk decides the gate and feeds the fold
+            // (`optimization_update_if_changed`), pinned by the kernel invariant tests to gating
+            // on the frontier-only read and folding separately. Still zero cached state: keeping
+            // a cached overlay valid across reorgs is complex and error-prone, so the full fold
+            // recomputes from the finalized base — just only when its frontier (and hence the
+            // dispatch gate) actually moved.
+            let update = chain_state.optimization_update_if_changed(
+                chain,
+                state.last_optimized_block.get(&chain).copied(),
+            );
 
             state.chains.insert(chain, ChainLifecycle::Active(chain_state));
-
-            let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
             // Dispatch only when *this* chain's fold frontier advanced and its own projection is
             // ready. Record the hash only on that success so an unready (`Ok(None)`) or failed
             // (`Err`) chain retries this block next event. The dispatched input is then re-derived
@@ -866,14 +883,12 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
             // signature is `behind=?` never resolving in the gauge/view while `pools`/`inflight`
             // look healthy. If a live run ever shows that, surface the error through the
             // observation read model rather than threading a logger in here.
-            if changed
-                && matches!(
-                    pool_reserves_for_optimization(&state, chain, &update),
-                    Ok(Some(_))
-                )
+            if let Some(update) = update
+                && let Ok(Some(chain_reserves)) =
+                    pool_reserves_for_optimization(&state, chain, &update)
             {
                 state.last_optimized_block.insert(chain, update.block_hash);
-                let input = merged_optimization_reserves(&state);
+                let input = merged_optimization_reserves(&state, chain, &chain_reserves);
                 if !input.reserves.is_empty() {
                     effects.push(Effect::RunOptimization { input });
                 }
@@ -1951,11 +1966,27 @@ mod tests {
         }
     }
 
+    /// The triggering chain's projection exactly as `chain_event` computes it before the merge —
+    /// the value the merge splices in instead of recomputing.
+    fn precomputed_reserves_for(state: &State, chain: ChainKey) -> ChainPoolReserves {
+        let update = match state.chains.get(&chain) {
+            Some(ChainLifecycle::Active(chain_state)) => chain_state.optimization_update(chain),
+            _ => panic!("fixture chain must be active"),
+        };
+        pool_reserves_for_optimization(state, chain, &update)
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn merged_optimization_reserves_concatenates_every_active_chain() {
         let state = merged_two_chain_state();
 
-        let merged = merged_optimization_reserves(&state);
+        // Differential pin: handing the merge one chain's freshly-computed projection (as the
+        // production call site does) must reproduce the recompute-everything output verbatim —
+        // all assertions below are unchanged from before the precomputed splice existed.
+        let precomputed = precomputed_reserves_for(&state, ChainKey::Ethereum);
+        let merged = merged_optimization_reserves(&state, ChainKey::Ethereum, &precomputed);
 
         // Both chains contribute their directional pair into one flat Vec, each tagged with its own
         // block, and the same raw addresses on different chains stay distinct keys (no collision).
@@ -1988,6 +2019,25 @@ mod tests {
             merged.reserves.len(),
             "reserve keys must be unique"
         );
+    }
+
+    #[test]
+    fn merged_optimization_reserves_splices_the_precomputed_chain_verbatim() {
+        let state = merged_two_chain_state();
+
+        // A sentinel block hash no recompute could produce: it surfacing in the merge proves the
+        // precomputed projection is spliced in, not recomputed from state.
+        let precomputed = ChainPoolReserves {
+            block_hash: hash(9),
+            reserves: precomputed_reserves_for(&state, ChainKey::Arbitrum).reserves,
+        };
+
+        let merged = merged_optimization_reserves(&state, ChainKey::Arbitrum, &precomputed);
+
+        assert_eq!(merged.block_hashes.get(&ChainKey::Arbitrum), Some(&hash(9)));
+        // The other chain still contributes via its own recompute.
+        assert_eq!(merged.block_hashes.get(&ChainKey::Ethereum), Some(&hash(1)));
+        assert_eq!(merged.reserves.len(), 4);
     }
 
     #[test]

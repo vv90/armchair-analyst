@@ -245,6 +245,42 @@ impl State {
         }
     }
 
+    /// [`Self::optimization_update`]'s `block_hash` without the fold: the current optimization
+    /// frontier ([`blocks_graph::BlocksGraph::optimization_frontier`]). The differential surface
+    /// pinning the dispatch gate — the invariant tests hold it equal to the full read's frontier
+    /// and to [`Self::optimization_update_if_changed`]'s verdict.
+    #[cfg(test)]
+    pub(crate) fn optimization_frontier(&self, chain: ChainKey) -> BlockHash {
+        let v4_manager = uniswap_v4::pool_manager_address(chain);
+        let verified = self.pool_registry.verified_pools(chain);
+        self.blocks
+            .graph
+            .optimization_frontier(&verified, v4_manager)
+    }
+
+    /// The production dispatch read: [`Self::optimization_update`] gated on its own frontier —
+    /// `None` when the frontier still equals `last_dispatched` (the fold would be discarded),
+    /// the full update otherwise, from a single frontier walk
+    /// ([`blocks_graph::BlocksGraph::optimization_pool_states_if_changed`]).
+    pub(crate) fn optimization_update_if_changed(
+        &self,
+        chain: ChainKey,
+        last_dispatched: Option<BlockHash>,
+    ) -> Option<OptimizationStateUpdate> {
+        let v4_manager = uniswap_v4::pool_manager_address(chain);
+        let verified = self.pool_registry.verified_pools(chain);
+        let (pool_states, block_hash) = self.blocks.graph.optimization_pool_states_if_changed(
+            &self.blocks.finalized_snapshot,
+            &verified,
+            v4_manager,
+            last_dispatched,
+        )?;
+        Some(OptimizationStateUpdate {
+            block_hash,
+            pool_states,
+        })
+    }
+
     /// Counts canonical blocks the tip is ahead of `reference_hash` on a connected path.
     /// Added so read models can measure fetch progress from an already-known frontier block
     /// (such as the last dispatched optimization block) without rebuilding the complete
@@ -1429,6 +1465,28 @@ mod tests {
                 "staged streamed logs must be disjoint from admitted blocks"
             );
         }
+        // The frontier-only read (the dispatch gate's differential surface) must never diverge
+        // from the full fold's frontier. Every kernel test drives `ChainKey::Ethereum`, so
+        // pinning that chain covers every state these tests can reach.
+        let update = state.optimization_update(ChainKey::Ethereum);
+        assert_eq!(
+            state.optimization_frontier(ChainKey::Ethereum),
+            update.block_hash,
+            "optimization_frontier must equal the full fold's frontier"
+        );
+        // The one-walk gated read (the production dispatch path) must gate exactly on that
+        // frontier: hold when it was the last dispatched block, open with the full fold's
+        // result otherwise.
+        assert_eq!(
+            state.optimization_update_if_changed(ChainKey::Ethereum, Some(update.block_hash)),
+            None,
+            "the gated read must hold when the frontier is unchanged"
+        );
+        assert_eq!(
+            state.optimization_update_if_changed(ChainKey::Ethereum, None),
+            Some(update),
+            "the gated read must open with the full fold's result"
+        );
     }
 
     /// Asserts no two in-flight header requests target the same block hash.
