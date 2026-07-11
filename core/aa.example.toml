@@ -12,8 +12,9 @@
 #
 # Per chain, the HTTP endpoints form a weighted pool (smooth weighted round-robin) that fails over to
 # another endpoint on a retryable error; a failing endpoint is benched on an exponential cooldown. The
-# WebSocket subscription channel uses a SINGLE connection per chain — the highest-weight [[rpc]] entry
-# that declares a `ws` wins that chain's subscription slot.
+# WebSocket subscription channel fans out to EVERY [[rpc]] entry that declares a `ws` URL for the chain,
+# concurrently — providers are redundant feeds, and duplicate deliveries are deduped downstream, so
+# declare `ws` on as many providers as your plans allow.
 #
 # Every active chain (ethereum, arbitrum, base, optimism, polygon, bnb, avalanche) MUST end up with at
 # least one HTTP endpoint and one WS URL, or startup fails. The per-chain table key (e.g. `bnb`) is the
@@ -36,9 +37,8 @@
 # RPC providers
 # ---------------------------------------------------------------------------------------------------
 
-# dRPC — every chain, HTTP + WebSocket. Highest weight, so it also serves the WS subscription channel
-# (the only provider here declaring `ws`, so it wins every chain's single subscription slot). The
-# per-chain URL is `{base}/{network}/{key}`; dRPC's network segment for BNB is `bsc`.
+# dRPC — every chain, HTTP + WebSocket. The per-chain URL is `{base}/{network}/{key}`; dRPC's network
+# segment for BNB is `bsc`, independent of the `bnb` config slug.
 [[rpc]]
 name = "drpc"
 weight = 3
@@ -51,31 +51,36 @@ polygon = { http = "https://lb.drpc.org/polygon/{key}", ws = "wss://lb.drpc.org/
 bnb = { http = "https://lb.drpc.org/bsc/{key}", ws = "wss://lb.drpc.org/bsc/{key}" }
 avalanche = { http = "https://lb.drpc.org/avalanche/{key}", ws = "wss://lb.drpc.org/avalanche/{key}" }
 
-# Alchemy — every chain, HTTP only. Shared free CU budget across all chains.
+# Alchemy — every chain, HTTP + WebSocket. Shared free CU budget across all chains; NOTE subscription
+# events (newHeads + logs on 7 chains, 24/7) bill CU continuously — drop the `ws` entries if the budget
+# runs hot. WS uses the same URL as HTTP with the `wss://` scheme.
 [[rpc]]
 name = "alchemy"
 weight = 4
 key_env = "AA_RPC_KEY_ALCHEMY"
-ethereum = { http = "https://eth-mainnet.g.alchemy.com/v2/{key}" }
-arbitrum = { http = "https://arb-mainnet.g.alchemy.com/v2/{key}" }
-base = { http = "https://base-mainnet.g.alchemy.com/v2/{key}" }
-optimism = { http = "https://opt-mainnet.g.alchemy.com/v2/{key}" }
-polygon = { http = "https://polygon-mainnet.g.alchemy.com/v2/{key}" }
-bnb = { http = "https://bnb-mainnet.g.alchemy.com/v2/{key}" }
-avalanche = { http = "https://avax-mainnet.g.alchemy.com/v2/{key}" }
+ethereum = { http = "https://eth-mainnet.g.alchemy.com/v2/{key}", ws = "wss://eth-mainnet.g.alchemy.com/v2/{key}" }
+arbitrum = { http = "https://arb-mainnet.g.alchemy.com/v2/{key}", ws = "wss://arb-mainnet.g.alchemy.com/v2/{key}" }
+base = { http = "https://base-mainnet.g.alchemy.com/v2/{key}", ws = "wss://base-mainnet.g.alchemy.com/v2/{key}" }
+optimism = { http = "https://opt-mainnet.g.alchemy.com/v2/{key}", ws = "wss://opt-mainnet.g.alchemy.com/v2/{key}" }
+polygon = { http = "https://polygon-mainnet.g.alchemy.com/v2/{key}", ws = "wss://polygon-mainnet.g.alchemy.com/v2/{key}" }
+bnb = { http = "https://bnb-mainnet.g.alchemy.com/v2/{key}", ws = "wss://bnb-mainnet.g.alchemy.com/v2/{key}" }
+avalanche = { http = "https://avax-mainnet.g.alchemy.com/v2/{key}", ws = "wss://avax-mainnet.g.alchemy.com/v2/{key}" }
 
-# Infura — every chain, HTTP only. Lowest effective free capacity here, so the lowest weight.
+# Infura — every chain, HTTP + WebSocket. Lowest effective free capacity here, so the lowest weight.
+# WS path is `/ws/v3/{key}` (unlike HTTP's `/v3/{key}`); WS on arbitrum/avalanche/bnb/optimism is Infura
+# "public beta". Subscription events count against the daily credit quota — drop the `ws` entries if it
+# runs hot.
 [[rpc]]
 name = "infura"
 weight = 2
 key_env = "AA_RPC_KEY_INFURA"
-ethereum = { http = "https://mainnet.infura.io/v3/{key}" }
-arbitrum = { http = "https://arbitrum-mainnet.infura.io/v3/{key}" }
-base = { http = "https://base-mainnet.infura.io/v3/{key}" }
-optimism = { http = "https://optimism-mainnet.infura.io/v3/{key}" }
-polygon = { http = "https://polygon-mainnet.infura.io/v3/{key}" }
-bnb = { http = "https://bsc-mainnet.infura.io/v3/{key}" }
-avalanche = { http = "https://avalanche-mainnet.infura.io/v3/{key}" }
+ethereum = { http = "https://mainnet.infura.io/v3/{key}", ws = "wss://mainnet.infura.io/ws/v3/{key}" }
+arbitrum = { http = "https://arbitrum-mainnet.infura.io/v3/{key}", ws = "wss://arbitrum-mainnet.infura.io/ws/v3/{key}" }
+base = { http = "https://base-mainnet.infura.io/v3/{key}", ws = "wss://base-mainnet.infura.io/ws/v3/{key}" }
+optimism = { http = "https://optimism-mainnet.infura.io/v3/{key}", ws = "wss://optimism-mainnet.infura.io/ws/v3/{key}" }
+polygon = { http = "https://polygon-mainnet.infura.io/v3/{key}", ws = "wss://polygon-mainnet.infura.io/ws/v3/{key}" }
+bnb = { http = "https://bsc-mainnet.infura.io/v3/{key}", ws = "wss://bsc-mainnet.infura.io/ws/v3/{key}" }
+avalanche = { http = "https://avalanche-mainnet.infura.io/v3/{key}", ws = "wss://avalanche-mainnet.infura.io/ws/v3/{key}" }
 
 # Chainstack — Arbitrum ONLY (free Developer plan = one node), pointed at the bottleneck chain. The HOST
 # is node-specific: paste your node's host from the Chainstack console.
@@ -85,17 +90,18 @@ weight = 8
 key_env = "AA_RPC_KEY_CHAINSTACK"
 arbitrum = { http = "https://arbitrum-mainnet.core.chainstack.com/{key}" }
 
-# Keyless public nodes — HTTP only, weight 1, no key needed. Low-weight resilience fallbacks.
+# Keyless public nodes — HTTP + WebSocket, weight 1, no key needed. Low-weight resilience fallbacks;
+# WS is the same host with the `wss://` scheme.
 [[rpc]]
 name = "publicnode"
 weight = 1
-ethereum = { http = "https://ethereum-rpc.publicnode.com" }
-arbitrum = { http = "https://arbitrum-one-rpc.publicnode.com" }
-base = { http = "https://base-rpc.publicnode.com" }
-optimism = { http = "https://optimism-rpc.publicnode.com" }
-polygon = { http = "https://polygon-bor-rpc.publicnode.com" }
-bnb = { http = "https://bsc-rpc.publicnode.com" }
-avalanche = { http = "https://avalanche-c-chain-rpc.publicnode.com" }
+ethereum = { http = "https://ethereum-rpc.publicnode.com", ws = "wss://ethereum-rpc.publicnode.com" }
+arbitrum = { http = "https://arbitrum-one-rpc.publicnode.com", ws = "wss://arbitrum-one-rpc.publicnode.com" }
+base = { http = "https://base-rpc.publicnode.com", ws = "wss://base-rpc.publicnode.com" }
+optimism = { http = "https://optimism-rpc.publicnode.com", ws = "wss://optimism-rpc.publicnode.com" }
+polygon = { http = "https://polygon-bor-rpc.publicnode.com", ws = "wss://polygon-bor-rpc.publicnode.com" }
+bnb = { http = "https://bsc-rpc.publicnode.com", ws = "wss://bsc-rpc.publicnode.com" }
+avalanche = { http = "https://avalanche-c-chain-rpc.publicnode.com", ws = "wss://avalanche-c-chain-rpc.publicnode.com" }
 
 # ---------------------------------------------------------------------------------------------------
 # Uniswap v4 subgraphs (optional — omit, or skip the key, to disable v4 metadata resolution)
@@ -116,10 +122,14 @@ avalanche = { http = "https://avalanche-c-chain-rpc.publicnode.com" }
 name = "thegraph"
 weight = 3
 key_env = "AA_GRAPH_API_KEY"
-# ethereum: official "uniswap-v4-ethereum" (Uniswap Labs); others: community "uniswap-v4-<chain>".
+# ethereum: official "uniswap-v4-ethereum" (Uniswap Labs); others: community deployments.
+# arbitrum: "uniswap-v4-arbitrum-one" (replaced 2026-07-10; the older G5Ts… deployment's indexers all
+#   went unhealthy). base: "uni-v4-flaunch" (replaced 2026-07-10; the whole "uniswap-v4-base" family
+#   sat on one broken indexer fleet — despite the name it indexes ALL Base v4 pools; validated against
+#   on-chain PoolManager Initialize logs).
 ethereum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/DiYPVdygkfjDWhbxGSqAQxwBKmfKnkWQojqeM2rkLb3G"
-arbitrum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/G5TsTKNi8yhPSV7kycaE23oWbqv9zzNqR49FoEQjzq1r"
-base = "https://gateway.thegraph.com/api/{key}/subgraphs/id/HNCFA9TyBqpo5qpe6QreQABAA1kV8g46mhkCcicu6v2R"
+arbitrum = "https://gateway.thegraph.com/api/{key}/subgraphs/id/EpEZyTnADuwvqpMh7vcTPFHDN3MwqiUN9QHapCBPbRWW"
+base = "https://gateway.thegraph.com/api/{key}/subgraphs/id/GqkCvwH9i1UZqkGVtFqkC12kMBcE1pgk5Fo9s2J2Fowc"
 optimism = "https://gateway.thegraph.com/api/{key}/subgraphs/id/6RBtsmGUYfeLeZsYyxyKSUiaA6WpuC69shMEQ1Cfuj9u"
 polygon = "https://gateway.thegraph.com/api/{key}/subgraphs/id/CwpebM66AH5uqS5sreKij8yEkkPcHvmyEs7EwFtdM5ND"
 bnb = "https://gateway.thegraph.com/api/{key}/subgraphs/id/EAq1nJKgjnuKH6Gj4RFjCW7LcL7E2uipbncdwV7TTWkX"
