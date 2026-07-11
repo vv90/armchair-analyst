@@ -838,9 +838,31 @@ fn request_missing_header(
     )
 }
 
+/// One kernel transition, telling the caller whether anything happened. `Inert` is a
+/// proof-carrying claim: state returned bit-identical, no effects, every derived read (fold
+/// frontier, schedules, path lengths) unchanged — the multi-chain wrapper may skip all
+/// post-transition re-derivation. Only provable no-ops may use it (today: the duplicate-of-tip
+/// head re-delivery). Carrying the state inside the variant keeps "inert with effects"
+/// unrepresentable.
+pub(crate) enum TransitionOutcome {
+    Inert(State),
+    Progressed(State, Vec<Effect>),
+}
+
 /// Applies one kernel event to state and returns the side effects the runtime must execute.
 /// Added as the pure deterministic boundary between EVM client state transitions and impure RPC/runtime work.
 pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Effect>) {
+    match transition_outcome(chain, state, event) {
+        TransitionOutcome::Inert(state) => (state, Vec::new()),
+        TransitionOutcome::Progressed(state, effects) => (state, effects),
+    }
+}
+
+/// [`transition`] with the no-op distinction preserved: the multi-chain wrapper matches on the
+/// outcome so an [`TransitionOutcome::Inert`] event skips its post-transition re-derivation
+/// (finalized-refresh probe and optimization overlay fold) instead of recomputing an identical
+/// result. Every other caller flattens through [`transition`].
+pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) -> TransitionOutcome {
     let (state, effects) = match event {
         Event::HeadObserved {
             hash,
@@ -876,12 +898,13 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
                 // total no-op on state: admission refused (refuse-and-keep), the head write is
                 // idempotent, and the staged-logs drain is empty for a present block (staging
                 // invariant). The derived schedule is therefore identical to the previous
-                // event's — skip the O(window) scheduling walk instead of re-deriving it. A
-                // duplicate whose hash is NOT the current head still moved the head (stale
-                // out-of-order delivery, or a reorg onto a backfilled fork) and falls through
-                // to the full pass below.
+                // event's — skip the O(window) scheduling walk instead of re-deriving it, and
+                // surface the no-op as `Inert` so the multi-chain wrapper can skip its own
+                // post-transition re-derivation too. A duplicate whose hash is NOT the current
+                // head still moved the head (stale out-of-order delivery, or a reorg onto a
+                // backfilled fork) and falls through to the full pass below.
                 blocks_graph::Admission::DuplicateBlock if hash == head_before => {
-                    (state, vec![])
+                    return TransitionOutcome::Inert(state);
                 }
                 _ => schedule_unknown_canonical_requests(chain, state, vec![]),
             }
@@ -1155,7 +1178,7 @@ pub fn transition(chain: ChainKey, state: State, event: Event) -> (State, Vec<Ef
         }
     };
 
-    (state, effects)
+    TransitionOutcome::Progressed(state, effects)
 }
 
 #[cfg(test)]
@@ -3492,6 +3515,54 @@ mod tests {
         );
         assert_single_block_header_request_effect(&effects, missing_parent_hash);
         assert_eq!(state.blocks.graph.observed_head_hash(), connected_hash);
+        assert_state_invariants(&state);
+    }
+
+    // Pins which transitions surface as `Inert` — the claim the multi-chain wrapper relies on to
+    // skip its post-transition re-derivation. Exactly the duplicate-of-tip re-delivery is inert;
+    // a genuine new head and a stale duplicate that moves the head are `Progressed`.
+    #[test]
+    fn transition_outcome_is_inert_exactly_for_a_duplicate_of_tip_head() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let first_head_hash = BlockHash::with_last_byte(2);
+        let second_head_hash = BlockHash::with_last_byte(3);
+        let state = state_with_observed_chain(finalized_hash, &[first_head_hash, second_head_hash]);
+        let head_event = |hash: BlockHash, parent_hash: BlockHash| Event::HeadObserved {
+            number: block_number_for(hash),
+            logs_bloom: bloom_matching_any(),
+            hash,
+            parent_hash,
+        };
+
+        // Re-delivering the current tip is the one inert case.
+        let state = match transition_outcome(
+            ChainKey::Ethereum,
+            state,
+            head_event(second_head_hash, first_head_hash),
+        ) {
+            TransitionOutcome::Inert(state) => state,
+            TransitionOutcome::Progressed(..) => panic!("duplicate-of-tip head must be inert"),
+        };
+
+        // A stale duplicate moves the head back — progressed, the wrapper must re-derive.
+        let state = match transition_outcome(
+            ChainKey::Ethereum,
+            state,
+            head_event(first_head_hash, finalized_hash),
+        ) {
+            TransitionOutcome::Progressed(state, _) => state,
+            TransitionOutcome::Inert(_) => panic!("head-moving duplicate must be progressed"),
+        };
+
+        // A genuine new head is progressed.
+        let state = match transition_outcome(
+            ChainKey::Ethereum,
+            state,
+            head_event(BlockHash::with_last_byte(4), second_head_hash),
+        ) {
+            TransitionOutcome::Progressed(state, _) => state,
+            TransitionOutcome::Inert(_) => panic!("genuine new head must be progressed"),
+        };
         assert_state_invariants(&state);
     }
 

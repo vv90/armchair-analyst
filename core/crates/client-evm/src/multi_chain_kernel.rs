@@ -808,8 +808,24 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
     // fields (`last_optimized_block`, the merged dispatch) around the reinserted chain.
     match state.chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
+            // Measured before the transition (the state moves into it); on an inert outcome the
+            // walk goes unused — the acceptable residual, negligible next to the skipped fold.
             let before_len = chain_state.canonical_path_len_from_finalized();
-            let (chain_state, effects) = kernel::transition(chain, chain_state, event);
+            // An inert transition returned state bit-identical, so every re-derivation below
+            // (finalized-refresh probe, optimization overlay fold, dispatch gate) would
+            // reproduce the previous event's results exactly: the path length cannot have
+            // crossed a refresh bucket, and the fold frontier — hence the `changed` gate and
+            // the (deterministic, this-chain-only) projection — is unchanged. Skip it all.
+            let (chain_state, effects) = match kernel::transition_outcome(chain, chain_state, event)
+            {
+                kernel::TransitionOutcome::Inert(chain_state) => {
+                    state.chains.insert(chain, ChainLifecycle::Active(chain_state));
+                    return (state, Vec::new());
+                }
+                kernel::TransitionOutcome::Progressed(chain_state, effects) => {
+                    (chain_state, effects)
+                }
+            };
             let after_len = chain_state.canonical_path_len_from_finalized();
             let refresh_policy = finalized_refresh_policy(chain);
             let should_fetch_finalized = kernel::should_fetch_finalized_header(
@@ -827,7 +843,7 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
-            // Re-derives the optimization overlay on every chain event: the blocks graph folds its
+            // Re-derives the optimization overlay on every progressed chain event: the blocks graph folds its
             // canonical unfinalized path over the finalized base, cloning only the pools that path
             // touched — O(unfinalized-path × its logs), cheap at block cadence next to the
             // downstream reserve projection (the O(N log N) sort over all tracked pools) and the
@@ -1715,6 +1731,38 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::RunOptimization { .. }))
         );
+    }
+
+    // Pins the inert skip: a fan-out re-delivery of the current tip produces NO effects at the
+    // multi-chain level — no `ChainEffect`, no `FetchFinalizedHeader`, no `RunOptimization` —
+    // and leaves the dispatch bookkeeping untouched. The kernel already proved the state
+    // bit-identical (`TransitionOutcome::Inert`); this asserts the wrapper adds nothing on top.
+    #[test]
+    fn chain_event_for_duplicate_of_tip_head_produces_no_effects() {
+        let state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let head_event = || Event::ChainEvent {
+            chain: ChainKey::Ethereum,
+            event: kernel::Event::HeadObserved {
+                number: 2,
+                logs_bloom: Bloom::default(),
+                hash: hash(2),
+                parent_hash: hash(1),
+            },
+        };
+
+        let (state, _effects) = transition(state, head_event());
+        let last_optimized_before = state.last_optimized_block.clone();
+
+        let (state, effects) = transition(state, head_event());
+
+        assert!(effects.is_empty());
+        assert_eq!(state.last_optimized_block, last_optimized_before);
     }
 
     #[test]
