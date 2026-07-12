@@ -8,16 +8,18 @@ use client_evm::{
     ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
     OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
     POLYGON_USDC_TOKEN_ADDRESS,
-    GraphEndpoints, MetadataCache, PoolRef, ProtocolPoolKey, PoolDataResult, PoolLog, PoolMetadata,
-    PoolMetadataResult, RequestId, TokenAddress, TokenMetadataResult, bootstrap,
-    fetch_block_header, fetch_block_logs, fetch_finalized_block_header,
-    fetch_pool_candidates_in_range, fetch_pool_data, fetch_pool_metadata, fetch_token_metadata,
-    fetch_v4_pool_metadata, kernel,
+    GetLogsRange, GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
+    PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RangeLogBlock, RequestId,
+    TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
+    bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
+    fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
+    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
+    kernel,
     multi_chain_kernel::{
         ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, State,
         Subscription, SubscriptionData, transition,
     },
-    subscribe_new_heads, subscribe_pool_events,
+    plan_ws_subscriptions, subscribe_new_heads, subscribe_pool_events,
 };
 use optimization::{
     OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
@@ -26,9 +28,9 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
-        mpsc::Sender,
+        mpsc::{Sender, channel},
     },
     thread::{self, JoinHandle},
     time,
@@ -57,6 +59,20 @@ pub(crate) struct ClientEvmRuntime {
     /// Wall-clock millis of the last emitted gauge line, throttling it to roughly once per second so
     /// the per-chain backlog snapshot lands in the log without per-transition spam.
     last_gauge_millis: AtomicU64,
+    /// Monotonic base for the transition timing fields below.
+    started: time::Instant,
+    /// Micros since `started` when the current input was dequeued (`log_input` runs just before the
+    /// transition, `observe_state` just after, both on the single transition thread — so their
+    /// difference is the pure transition duration, and plain interior mutability suffices).
+    last_input_micros: AtomicU64,
+    /// The current input's formatted log line, echoed into the slow-transition warning so the
+    /// culprit is on the warning line itself (adjacent lines can interleave with effect threads).
+    last_input_line: Mutex<String>,
+    /// Transitions processed since the last gauge line (`events=` on the gauge): with the 1/s gauge
+    /// cadence this is the event-loop throughput, the saturation gauge for the single fold thread.
+    transitions_since_gauge: AtomicU64,
+    /// Slowest transition since the last gauge line, in micros (`max_ms=` on the gauge).
+    max_transition_micros: AtomicU64,
 }
 
 impl ClientEvmRuntime {
@@ -78,7 +94,17 @@ impl ClientEvmRuntime {
             view,
             logger,
             last_gauge_millis: AtomicU64::new(0),
+            started: time::Instant::now(),
+            last_input_micros: AtomicU64::new(0),
+            last_input_line: Mutex::new(String::new()),
+            transitions_since_gauge: AtomicU64::new(0),
+            max_transition_micros: AtomicU64::new(0),
         }
+    }
+
+    /// Micros since runtime construction: the monotonic clock the transition timing reads.
+    fn elapsed_micros(&self) -> u64 {
+        self.started.elapsed().as_micros() as u64
     }
 
     /// Per-chain WebSocket endpoints used by the new-heads / pool-events subscription channel (single
@@ -234,38 +260,10 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     ) {
         match subscription {
             Subscription::NewHeadsSubscription(chain) => {
-                let ws_url = match self.subscriptions().ws(chain) {
-                    Ok(ws_url) => ws_url,
-                    Err(error) => {
-                        self.logger.log(&format!(
-                            "error chain={chain:?} subscription_ws_unavailable kind=new_heads error={error}"
-                        ));
-                        return;
-                    }
-                };
-                self.reconnect_loop(chain, "new_heads", || {
-                    subscribe_new_heads(ws_url, sender, |client_event| {
-                        map_client_subscription_data(client_event)
-                            .map(|data| Event::SubscriptionData { chain, data })
-                    })
-                });
+                self.spawn_new_heads_fan_out(sender, chain);
             }
             Subscription::PoolEventsSubscription(chain) => {
-                let ws_url = match self.subscriptions().ws(chain) {
-                    Ok(ws_url) => ws_url,
-                    Err(error) => {
-                        self.logger.log(&format!(
-                            "error chain={chain:?} subscription_ws_unavailable kind=pool_events error={error}"
-                        ));
-                        return;
-                    }
-                };
-                self.reconnect_loop(chain, "pool_events", || {
-                    subscribe_pool_events(ws_url, sender, |client_event| {
-                        map_client_subscription_data(client_event)
-                            .map(|data| Event::SubscriptionData { chain, data })
-                    })
-                });
+                self.spawn_pool_events_fan_out(sender, chain);
             }
             Subscription::TickSubscription(interval) => {
                 drop(spawn_tick_subscription(sender.clone(), interval));
@@ -288,7 +286,13 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     }
 
     fn log_input(&self, input: &<ClientEvmApp as Application>::Input) {
-        self.logger.log(&format_input_log(input));
+        let line = format_input_log(input);
+        self.logger.log(&line);
+        self.last_input_micros
+            .store(self.elapsed_micros(), Ordering::Relaxed);
+        if let Ok(mut last_line) = self.last_input_line.lock() {
+            *last_line = line;
+        }
     }
 
     fn log_error(&self, error: ApplicationError<<ClientEvmApp as Application>::Input>) {
@@ -303,6 +307,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     }
 
     fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
+        self.record_transition_duration();
         self.view.render(state);
         self.log_gauge(state);
     }
@@ -320,6 +325,20 @@ const EFFECT_POOL_SIZE: usize = 64;
 /// Minimum gap between gauge lines. `observe_state` runs on every transition, so without this the
 /// gauge would be emitted thousands of times a second.
 const GAUGE_INTERVAL_MILLIS: u64 = 1000;
+
+/// A single transition at or above this earns its own `warn slow_transition` line. Sized against
+/// the fastest tracked block cadence (Arbitrum ~250ms): one event routinely eating a tenth of
+/// that budget on the single transition thread deserves a trace before the backlog does.
+const SLOW_TRANSITION_WARN_MILLIS: u64 = 25;
+
+/// The `warn slow_transition` line for a transition that ran `elapsed_micros`, or `None` below the
+/// [`SLOW_TRANSITION_WARN_MILLIS`] threshold. Echoes the input's own log line so the culprit event
+/// is on the warning itself. Pure so the threshold gate is unit-tested without a runtime.
+fn slow_transition_log(elapsed_micros: u64, input_line: &str) -> Option<String> {
+    let millis = elapsed_micros / 1000;
+    (millis >= SLOW_TRANSITION_WARN_MILLIS)
+        .then(|| format!("warn slow_transition ms={millis} {input_line}"))
+}
 
 /// First wait after a subscription drops, and the value the backoff resets to after a healthy run.
 const RECONNECT_BASE: time::Duration = time::Duration::from_millis(250);
@@ -343,49 +362,158 @@ fn next_reconnect_delay(previous: Option<time::Duration>, ran_for: time::Duratio
     }
 }
 
+/// Runs one WebSocket subscription forever, reconnecting with [`next_reconnect_delay`] backoff when it
+/// drops. `attempt` performs one connect-and-stream cycle (one of `subscribe_new_heads` /
+/// `subscribe_pool_events`) and returns when the socket closes (`Ok`) or fails (`Err`) — either way we
+/// reconnect, so a free-tier idle-timeout no longer kills a feed for good. Free of `self` so each of a
+/// chain's fanned-out provider threads owns its own loop with a cloned [`Logger`]. Never returns.
+fn reconnect_loop(
+    logger: &Logger,
+    chain: ChainKey,
+    kind: &str,
+    mut attempt: impl FnMut() -> Result<(), ClientEvmError>,
+) {
+    let mut previous_delay: Option<time::Duration> = None;
+    let mut connects: u64 = 0;
+    loop {
+        connects += 1;
+        logger.log(&format!(
+            "subscription chain={chain:?} kind={kind} connecting attempt={connects}"
+        ));
+
+        let started = time::Instant::now();
+        let outcome = attempt();
+        let ran_for = started.elapsed();
+
+        let reason = match &outcome {
+            Ok(()) => "closed".to_owned(),
+            Err(error) => format!("error: {error}"),
+        };
+        let delay = next_reconnect_delay(previous_delay, ran_for);
+        logger.log(&format!(
+            "subscription chain={chain:?} kind={kind} disconnected ran_ms={} reason={reason} reconnect_in_ms={}",
+            ran_for.as_millis(),
+            delay.as_millis()
+        ));
+
+        thread::sleep(delay);
+        previous_delay = Some(delay);
+    }
+}
+
+/// Blocks on every fanned-out subscription thread. Each [`reconnect_loop`] never returns, so this
+/// parks the owning subscription thread for the life of the process (the threads run concurrently).
+fn join_all(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        drop(handle.join());
+    }
+}
+
 impl ClientEvmRuntime {
-    /// Runs a WebSocket subscription forever, reconnecting with [`next_reconnect_delay`] backoff when
-    /// it drops. `attempt` performs one connect-and-stream cycle (one of `subscribe_new_heads` /
-    /// `subscribe_pool_events`) and returns when the socket closes (`Ok`) or fails (`Err`) — either
-    /// way we reconnect, so a free-tier idle-timeout no longer kills a chain's feed for good. Never
-    /// returns; it owns the subscription thread for the life of the process.
-    fn reconnect_loop(
-        &self,
-        chain: ChainKey,
-        kind: &str,
-        mut attempt: impl FnMut() -> Result<(), ClientEvmError>,
-    ) {
-        let mut previous_delay: Option<time::Duration> = None;
-        let mut connects: u64 = 0;
-        loop {
-            connects += 1;
+    /// Fans the new-heads feed out across every configured WS provider for `chain`: one independent
+    /// reconnecting connection each, all delivering straight into the kernel channel. Duplicate heads
+    /// across providers are absorbed by the kernel (`DuplicateBlock`); heads are latency-sensitive, so
+    /// there is no debounce here. Blocks for the life of the process (each connection loops forever).
+    fn spawn_new_heads_fan_out(&self, sender: &Sender<Event>, chain: ChainKey) {
+        let endpoints = self.chain_ws_endpoints(chain, "new_heads");
+        let handles = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let logger = self.logger.clone();
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    let kind = format!("new_heads provider={}", endpoint.label);
+                    reconnect_loop(&logger, chain, &kind, || {
+                        subscribe_new_heads(&endpoint.url, &sender, |client_event| {
+                            map_new_head_data(client_event)
+                                .map(|data| Event::SubscriptionData { chain, data })
+                        })
+                    });
+                })
+            })
+            .collect();
+        join_all(handles);
+    }
+
+    /// Fans the pool-events feed out across every configured WS provider for `chain`: each provider's
+    /// per-log stream is funnelled through one mpsc into a single consolidator, which debounces and
+    /// dedups the burst (pure [`consolidate_pool_logs`]) into one batched `LogObserved` per block
+    /// before it reaches the kernel channel. Blocks for the life of the process.
+    fn spawn_pool_events_fan_out(&self, sender: &Sender<Event>, chain: ChainKey) {
+        let endpoints = self.chain_ws_endpoints(chain, "pool_events");
+        if endpoints.is_empty() {
+            return;
+        }
+
+        let (raw_sender, raw_receiver) = channel::<(BlockHash, PoolLog)>();
+        let mut handles: Vec<JoinHandle<()>> = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let logger = self.logger.clone();
+                let raw_sender = raw_sender.clone();
+                thread::spawn(move || {
+                    let kind = format!("pool_events provider={}", endpoint.label);
+                    reconnect_loop(&logger, chain, &kind, || {
+                        subscribe_pool_events(&endpoint.url, &raw_sender, map_pool_log_data)
+                    });
+                })
+            })
+            .collect();
+        // Drop the original handle so the consolidator only sees `Disconnected` once every provider
+        // thread is gone (never, in practice — each reconnects forever).
+        drop(raw_sender);
+
+        let sender = sender.clone();
+        handles.push(thread::spawn(move || {
+            consolidate_pool_logs(&raw_receiver, POOL_LOG_BATCH_WINDOW, |block_hash, logs| {
+                let event = Event::SubscriptionData {
+                    chain,
+                    data: SubscriptionData::PoolLog { block_hash, logs },
+                };
+                drop(sender.send(event));
+            });
+        }));
+        join_all(handles);
+    }
+
+    /// The configured WS endpoints for one chain, taken from the pure fan-out plan. Logs (once) and
+    /// yields empty when the chain has none, so a missing WS config surfaces rather than silently
+    /// opening no feed.
+    fn chain_ws_endpoints(&self, chain: ChainKey, kind: &str) -> Vec<WsSubscriptionEndpoint> {
+        let endpoints: Vec<WsSubscriptionEndpoint> = plan_ws_subscriptions(self.subscriptions())
+            .into_iter()
+            .filter(|endpoint| endpoint.chain == chain)
+            .collect();
+        if endpoints.is_empty() {
             self.logger.log(&format!(
-                "subscription chain={chain:?} kind={kind} connecting attempt={connects}"
+                "error chain={chain:?} subscription_ws_unavailable kind={kind}"
             ));
+        }
+        endpoints
+    }
 
-            let started = time::Instant::now();
-            let outcome = attempt();
-            let ran_for = started.elapsed();
+    /// Measures the transition that just ran (`log_input` stamped its start on this same thread),
+    /// feeds the per-gauge-interval counters, and warns on a single transition slow enough to
+    /// threaten the event loop's cadence — the direct probe for the per-event overlay-fold cost.
+    fn record_transition_duration(&self) {
+        let elapsed_micros = self
+            .elapsed_micros()
+            .saturating_sub(self.last_input_micros.load(Ordering::Relaxed));
+        self.transitions_since_gauge.fetch_add(1, Ordering::Relaxed);
+        self.max_transition_micros
+            .fetch_max(elapsed_micros, Ordering::Relaxed);
 
-            let reason = match &outcome {
-                Ok(()) => "closed".to_owned(),
-                Err(error) => format!("error: {error}"),
-            };
-            let delay = next_reconnect_delay(previous_delay, ran_for);
-            self.logger.log(&format!(
-                "subscription chain={chain:?} kind={kind} disconnected ran_ms={} reason={reason} reconnect_in_ms={}",
-                ran_for.as_millis(),
-                delay.as_millis()
-            ));
-
-            thread::sleep(delay);
-            previous_delay = Some(delay);
+        if let Ok(last_line) = self.last_input_line.lock() {
+            if let Some(warning) = slow_transition_log(elapsed_micros, &last_line) {
+                self.logger.log(&warning);
+            }
         }
     }
 
-    /// Emits a single per-chain backlog snapshot (`behind` / `pools` / `inflight`) to the log, at most
-    /// once per [`GAUGE_INTERVAL_MILLIS`]. Runs on the single transition thread, so the throttle needs
-    /// no synchronization beyond interior mutability.
+    /// Emits a single per-chain backlog snapshot (`behind` / `window` / `pools` / `inflight`) plus
+    /// the interval's event-loop counters to the log, at most once per [`GAUGE_INTERVAL_MILLIS`].
+    /// Runs on the single transition thread, so the throttle needs no synchronization beyond
+    /// interior mutability.
     fn log_gauge(&self, state: &State) {
         let now = now_millis();
         if now.saturating_sub(self.last_gauge_millis.load(Ordering::Relaxed)) < GAUGE_INTERVAL_MILLIS
@@ -393,7 +521,10 @@ impl ClientEvmRuntime {
             return;
         }
         self.last_gauge_millis.store(now, Ordering::Relaxed);
-        self.logger.log(&format_gauge_log(&state.observe()));
+        let events = self.transitions_since_gauge.swap(0, Ordering::Relaxed);
+        let max_transition_millis = self.max_transition_micros.swap(0, Ordering::Relaxed) / 1000;
+        self.logger
+            .log(&format_gauge_log(&state.observe(), events, max_transition_millis));
     }
 
     fn send_optimization_input(&self, input: OptimizationPoolReserves) {
@@ -475,41 +606,66 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Renders one `gauge` line: a per-chain backlog snapshot. Active chains carry `behind`/`pools`/
-/// `inflight`; bootstrapping chains render as `init`. Pure so it can be unit-tested off a synthetic
-/// observation set.
-fn format_gauge_log(observations: &[(ChainKey, ChainObservation)]) -> String {
+/// Renders one `gauge` line: a per-chain backlog snapshot plus the interval's event-loop counters.
+/// Active chains carry `behind`/`window`/`pools`/`inflight`/`ws_miss`; bootstrapping chains render
+/// as `init` with their replay-buffer depth. `events` is the transitions processed since the last
+/// gauge line and `max_transition_millis` the slowest of them — together the saturation gauge for
+/// the single transition thread. Pure so it can be unit-tested off a synthetic observation set.
+fn format_gauge_log(
+    observations: &[(ChainKey, ChainObservation)],
+    events: u64,
+    max_transition_millis: u64,
+) -> String {
     let segments = observations
         .iter()
         .map(|(chain, observation)| match observation {
-            ChainObservation::Initializing => format!("{chain:?}=init"),
+            ChainObservation::Initializing { buffered_events } => {
+                format!("{chain:?}=init buffered={buffered_events}")
+            }
             ChainObservation::Active(ChainProgress {
                 verified_pools,
                 blocks_behind_tip,
+                canonical_window,
                 in_flight_requests,
+                ws_misses,
             }) => {
-                let behind = match blocks_behind_tip {
-                    Some(distance) => distance.to_string(),
-                    None => "?".to_owned(),
-                };
+                let behind = format_block_count(*blocks_behind_tip);
+                let window = format_block_count(*canonical_window);
                 format!(
-                    "{chain:?}=active behind={behind} pools={verified_pools} inflight={in_flight_requests}"
+                    "{chain:?}=active behind={behind} window={window} pools={verified_pools} inflight={in_flight_requests} ws_miss={ws_misses}"
                 )
             }
         })
         .collect::<Vec<_>>()
         .join("  ");
 
-    format!("gauge {segments}")
+    format!("gauge {segments}  events={events} max_ms={max_transition_millis}")
+}
+
+/// Renders an optional block count with `?` for the not-yet-measurable case (no dispatch reference
+/// yet, or a tip not connected to the anchor).
+fn format_block_count(count: Option<usize>) -> String {
+    match count {
+        Some(count) => count.to_string(),
+        None => "?".to_owned(),
+    }
 }
 
 fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> String {
     match data {
         SubscriptionData::NewHead {
-            hash, parent_hash, ..
-        } => format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}"),
-        SubscriptionData::PoolLog { block_hash, .. } => {
-            format!("input chain={chain:?} log_observed block={block_hash} pools=1")
+            hash,
+            parent_hash,
+            number,
+            ..
+        } => format!(
+            "input chain={chain:?} head_observed hash={hash} parent={parent_hash} number={number}"
+        ),
+        SubscriptionData::PoolLog { block_hash, logs } => {
+            format!(
+                "input chain={chain:?} log_observed block={block_hash} pools={}",
+                logs.len(),
+            )
         }
     }
 }
@@ -517,10 +673,13 @@ fn format_subscription_data_log(chain: ChainKey, data: &SubscriptionData) -> Str
 fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
     match event {
         kernel::Event::HeadObserved {
-            hash, parent_hash, ..
-        } => {
-            format!("input chain={chain:?} head_observed hash={hash} parent={parent_hash}")
-        }
+            hash,
+            parent_hash,
+            number,
+            ..
+        } => format!(
+            "input chain={chain:?} head_observed hash={hash} parent={parent_hash} number={number}"
+        ),
         kernel::Event::FinalizedBlockObserved { block_hash } => {
             format!("input chain={chain:?} finalized_block_observed hash={block_hash}")
         }
@@ -528,9 +687,10 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             request_id,
             hash,
             parent_hash,
+            number,
             ..
         } => format!(
-            "input chain={chain:?} block_header_received request={} hash={hash} parent={parent_hash}",
+            "input chain={chain:?} block_header_received request={} hash={hash} parent={parent_hash} number={number}",
             format_typed_request_id_log(request_id),
         ),
         kernel::Event::BlockHeaderNotFound { request_id } => format!(
@@ -542,14 +702,14 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             format_typed_request_id_log(request_id),
             logs.len(),
         ),
+        kernel::Event::BlockLogsRangeReceived { request_id, blocks } => format!(
+            "input chain={chain:?} block_logs_range_received request={} blocks={}",
+            format_typed_request_id_log(request_id),
+            blocks.len(),
+        ),
         kernel::Event::LogObserved { block_hash, logs } => format!(
             "input chain={chain:?} log_observed block={block_hash} pools={}",
             logs.len(),
-        ),
-        kernel::Event::PoolDataReceived { request_id, pools } => format!(
-            "input chain={chain:?} pool_data_received request={} pools={}",
-            format_typed_request_id_log(request_id),
-            pools.len(),
         ),
         kernel::Event::PoolMetadataReceived {
             request_id,
@@ -566,6 +726,11 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             "input chain={chain:?} token_metadata_received request={} tokens={}",
             format_typed_request_id_log(request_id),
             metadata.len(),
+        ),
+        kernel::Event::PoolDataReceived { request_id, pools } => format!(
+            "input chain={chain:?} pool_data_received request={} pools={}",
+            format_typed_request_id_log(request_id),
+            pools.len(),
         ),
         kernel::Event::RequestFailed { request_id } => format!(
             "input chain={chain:?} request_failed request={}",
@@ -604,6 +769,21 @@ fn format_typed_request_id_log<R>(request_id: &RequestId<R>) -> String {
     format!("{request_id:?}")
 }
 
+/// One line per issued ranged-getLogs fetch, mirroring the response line's request id so
+/// issue → response/failure pairs up in the log.
+fn format_logs_range_effect_log(
+    chain: ChainKey,
+    request_id: &RequestId<GetLogsRange>,
+    from: u64,
+    to: u64,
+    covered: usize,
+) -> String {
+    format!(
+        "effect logs_range chain={chain:?} request={} from={from} to={to} covered={covered}",
+        format_typed_request_id_log(request_id),
+    )
+}
+
 fn format_request_id_log(request_id: &AnyRequestId) -> String {
     format!("{request_id:?}")
 }
@@ -640,9 +820,23 @@ impl ClientEvmRuntime {
             bootstrap::AnyIssuedRequest::PoolCandidates(request) => {
                 let request_id = request.request_id;
                 let from_block = request.request_payload.from_block;
+                let scan_tip = request.request_payload.scan_tip;
 
-                match fetch_pool_candidates_in_range(&self.agent, endpoints, chain, from_block) {
-                    Ok(blocks) => bootstrap::Event::PoolCandidatesReceived { request_id, blocks },
+                match fetch_pool_candidates_window(
+                    &self.agent,
+                    endpoints,
+                    chain,
+                    from_block,
+                    scan_tip,
+                ) {
+                    Ok((blocks, scan_tip, next_from)) => {
+                        bootstrap::Event::PoolCandidatesReceived {
+                            request_id,
+                            blocks,
+                            scan_tip,
+                            next_from,
+                        }
+                    }
                     Err(error) => {
                         let request_id = bootstrap::AnyRequestId::PoolCandidates(request_id);
                         self.logger.log(&format!(
@@ -714,25 +908,41 @@ impl ClientEvmRuntime {
             &self.logger,
             |block_hash| fetch_block_header(&self.agent, self.endpoints(), chain, block_hash),
             |block_hash| fetch_block_logs(&self.agent, self.endpoints(), chain, block_hash),
-            |at, pools| fetch_pool_data(&self.agent, self.endpoints(), chain, at, pools),
             |at, candidates| self.cached_pool_metadata(chain, at, candidates),
             |at, tokens| self.cached_token_metadata(chain, at, tokens),
+            // Pool data is anchor-specific and the anchor moves, so — unlike immutable metadata —
+            // it is read live with no cache wrapper.
+            |at, pools| fetch_pool_data(&self.agent, self.endpoints(), chain, at, pools),
+            |from, to| fetch_pool_logs_in_range(&self.agent, self.endpoints(), chain, from, to),
         )
     }
 }
 
-fn map_client_subscription_data(client_chain_event: ClientEvent) -> Option<SubscriptionData> {
+fn map_new_head_data(client_chain_event: ClientEvent) -> Option<SubscriptionData> {
     match client_chain_event {
         ClientEvent::NewHead { header, .. } => Some(SubscriptionData::NewHead {
             hash: header.inner.hash,
             parent_hash: header.inner.inner.parent_hash,
             logs_bloom: header.inner.inner.logs_bloom,
+            number: header.inner.inner.number,
         }),
+        ClientEvent::PoolLogObserved { .. }
+        | ClientEvent::Subscribed { .. }
+        | ClientEvent::Closed { .. } => None,
+    }
+}
+
+/// The raw per-log projection for the pool-events feed. Each provider connection maps into this;
+/// the consolidator ([`consolidate_pool_logs`]) then dedups and batches the burst before it reaches
+/// the kernel channel — so the debounce, not this mapper, decides delivery.
+fn map_pool_log_data(client_chain_event: ClientEvent) -> Option<(BlockHash, PoolLog)> {
+    match client_chain_event {
         ClientEvent::PoolLogObserved {
             block_hash, log, ..
-        } => Some(SubscriptionData::PoolLog { block_hash, log }),
-        ClientEvent::Subscribed { .. } => None,
-        ClientEvent::Closed { .. } => None,
+        } => Some((block_hash, log)),
+        ClientEvent::NewHead { .. }
+        | ClientEvent::Subscribed { .. }
+        | ClientEvent::Closed { .. } => None,
     }
 }
 
@@ -897,26 +1107,24 @@ where
 fn execute_chain_effect_with<
     FetchBlockHeader,
     FetchBlockLogs,
-    FetchPoolData,
     FetchPoolMetadata,
     FetchTokenMetadata,
+    FetchPoolData,
+    FetchLogsRange,
 >(
     chain: ChainKey,
     effect: kernel::Effect,
     logger: &Logger,
     fetch_block_header: FetchBlockHeader,
     fetch_block_logs: FetchBlockLogs,
-    fetch_pool_data: FetchPoolData,
     fetch_pool_metadata: FetchPoolMetadata,
     fetch_token_metadata: FetchTokenMetadata,
+    fetch_pool_data: FetchPoolData,
+    fetch_logs_range: FetchLogsRange,
 ) -> Vec<Event>
 where
     FetchBlockHeader: FnOnce(BlockHash) -> Result<Option<ClientHead>, ClientEvmError>,
     FetchBlockLogs: FnOnce(BlockHash) -> Result<Vec<PoolLog>, ClientEvmError>,
-    FetchPoolData: FnOnce(
-        BlockHash,
-        HashSet<PoolRef>,
-    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
     FetchPoolMetadata:
         FnOnce(
             BlockHash,
@@ -928,6 +1136,12 @@ where
             BlockHash,
             HashSet<TokenAddress>,
         ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError>,
+    FetchPoolData:
+        FnOnce(
+            BlockHash,
+            HashSet<PoolRef>,
+        ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
+    FetchLogsRange: FnOnce(u64, u64) -> Result<Vec<RangeLogBlock>, ClientEvmError>,
 {
     match effect {
         kernel::Effect::Request(request) => match request {
@@ -943,6 +1157,7 @@ where
                             hash: header.inner.hash,
                             parent_hash: header.inner.inner.parent_hash,
                             logs_bloom: header.inner.inner.logs_bloom,
+                            number: header.inner.inner.number,
                         },
                     }],
                     Ok(None) => vec![Event::ChainEvent {
@@ -972,28 +1187,6 @@ where
                     }],
                     Err(error) => {
                         let request_id = AnyRequestId::BlockLogs(request_id);
-                        logger.log(&format!(
-                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
-                        ));
-                        vec![Event::ChainEvent {
-                            chain,
-                            event: kernel::Event::RequestFailed { request_id },
-                        }]
-                    }
-                }
-            }
-            AnyIssuedRequest::PoolData(request) => {
-                let request_id = request.request_id;
-                let at = request.request_payload.at;
-                let pools = request.request_payload.pools;
-
-                match fetch_pool_data(at, pools) {
-                    Ok(pools) => vec![Event::ChainEvent {
-                        chain,
-                        event: kernel::Event::PoolDataReceived { request_id, pools },
-                    }],
-                    Err(error) => {
-                        let request_id = AnyRequestId::PoolData(request_id);
                         logger.log(&format!(
                             "error chain={chain:?} request_failed request={request_id:?} error={error}"
                         ));
@@ -1054,6 +1247,65 @@ where
                     }
                 }
             }
+            AnyIssuedRequest::PoolData(request) => {
+                let request_id = request.request_id;
+                let at = request.request_payload.at;
+                let pools = request.request_payload.pools;
+
+                match fetch_pool_data(at, pools) {
+                    Ok(pools) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::PoolDataReceived { request_id, pools },
+                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::PoolData(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
+                }
+            }
+            AnyIssuedRequest::LogsRange(request) => {
+                let request_id = request.request_id;
+                let from = request.request_payload.from_block();
+                let to = request.request_payload.to_block();
+                // The rare authoritative path (finalization verification / hole backstop) is worth
+                // a line at issuance — otherwise it is only visible when it fails.
+                logger.log(&format_logs_range_effect_log(
+                    chain,
+                    &request_id,
+                    from,
+                    to,
+                    request.request_payload.covered().len(),
+                ));
+
+                match fetch_logs_range(from, to) {
+                    Ok(blocks) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::BlockLogsRangeReceived {
+                            request_id,
+                            blocks: blocks
+                                .into_iter()
+                                .map(|block| (block.hash, block.logs))
+                                .collect(),
+                        },
+                    }],
+                    Err(error) => {
+                        let request_id = AnyRequestId::LogsRange(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} error={error}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
+                }
+            }
         },
     }
 }
@@ -1061,8 +1313,8 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetPoolData, GetPoolMetadata,
-        GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey, PoolDataResult,
+        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetLogsRange, GetPoolData,
+        GetPoolMetadata, GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
         PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
         TokenMetadataResult, UniswapV3Fee,
     };
@@ -1104,24 +1356,49 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 37,
                     blocks_behind_tip: Some(4),
+                    canonical_window: Some(70),
                     in_flight_requests: 12,
+                    ws_misses: 2,
                 }),
             ),
-            (ChainKey::Base, ChainObservation::Initializing),
+            (
+                ChainKey::Base,
+                ChainObservation::Initializing { buffered_events: 9 },
+            ),
             (
                 ChainKey::Arbitrum,
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 0,
                     blocks_behind_tip: None,
+                    canonical_window: None,
                     in_flight_requests: 0,
+                    ws_misses: 0,
                 }),
             ),
         ];
 
         assert_eq!(
-            format_gauge_log(&observations),
-            "gauge Ethereum=active behind=4 pools=37 inflight=12  Base=init  \
-             Arbitrum=active behind=? pools=0 inflight=0"
+            format_gauge_log(&observations, 153, 31),
+            "gauge Ethereum=active behind=4 window=70 pools=37 inflight=12 ws_miss=2  \
+             Base=init buffered=9  \
+             Arbitrum=active behind=? window=? pools=0 inflight=0 ws_miss=0  \
+             events=153 max_ms=31"
+        );
+    }
+
+    #[test]
+    fn slow_transition_log_fires_at_the_threshold_and_echoes_the_input_line() {
+        let threshold_micros = SLOW_TRANSITION_WARN_MILLIS * 1000;
+
+        assert_eq!(
+            slow_transition_log(threshold_micros, "input chain=Arbitrum tick"),
+            Some(format!(
+                "warn slow_transition ms={SLOW_TRANSITION_WARN_MILLIS} input chain=Arbitrum tick"
+            ))
+        );
+        assert_eq!(
+            slow_transition_log(threshold_micros - 1, "input chain=Arbitrum tick"),
+            None
         );
     }
 
@@ -1137,8 +1414,14 @@ mod tests {
         );
 
         assert_eq!(
-            runtime.subscriptions().ws(ChainKey::Ethereum).expect("ethereum ws"),
-            "wss://example.invalid/ws"
+            runtime
+                .subscriptions()
+                .ws_endpoints(ChainKey::Ethereum)
+                .expect("ethereum ws")
+                .iter()
+                .map(|spec| spec.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wss://example.invalid/ws"]
         );
     }
 
@@ -1302,9 +1585,12 @@ mod tests {
                     hash: block_hash,
                     parent_hash,
                     logs_bloom: Bloom::default(),
+                    number: 1,
                 },
             }),
-            format!("input chain=Ethereum head_observed hash={block_hash} parent={parent_hash}")
+            format!(
+                "input chain=Ethereum head_observed hash={block_hash} parent={parent_hash} number=1"
+            )
         );
         assert_eq!(
             format_input_log(&Event::ChainEvent {
@@ -1314,10 +1600,11 @@ mod tests {
                     hash: block_hash,
                     parent_hash,
                     logs_bloom: Bloom::default(),
+                    number: 1,
                 },
             }),
             format!(
-                "input chain=Ethereum block_header_received request=7 hash={block_hash} parent={parent_hash}"
+                "input chain=Ethereum block_header_received request=7 hash={block_hash} parent={parent_hash} number=1"
             )
         );
         assert_eq!(
@@ -1332,7 +1619,6 @@ mod tests {
     #[test]
     fn input_log_formats_request_result_counts() {
         let logs_request_id = RequestId::<GetBlockLogs>::from_raw_for_test(8);
-        let pool_request_id = RequestId::<GetPoolData>::from_raw_for_test(9);
         let metadata_request_id = RequestId::<GetPoolMetadata>::from_raw_for_test(10);
         let token_metadata_request_id = RequestId::<GetTokenMetadata>::from_raw_for_test(11);
 
@@ -1345,16 +1631,6 @@ mod tests {
                 },
             }),
             "input chain=Ethereum block_logs_received request=8 pools=0"
-        );
-        assert_eq!(
-            format_input_log(&Event::ChainEvent {
-                chain: ChainKey::Ethereum,
-                event: kernel::Event::PoolDataReceived {
-                    request_id: pool_request_id,
-                    pools: HashMap::new(),
-                },
-            }),
-            "input chain=Ethereum pool_data_received request=9 pools=0"
         );
         assert_eq!(
             format_input_log(&Event::ChainEvent {
@@ -1403,6 +1679,16 @@ mod tests {
     }
 
     #[test]
+    fn logs_range_effect_log_carries_the_request_id_and_window() {
+        let request_id = RequestId::<GetLogsRange>::from_raw_for_test(9);
+
+        assert_eq!(
+            format_logs_range_effect_log(ChainKey::Arbitrum, &request_id, 100, 164, 3),
+            "effect logs_range chain=Arbitrum request=9 from=100 to=164 covered=3"
+        );
+    }
+
+    #[test]
     fn request_id_log_formats_request_kind_and_id() {
         assert_eq!(
             format_request_id_log(&AnyRequestId::BlockHeader(
@@ -1415,12 +1701,6 @@ mod tests {
                 RequestId::<GetBlockLogs>::from_raw_for_test(8),
             )),
             "block_logs#8"
-        );
-        assert_eq!(
-            format_request_id_log(&AnyRequestId::PoolData(
-                RequestId::<GetPoolData>::from_raw_for_test(9),
-            )),
-            "pool_data#9"
         );
         assert_eq!(
             format_request_id_log(&AnyRequestId::PoolMetadata(
@@ -1815,9 +2095,10 @@ mod tests {
                 Ok(Some(header))
             },
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1855,9 +2136,10 @@ mod tests {
                 Ok(None)
             },
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1887,9 +2169,10 @@ mod tests {
                 })
             },
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1919,9 +2202,10 @@ mod tests {
                 assert_eq!(requested_hash, block_hash);
                 Ok(Vec::new())
             },
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1957,9 +2241,10 @@ mod tests {
                     reason: "bad config".to_owned(),
                 })
             },
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -1969,78 +2254,6 @@ mod tests {
                 event:
                     kernel::Event::RequestFailed {
                         request_id: client_evm::AnyRequestId::BlockLogs(request_id),
-                    },
-            }] if *event_chain == chain && *request_id == expected_request_id
-        ));
-    }
-
-    #[test]
-    fn pool_data_request_success_maps_to_chain_event() {
-        let chain = ChainKey::Ethereum;
-        let at = hash(2);
-        let (effect, expected_request_id) = pool_data_request_effect(at);
-
-        let events = execute_chain_effect_with(
-            chain,
-            effect,
-            &Logger::sink(),
-            unexpected_block_header_fetch,
-            unexpected_block_logs_fetch,
-            |requested_at, requested_pools| {
-                assert_eq!(requested_at, at);
-                assert!(requested_pools.is_empty());
-                Ok(HashMap::new())
-            },
-            unexpected_pool_metadata_fetch,
-            unexpected_token_metadata_fetch,
-        );
-
-        assert!(matches!(
-            events.as_slice(),
-            [Event::ChainEvent {
-                chain: event_chain,
-                event:
-                    kernel::Event::PoolDataReceived {
-                        request_id,
-                        pools,
-                    },
-            }] if *event_chain == chain
-                && *request_id == expected_request_id
-                && pools.is_empty()
-        ));
-    }
-
-    #[test]
-    fn pool_data_request_failure_maps_to_request_failed_event() {
-        let chain = ChainKey::Ethereum;
-        let at = hash(2);
-        let (effect, expected_request_id) = pool_data_request_effect(at);
-
-        let events = execute_chain_effect_with(
-            chain,
-            effect,
-            &Logger::sink(),
-            unexpected_block_header_fetch,
-            unexpected_block_logs_fetch,
-            |requested_at, requested_pools| {
-                assert_eq!(requested_at, at);
-                assert!(requested_pools.is_empty());
-                Err(ClientEvmError::InvalidConfig {
-                    scope: ConfigScope::Http,
-                    reason: "bad config".to_owned(),
-                })
-            },
-            unexpected_pool_metadata_fetch,
-            unexpected_token_metadata_fetch,
-        );
-
-        assert!(matches!(
-            events.as_slice(),
-            [Event::ChainEvent {
-                chain: event_chain,
-                event:
-                    kernel::Event::RequestFailed {
-                        request_id: client_evm::AnyRequestId::PoolData(request_id),
                     },
             }] if *event_chain == chain && *request_id == expected_request_id
         ));
@@ -2060,13 +2273,14 @@ mod tests {
             &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             |requested_at, requested_candidates| {
                 assert_eq!(requested_at, at);
                 assert_eq!(requested_candidates, HashSet::from([candidate]));
                 Ok(HashMap::new())
             },
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2097,7 +2311,6 @@ mod tests {
             &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             |requested_at, requested_candidates| {
                 assert_eq!(requested_at, at);
                 assert_eq!(requested_candidates, candidates);
@@ -2107,6 +2320,8 @@ mod tests {
                 })
             },
             unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2135,13 +2350,14 @@ mod tests {
             &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             |requested_at, requested_tokens| {
                 assert_eq!(requested_at, at);
                 assert_eq!(requested_tokens, HashSet::from([token]));
                 Ok(HashMap::new())
             },
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2172,7 +2388,6 @@ mod tests {
             &Logger::sink(),
             unexpected_block_header_fetch,
             unexpected_block_logs_fetch,
-            unexpected_pool_data_fetch,
             unexpected_pool_metadata_fetch,
             |requested_at, requested_tokens| {
                 assert_eq!(requested_at, at);
@@ -2182,6 +2397,8 @@ mod tests {
                     reason: "bad config".to_owned(),
                 })
             },
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
         );
 
         assert!(matches!(
@@ -2201,7 +2418,7 @@ mod tests {
     ) -> (kernel::Effect, RequestId<GetBlockHeader>) {
         let finalized_hash = hash(1);
         let observed_hash = hash(3);
-        let state = kernel::State::init(kernel::FinalizedState::empty_at(finalized_hash));
+        let state = kernel::State::init(finalized_hash);
 
         let (_state, effects) = kernel::transition(
             ChainKey::Ethereum,
@@ -2210,6 +2427,7 @@ mod tests {
                 hash: observed_hash,
                 parent_hash: block_hash,
                 logs_bloom: Bloom::default(),
+                number: 3,
             },
         );
 
@@ -2233,20 +2451,6 @@ mod tests {
             kernel::Effect::Request(AnyIssuedRequest::BlockLogs(IssuedRequest {
                 request_id,
                 request_payload: GetBlockLogs { block_hash },
-            })),
-            request_id,
-        )
-    }
-
-    fn pool_data_request_effect(at: BlockHash) -> (kernel::Effect, RequestId<GetPoolData>) {
-        let request_id = RequestId::from_raw_for_test(8);
-        (
-            kernel::Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
-                request_id,
-                request_payload: GetPoolData {
-                    at,
-                    pools: HashSet::new(),
-                },
             })),
             request_id,
         )
@@ -2280,6 +2484,189 @@ mod tests {
         )
     }
 
+    fn pool_data_request_effect(
+        at: BlockHash,
+        pools: HashSet<PoolRef>,
+    ) -> (kernel::Effect, RequestId<GetPoolData>) {
+        let request_id = RequestId::from_raw_for_test(11);
+        (
+            kernel::Effect::Request(AnyIssuedRequest::PoolData(IssuedRequest {
+                request_id,
+                request_payload: GetPoolData { at, pools },
+            })),
+            request_id,
+        )
+    }
+
+    fn logs_range_request_effect(
+        from: u64,
+        to: u64,
+        covered: HashSet<BlockHash>,
+    ) -> (kernel::Effect, RequestId<GetLogsRange>) {
+        let request_id = RequestId::from_raw_for_test(12);
+        (
+            kernel::Effect::Request(AnyIssuedRequest::LogsRange(IssuedRequest {
+                request_id,
+                request_payload: GetLogsRange::new(from, to, covered)
+                    .expect("test window is ordered"),
+            })),
+            request_id,
+        )
+    }
+
+    #[test]
+    fn logs_range_request_success_maps_to_chain_event_grouped_by_hash() {
+        let chain = ChainKey::Ethereum;
+        let block_hash = hash(7);
+        let (effect, expected_request_id) =
+            logs_range_request_effect(20, 21, HashSet::from([block_hash]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            |from, to| {
+                assert_eq!(from, 20);
+                assert_eq!(to, 21);
+                Ok(vec![RangeLogBlock {
+                    number: 20,
+                    hash: block_hash,
+                    logs: Vec::new(),
+                }])
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::BlockLogsRangeReceived {
+                        request_id,
+                        blocks,
+                    },
+            }] if *event_chain == chain
+                && *request_id == expected_request_id
+                && blocks.as_slice() == [(block_hash, Vec::new())]
+        ));
+    }
+
+    #[test]
+    fn logs_range_request_failure_maps_to_request_failed_event() {
+        let chain = ChainKey::Ethereum;
+        let (effect, expected_request_id) =
+            logs_range_request_effect(20, 21, HashSet::from([hash(7)]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            |_from, _to| {
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::RequestFailed {
+                        request_id: client_evm::AnyRequestId::LogsRange(request_id),
+                    },
+            }] if *event_chain == chain && *request_id == expected_request_id
+        ));
+    }
+
+    #[test]
+    fn pool_data_request_success_maps_to_chain_event() {
+        let chain = ChainKey::Ethereum;
+        let at = hash(2);
+        let pool = pool_address(3);
+        let (effect, expected_request_id) = pool_data_request_effect(at, HashSet::from([pool]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            |requested_at, requested_pools| {
+                assert_eq!(requested_at, at);
+                assert_eq!(requested_pools, HashSet::from([pool]));
+                Ok(HashMap::new())
+            },
+            unexpected_logs_range_fetch,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::PoolDataReceived {
+                        request_id,
+                        pools,
+                    },
+            }] if *event_chain == chain
+                && *request_id == expected_request_id
+                && pools.is_empty()
+        ));
+    }
+
+    #[test]
+    fn pool_data_request_failure_maps_to_request_failed_event() {
+        let chain = ChainKey::Ethereum;
+        let at = hash(2);
+        let pool = pool_address(3);
+        let (effect, expected_request_id) = pool_data_request_effect(at, HashSet::from([pool]));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            |requested_at, requested_pools| {
+                assert_eq!(requested_at, at);
+                assert_eq!(requested_pools, HashSet::from([pool]));
+                Err(ClientEvmError::InvalidConfig {
+                    scope: ConfigScope::Http,
+                    reason: "bad config".to_owned(),
+                })
+            },
+            unexpected_logs_range_fetch,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::RequestFailed {
+                        request_id: client_evm::AnyRequestId::PoolData(request_id),
+                    },
+            }] if *event_chain == chain && *request_id == expected_request_id
+        ));
+    }
+
     fn unexpected_block_header_fetch(
         _block_hash: BlockHash,
     ) -> Result<Option<ClientHead>, ClientEvmError> {
@@ -2288,13 +2675,6 @@ mod tests {
 
     fn unexpected_block_logs_fetch(_block_hash: BlockHash) -> Result<Vec<PoolLog>, ClientEvmError> {
         panic!("block logs fetch must not be called")
-    }
-
-    fn unexpected_pool_data_fetch(
-        _at: BlockHash,
-        _pools: HashSet<PoolRef>,
-    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError> {
-        panic!("pool data fetch must not be called")
     }
 
     fn unexpected_pool_metadata_fetch(
@@ -2309,6 +2689,20 @@ mod tests {
         _tokens: HashSet<TokenAddress>,
     ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
         panic!("token metadata fetch must not be called")
+    }
+
+    fn unexpected_pool_data_fetch(
+        _at: BlockHash,
+        _pools: HashSet<PoolRef>,
+    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError> {
+        panic!("pool data fetch must not be called")
+    }
+
+    fn unexpected_logs_range_fetch(
+        _from: u64,
+        _to: u64,
+    ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
+        panic!("ranged logs fetch must not be called")
     }
 
     fn pool_candidate_address(last_byte: u8) -> ProtocolPoolKey {
@@ -2419,7 +2813,14 @@ mod tests {
     fn test_subscriptions() -> ChainSubscriptions {
         let mut ws = std::collections::BTreeMap::new();
         for &chain in client_evm::ACTIVE_CHAINS {
-            ws.insert(chain, "wss://example.invalid/ws".to_owned());
+            ws.insert(
+                chain,
+                vec![client_evm::EndpointSpec::new(
+                    "test",
+                    "wss://example.invalid/ws",
+                    1,
+                )],
+            );
         }
         ChainSubscriptions::new(ws).expect("test subscriptions")
     }

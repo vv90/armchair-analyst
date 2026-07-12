@@ -128,18 +128,33 @@ enum KeyResolution {
     Skipped,
 }
 
+/// Where a provider's key came from, for a non-secret startup log line. Carries the env var *name* but
+/// never the key value, so a key that the gateway rejects can be traced to the exact origin to fix
+/// (which env var, or the interactive prompt) from the run log alone.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum KeySource {
+    NotNeeded,
+    Env(String),
+    Prompt,
+    Skipped,
+}
+
 /// Every endpoint setting resolved from the config file, with keys substituted: per-chain HTTP specs for
-/// the failover pools, a single WS URL per chain for the subscription channel, and per-chain subgraph
-/// specs for v4 metadata resolution. The caller assembles these into the client-evm endpoint types.
+/// the failover pools, every provider's WS spec per chain for the fanned-out subscription channels, and
+/// per-chain subgraph specs for v4 metadata resolution. The caller assembles these into the client-evm
+/// endpoint types.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResolvedEndpoints {
     pub rpc_http: BTreeMap<ChainKey, Vec<EndpointSpec>>,
-    pub rpc_ws: BTreeMap<ChainKey, String>,
+    pub rpc_ws: BTreeMap<ChainKey, Vec<EndpointSpec>>,
     pub subgraph: BTreeMap<ChainKey, Vec<EndpointSpec>>,
     /// Names of `[[rpc]]` providers dropped because their key was skipped (blank prompt / unset env).
     /// A dropped provider is absent from every pool above; recorded so startup can surface it, since a
     /// silent drop otherwise looks identical to a provider that was never configured.
     pub skipped_rpc_providers: Vec<String>,
+    /// Each provider's key origin (never the value), in config order across `[[rpc]]` then
+    /// `[[subgraph]]`. Surfaced at startup so a gateway auth rejection points at the exact key to fix.
+    pub key_sources: Vec<(String, KeySource)>,
 }
 
 /// Loads and resolves the unified config file named by [`CONFIG_FILE_ENV`]. The file is **required** (an
@@ -184,8 +199,6 @@ where
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
     let mut resolved = ResolvedEndpoints::default();
-    // The highest-weight provider that declares a WS URL wins each chain's single subscription slot.
-    let mut best_ws: BTreeMap<ChainKey, (u32, String)> = BTreeMap::new();
 
     for provider in file.rpc {
         let needs_key = provider.chains.values().any(|urls| {
@@ -195,14 +208,16 @@ where
                     .as_deref()
                     .is_some_and(|ws| ws.contains(KEY_PLACEHOLDER))
         });
-        let key = match resolve_provider_key(
+        let (resolution, source) = resolve_provider_key(
             &provider.name,
             provider.key_env.as_deref(),
             needs_key,
             RPC_KEY_PREFIX,
             read_env,
             prompt,
-        )? {
+        )?;
+        resolved.key_sources.push((provider.name.clone(), source));
+        let key = match resolution {
             KeyResolution::Skipped => {
                 resolved.skipped_rpc_providers.push(provider.name.clone());
                 continue;
@@ -223,34 +238,32 @@ where
 
             if let Some(ws) = &urls.ws {
                 let ws = substitute_key(ws, key.as_deref());
-                let replace = best_ws
-                    .get(&chain)
-                    .is_none_or(|(best_weight, _)| weight > *best_weight);
-                if replace {
-                    best_ws.insert(chain, (weight, ws));
-                }
+                // Keep every provider's WS URL: the runtime fans subscriptions out across all of
+                // them per chain (redundancy), rather than picking a single best endpoint.
+                resolved
+                    .rpc_ws
+                    .entry(chain)
+                    .or_default()
+                    .push(EndpointSpec::new(provider.name.clone(), ws, weight));
             }
         }
     }
-
-    resolved.rpc_ws = best_ws
-        .into_iter()
-        .map(|(chain, (_, url))| (chain, url))
-        .collect();
 
     for provider in file.subgraph {
         let needs_key = provider
             .chains
             .values()
             .any(|url| url.contains(KEY_PLACEHOLDER));
-        let key = match resolve_provider_key(
+        let (resolution, source) = resolve_provider_key(
             &provider.name,
             provider.key_env.as_deref(),
             needs_key,
             GRAPH_KEY_PREFIX,
             read_env,
             prompt,
-        )? {
+        )?;
+        resolved.key_sources.push((provider.name.clone(), source));
+        let key = match resolution {
             KeyResolution::Skipped => continue,
             KeyResolution::NotNeeded => None,
             KeyResolution::Resolved(key) => Some(key),
@@ -287,14 +300,38 @@ pub(crate) fn summarize_endpoints(resolved: &ResolvedEndpoints) -> Vec<String> {
                 .map(|spec| format!("{}:{}", spec.label, spec.weight))
                 .collect::<Vec<_>>()
                 .join(",");
-            let ws = if resolved.rpc_ws.contains_key(chain) {
-                "present"
-            } else {
-                "absent"
-            };
+            let ws = resolved
+                .rpc_ws
+                .get(chain)
+                .map(|specs| {
+                    specs
+                        .iter()
+                        .map(|spec| format!("{}:{}", spec.label, spec.weight))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
             format!("endpoints chain={chain:?} http={providers} ws={ws}")
         })
         .collect();
+
+    // Subgraph pools are partial-coverage and single-provider today, so a `graph pools` auth failure
+    // otherwise names no provider. Mirror the RPC line per v4-enabled chain so the failing subgraph is
+    // identifiable from the log.
+    for (chain, specs) in &resolved.subgraph {
+        let providers = specs
+            .iter()
+            .map(|spec| format!("{}:{}", spec.label, spec.weight))
+            .collect::<Vec<_>>()
+            .join(",");
+        lines.push(format!("endpoints chain={chain:?} graph={providers}"));
+    }
+
+    // Where each provider's key came from — env var name, prompt, or skipped — never the value, so a
+    // gateway auth rejection points straight at the origin to fix.
+    for (provider, source) in &resolved.key_sources {
+        lines.push(format_key_source(provider, source));
+    }
 
     lines.push(format!(
         "endpoints skipped_rpc_providers={}",
@@ -327,27 +364,39 @@ fn resolve_provider_key<Env, Prompt>(
     key_prefix: &str,
     read_env: &mut Env,
     prompt: &mut Prompt,
-) -> Result<KeyResolution, CliError>
+) -> Result<(KeyResolution, KeySource), CliError>
 where
     Env: FnMut(&str) -> Option<String>,
     Prompt: FnMut(&str) -> Result<String, CliError>,
 {
     if !needs_key {
-        return Ok(KeyResolution::NotNeeded);
+        return Ok((KeyResolution::NotNeeded, KeySource::NotNeeded));
     }
 
     let env_name = key_env
         .map(str::to_owned)
         .unwrap_or_else(|| derived_key_env(key_prefix, name));
     if let Some(key) = read_env(&env_name).and_then(normalize_config_value) {
-        return Ok(KeyResolution::Resolved(key));
+        return Ok((KeyResolution::Resolved(key), KeySource::Env(env_name)));
     }
 
     let answer = prompt(&format!("{name} API key (leave blank to skip):"))?;
     Ok(match normalize_config_value(answer) {
-        Some(key) => KeyResolution::Resolved(key),
-        None => KeyResolution::Skipped,
+        Some(key) => (KeyResolution::Resolved(key), KeySource::Prompt),
+        None => (KeyResolution::Skipped, KeySource::Skipped),
     })
+}
+
+/// Renders one non-secret key-origin line: `key provider=<name> source=env:<VAR>|prompt|skipped|none`.
+/// Never emits the key value.
+fn format_key_source(provider: &str, source: &KeySource) -> String {
+    let origin = match source {
+        KeySource::NotNeeded => "none".to_owned(),
+        KeySource::Env(name) => format!("env:{name}"),
+        KeySource::Prompt => "prompt".to_owned(),
+        KeySource::Skipped => "skipped".to_owned(),
+    };
+    format!("key provider={provider} source={origin}")
 }
 
 /// Default environment variable name for a provider's key: `<key_prefix><NAME>`, with the name upcased
@@ -470,14 +519,23 @@ mod tests {
             EndpointSpec::new("publicnode", "https://ethereum-rpc.publicnode.com", 1)
         );
 
-        // Single WS per chain (the weight-3 dRPC wins; publicnode declares no ws).
+        // Every provider that declares a WS URL is kept per chain (here only dRPC does; publicnode
+        // declares no ws), with the key substituted.
         assert_eq!(
-            resolved.rpc_ws.get(&ChainKey::Ethereum).map(String::as_str),
-            Some("wss://lb.drpc.org/ethereum/rpc-secret")
+            resolved.rpc_ws.get(&ChainKey::Ethereum),
+            Some(&vec![EndpointSpec::new(
+                "drpc",
+                "wss://lb.drpc.org/ethereum/rpc-secret",
+                3
+            )])
         );
         assert_eq!(
-            resolved.rpc_ws.get(&ChainKey::Arbitrum).map(String::as_str),
-            Some("wss://lb.drpc.org/arbitrum/rpc-secret")
+            resolved.rpc_ws.get(&ChainKey::Arbitrum),
+            Some(&vec![EndpointSpec::new(
+                "drpc",
+                "wss://lb.drpc.org/arbitrum/rpc-secret",
+                3
+            )])
         );
 
         // Subgraph on Ethereum with the graph key substituted.
@@ -493,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn highest_weight_provider_wins_the_ws_slot() {
+    fn every_provider_ws_url_is_kept_for_fan_out() {
         let toml = r#"
             [[rpc]]
             name = "low"
@@ -512,9 +570,13 @@ mod tests {
         )
         .expect("resolution succeeds");
 
+        // Both providers' WS URLs survive, in configuration order — no single-slot collapse.
         assert_eq!(
-            resolved.rpc_ws.get(&ChainKey::Ethereum).map(String::as_str),
-            Some("wss://high/ws")
+            resolved.rpc_ws.get(&ChainKey::Ethereum),
+            Some(&vec![
+                EndpointSpec::new("low", "wss://low/ws", 1),
+                EndpointSpec::new("high", "wss://high/ws", 5),
+            ])
         );
     }
 
@@ -601,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_endpoints_lists_providers_ws_presence_and_skips() {
+    fn summarize_endpoints_lists_providers_ws_composition_and_skips() {
         let mut resolved = ResolvedEndpoints::default();
         resolved.rpc_http.insert(
             ChainKey::Ethereum,
@@ -613,17 +675,108 @@ mod tests {
         resolved
             .rpc_http
             .insert(ChainKey::Arbitrum, vec![EndpointSpec::new("publicnode", "https://p", 1)]);
-        // Only Ethereum has a WS endpoint, so Arbitrum must read as `ws=absent`.
-        resolved.rpc_ws.insert(ChainKey::Ethereum, "wss://d".to_owned());
+        // Ethereum has two WS providers; Arbitrum has none, so its `ws=` list must render empty.
+        resolved.rpc_ws.insert(
+            ChainKey::Ethereum,
+            vec![
+                EndpointSpec::new("drpc", "wss://d", 3),
+                EndpointSpec::new("alchemy", "wss://a", 4),
+            ],
+        );
         resolved.skipped_rpc_providers.push("infura".to_owned());
 
         assert_eq!(
             summarize_endpoints(&resolved),
             vec![
-                "endpoints chain=Ethereum http=drpc:3,alchemy:4 ws=present".to_owned(),
-                "endpoints chain=Arbitrum http=publicnode:1 ws=absent".to_owned(),
+                "endpoints chain=Ethereum http=drpc:3,alchemy:4 ws=drpc:3,alchemy:4".to_owned(),
+                "endpoints chain=Arbitrum http=publicnode:1 ws=".to_owned(),
                 "endpoints skipped_rpc_providers=infura".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn summarize_endpoints_lists_subgraph_pools_and_key_sources() {
+        let mut resolved = ResolvedEndpoints::default();
+        resolved
+            .rpc_http
+            .insert(ChainKey::Ethereum, vec![EndpointSpec::new("drpc", "https://d", 3)]);
+        resolved
+            .subgraph
+            .insert(ChainKey::Ethereum, vec![EndpointSpec::new("thegraph", "https://g", 3)]);
+        resolved.key_sources.push((
+            "drpc".to_owned(),
+            KeySource::Env("AA_RPC_KEY_DRPC".to_owned()),
+        ));
+        resolved.key_sources.push((
+            "thegraph".to_owned(),
+            KeySource::Env("AA_GRAPH_API_KEY".to_owned()),
+        ));
+
+        assert_eq!(
+            summarize_endpoints(&resolved),
+            vec![
+                "endpoints chain=Ethereum http=drpc:3 ws=".to_owned(),
+                "endpoints chain=Ethereum graph=thegraph:3".to_owned(),
+                "key provider=drpc source=env:AA_RPC_KEY_DRPC".to_owned(),
+                "key provider=thegraph source=env:AA_GRAPH_API_KEY".to_owned(),
+                "endpoints skipped_rpc_providers=".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_key_source_renders_each_origin_without_the_value() {
+        assert_eq!(
+            format_key_source("thegraph", &KeySource::Env("AA_GRAPH_API_KEY".to_owned())),
+            "key provider=thegraph source=env:AA_GRAPH_API_KEY"
+        );
+        assert_eq!(
+            format_key_source("thegraph", &KeySource::Prompt),
+            "key provider=thegraph source=prompt"
+        );
+        assert_eq!(
+            format_key_source("infura", &KeySource::Skipped),
+            "key provider=infura source=skipped"
+        );
+        assert_eq!(
+            format_key_source("publicnode", &KeySource::NotNeeded),
+            "key provider=publicnode source=none"
+        );
+    }
+
+    #[test]
+    fn subgraph_key_source_records_the_resolving_env_var_name() {
+        let toml = r#"
+            [[rpc]]
+            name = "publicnode"
+            ethereum = { http = "https://eth.public.example" }
+
+            [[subgraph]]
+            name = "thegraph"
+            key_env = "AA_GRAPH_API_KEY"
+            ethereum = "https://gateway.example/api/{key}/subgraphs/id/abc"
+        "#;
+        let resolved = load_config_with(
+            env_from([
+                (CONFIG_FILE_ENV, "config.toml"),
+                ("AA_GRAPH_API_KEY", "deadbeef"),
+            ]),
+            |_| Ok(toml.to_owned()),
+            never_prompt(),
+        )
+        .expect("resolution succeeds");
+
+        // The failing-key scenario: the subgraph key's origin is recoverable as the exact env var.
+        assert!(resolved.key_sources.contains(&(
+            "thegraph".to_owned(),
+            KeySource::Env("AA_GRAPH_API_KEY".to_owned()),
+        )));
+        // A keyless RPC provider needs no key and is recorded as such.
+        assert!(
+            resolved
+                .key_sources
+                .contains(&("publicnode".to_owned(), KeySource::NotNeeded))
         );
     }
 

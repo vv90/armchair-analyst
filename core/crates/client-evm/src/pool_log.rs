@@ -23,6 +23,10 @@ use crate::uniswap_v4::{self, PoolId};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolLog {
     pub pool: ProtocolPoolKey,
+    /// Intra-block position, read exactly once: the graph's ingestion boundary
+    /// (`blocks_graph::key_by_log_index`) turns it into the `BTreeMap<u64, PoolLog>` key that all
+    /// downstream ordering/dedup relies on (invariant L3). Everything past ingestion must use the
+    /// map key, never this field.
     pub log_index: u64,
     pub event: PoolLogEvent,
 }
@@ -133,7 +137,7 @@ pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
         let modify = uniswap_v4::ModifyLiquidity::decode_log_data(data).ok()?;
         // v4 collapses v3's Mint/Burn into one signed delta: a non-negative delta adds liquidity
         // (Mint), a negative delta removes it (Burn). The magnitude is bounded by the pool's
-        // `uint128` liquidity; a value that does not fit drops the log to the GetPoolData fallback
+        // `uint128` liquidity; a value that does not fit leaves the pool underivable for this run
         // rather than panicking.
         let amount = u128::try_from(modify.liquidityDelta.unsigned_abs()).ok()?;
         let event = if modify.liquidityDelta.is_negative() {
@@ -172,7 +176,8 @@ pub fn decode_pool_log(log: &Log) -> Option<PoolLog> {
 /// state whenever the run is seeded by `base` or by an absolute event within it — i.e. a block
 /// containing a swap derives without any base. Returns `None` only when the run ends still unseeded
 /// (a delta-only run with no `base`) or when a liquidity adjustment overflows; the caller then
-/// leaves the block unsnapshotted and the existing `GetPoolData` path covers it. An empty run
+/// leaves the pool state underivable for this run (the deferred anchor-height seeding follow-up
+/// covers such pools). An empty run
 /// returns `base`.
 pub fn derive_pool_state(base: Option<&PoolState>, ordered: &[&PoolLogEvent]) -> Option<PoolState> {
     let mut running = base.cloned();
@@ -723,7 +728,7 @@ mod tests {
         };
 
         // With no base and no absolute event to seed the run, there is nothing to apply the
-        // deltas to, so the block is left underivable for the GetPoolData fallback.
+        // deltas to, so the run is left underivable.
         assert_eq!(derive_pool_state(None, &[&mint]), None);
         assert_eq!(derive_pool_state(None, &[&burn]), None);
         assert_eq!(derive_pool_state(None, &[&mint, &burn]), None);

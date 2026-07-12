@@ -109,13 +109,6 @@ pub enum PoolMetadataFailure {
 pub type PoolMetadataResult = Result<PoolMetadata, PoolMetadataFailure>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TrustedPoolLogs {
-    Unknown,
-    PendingValidation,
-    Resolved(HashSet<PoolRef>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustedPoolRegistry {
     verified: HashMap<PoolRef, PoolMetadata>,
     rejected: HashSet<ProtocolPoolKey>,
@@ -167,6 +160,17 @@ impl TrustedPoolRegistry {
         self.verified.len()
     }
 
+    /// The verified pools tracked on `chain` — the identity set the graph fold watches and may seed.
+    /// Added so the log-sourced graph (registry-free by design) can be handed the tracked-pool set to
+    /// widen its bloom-watch and seed absolute-state logs for pools discovered after bootstrap.
+    pub fn verified_pools(&self, chain: ChainKey) -> HashSet<PoolRef> {
+        self.verified
+            .keys()
+            .copied()
+            .filter(|pool| pool.chain == chain)
+            .collect()
+    }
+
     /// Returns the verified pool addresses on `chain`.
     /// Added so the log-fetch gate can test a block's `logsBloom` against the trusted-pool set and
     /// skip the authoritative fetch for blocks that provably touch none of them.
@@ -194,34 +198,6 @@ impl TrustedPoolRegistry {
         self.verified_pool(chain, candidate).is_some() || self.is_rejected(candidate)
     }
 
-    pub fn unknown_candidates(
-        &self,
-        chain: ChainKey,
-        candidates: &HashSet<ProtocolPoolKey>,
-    ) -> HashSet<ProtocolPoolKey> {
-        candidates
-            .iter()
-            .copied()
-            .filter(|candidate| !self.is_known(chain, *candidate))
-            .collect()
-    }
-
-    pub fn trusted_pool_logs(
-        &self,
-        chain: ChainKey,
-        candidates: &HashSet<ProtocolPoolKey>,
-    ) -> TrustedPoolLogs {
-        let mut pools = HashSet::new();
-        for candidate in candidates {
-            if let Some(pool) = self.verified_pool(chain, *candidate) {
-                pools.insert(pool);
-            } else if !self.is_rejected(*candidate) {
-                return TrustedPoolLogs::PendingValidation;
-            }
-        }
-
-        TrustedPoolLogs::Resolved(pools)
-    }
 }
 
 #[cfg(test)]
@@ -447,34 +423,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn trusted_pool_logs_are_pending_until_every_candidate_is_known() {
-        let verified = candidate(3);
-        let rejected = candidate(4);
-        let pending = candidate(5);
-        let registry = TrustedPoolRegistry::new()
-            .with_metadata_results(
-                ChainKey::Ethereum,
-                HashMap::from([(verified, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
-            )
-            .with_metadata_results(
-                ChainKey::Ethereum,
-                HashMap::from([(rejected, Err(PoolMetadataFailure::FactoryReturnedZero))]),
-            );
-
-        assert_eq!(
-            registry.trusted_pool_logs(
-                ChainKey::Ethereum,
-                &HashSet::from([verified, rejected, pending])
-            ),
-            TrustedPoolLogs::PendingValidation
-        );
-        assert_eq!(
-            registry.trusted_pool_logs(ChainKey::Ethereum, &HashSet::from([verified, rejected])),
-            TrustedPoolLogs::Resolved(HashSet::from([PoolRef { key: verified, chain: ChainKey::Ethereum }]))
-        );
-    }
-
+    // `trusted_pool_logs`/`TrustedPoolLogs`/`unknown_candidates` were deleted as dead API
+    // (no production consumer since the Increment-4 swap; the kernel derives trust directly via
+    // `verified_pool`/`is_known`); their tests — a unit pin and two proptest sections — went
+    // with them. The remaining property below still pins every registry query production uses.
     proptest! {
         #[test]
         fn verified_and_rejected_sets_never_overlap_after_applying_results(
@@ -506,16 +458,11 @@ mod tests {
                 proptest::collection::hash_map(any::<u8>(), any::<bool>(), 0..16),
                 0..32,
             ),
-            query_bytes in proptest::collection::hash_set(any::<u8>(), 0..32),
         ) {
             let mut registry = TrustedPoolRegistry::new();
             let mut expected_verified = HashSet::new();
             let mut expected_rejected = HashSet::new();
             let mut observed_candidates = HashSet::new();
-            let query = query_bytes
-                .into_iter()
-                .map(candidate)
-                .collect::<HashSet<_>>();
 
             for batch in batches {
                 let results = batch
@@ -560,31 +507,6 @@ mod tests {
                         registry.is_known(ChainKey::Ethereum, *candidate),
                         expected_verified.contains(candidate) || expected_rejected.contains(candidate)
                     );
-                }
-
-                let expected_unknown = query
-                    .iter()
-                    .copied()
-                    .filter(|candidate| !registry.is_known(ChainKey::Ethereum, *candidate))
-                    .collect::<HashSet<_>>();
-                prop_assert_eq!(registry.unknown_candidates(ChainKey::Ethereum, &query), expected_unknown);
-
-                match registry.trusted_pool_logs(ChainKey::Ethereum, &query) {
-                    TrustedPoolLogs::PendingValidation => {
-                        prop_assert!(query.iter().any(|candidate| !registry.is_known(ChainKey::Ethereum, *candidate)));
-                    }
-                    TrustedPoolLogs::Resolved(pools) => {
-                        let expected_pools = query
-                            .iter()
-                            .filter_map(|candidate| registry.verified_pool(ChainKey::Ethereum, *candidate))
-                            .collect::<HashSet<_>>();
-
-                        prop_assert!(query.iter().all(|candidate| registry.is_known(ChainKey::Ethereum, *candidate)));
-                        prop_assert_eq!(pools, expected_pools);
-                    }
-                    TrustedPoolLogs::Unknown => {
-                        prop_assert!(false, "registry-level trusted logs should not be unknown");
-                    }
                 }
             }
         }

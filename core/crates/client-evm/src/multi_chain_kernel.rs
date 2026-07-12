@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     time::Duration,
 };
 
@@ -27,24 +28,36 @@ pub struct ChainProgress {
     /// Canonical blocks the tip is ahead of the chain's last dispatched optimization block.
     /// `None` while no optimization has been dispatched or the reference is off the current path.
     pub blocks_behind_tip: Option<usize>,
+    /// Connected canonical path length from the finalized anchor to the tip — the window every
+    /// optimization overlay recompute folds over. Growth past the chain's finalized-refresh
+    /// target is the early signature of finalization not advancing (e.g. a wrong provisional
+    /// finality constant), visible here before it shows up as CPU or memory. `None` while the
+    /// tip is not yet connected to the anchor.
+    pub canonical_window: Option<usize>,
     /// RPC requests currently in flight for the chain (dispatched, not yet answered): the per-chain
     /// fetch-backlog gauge.
     pub in_flight_requests: usize,
+    /// Cumulative WS-miss count: how often an authoritative log fetch diverged from the streamed
+    /// set it replaced. The trust gauge of the WS-primary flip — ~0 means the feeds have never
+    /// been caught wrong.
+    pub ws_misses: u64,
 }
 
 /// A render snapshot of one chain: lifecycle phase plus metrics that exist only while active.
 /// Added as the single read model `observe` returns, keeping `ChainStatus` a pure lifecycle indicator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChainObservation {
-    Initializing,
+    /// Still bootstrapping. `buffered_events` counts the live subscription deliveries queued for
+    /// replay at activation, so the size of the activation burst is visible while it accumulates.
+    Initializing { buffered_events: usize },
     Active(ChainProgress),
 }
 
 pub struct State {
     chains: BTreeMap<ChainKey, ChainLifecycle>,
     latest_optimization_result: Option<OptimizationStepResult>,
-    /// Latest fully-fetched block per chain for which optimization reserves were dispatched.
-    /// Added so `RunOptimization` fires only when a chain's complete pool-state frontier advances.
+    /// Latest fold-frontier block per chain for which optimization reserves were dispatched.
+    /// Added so `RunOptimization` fires only when a chain's optimization fold frontier advances.
     last_optimized_block: BTreeMap<ChainKey, BlockHash>,
 }
 
@@ -59,12 +72,23 @@ enum ChainLifecycle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FinalizedRefreshPolicy {
     target_len: usize,
-    retry_stride: usize,
+    /// Non-zero by type: the refresh predicate's bucket arithmetic divides by the stride, so a
+    /// zero would be a build error here, not a runtime guard downstream.
+    retry_stride: NonZeroUsize,
+}
+
+/// Compile-time-checked stride literal: a zero fails const evaluation (a build error), never the
+/// runtime — every use below is a `const` item.
+const fn nonzero_stride(value: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(value) {
+        Some(stride) => stride,
+        None => panic!("finalized-refresh retry stride must be non-zero"),
+    }
 }
 
 const ETHEREUM_APPROX_FINALIZED_BLOCK_AGE: usize = 64;
 const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
-const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(8);
 
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ETHEREUM_BOOTSTRAP_TIP_TRIM: usize = 4;
@@ -77,7 +101,7 @@ const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // for the activation chunk.
 const ARBITRUM_APPROX_FINALIZED_BLOCK_AGE: usize = 1_000;
 const ARBITRUM_FINALIZED_RETENTION_MARGIN: usize = 64;
-const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
+const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(32);
 
 /// Reorg-prone blocks nearest the observed tip left out of the seeded block graph.
 const ARBITRUM_BOOTSTRAP_TIP_TRIM: usize = 8;
@@ -90,13 +114,13 @@ const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // depth; revisit against observed reorg depth.
 const BASE_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
 const BASE_FINALIZED_RETENTION_MARGIN: usize = 32;
-const BASE_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const BASE_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const BASE_BOOTSTRAP_TIP_TRIM: usize = 8;
 const BASE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 const OPTIMISM_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
 const OPTIMISM_FINALIZED_RETENTION_MARGIN: usize = 32;
-const OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const OPTIMISM_BOOTSTRAP_TIP_TRIM: usize = 8;
 const OPTIMISM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
@@ -104,21 +128,21 @@ const OPTIMISM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // set, so its retention/look-back windows are the largest.
 const POLYGON_APPROX_FINALIZED_BLOCK_AGE: usize = 400;
 const POLYGON_FINALIZED_RETENTION_MARGIN: usize = 64;
-const POLYGON_FINALIZED_REFRESH_RETRY_STRIDE: usize = 32;
+const POLYGON_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(32);
 const POLYGON_BOOTSTRAP_TIP_TRIM: usize = 16;
 const POLYGON_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — BNB Chain (~3s blocks) has fast finality with occasional short reorgs.
 const BNB_APPROX_FINALIZED_BLOCK_AGE: usize = 150;
 const BNB_FINALIZED_RETENTION_MARGIN: usize = 32;
-const BNB_FINALIZED_REFRESH_RETRY_STRIDE: usize = 16;
+const BNB_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const BNB_BOOTSTRAP_TIP_TRIM: usize = 12;
 const BNB_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — Avalanche C-Chain (~2s blocks) has near-instant finality, so the smallest window.
 const AVALANCHE_APPROX_FINALIZED_BLOCK_AGE: usize = 80;
 const AVALANCHE_FINALIZED_RETENTION_MARGIN: usize = 16;
-const AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE: usize = 8;
+const AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(8);
 const AVALANCHE_BOOTSTRAP_TIP_TRIM: usize = 6;
 const AVALANCHE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
@@ -240,32 +264,38 @@ fn observe_chain(
     last_optimized_block: Option<BlockHash>,
 ) -> ChainObservation {
     match chain_state {
-        ChainLifecycle::Bootstrapping(..) => ChainObservation::Initializing,
+        ChainLifecycle::Bootstrapping(_, buffered) => ChainObservation::Initializing {
+            buffered_events: buffered.len(),
+        },
         ChainLifecycle::Active(chain_state) => ChainObservation::Active(ChainProgress {
             verified_pools: chain_state.verified_pool_count(),
             blocks_behind_tip: last_optimized_block
                 .and_then(|reference| chain_state.blocks_behind(reference)),
+            canonical_window: chain_state.canonical_path_len_from_finalized(),
             in_flight_requests: chain_state.in_flight_request_count(),
+            ws_misses: chain_state.ws_miss_count(),
         }),
     }
 }
 
-/// Projects the requested chain's active kernel state and a complete pool-state overlay into optimization reserves.
+/// Projects the requested chain's active kernel state and its optimization overlay into optimization reserves.
 /// Added as the pure bridge from validated EVM pool state into the optimization crate's directional reserve model.
 pub fn pool_reserves_for_optimization(
     state: &State,
     chain: ChainKey,
-    update: &kernel::CompletePoolStateUpdate,
+    update: &kernel::OptimizationStateUpdate,
 ) -> Result<Option<ChainPoolReserves>, PoolReserveProjectionError> {
     let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&chain) else {
         return Ok(None);
     };
 
-    // Resolve the overlay descriptor against the current block graph. `None` means a snapshot
-    // location is missing — a broken invariant — so we emit no reserves rather than untrustworthy ones.
-    let Some(overlay) = chain_state.resolve_complete_pool_states(update) else {
-        return Ok(None);
-    };
+    // The overlay carries owned folded states (no locations to resolve — the fold cannot
+    // dangle); merge it over the finalized base for the full per-pool view.
+    let overlay = update
+        .pool_states
+        .iter()
+        .map(|(pool, pool_state)| (*pool, pool_state))
+        .collect();
 
     let mut reserves = Vec::new();
 
@@ -307,8 +337,17 @@ pub fn pool_reserves_for_optimization(
 /// Rebuilds the merged optimizer input from every active chain's current kernel state. Pure over
 /// `&State`: each call re-projects from the authoritative per-chain states rather than reading any
 /// cached reserves, so the merge can never serve stale or drifted data. Chains that are still
-/// bootstrapping, lack a resolvable overlay, or fail projection simply contribute nothing this round.
-fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
+/// bootstrapping or fail projection simply contribute nothing this round.
+///
+/// The one exception to re-projection: `precomputed` is the triggering chain's projection the
+/// caller just computed from this same `state` (the dispatch gate needed it anyway), spliced in
+/// verbatim so that chain's fold + projection is not immediately recomputed — a pure substitution
+/// of an identical recomputation, never a cache.
+fn merged_optimization_reserves(
+    state: &State,
+    precomputed_chain: ChainKey,
+    precomputed: &ChainPoolReserves,
+) -> OptimizationPoolReserves {
     let mut block_hashes = BTreeMap::new();
     let mut reserves = Vec::new();
 
@@ -316,9 +355,12 @@ fn merged_optimization_reserves(state: &State) -> OptimizationPoolReserves {
         let ChainLifecycle::Active(chain_state) = lifecycle else {
             continue;
         };
-        let Some(update) = chain_state.latest_complete_pool_state_update(chain) else {
+        if chain == precomputed_chain {
+            block_hashes.insert(chain, precomputed.block_hash);
+            reserves.extend(precomputed.reserves.iter().copied());
             continue;
-        };
+        }
+        let update = chain_state.optimization_update(chain);
         if let Ok(Some(chain_reserves)) = pool_reserves_for_optimization(state, chain, &update) {
             block_hashes.insert(chain, chain_reserves.block_hash);
             reserves.extend(chain_reserves.reserves);
@@ -462,10 +504,13 @@ pub enum SubscriptionData {
         hash: BlockHash,
         parent_hash: BlockHash,
         logs_bloom: Bloom,
+        number: u64,
     },
     PoolLog {
         block_hash: BlockHash,
-        log: PoolLog,
+        /// A consolidated, `log_index`-ordered batch for one block — the adapter's debounce window
+        /// dedups a burst (and repeats across providers) into a single delivery.
+        logs: Vec<PoolLog>,
     },
 }
 
@@ -477,15 +522,16 @@ impl SubscriptionData {
                 hash,
                 parent_hash,
                 logs_bloom,
+                number,
             } => kernel::Event::HeadObserved {
                 hash,
                 parent_hash,
                 logs_bloom,
+                number,
             },
-            SubscriptionData::PoolLog { block_hash, log } => kernel::Event::LogObserved {
-                block_hash,
-                logs: vec![log],
-            },
+            SubscriptionData::PoolLog { block_hash, logs } => {
+                kernel::Event::LogObserved { block_hash, logs }
+            }
         }
     }
 }
@@ -576,6 +622,27 @@ fn optimization_step_completed(
     )
 }
 
+/// Runs `f` on `chain`'s lifecycle entry (removed for ownership; reinserted unless `f` returns
+/// `None`, which drops the chain), leaving every other `State` field untouched. The per-chain
+/// handlers that neither read nor write the optimization fields all route through here, so the
+/// remove/reinsert/rebuild dance has a single owner. An absent chain is a no-op.
+fn with_chain_lifecycle(
+    mut state: State,
+    chain: ChainKey,
+    f: impl FnOnce(ChainLifecycle) -> (Option<ChainLifecycle>, Vec<Effect>),
+) -> (State, Vec<Effect>) {
+    match state.chains.remove(&chain) {
+        Some(lifecycle) => {
+            let (lifecycle, effects) = f(lifecycle);
+            if let Some(lifecycle) = lifecycle {
+                state.chains.insert(chain, lifecycle);
+            }
+            (state, effects)
+        }
+        None => (state, Vec::new()),
+    }
+}
+
 /// Advances an active chain's finalized boundary from a refreshed finalized header.
 /// Added so the finalized-header refresh feed can drive each inner kernel's compaction; bootstrapping
 /// chains fetch their own anchor and ignore this feed.
@@ -584,52 +651,23 @@ fn finalized_header_received(
     chain: ChainKey,
     block_hash: BlockHash,
 ) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
-        Some(ChainLifecycle::Active(chain_state)) => {
+    with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
+        ChainLifecycle::Active(chain_state) => {
             let (chain_state, effects) = kernel::transition(
                 chain,
                 chain_state,
                 kernel::Event::FinalizedBlockObserved { block_hash },
             );
-            chains.insert(chain, ChainLifecycle::Active(chain_state));
             (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
+                Some(ChainLifecycle::Active(chain_state)),
                 effects
                     .into_iter()
                     .map(|effect| Effect::ChainEffect { chain, effect })
                     .collect(),
             )
         }
-        Some(other) => {
-            chains.insert(chain, other);
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                Vec::new(),
-            )
-        }
-        None => (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            Vec::new(),
-        ),
-    }
+        other => (Some(other), Vec::new()),
+    })
 }
 
 /// Ignores an unavailable finalized-header refresh.
@@ -643,47 +681,12 @@ fn finalized_header_unavailable(state: State, _chain: ChainKey) -> (State, Vec<E
 /// Added so bootstrap responses advance the phase machine, activate the inner kernel on completion,
 /// or drop the chain when the anchor can never be obtained.
 fn bootstrap_event(state: State, chain: ChainKey, event: bootstrap::Event) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
-        Some(ChainLifecycle::Bootstrapping(bootstrap_state, buffered)) => {
-            let (lifecycle, effects) = advance_bootstrap(chain, bootstrap_state, buffered, event);
-            if let Some(lifecycle) = lifecycle {
-                chains.insert(chain, lifecycle);
-            }
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                effects,
-            )
+    with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
+        ChainLifecycle::Bootstrapping(bootstrap_state, buffered) => {
+            advance_bootstrap(chain, bootstrap_state, buffered, event)
         }
-        Some(other) => {
-            chains.insert(chain, other);
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                Vec::new(),
-            )
-        }
-        None => (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            Vec::new(),
-        ),
-    }
+        other => (Some(other), Vec::new()),
+    })
 }
 
 /// Runs one bootstrap transition and maps its completion onto the chain lifecycle.
@@ -760,7 +763,7 @@ fn activate_bootstrap_outcome(
 
     let seed_blocks = seed_blocks
         .into_iter()
-        .map(|block| (block.hash, block.parent_hash, block.candidates))
+        .map(|block| (block.hash, block.parent_hash, block.number, block.logs))
         .collect();
 
     kernel::State::activate_from_seed(
@@ -800,49 +803,43 @@ fn buffer_subscription_data(
     chain: ChainKey,
     data: SubscriptionData,
 ) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
-        Some(ChainLifecycle::Bootstrapping(bootstrap_state, mut buffered)) => {
+    with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
+        ChainLifecycle::Bootstrapping(bootstrap_state, mut buffered) => {
             buffered.push(data);
-            chains.insert(
-                chain,
-                ChainLifecycle::Bootstrapping(bootstrap_state, buffered),
-            );
+            (
+                Some(ChainLifecycle::Bootstrapping(bootstrap_state, buffered)),
+                Vec::new(),
+            )
         }
-        Some(other) => {
-            chains.insert(chain, other);
-        }
-        None => {}
-    }
-
-    (
-        State {
-            chains,
-            latest_optimization_result,
-            last_optimized_block,
-        },
-        Vec::new(),
-    )
+        other => (Some(other), Vec::new()),
+    })
 }
 
 /// Forwards an inner kernel event to an active chain and wraps its effects with the chain key.
 /// Added to preserve chain isolation while letting callers drive per-chain kernel events through one wrapper.
-fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, Vec<Effect>) {
-    let State {
-        mut chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-
-    match chains.remove(&chain) {
+fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (State, Vec<Effect>) {
+    // Not `with_chain_lifecycle`: this is the one handler that reads and writes the optimization
+    // fields (`last_optimized_block`, the merged dispatch) around the reinserted chain.
+    match state.chains.remove(&chain) {
         Some(ChainLifecycle::Active(chain_state)) => {
+            // Measured before the transition (the state moves into it); on an inert outcome the
+            // walk goes unused — the acceptable residual, negligible next to the skipped fold.
             let before_len = chain_state.canonical_path_len_from_finalized();
-            let (chain_state, effects) = kernel::transition(chain, chain_state, event);
+            // An inert transition returned state bit-identical, so every re-derivation below
+            // (finalized-refresh probe, optimization overlay fold, dispatch gate) would
+            // reproduce the previous event's results exactly: the path length cannot have
+            // crossed a refresh bucket, and the fold frontier — hence the `changed` gate and
+            // the (deterministic, this-chain-only) projection — is unchanged. Skip it all.
+            let (chain_state, effects) = match kernel::transition_outcome(chain, chain_state, event)
+            {
+                kernel::TransitionOutcome::Inert(chain_state) => {
+                    state.chains.insert(chain, ChainLifecycle::Active(chain_state));
+                    return (state, Vec::new());
+                }
+                kernel::TransitionOutcome::Progressed(chain_state, effects) => {
+                    (chain_state, effects)
+                }
+            };
             let after_len = chain_state.canonical_path_len_from_finalized();
             let refresh_policy = finalized_refresh_policy(chain);
             let should_fetch_finalized = kernel::should_fetch_finalized_header(
@@ -860,78 +857,58 @@ fn chain_event(state: State, chain: ChainKey, event: kernel::Event) -> (State, V
                 effects.push(Effect::FetchFinalizedHeader { chain });
             }
 
-            // Re-derives the complete pool-state overlay on every chain event. The walk from tip to
-            // the finalized anchor only accumulates snapshot *locations* (`pool -> block_hash`), so it
-            // clones no `PoolState` and costs O(unfinalized-path + recent activity) — cheap. The real
-            // cost is downstream in reserve projection (the O(N log N) sort over all tracked pools),
-            // which at block cadence is still negligible next to the optimization backend's work.
-            // Caching the overlay is intentionally avoided: keeping a cached overlay valid across
-            // reorgs is complex and error-prone, and the recompute is not a bottleneck.
-            let optimization_update = chain_state.latest_complete_pool_state_update(chain);
+            // Gate the optimization fold on its frontier: the fold's result is consumed only
+            // when the frontier advanced past the last dispatched block, so on every other
+            // event — most log deliveries and scheduler-progressing responses — folding would be
+            // wasted work. One walk decides the gate and feeds the fold
+            // (`optimization_update_if_changed`), pinned by the kernel invariant tests to gating
+            // on the frontier-only read and folding separately. Still zero cached state: keeping
+            // a cached overlay valid across reorgs is complex and error-prone, so the full fold
+            // recomputes from the finalized base — just only when its frontier (and hence the
+            // dispatch gate) actually moved.
+            let update = chain_state.optimization_update_if_changed(
+                chain,
+                state.last_optimized_block.get(&chain).copied(),
+            );
 
-            chains.insert(chain, ChainLifecycle::Active(chain_state));
-
-            let mut state = State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            };
-
-            if let Some(update) = optimization_update {
-                let changed = state.last_optimized_block.get(&chain) != Some(&update.block_hash);
-                // Dispatch only when *this* chain's fully-fetched block advanced and its own
-                // projection is ready. Record the hash only on that success so an unready
-                // (`Ok(None)`) or failed (`Err`) chain retries this block next event. The dispatched
-                // input is then re-derived across *all* active chains, so a slow chain rides along
-                // with its current state and a fast chain never stalls waiting for it.
-                if changed
-                    && matches!(
-                        pool_reserves_for_optimization(&state, chain, &update),
-                        Ok(Some(_))
-                    )
-                {
-                    state.last_optimized_block.insert(chain, update.block_hash);
-                    let input = merged_optimization_reserves(&state);
-                    if !input.reserves.is_empty() {
-                        effects.push(Effect::RunOptimization { input });
-                    }
+            state.chains.insert(chain, ChainLifecycle::Active(chain_state));
+            // Dispatch only when *this* chain's fold frontier advanced and its own projection is
+            // ready. Record the hash only on that success so an unready (`Ok(None)`) or failed
+            // (`Err`) chain retries this block next event. The dispatched input is then re-derived
+            // across *all* active chains, so a slow chain rides along with its current state and a
+            // fast chain never stalls waiting for it.
+            //
+            // A persistent `Err(PoolReserveProjectionError)` is deliberately silent here (this is
+            // pure code — no logger to hand it to): the chain simply never dispatches. Its runtime
+            // signature is `behind=?` never resolving in the gauge/view while `pools`/`inflight`
+            // look healthy. If a live run ever shows that, surface the error through the
+            // observation read model rather than threading a logger in here.
+            if let Some(update) = update
+                && let Ok(Some(chain_reserves)) =
+                    pool_reserves_for_optimization(&state, chain, &update)
+            {
+                state.last_optimized_block.insert(chain, update.block_hash);
+                let input = merged_optimization_reserves(&state, chain, &chain_reserves);
+                if !input.reserves.is_empty() {
+                    effects.push(Effect::RunOptimization { input });
                 }
             }
 
             (state, effects)
         }
         Some(existing_chain) => {
-            chains.insert(chain, existing_chain);
-            (
-                State {
-                    chains,
-                    latest_optimization_result,
-                    last_optimized_block,
-                },
-                Vec::new(),
-            )
+            state.chains.insert(chain, existing_chain);
+            (state, Vec::new())
         }
-        None => (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            Vec::new(),
-        ),
+        None => (state, Vec::new()),
     }
 }
 
 /// Advances active and bootstrapping chains and forwards any retry or scheduler effects they produce.
 /// Added so a single global tick can drive request TTL handling for active kernels and the bootstrap
 /// retry/deadline timers for chains still warming up.
-fn tick(state: State) -> (State, Vec<Effect>) {
-    let State {
-        chains,
-        latest_optimization_result,
-        last_optimized_block,
-    } = state;
-    let (chains, effects) = chains.into_iter().fold(
+fn tick(mut state: State) -> (State, Vec<Effect>) {
+    let (chains, effects) = std::mem::take(&mut state.chains).into_iter().fold(
         (BTreeMap::new(), Vec::new()),
         |(mut chains, mut effects), (chain, chain_state)| {
             match chain_state {
@@ -958,15 +935,9 @@ fn tick(state: State) -> (State, Vec<Effect>) {
             (chains, effects)
         },
     );
+    state.chains = chains;
 
-    (
-        State {
-            chains,
-            latest_optimization_result,
-            last_optimized_block,
-        },
-        effects,
-    )
+    (state, effects)
 }
 
 fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
@@ -1084,11 +1055,40 @@ mod tests {
             assert_eq!(state.status(chain), Some(ChainStatus::Initializing));
             assert!(
                 observations.iter().any(|(observed_chain, observation)| {
-                    *observed_chain == chain && *observation == ChainObservation::Initializing
+                    *observed_chain == chain
+                        && matches!(observation, ChainObservation::Initializing { .. })
                 }),
                 "active chain {chain:?} should be seeded as initializing"
             );
         }
+    }
+
+    // Maps a live-subscription new head into its kernel event.
+    // This pins that the block number survives the SubscriptionData -> kernel::Event hop, the one
+    // intermediate struct that carries it, so the graph's block-admission entry can read it.
+    #[test]
+    fn subscription_new_head_carries_block_number_into_head_observed_event() {
+        let head = BlockHash::with_last_byte(20);
+        let parent = BlockHash::with_last_byte(1);
+        let number = 4_242;
+
+        let event = SubscriptionData::NewHead {
+            hash: head,
+            parent_hash: parent,
+            logs_bloom: Bloom::ZERO,
+            number,
+        }
+        .into_kernel_event();
+
+        assert!(matches!(
+            event,
+            kernel::Event::HeadObserved {
+                hash,
+                parent_hash,
+                number: observed_number,
+                ..
+            } if hash == head && parent_hash == parent && observed_number == number
+        ));
     }
 
     #[test]
@@ -1170,7 +1170,37 @@ mod tests {
 
         assert_eq!(
             state.observe(),
-            vec![(chain, ChainObservation::Initializing)]
+            vec![(
+                chain,
+                ChainObservation::Initializing { buffered_events: 0 }
+            )]
+        );
+    }
+
+    #[test]
+    fn observe_counts_subscription_data_buffered_during_bootstrap() {
+        let chain = ChainKey::Ethereum;
+        let (state, _effects) = State::init(&[chain]);
+
+        let (state, _effects) = transition(
+            state,
+            Event::SubscriptionData {
+                chain,
+                data: SubscriptionData::NewHead {
+                    hash: hash(2),
+                    parent_hash: hash(1),
+                    logs_bloom: Bloom::ZERO,
+                    number: 2,
+                },
+            },
+        );
+
+        assert_eq!(
+            state.observe(),
+            vec![(
+                chain,
+                ChainObservation::Initializing { buffered_events: 1 }
+            )]
         );
     }
 
@@ -1195,7 +1225,9 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 1,
                     blocks_behind_tip: None,
+                    canonical_window: Some(0),
                     in_flight_requests: 0,
+                    ws_misses: 0,
                 })
             )]
         );
@@ -1225,10 +1257,33 @@ mod tests {
                 ChainObservation::Active(ChainProgress {
                     verified_pools: 1,
                     blocks_behind_tip: Some(0),
+                    canonical_window: Some(0),
                     in_flight_requests: 0,
+                    ws_misses: 0,
                 })
             )]
         );
+    }
+
+    #[test]
+    fn observe_reports_the_canonical_window_growing_with_connected_heads() {
+        let chain = ChainKey::Ethereum;
+        let state = active_state_at(chain, hash(0));
+
+        let (state, _effects) = drive_connected_heads(state, chain, 3);
+
+        // Three connected heads above the anchor: the fold window the gauge surfaces is exactly
+        // the canonical path length.
+        assert!(matches!(
+            state.observe().as_slice(),
+            [(
+                observed_chain,
+                ChainObservation::Active(ChainProgress {
+                    canonical_window: Some(3),
+                    ..
+                })
+            )] if *observed_chain == chain
+        ));
     }
 
     #[test]
@@ -1257,7 +1312,7 @@ mod tests {
 
         assert_eq!(state.status(chain), Some(ChainStatus::Active));
 
-        let (_state, effects) = transition(
+        let (state, _effects) = transition(
             state,
             Event::ChainEvent {
                 chain,
@@ -1265,9 +1320,12 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: child_hash,
                     parent_hash: finalized_hash,
+                    number: block_number_for(child_hash),
                 },
             },
         );
+        // WS-primary: the backstop log fetch fires once the block sinks past the settle window.
+        let (_state, effects) = observe_clear_padding(state, chain, child_hash, 0xE1);
         assert_single_log_request_chain_effect(&effects, chain, child_hash);
     }
 
@@ -1325,6 +1383,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: observed_hash,
                     parent_hash: missing_parent_hash,
+                    number: block_number_for(observed_hash),
                 },
             },
         );
@@ -1357,6 +1416,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: observed_hash,
                     parent_hash: missing_parent_hash,
+                    number: block_number_for(observed_hash),
                 },
             },
         );
@@ -1409,10 +1469,12 @@ mod tests {
         let policy = finalized_refresh_policy(chain);
         let state = active_state_at(chain, finalized_hash);
         let (state, effects) = drive_connected_heads(state, chain, policy.target_len);
+        // WS-primary: the last head observation carries the backstop fetch for the block that just
+        // crossed the settle window, not for the head itself.
         let request_id = assert_single_log_request_chain_effect(
             &effects,
             chain,
-            hash_for_index(policy.target_len),
+            hash_for_index(policy.target_len - kernel::STREAM_SETTLE_DEPTH),
         );
 
         let (_state, effects) = transition(
@@ -1437,7 +1499,7 @@ mod tests {
         let state = active_state_at(chain, finalized_hash);
         let (mut state, _effects) = drive_connected_heads(state, chain, policy.target_len);
 
-        for block_index in policy.target_len + 1..policy.target_len + policy.retry_stride {
+        for block_index in policy.target_len + 1..policy.target_len + policy.retry_stride.get() {
             let (next_state, effects) = observe_head(
                 state,
                 chain,
@@ -1460,7 +1522,7 @@ mod tests {
         let mut state = state;
         let mut refresh_count = 0usize;
 
-        for block_index in policy.target_len + 1..=policy.target_len + policy.retry_stride {
+        for block_index in policy.target_len + 1..=policy.target_len + policy.retry_stride.get() {
             let (next_state, effects) = observe_head(
                 state,
                 chain,
@@ -1507,6 +1569,7 @@ mod tests {
                         request_id,
                         hash: missing_hash,
                         parent_hash,
+                        number: block_number_for(missing_hash),
                     },
                 },
             );
@@ -1535,7 +1598,7 @@ mod tests {
         let compacted_hash = hash(2);
         let old_branch_hash = hash(3);
         let state = active_state_at(chain, finalized_hash);
-        let (state, effects) = transition(
+        let (state, _effects) = transition(
             state,
             Event::ChainEvent {
                 chain,
@@ -1543,9 +1606,12 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: compacted_hash,
                     parent_hash: finalized_hash,
+                    number: block_number_for(compacted_hash),
                 },
             },
         );
+        // WS-primary: sink the block past the settle window so the backstop issues its log fetch.
+        let (state, effects) = observe_clear_padding(state, chain, compacted_hash, 0xE1);
         let log_request_id =
             assert_single_log_request_chain_effect(&effects, chain, compacted_hash);
         let (state, effects) = transition(
@@ -1582,6 +1648,7 @@ mod tests {
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
                     hash: old_branch_hash,
                     parent_hash: finalized_hash,
+                    number: block_number_for(old_branch_hash),
                 },
             },
         );
@@ -1681,10 +1748,42 @@ mod tests {
         );
     }
 
+    // Pins the inert skip: a fan-out re-delivery of the current tip produces NO effects at the
+    // multi-chain level — no `ChainEffect`, no `FetchFinalizedHeader`, no `RunOptimization` —
+    // and leaves the dispatch bookkeeping untouched. The kernel already proved the state
+    // bit-identical (`TransitionOutcome::Inert`); this asserts the wrapper adds nothing on top.
+    #[test]
+    fn chain_event_for_duplicate_of_tip_head_produces_no_effects() {
+        let state = projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let head_event = || Event::ChainEvent {
+            chain: ChainKey::Ethereum,
+            event: kernel::Event::HeadObserved {
+                number: 2,
+                logs_bloom: Bloom::default(),
+                hash: hash(2),
+                parent_hash: hash(1),
+            },
+        };
+
+        let (state, _effects) = transition(state, head_event());
+        let last_optimized_before = state.last_optimized_block.clone();
+
+        let (state, effects) = transition(state, head_event());
+
+        assert!(effects.is_empty());
+        assert_eq!(state.last_optimized_block, last_optimized_before);
+    }
+
     #[test]
     fn pool_reserves_projection_returns_none_when_ethereum_chain_is_inactive() {
         let (state, _) = State::init(&[ChainKey::Ethereum]);
-        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(1), HashMap::new());
+        let update = projection_update(hash(1), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -1700,7 +1799,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(2), HashMap::new());
+        let update = projection_update(hash(2), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1723,7 +1822,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(ChainKey::Ethereum, state, hash(2), HashMap::new());
+        let update = projection_update(hash(2), HashMap::new());
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1782,10 +1881,8 @@ mod tests {
             last_optimized_block: BTreeMap::new(),
         };
 
-        let (state, ethereum_update) =
-            projection_update(ChainKey::Ethereum, state, hash(3), HashMap::new());
-        let (state, arbitrum_update) =
-            projection_update(ChainKey::Arbitrum, state, hash(4), HashMap::new());
+        let ethereum_update = projection_update(hash(3), HashMap::new());
+        let arbitrum_update = projection_update(hash(4), HashMap::new());
 
         let ethereum_reserves =
             pool_reserves_for_optimization(&state, ChainKey::Ethereum, &ethereum_update)
@@ -1869,11 +1966,27 @@ mod tests {
         }
     }
 
+    /// The triggering chain's projection exactly as `chain_event` computes it before the merge —
+    /// the value the merge splices in instead of recomputing.
+    fn precomputed_reserves_for(state: &State, chain: ChainKey) -> ChainPoolReserves {
+        let update = match state.chains.get(&chain) {
+            Some(ChainLifecycle::Active(chain_state)) => chain_state.optimization_update(chain),
+            _ => panic!("fixture chain must be active"),
+        };
+        pool_reserves_for_optimization(state, chain, &update)
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn merged_optimization_reserves_concatenates_every_active_chain() {
         let state = merged_two_chain_state();
 
-        let merged = merged_optimization_reserves(&state);
+        // Differential pin: handing the merge one chain's freshly-computed projection (as the
+        // production call site does) must reproduce the recompute-everything output verbatim —
+        // all assertions below are unchanged from before the precomputed splice existed.
+        let precomputed = precomputed_reserves_for(&state, ChainKey::Ethereum);
+        let merged = merged_optimization_reserves(&state, ChainKey::Ethereum, &precomputed);
 
         // Both chains contribute their directional pair into one flat Vec, each tagged with its own
         // block, and the same raw addresses on different chains stay distinct keys (no collision).
@@ -1906,6 +2019,25 @@ mod tests {
             merged.reserves.len(),
             "reserve keys must be unique"
         );
+    }
+
+    #[test]
+    fn merged_optimization_reserves_splices_the_precomputed_chain_verbatim() {
+        let state = merged_two_chain_state();
+
+        // A sentinel block hash no recompute could produce: it surfacing in the merge proves the
+        // precomputed projection is spliced in, not recomputed from state.
+        let precomputed = ChainPoolReserves {
+            block_hash: hash(9),
+            reserves: precomputed_reserves_for(&state, ChainKey::Arbitrum).reserves,
+        };
+
+        let merged = merged_optimization_reserves(&state, ChainKey::Arbitrum, &precomputed);
+
+        assert_eq!(merged.block_hashes.get(&ChainKey::Arbitrum), Some(&hash(9)));
+        // The other chain still contributes via its own recompute.
+        assert_eq!(merged.block_hashes.get(&ChainKey::Ethereum), Some(&hash(1)));
+        assert_eq!(merged.reserves.len(), 4);
     }
 
     #[test]
@@ -1959,12 +2091,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, updated_pool_state.clone())]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, updated_pool_state.clone())]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -1989,12 +2116,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, balanced_pool_state(1_000_000))]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -2013,12 +2135,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, balanced_pool_state(1_000_000))]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -2041,12 +2158,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(native, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, pool_state.clone())]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, pool_state.clone())]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -2074,12 +2186,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(0)), (token1, token_metadata(0))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, pool_state)]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, pool_state)]));
 
         let error =
             pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
@@ -2112,12 +2219,7 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let (state, update) = projection_update(
-            ChainKey::Ethereum,
-            state,
-            hash(2),
-            HashMap::from([(pool, inconsistent_pool_state)]),
-        );
+        let update = projection_update(hash(2), HashMap::from([(pool, inconsistent_pool_state)]));
 
         let error =
             pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap_err();
@@ -2165,8 +2267,7 @@ mod tests {
                 pool_metadata,
                 token_metadata,
             );
-            let (state, update) = projection_update(ChainKey::Ethereum,
-                state,
+            let update = projection_update(
                 update_hash,
                 pools
                     .iter()
@@ -2209,6 +2310,13 @@ mod tests {
 
     fn hash(value: u8) -> BlockHash {
         BlockHash::with_last_byte(value)
+    }
+
+    /// Test-only block number recovered from a block hash's trailing byte. These tests encode block
+    /// identity in `BlockHash::with_last_byte(_)`, so this yields a per-hash-stable number for the
+    /// log-sourced graph's block-admission entry. No production consumer of the plumbed `number` yet.
+    fn block_number_for(hash: BlockHash) -> u64 {
+        hash.0[31] as u64
     }
 
     fn pool(value: u8) -> PoolRef {
@@ -2264,10 +2372,6 @@ mod tests {
         pool_metadata: HashMap<PoolRef, PoolMetadata>,
         token_metadata: HashMap<TokenAddress, TokenMetadata>,
     ) -> State {
-        let finalized_state = kernel::FinalizedState::with_pool_snapshots_for_test(
-            finalized_hash,
-            finalized_snapshots,
-        );
         let pool_registry = TrustedPoolRegistry::new().with_metadata_results(
             chain,
             pool_metadata
@@ -2285,7 +2389,8 @@ mod tests {
                 .collect(),
         );
         let chain_state = kernel::State::for_pool_reserve_projection_test(
-            finalized_state,
+            finalized_hash,
+            finalized_snapshots,
             pool_registry,
             token_registry,
         );
@@ -2297,50 +2402,17 @@ mod tests {
         }
     }
 
-    /// Seeds the overlay snapshots into a block on the given chain and returns the matching
-    /// locations descriptor, mirroring how the kernel produces overlays the projection resolves.
+    /// Builds the owned overlay update the kernel's optimization read produces, so
+    /// projection tests can exercise `pool_reserves_for_optimization` without driving log events
+    /// through the fold.
     fn projection_update(
-        chain: ChainKey,
-        state: State,
         block_hash: BlockHash,
-        overlay_pool_states: HashMap<PoolRef, PoolState>,
-    ) -> (State, kernel::CompletePoolStateUpdate) {
-        let pool_snapshot_blocks = overlay_pool_states
-            .keys()
-            .map(|pool| (*pool, block_hash))
-            .collect();
-
-        let State {
-            mut chains,
-            latest_optimization_result,
-            last_optimized_block,
-        } = state;
-        match chains.remove(&chain) {
-            Some(ChainLifecycle::Active(chain_state)) => {
-                chains.insert(
-                    chain,
-                    ChainLifecycle::Active(
-                        chain_state.with_overlay_block_for_test(block_hash, overlay_pool_states),
-                    ),
-                );
-            }
-            Some(other) => {
-                chains.insert(chain, other);
-            }
-            None => {}
+        pool_states: HashMap<PoolRef, PoolState>,
+    ) -> kernel::OptimizationStateUpdate {
+        kernel::OptimizationStateUpdate {
+            block_hash,
+            pool_states,
         }
-
-        (
-            State {
-                chains,
-                latest_optimization_result,
-                last_optimized_block,
-            },
-            kernel::CompletePoolStateUpdate {
-                block_hash,
-                pool_snapshot_blocks,
-            },
-        )
     }
 
     fn assert_directional_pair(
@@ -2441,6 +2513,8 @@ mod tests {
             AnyIssuedRequest::PoolCandidates(issued) => bootstrap::Event::PoolCandidatesReceived {
                 request_id: issued.request_id,
                 blocks: Vec::new(),
+                scan_tip: 0,
+                next_from: None,
             },
             AnyIssuedRequest::PoolMetadata(issued) => bootstrap::Event::PoolMetadataReceived {
                 request_id: issued.request_id,
@@ -2492,6 +2566,7 @@ mod tests {
                     hash: head,
                     parent_hash: finalized,
                     logs_bloom: Bloom::ZERO,
+                    number: 20,
                 },
             },
         );
@@ -2596,9 +2671,44 @@ mod tests {
                     hash,
                     parent_hash,
                     logs_bloom: crate::Bloom::repeat_byte(0xff),
+                    number: block_number_for(hash),
                 },
             },
         )
+    }
+
+    /// Observes `STREAM_SETTLE_DEPTH` bloom-clear padding heads above `parent_hash`, sinking the
+    /// blocks under test past the stream's settle window so the per-block backstop may fetch them
+    /// (WS-primary — see the kernel tests' twin helper). Returns the state and the *last* padding
+    /// transition's effects, where the uncovered holes' log requests surface.
+    fn observe_clear_padding(
+        state: State,
+        chain: ChainKey,
+        parent_hash: BlockHash,
+        first_byte: u8,
+    ) -> (State, Vec<Effect>) {
+        let mut state = state;
+        let mut parent_hash = parent_hash;
+        let mut effects = Vec::new();
+        for offset in 0..kernel::STREAM_SETTLE_DEPTH {
+            let padding_hash = hash(first_byte + offset as u8);
+            let (next_state, next_effects) = transition(
+                state,
+                Event::ChainEvent {
+                    chain,
+                    event: kernel::Event::HeadObserved {
+                        hash: padding_hash,
+                        parent_hash,
+                        logs_bloom: crate::Bloom::default(),
+                        number: block_number_for(padding_hash),
+                    },
+                },
+            );
+            state = next_state;
+            effects = next_effects;
+            parent_hash = padding_hash;
+        }
+        (state, effects)
     }
 
     fn hash_for_index(index: usize) -> BlockHash {

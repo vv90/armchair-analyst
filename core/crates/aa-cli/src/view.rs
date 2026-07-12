@@ -155,14 +155,19 @@ fn format_chain(chain: ChainKey) -> &'static str {
 
 fn format_observation(observation: ChainObservation) -> String {
     match observation {
-        ChainObservation::Initializing => "Initializing".to_owned(),
+        ChainObservation::Initializing { buffered_events } => {
+            format!("Initializing  buffered={buffered_events}")
+        }
         ChainObservation::Active(ChainProgress {
             verified_pools,
             blocks_behind_tip,
+            canonical_window,
             in_flight_requests,
+            ws_misses,
         }) => format!(
-            "Active  pools={verified_pools}  behind={}  inflight={in_flight_requests}",
-            format_distance(blocks_behind_tip)
+            "Active  pools={verified_pools}  behind={}  window={}  inflight={in_flight_requests}  ws_miss={ws_misses}",
+            format_distance(blocks_behind_tip),
+            format_distance(canonical_window)
         ),
     }
 }
@@ -181,22 +186,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_lines_renders_initializing_observation() {
-        let observations = [(ChainKey::Ethereum, ChainObservation::Initializing)];
+    fn format_lines_renders_initializing_observation_with_replay_buffer_depth() {
+        let observations = [(
+            ChainKey::Ethereum,
+            ChainObservation::Initializing { buffered_events: 42 },
+        )];
 
         assert_eq!(
             format_lines(&observations, None),
-            vec!["Ethereum: Initializing"]
+            vec!["Ethereum: Initializing  buffered=42"]
         );
     }
 
     #[test]
     fn format_lines_renders_arbitrum_chain_label() {
-        let observations = [(ChainKey::Arbitrum, ChainObservation::Initializing)];
+        let observations = [(
+            ChainKey::Arbitrum,
+            ChainObservation::Initializing { buffered_events: 0 },
+        )];
 
         assert_eq!(
             format_lines(&observations, None),
-            vec!["Arbitrum: Initializing"]
+            vec!["Arbitrum: Initializing  buffered=0"]
         );
     }
 
@@ -207,13 +218,15 @@ mod tests {
             ChainObservation::Active(ChainProgress {
                 verified_pools: 37,
                 blocks_behind_tip: Some(2),
+                canonical_window: Some(64),
                 in_flight_requests: 5,
+                ws_misses: 1,
             }),
         )];
 
         assert_eq!(
             format_lines(&observations, None),
-            vec!["Ethereum: Active  pools=37  behind=2  inflight=5"]
+            vec!["Ethereum: Active  pools=37  behind=2  window=64  inflight=5  ws_miss=1"]
         );
     }
 
@@ -224,24 +237,29 @@ mod tests {
             ChainObservation::Active(ChainProgress {
                 verified_pools: 0,
                 blocks_behind_tip: None,
+                canonical_window: None,
                 in_flight_requests: 0,
+                ws_misses: 0,
             }),
         )];
 
         assert_eq!(
             format_lines(&observations, None),
-            vec!["Ethereum: Active  pools=0  behind=?  inflight=0"]
+            vec!["Ethereum: Active  pools=0  behind=?  window=?  inflight=0  ws_miss=0"]
         );
     }
 
     #[test]
     fn format_lines_appends_optimization_result_on_its_own_line() {
-        let observations = [(ChainKey::Ethereum, ChainObservation::Initializing)];
+        let observations = [(
+            ChainKey::Ethereum,
+            ChainObservation::Initializing { buffered_events: 0 },
+        )];
 
         assert_eq!(
             format_lines(&observations, Some(result())),
             vec![
-                "Ethereum: Initializing".to_owned(),
+                "Ethereum: Initializing  buffered=0".to_owned(),
                 "Optimization  status=Initialized  profit=1.5  reserves=3".to_owned(),
             ]
         );
