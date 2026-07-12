@@ -62,153 +62,46 @@ pub mod test {
         }
     }
 
+    /// Plants a genuinely profitable USDC -> WETH -> WBTC -> USDC cycle through the 3000-fee
+    /// pools by skewing the WETH/WBTC price ~10% (multiplicative — an additive nudge would
+    /// vanish against the ~1e22-scale reserves). Both directional entries mirror the same pool,
+    /// so `token_1` forward and `token_0` reverse grow together. Returns the reserves and the
+    /// cycle's after-fee profit for a 1000-unit USDC input, verified with `calculate_quote`.
     pub fn plant_arbitrage(
         mut reserves_map: HashMap<(TokenAddress, TokenAddress, i32), VirtualReserveValues>,
     ) -> (
         HashMap<(TokenAddress, TokenAddress, i32), VirtualReserveValues>,
         f32,
     ) {
-        // Plant arbitrage by modifying reserves
-        // Increase USDC in WETH pool and decrease in WBTC pool
-        // {
-        //     let usdc_weth = reserves_map
-        //         .get_mut(&(tokens::USDC.address, tokens::WETH.address, Fee::Medium))
-        //         .unwrap();
-
-        //     usdc_weth.token_0 += 1000000.0;
-        // }
+        let price_skew = 1.10;
         {
             let weth_wbtc = reserves_map
                 .get_mut(&(tokens::WETH.address, tokens::WBTC.address, 3000))
-                .unwrap();
-            println!("WETH/WBTC: {:?}", weth_wbtc);
-            weth_wbtc.token_1 += 100.0;
+                .expect("WETH/WBTC 3000 pool missing from fixture");
+            weth_wbtc.token_1 *= price_skew;
         }
         {
             let wbtc_weth = reserves_map
                 .get_mut(&(tokens::WBTC.address, tokens::WETH.address, 3000))
-                .unwrap();
-            println!("WBTC/WETH: {:?}", wbtc_weth);
-            wbtc_weth.token_0 += 100.0;
+                .expect("WBTC/WETH 3000 pool missing from fixture");
+            wbtc_weth.token_0 *= price_skew;
         }
-        // {
-        //     let wbtc_usdc = reserves_map
-        //         .get_mut(&(tokens::WBTC.address, tokens::USDC.address, Fee::Medium))
-        //         .unwrap();
-        // }
 
         let usdc_weth = reserves_map
             .get(&(tokens::USDC.address, tokens::WETH.address, 3000))
-            .unwrap();
+            .expect("USDC/WETH 3000 pool missing from fixture");
         let weth_wbtc = reserves_map
             .get(&(tokens::WETH.address, tokens::WBTC.address, 3000))
-            .unwrap();
+            .expect("WETH/WBTC 3000 pool missing from fixture");
         let wbtc_usdc = reserves_map
             .get(&(tokens::WBTC.address, tokens::USDC.address, 3000))
-            .unwrap();
-        let wbtc_weth = reserves_map
-            .get(&(tokens::WBTC.address, tokens::WETH.address, 3000))
-            .unwrap();
+            .expect("WBTC/USDC 3000 pool missing from fixture");
 
-        println!("WETH/WBTC: {:?}", weth_wbtc);
-        println!("WBTC/WETH: {:?}", wbtc_weth);
         let usdc_amount = 1000.0;
         let weth_amount = calculate_quote(usdc_weth, usdc_amount, false);
         let wbtc_amount = calculate_quote(weth_wbtc, weth_amount, false);
         let usdc_amount_final = calculate_quote(wbtc_usdc, wbtc_amount, false);
 
-        println!(
-            "Planted arbitrage: USDC -> WETH -> WBTC -> USDC: {} -> {} -> {} -> {}",
-            usdc_amount, weth_amount, wbtc_amount, usdc_amount_final
-        );
-
         (reserves_map, usdc_amount_final - usdc_amount)
     }
 }
-// #[cfg(test)]
-// pub mod tests {
-
-//     use crate::{
-//         ethereum::tokens,
-//         uniswap::v3::{
-//             pool::{Fee, PoolAddress},
-//             pool_state::PoolState,
-//         },
-//     };
-//     use alloy::primitives::{Address, FixedBytes, U160, aliases::I24};
-//     use rust_decimal::prelude::*;
-//     use rust_decimal_macros::dec;
-//     use tokens::TokenInfo;
-
-//     use super::*;
-
-//     const POOL_STATE_WBTC_USDC: PoolState = PoolState {
-//         sqrt_price_x96: U160::from_limbs([17134602959287796597, 139272449984, 0]),
-//         liquidity: U160::from_limbs([50170120777514, 0, 0]),
-//         tick: I24::from_limbs([69583]),
-//     };
-
-//     #[test]
-//     fn test_calculate_quote() {
-//         let fee = Fee::Medium;
-
-//         let token_0 = tokens::WBTC.clone();
-//         let token_1 = tokens::USDC.clone();
-//         let reserves = POOL_STATE_WBTC_USDC
-//             .pool_virtual_reserves(
-//                 tokens::WBTC.decimals,
-//                 tokens::USDC.decimals,
-//                 fee as u32,
-//                 fee.tick_spacing(),
-//             )
-//             .unwrap();
-
-//         let reference_amount_in = 10u128.pow(token_0.decimals() - 3);
-//         let reference_quote =
-//             POOL_STATE_WBTC_USDC.calculate_quote(10u128.pow(token_0.decimals()), fee, false);
-//         println!(
-//             "Reference quote: {} -> {}",
-//             Decimal::from_i128_with_scale(reference_amount_in as i128, token_0.decimals()),
-//             Decimal::from_i128_with_scale(reference_quote as i128, token_1.decimals())
-//         );
-//         println!("{} - {}", token_0.symbol(), token_1.symbol());
-
-//         let expected_quote = POOL_STATE_WBTC_USDC.calculate_quote_dec(
-//             dec!(1),
-//             false,
-//             token_0.decimals(),
-//             token_1.decimals(),
-//         );
-
-//         let expected_reverse_quote = POOL_INFO_WBTC_USDC.calculate_quote_dec(
-//             dec!(100.0),
-//             true,
-//             token_0.decimals(),
-//             token_1.decimals(),
-//         );
-
-//         println!("Expected quote: {} -> {}", dec!(1), expected_quote);
-
-//         println!(
-//             "Expected reverse quote: {} -> {}",
-//             dec!(100.0),
-//             expected_reverse_quote
-//         );
-
-//         let quote = calculate_quote(&reserves, 1.0, false);
-//         let reverse_quote = calculate_quote(&reserves, 100.0, true);
-
-//         assert!(
-//             (quote - expected_quote.to_f64().unwrap()).abs() < f64::EPSILON,
-//             "Quote mismatch. Expected: {}, Got: {}",
-//             expected_quote,
-//             quote
-//         );
-//         assert!(
-//             (reverse_quote - expected_reverse_quote.to_f64().unwrap()).abs() < f64::EPSILON,
-//             "Reverse quote mismatch. Expected: {}, Got: {}",
-//             expected_reverse_quote,
-//             reverse_quote
-//         );
-//     }
-// }

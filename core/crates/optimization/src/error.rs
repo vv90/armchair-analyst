@@ -5,6 +5,9 @@ pub enum OptimizationError {
     #[error("init_asset not found")]
     InitAssetNotFound,
 
+    #[error("no reserve outputs the init_asset")]
+    InitAssetOutputNotFound,
+
     #[error("Invalid init asset index")]
     InvalidInitAssetIndex,
 

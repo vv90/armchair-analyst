@@ -41,8 +41,10 @@ enum OptimizationRunnerInner<
     TToken: Clone + Copy + PartialEq + Eq + Hash,
     const LAYERS: usize,
 > {
-    Wgpu(TypedOptimizationRunner<WgpuBackend, TPool, TToken, LAYERS>),
-    Cpu(TypedOptimizationRunner<CpuBackend, TPool, TToken, LAYERS>),
+    // Boxed to keep the two backend variants close in size (a `TypedOptimizationRunner` holds the
+    // full tensor block) and to shrink the value moved on every `run` step.
+    Wgpu(Box<TypedOptimizationRunner<WgpuBackend, TPool, TToken, LAYERS>>),
+    Cpu(Box<TypedOptimizationRunner<CpuBackend, TPool, TToken, LAYERS>>),
 }
 
 struct TypedOptimizationRunner<
@@ -65,6 +67,9 @@ struct OptimizationSession<
     optimizer: ModelOptimizer<B, LAYERS>,
     session_config: OptimizationSessionConfig<TToken>,
     reserve_keys: HashSet<ReserveKey<TPool, TToken>>,
+    // Pools currently masked out of routing, echoed on `Continued` steps for diagnostics. Set in
+    // lockstep with the model's disabled mask, so it never drifts from the tensors.
+    disabled_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -80,8 +85,15 @@ pub struct OptimizationStepConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum OptimizationStepUpdate<TPool: Copy, TToken: Copy> {
-    NewReserves(Vec<PoolReserves<TPool, TToken>>),
+pub enum OptimizationStepUpdate<TPool: Copy + Eq + Hash, TToken: Copy> {
+    /// A fresh reserve snapshot plus the set of pool ids to temporarily mask out of routing
+    /// (e.g. pools on a chain that has fallen behind). Disabling a pool keeps it in the snapshot
+    /// and the key set, so the model updates in place instead of reinitializing and its trained
+    /// weights survive. Ids not present in the snapshot are ignored.
+    NewReserves {
+        reserves: Vec<PoolReserves<TPool, TToken>>,
+        disabled: HashSet<TPool>,
+    },
     Continue,
 }
 
@@ -100,6 +112,7 @@ pub struct OptimizationStepResult {
     pub output_amount: f32,
     pub profit_amount: f32,
     pub reserves_count: usize,
+    pub disabled_count: usize,
     pub iterations_completed: usize,
 }
 
@@ -164,7 +177,7 @@ where
 
                 Ok((
                     OptimizationRunner {
-                        inner: OptimizationRunnerInner::Wgpu(runner),
+                        inner: OptimizationRunnerInner::Wgpu(Box::new(runner)),
                     },
                     result,
                 ))
@@ -180,7 +193,7 @@ where
 
                 Ok((
                     OptimizationRunner {
-                        inner: OptimizationRunnerInner::Cpu(runner),
+                        inner: OptimizationRunnerInner::Cpu(Box::new(runner)),
                     },
                     result,
                 ))
@@ -204,7 +217,7 @@ where
 
                 Ok((
                     OptimizationRunner {
-                        inner: OptimizationRunnerInner::Wgpu(runner),
+                        inner: OptimizationRunnerInner::Wgpu(Box::new(runner)),
                     },
                     result,
                 ))
@@ -214,7 +227,7 @@ where
 
                 Ok((
                     OptimizationRunner {
-                        inner: OptimizationRunnerInner::Cpu(runner),
+                        inner: OptimizationRunnerInner::Cpu(Box::new(runner)),
                     },
                     result,
                 ))
@@ -337,11 +350,14 @@ where
         session_config.init_asset,
         &session_config.bridges,
     );
+    // First init has no disable signal — that arrives with `NewReserves` updates once the session
+    // is running — so it starts with every pool active.
     initialize_optimization_session_with_status(
         reserves,
         session_config,
         step_config,
         OptimizationStepStatus::Initialized,
+        &HashSet::new(),
     )
 }
 
@@ -365,8 +381,8 @@ where
         OptimizationStepUpdate::Continue => {
             run_optimization_chunk(session, step_config, OptimizationStepStatus::Continued)
         }
-        OptimizationStepUpdate::NewReserves(reserves) => {
-            run_optimization_step_with_reserves(session, reserves, step_config)
+        OptimizationStepUpdate::NewReserves { reserves, disabled } => {
+            run_optimization_step_with_reserves(session, reserves, &disabled, step_config)
         }
     }
 }
@@ -374,6 +390,7 @@ where
 fn run_optimization_step_with_reserves<B, TPool, TToken, const LAYERS: usize>(
     session: OptimizationSession<B, TPool, TToken, LAYERS>,
     reserves: Vec<PoolReserves<TPool, TToken>>,
+    disabled: &HashSet<TPool>,
     step_config: &OptimizationStepConfig,
 ) -> Result<
     (
@@ -407,16 +424,18 @@ where
             session_config,
             step_config,
             OptimizationStepStatus::Reinitialized,
+            disabled,
         );
     }
 
-    match model.update(reserves.clone()) {
+    match model.update(reserves.clone(), disabled) {
         Ok(model) => run_optimization_chunk(
             OptimizationSession {
                 model,
                 optimizer,
                 session_config,
                 reserve_keys: incoming_keys,
+                disabled_count: effective_disabled_count(&reserves, disabled),
             },
             step_config,
             OptimizationStepStatus::Updated,
@@ -426,8 +445,28 @@ where
             session_config,
             step_config,
             OptimizationStepStatus::Reinitialized,
+            disabled,
         ),
     }
+}
+
+/// Number of `disabled` ids that actually appear as a pool in `reserves` — the pools the mask
+/// truly affects. Ids the routing filter already pruned (or that were never present) are excluded
+/// so the diagnostic reflects reality rather than the raw request.
+fn effective_disabled_count<TPool, TToken>(
+    reserves: &[PoolReserves<TPool, TToken>],
+    disabled: &HashSet<TPool>,
+) -> usize
+where
+    TPool: Copy + Eq + Hash,
+    TToken: Copy,
+{
+    reserves
+        .iter()
+        .map(|reserve| reserve.pool_id)
+        .collect::<HashSet<_>>()
+        .intersection(disabled)
+        .count()
 }
 
 fn initialize_optimization_session_with_status<B, TPool, TToken, const LAYERS: usize>(
@@ -435,6 +474,7 @@ fn initialize_optimization_session_with_status<B, TPool, TToken, const LAYERS: u
     session_config: OptimizationSessionConfig<TToken>,
     step_config: &OptimizationStepConfig,
     status: OptimizationStepStatus,
+    disabled: &HashSet<TPool>,
 ) -> Result<
     (
         OptimizationSession<B, TPool, TToken, LAYERS>,
@@ -448,10 +488,12 @@ where
     TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
     let reserve_keys = validate_reserve_snapshot(&reserves, &session_config, step_config)?;
+    let disabled_count = effective_disabled_count(&reserves, disabled);
     let model = Model::<B, TPool, TToken, LAYERS>::init(
         session_config.init_asset,
         reserves,
         &session_config.bridges,
+        disabled,
     )
     .map_err(|source| OptimizationStepError::ModelInit { source })?;
     let optimizer = Model::<B, TPool, TToken, LAYERS>::init_optimizer();
@@ -462,6 +504,7 @@ where
             optimizer,
             session_config,
             reserve_keys,
+            disabled_count,
         },
         step_config,
         status,
@@ -491,6 +534,7 @@ where
         optimizer,
         session_config,
         reserve_keys,
+        disabled_count,
     } = session;
     let reserves_count = reserve_keys.len();
     let (model, optimizer) = model.optimize_with(
@@ -507,6 +551,7 @@ where
         output_amount,
         profit_amount: output_amount - step_config.input_amount,
         reserves_count,
+        disabled_count,
         iterations_completed: step_config.iterations,
     };
 
@@ -516,6 +561,7 @@ where
             optimizer,
             session_config,
             reserve_keys,
+            disabled_count,
         },
         result,
     ))
@@ -655,9 +701,10 @@ mod tests {
         let (runner, _) = initialized_cpu_runner();
 
         let (_runner, result) = runner
-            .run(OptimizationStepUpdate::NewReserves(scaled_base_reserves(
-                1.01,
-            )))
+            .run(OptimizationStepUpdate::NewReserves {
+                reserves: scaled_base_reserves(1.01),
+                disabled: HashSet::new(),
+            })
             .unwrap();
 
         assert_eq!(result.status, OptimizationStepStatus::Updated);
@@ -669,7 +716,10 @@ mod tests {
         let (runner, _) = initialized_cpu_runner();
 
         let (_runner, result) = runner
-            .run(OptimizationStepUpdate::NewReserves(expanded_reserves()))
+            .run(OptimizationStepUpdate::NewReserves {
+                reserves: expanded_reserves(),
+                disabled: HashSet::new(),
+            })
             .unwrap();
 
         assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
@@ -738,7 +788,10 @@ mod tests {
 
         let (_session, result) = run_optimization_step(
             session,
-            OptimizationStepUpdate::NewReserves(scaled_base_reserves(1.01)),
+            OptimizationStepUpdate::NewReserves {
+                reserves: scaled_base_reserves(1.01),
+                disabled: HashSet::new(),
+            },
             &step_config(0),
         )
         .unwrap();
@@ -755,7 +808,10 @@ mod tests {
 
         let (_session, result) = run_optimization_step(
             session,
-            OptimizationStepUpdate::NewReserves(reserves),
+            OptimizationStepUpdate::NewReserves {
+                reserves,
+                disabled: HashSet::new(),
+            },
             &step_config(0),
         )
         .unwrap();
@@ -770,7 +826,10 @@ mod tests {
 
         let (_session, result) = run_optimization_step(
             session,
-            OptimizationStepUpdate::NewReserves(expanded_reserves()),
+            OptimizationStepUpdate::NewReserves {
+                reserves: expanded_reserves(),
+                disabled: HashSet::new(),
+            },
             &step_config(0),
         )
         .unwrap();
@@ -790,7 +849,10 @@ mod tests {
 
         let (_session, result) = run_optimization_step(
             session,
-            OptimizationStepUpdate::NewReserves(base_reserves()),
+            OptimizationStepUpdate::NewReserves {
+                reserves: base_reserves(),
+                disabled: HashSet::new(),
+            },
             &step_config(0),
         )
         .unwrap();
@@ -816,13 +878,78 @@ mod tests {
 
         let (_session, result) = run_optimization_step(
             session,
-            OptimizationStepUpdate::NewReserves(replacement_reserves),
+            OptimizationStepUpdate::NewReserves {
+                reserves: replacement_reserves,
+                disabled: HashSet::new(),
+            },
             &step_config(0),
         )
         .unwrap();
 
         assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
         assert_eq!(result.reserves_count, 1);
+    }
+
+    #[test]
+    fn disabling_a_pool_keeps_key_set_and_updates_without_reinitializing() {
+        let (session, _) = initialized_session();
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves {
+                reserves: base_reserves(),
+                disabled: HashSet::from([1]),
+            },
+            &step_config(0),
+        )
+        .unwrap();
+
+        // Disabling a pool does not change the reserve key set, so the session updates in place
+        // (weights preserved) rather than reinitializing.
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
+        assert_eq!(result.reserves_count, 2);
+        assert_eq!(result.disabled_count, 1);
+    }
+
+    #[test]
+    fn disabled_id_absent_from_snapshot_is_ignored() {
+        let (session, _) = initialized_session();
+
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves {
+                reserves: base_reserves(),
+                disabled: HashSet::from([999]),
+            },
+            &step_config(0),
+        )
+        .unwrap();
+
+        // A disabled id no reserve carries (e.g. routing-filter-pruned upstream) is a normal
+        // state, not an error: the step still succeeds and nothing is counted as disabled.
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
+        assert_eq!(result.disabled_count, 0);
+    }
+
+    #[test]
+    fn reinitialization_carries_the_disabled_set() {
+        let (session, _) = initialized_session();
+
+        // A changed key set forces reinitialization; the disable request must still be applied to
+        // the freshly built model, and reflected in the diagnostic count.
+        let (_session, result) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves {
+                reserves: expanded_reserves(),
+                disabled: HashSet::from([2]),
+            },
+            &step_config(0),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.reserves_count, 3);
+        assert_eq!(result.disabled_count, 1);
     }
 
     #[test]
@@ -1120,7 +1247,10 @@ mod tests {
         // session updates in place instead of reinitializing.
         let (_session, result) = run_optimization_step(
             session,
-            OptimizationStepUpdate::NewReserves(scaled(triangle_with_leaf_reserves(), 1.01)),
+            OptimizationStepUpdate::NewReserves {
+                reserves: scaled(triangle_with_leaf_reserves(), 1.01),
+                disabled: HashSet::new(),
+            },
             &step_config(0),
         )
         .unwrap();

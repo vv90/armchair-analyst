@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 
 use client_evm::{PoolRef, TokenAddress, multi_chain_kernel::OptimizationPoolReserves};
@@ -62,7 +63,12 @@ pub fn run_optimization<T>(
             Some(snapshot) if !reserves_reach_init_asset(&snapshot.reserves, &session_config) => {
                 OptimizationStepUpdate::Continue
             }
-            Some(snapshot) => OptimizationStepUpdate::NewReserves(snapshot.reserves),
+            // No lagging-pool gate wired in yet: every reported pool stays active. The kernel-side
+            // staleness gate that populates `disabled` is a separate follow-up.
+            Some(snapshot) => OptimizationStepUpdate::NewReserves {
+                reserves: snapshot.reserves,
+                disabled: HashSet::new(),
+            },
             None => OptimizationStepUpdate::Continue,
         };
         let (next_runner, result) = runner.run(update).map_err(RunOptimizationError::Step)?;

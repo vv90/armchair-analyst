@@ -291,6 +291,7 @@ mod tests {
             output_amount: 2.5,
             profit_amount: 1.5,
             reserves_count: 3,
+            disabled_count: 0,
             iterations_completed: 7,
         }
     }

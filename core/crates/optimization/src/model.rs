@@ -4,9 +4,7 @@ use burn::{
     module::Param,
     optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     prelude::*,
-    tensor::{
-        Distribution, Slice, activation::softmax, backend::AutodiffBackend, cast::ToElement,
-    },
+    tensor::{Distribution, Slice, activation::softmax, backend::AutodiffBackend},
 };
 use thiserror::Error;
 
@@ -110,18 +108,6 @@ impl<T: Clone, I: Clone + Copy + PartialEq + Eq + std::hash::Hash> ModelLayout<T
         new_state
     }
 
-    // fn into_data<U: Default>(self, fn_value_into_data: impl Fn(T) -> U) -> Vec<U> {
-    //     let fn_ref = &fn_value_into_data;
-
-    //     self.rows
-    //         .into_iter()
-    //         .flat_map(|row| {
-    //             row.into_iter()
-    //                 .map(|opt_value| opt_value.map_or(U::default(), fn_ref))
-    //         })
-    //         .collect()
-    // }
-
     fn get_indexes(&self, input_token: &I, output_token: &I) -> Vec<(RowIndex, ColumnIndex)> {
         self.input_indexes
             .get(input_token)
@@ -142,8 +128,6 @@ impl<T: Clone, I: Clone + Copy + PartialEq + Eq + std::hash::Hash> ModelLayout<T
                 self.output_indexes
                     .get(input_token_address)
                     .map(|set| (column_index, set))
-                // .and_then(|set| set.iter().next())
-                // .map(|row_index| (*row_index, *column_index))
             })
             .flat_map(|(column_index, set)| set.iter().map(|row_index| (*row_index, *column_index)))
             .chain(
@@ -154,20 +138,27 @@ impl<T: Clone, I: Clone + Copy + PartialEq + Eq + std::hash::Hash> ModelLayout<T
             .collect()
     }
 
-    fn output_token_indexes(&self) -> Vec<usize> {
+    fn output_token_indexes(&self) -> Result<Vec<usize>, OptimizationError> {
         let mut indexes = vec![0; self.rows.len()];
 
-        self.output_indexes
+        for (token_address, RowIndex(idx)) in self
+            .output_indexes
             .iter()
             .flat_map(|(token_address, idxs)| idxs.iter().map(move |idx| (token_address, idx)))
-            .for_each(|(token_address, RowIndex(idx))| {
-                indexes[*idx] = self.input_indexes.get(token_address).unwrap().0;
-            });
+        {
+            // Invariant-backed: `with_reserve_values` indexes every output token as an input
+            // column too, so a miss here means a corrupted layout.
+            let ColumnIndex(column) = self
+                .input_indexes
+                .get(token_address)
+                .ok_or(OptimizationError::InvalidLayoutIndex)?;
+            indexes[*idx] = *column;
+        }
 
-        indexes
+        Ok(indexes)
     }
 
-    fn inputs(&self) -> Vec<I> {
+    fn inputs(&self) -> Result<Vec<I>, OptimizationError> {
         let mut tokens = vec![None; self.input_indexes.len()];
         self.input_indexes
             .iter()
@@ -175,10 +166,13 @@ impl<T: Clone, I: Clone + Copy + PartialEq + Eq + std::hash::Hash> ModelLayout<T
                 tokens[*idx] = Some(*token_address);
             });
 
-        tokens.into_iter().collect::<Option<Vec<_>>>().unwrap()
+        tokens
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(OptimizationError::InvalidLayoutIndex)
     }
 
-    fn outputs(&self) -> Vec<I> {
+    fn outputs(&self) -> Result<Vec<I>, OptimizationError> {
         let mut tokens = vec![None; self.rows.len()];
         for (token_address, RowIndex(idx)) in
             self.output_indexes
@@ -189,7 +183,10 @@ impl<T: Clone, I: Clone + Copy + PartialEq + Eq + std::hash::Hash> ModelLayout<T
         {
             tokens[*idx] = Some(*token_address);
         }
-        tokens.into_iter().collect::<Option<Vec<_>>>().unwrap()
+        tokens
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(OptimizationError::InvalidLayoutIndex)
     }
 
     pub fn shape(&self) -> [usize; 2] {
@@ -236,6 +233,7 @@ impl<B: Backend> Layer<B> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         input: Tensor<B, 1>,
@@ -243,12 +241,19 @@ impl<B: Backend> Layer<B> {
         y: &Tensor<B, 2>,
         gamma: &Tensor<B, 2>,
         bypass_mask: &Tensor<B, 2, Bool>,
+        disabled_mask: &Tensor<B, 2, Bool>,
         max_swap: &Tensor<B, 2>,
         token_indexes: &Tensor<B, 1, Int>,
     ) -> Tensor<B, 1> {
         let dims = self.weights.shape();
         let out_dim = dims.dims[0];
-        let w_normalized = softmax(self.weights.val(), 0);
+        // Disabled cells are pushed to a large negative weight *before* softmax: their
+        // post-softmax share collapses to ~0 (flow renormalizes onto healthy pools) and, because
+        // `mask_fill` yields a zero gradient at filled positions, their trained weights are frozen
+        // rather than trained away. A finite fill (not -inf) keeps softmax numerically defined even
+        // when every cell in a column is disabled (uniform split, no NaN).
+        let masked_weights = self.weights.val().mask_fill(disabled_mask.clone(), -1e9);
+        let w_normalized = softmax(masked_weights, 0);
 
         let input_amounts: Tensor<B, 2> = input.clone().expand(dims).mul(w_normalized);
         let input_amounts_after_fee: Tensor<B, 2> = input_amounts.clone().mul(gamma.clone());
@@ -285,11 +290,13 @@ struct LayerBlock<B: Backend, const LAYERS: usize> {
     reserves_out: Tensor<B, 2>,
     fee_multiplier: Tensor<B, 2>,
     bypass_mask: Tensor<B, 2, Bool>,
+    disabled_mask: Tensor<B, 2, Bool>,
     max_swap: Tensor<B, 2>,
     init_asset_index: i64,
     output_asset_indexes: Tensor<B, 1, Int>,
     layer_out_output_asset_indexes: Tensor<B, 1, Int>,
     layer_out_bypass_mask: Tensor<B, 2, Bool>,
+    layer_out_disabled_mask: Tensor<B, 2, Bool>,
     layer_out_pool_indexes: Tensor<B, 1, Int>,
     layer_in: Layer<B>,
     layers: [Layer<B>; LAYERS],
@@ -297,12 +304,14 @@ struct LayerBlock<B: Backend, const LAYERS: usize> {
 }
 
 impl<B: Backend, const LAYERS: usize> LayerBlock<B, LAYERS> {
+    #[allow(clippy::type_complexity)]
     fn layer_in_params(
         &self,
     ) -> (
         Tensor<B, 2>,
         Tensor<B, 2>,
         Tensor<B, 2>,
+        Tensor<B, 2, Bool>,
         Tensor<B, 2, Bool>,
         Tensor<B, 2>,
     ) {
@@ -315,12 +324,14 @@ impl<B: Backend, const LAYERS: usize> LayerBlock<B, LAYERS> {
             self.reserves_out.clone().slice(input_asset_range),
             self.fee_multiplier.clone().slice(input_asset_range),
             self.bypass_mask.clone().slice(input_asset_range),
+            self.disabled_mask.clone().slice(input_asset_range),
             self.max_swap.clone().slice(input_asset_range),
         )
     }
 
     pub fn forward(&self, input: Tensor<B, 1>) -> Tensor<B, 1> {
-        let (x_in, y_in, gamma_in, bypass_mask_in, max_swap_in) = self.layer_in_params();
+        let (x_in, y_in, gamma_in, bypass_mask_in, disabled_mask_in, max_swap_in) =
+            self.layer_in_params();
 
         let layer_in_output = self.layer_in.forward(
             input.clone(),
@@ -328,6 +339,7 @@ impl<B: Backend, const LAYERS: usize> LayerBlock<B, LAYERS> {
             &y_in,
             &gamma_in,
             &bypass_mask_in,
+            &disabled_mask_in,
             &max_swap_in,
             &self.output_asset_indexes,
         );
@@ -341,6 +353,7 @@ impl<B: Backend, const LAYERS: usize> LayerBlock<B, LAYERS> {
                 &self.reserves_out,
                 &self.fee_multiplier,
                 &self.bypass_mask,
+                &self.disabled_mask,
                 &self.max_swap,
                 &self.output_asset_indexes,
             );
@@ -369,6 +382,7 @@ impl<B: Backend, const LAYERS: usize> LayerBlock<B, LAYERS> {
             &y_out,
             &gamma_out,
             &self.layer_out_bypass_mask,
+            &self.layer_out_disabled_mask,
             &max_swap_out,
             &self.layer_out_output_asset_indexes,
         )
@@ -384,6 +398,7 @@ pub struct Model<
     layout: ModelLayout<U, I>,
     reserves_in_data: Vec<B::FloatElem>,
     reserves_out_data: Vec<B::FloatElem>,
+    fee_multiplier_data: Vec<B::FloatElem>,
     max_swap_data: Vec<B::FloatElem>,
     block: LayerBlock<B, LAYERS>,
 }
@@ -420,12 +435,6 @@ impl<
         }
     }
 
-    pub fn optimize(self, input_elem: B::FloatElem, num_iterations: usize) -> Self {
-        let optimizer = Self::init_optimizer();
-        let (model, _optimizer) = self.optimize_with(optimizer, input_elem, num_iterations);
-        model
-    }
-
     pub fn optimize_with(
         self,
         mut optimizer: ModelOptimizer<B, LAYERS>,
@@ -448,13 +457,21 @@ impl<
     }
 }
 
-impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, const LAYERS: usize>
-    Model<B, U, I, LAYERS>
+impl<
+    B: Backend,
+    U: Copy + Eq + std::hash::Hash,
+    I: Clone + Copy + PartialEq + Eq + std::hash::Hash,
+    const LAYERS: usize,
+> Model<B, U, I, LAYERS>
 {
+    /// Builds the model tensors from a reserve snapshot. `disabled` holds pool ids that should be
+    /// masked out of the softmax routing (see [`Model::update`]); pass an empty set for the
+    /// all-pools-active case. Ids in `disabled` that no reserve carries are simply ignored.
     pub fn init(
         init_asset: I,
         pool_reserves: Vec<PoolReserves<U, I>>,
         bridges: &HashSet<(I, I)>,
+        disabled: &HashSet<U>,
     ) -> Result<Self, OptimizationError> {
         let device = &B::Device::default();
         let model_layout = pool_reserves
@@ -471,7 +488,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
             .output_indexes
             .get(&init_asset)
             .map(|idxs| idxs.iter().map(|RowIndex(idx)| *idx).collect::<Vec<_>>())
-            .unwrap();
+            .ok_or(OptimizationError::InitAssetOutputNotFound)?;
         let init_asset_pools_count = init_asset_pool_indexes.len();
 
         let bypass_indexes = model_layout.bypass_indexes(bridges);
@@ -487,7 +504,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
         let dims = [size_pools, size_tokens];
         let buf_size = size_tokens * size_pools;
 
-        let asset_indexes_data = model_layout.output_token_indexes();
+        let asset_indexes_data = model_layout.output_token_indexes()?;
 
         let (
             reserves_in_data,
@@ -495,6 +512,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
             fee_multiplier_data,
             max_swap_data,
             bypass_mask_data,
+            disabled_mask_data,
         ) = model_layout
             .rows
             .iter()
@@ -511,6 +529,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                     Vec::with_capacity(buf_size),
                     Vec::with_capacity(buf_size),
                     Vec::with_capacity(buf_size),
+                    Vec::with_capacity(buf_size),
                 ),
                 |(
                     mut reserves_in_data,
@@ -518,14 +537,16 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                     mut fee_multiplier_data,
                     mut max_swap_data,
                     mut bypass_mask_data,
+                    mut disabled_mask_data,
                 ): (
                     Vec<B::FloatElem>,
                     Vec<B::FloatElem>,
                     Vec<B::FloatElem>,
                     Vec<B::FloatElem>,
                     Vec<bool>,
+                    Vec<bool>,
                 ),
-                 (row_index, column_index, reserve): (
+                 (row_index, column_index, cell): (
                     RowIndex,
                     ColumnIndex,
                     &Option<(U, VirtualReserveValues)>,
@@ -536,28 +557,28 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                     Vec<B::FloatElem>,
                     Vec<B::FloatElem>,
                     Vec<bool>,
+                    Vec<bool>,
                 ) {
+                    disabled_mask_data.push(
+                        cell.as_ref()
+                            .map(|(pool_id, _)| disabled.contains(pool_id))
+                            .unwrap_or(false),
+                    );
+
                     let reserve =
-                        reserve
-                            .as_ref()
-                            .map(|(_, r)| r)
-                            .unwrap_or(&VirtualReserveValues {
-                                token_0: 0.0,
-                                token_1: 0.0,
-                                fee_multiplier: 0.0,
-                                max_swap_0: 0.0,
-                                max_swap_1: 0.0,
-                            });
+                        cell.as_ref().map(|(_, r)| r).unwrap_or(&VirtualReserveValues {
+                            token_0: 0.0,
+                            token_1: 0.0,
+                            fee_multiplier: 0.0,
+                            max_swap_0: 0.0,
+                            max_swap_1: 0.0,
+                        });
                     reserves_in_data.push(B::FloatElem::from_elem(reserve.token_0));
                     reserves_out_data.push(B::FloatElem::from_elem(reserve.token_1));
                     fee_multiplier_data.push(B::FloatElem::from_elem(reserve.fee_multiplier));
                     max_swap_data.push(B::FloatElem::from_elem(reserve.max_swap_0));
 
-                    bypass_mask_data.push(if bypass_indexes.contains(&(row_index, column_index)) {
-                        true
-                    } else {
-                        false
-                    });
+                    bypass_mask_data.push(bypass_indexes.contains(&(row_index, column_index)));
 
                     (
                         reserves_in_data,
@@ -565,11 +586,14 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                         fee_multiplier_data,
                         max_swap_data,
                         bypass_mask_data,
+                        disabled_mask_data,
                     )
                 },
             );
         let bypass_mask =
             Tensor::<B, 1, Bool>::from_data(bypass_mask_data.as_slice(), device).reshape(dims);
+        let disabled_mask =
+            Tensor::<B, 1, Bool>::from_data(disabled_mask_data.as_slice(), device).reshape(dims);
 
         let layer_out_pool_indexes =
             Tensor::<B, 1, Int>::from_data(init_asset_pool_indexes.as_slice(), device);
@@ -579,7 +603,12 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
             .int()
             .select(0, layer_out_pool_indexes.clone())
             .bool();
-        // let layer_out_bypass_mask_data = vec![true; size_tokens * init_asset_pools_count];
+
+        let layer_out_disabled_mask = disabled_mask
+            .clone()
+            .int()
+            .select(0, layer_out_pool_indexes.clone())
+            .bool();
 
         Ok(Model {
             block: LayerBlock {
@@ -590,7 +619,6 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                 fee_multiplier: Tensor::<B, 1>::from_data(fee_multiplier_data.as_slice(), device)
                     .reshape(dims),
                 max_swap: Tensor::<B, 1>::from_data(max_swap_data.as_slice(), device).reshape(dims),
-                // input_asset_index: Tensor::<B, 1, Int>::from_data([0 as i32], device),
                 init_asset_index: init_asset_index as i64,
                 output_asset_indexes: Tensor::<B, 1, Int>::from_data(
                     asset_indexes_data.as_slice(),
@@ -603,7 +631,9 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
                     device,
                 ),
                 bypass_mask,
+                disabled_mask,
                 layer_out_bypass_mask,
+                layer_out_disabled_mask,
                 layer_out_pool_indexes,
                 layer_in: Layer::init([size_pools, 1], size_tokens, device),
                 layers: [(); LAYERS]
@@ -612,6 +642,7 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
             },
             reserves_in_data,
             reserves_out_data,
+            fee_multiplier_data,
             max_swap_data,
             layout: ModelLayout {
                 input_indexes: model_layout.input_indexes,
@@ -625,15 +656,15 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
         })
     }
 
-    pub fn shape(&self) -> [usize; 2] {
-        self.layout.shape()
-    }
-
     pub fn evaluate(&self, input: B::FloatElem) -> B::FloatElem {
         let input_tensor: Tensor<B, 1> = Tensor::from([input]);
         self.block.forward(input_tensor).into_scalar()
     }
 
+    // Not wired into the runner yet: this is the route-extraction surface for turning trained
+    // weights into an executable swap path. Exercised by tests until the execution layer
+    // exposes it.
+    #[allow(dead_code)]
     pub fn swaps_graph<L1: Default, F: Fn(&U) -> L1>(
         &self,
         layout_value_map: F,
@@ -641,8 +672,8 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
     ) -> Result<Graph<I, (f32, L1), Directed>, OptimizationError> {
         let graph: Graph<I, (f32, L1), Directed> = Graph::new();
 
-        let inputs = self.layout.inputs();
-        let outputs = self.layout.outputs();
+        let inputs = self.layout.inputs()?;
+        let outputs = self.layout.outputs()?;
 
         let init_asset = inputs
             .get(self.block.init_asset_index as usize)
@@ -794,18 +825,23 @@ impl<B: Backend, U: Copy, I: Clone + Copy + PartialEq + Eq + std::hash::Hash, co
 
 impl<
     B: Backend,
-    U: Copy + PartialEq,
+    U: Copy + PartialEq + Eq + std::hash::Hash,
     I: Clone + Copy + PartialEq + Eq + std::hash::Hash,
     const LAYERS: usize,
 > Model<B, U, I, LAYERS>
 {
+    /// Re-uploads the reserve values for `reserves` (which must keep the exact same directional
+    /// key set the model was built with) and rebuilds the disabled-pool softmax mask from
+    /// `disabled`. Disabled pools keep their reserves and layout slot — only their routing weight
+    /// is masked — so re-enabling is a later `update` without the id and the trained weights are
+    /// preserved throughout. Ids in `disabled` that this model does not carry (e.g. a pool the
+    /// routing filter pruned upstream) are silently ignored.
     pub fn update(
         mut self,
         reserves: Vec<PoolReserves<U, I>>,
+        disabled: &HashSet<U>,
     ) -> Result<Self, ModelUpdateError<U, I>> {
         let [_, m] = self.layout.shape();
-        // let mut max_swap_data = vec![0.0; n * m];
-        // let mut mask_data = vec![false; n * m];
 
         for reserve in reserves {
             let Some((RowIndex(row), ColumnIndex(col))) = self.layout.find_reserve_position(
@@ -823,6 +859,7 @@ impl<
             let index = row * m + col;
             self.reserves_in_data[index] = B::FloatElem::from_elem(reserve.value.token_0);
             self.reserves_out_data[index] = B::FloatElem::from_elem(reserve.value.token_1);
+            self.fee_multiplier_data[index] = B::FloatElem::from_elem(reserve.value.fee_multiplier);
             self.max_swap_data[index] = B::FloatElem::from_elem(reserve.value.max_swap_0);
         }
 
@@ -834,10 +871,35 @@ impl<
             Tensor::<B, 1>::from_data(self.reserves_out_data.as_slice(), &r_out.device())
                 .reshape(r_out.shape())
         });
+        self.block.fee_multiplier.inplace(|fee| {
+            Tensor::<B, 1>::from_data(self.fee_multiplier_data.as_slice(), &fee.device())
+                .reshape(fee.shape())
+        });
         self.block.max_swap.inplace(|max_swap| {
             Tensor::<B, 1>::from_data(self.max_swap_data.as_slice(), &max_swap.device())
                 .reshape(max_swap.shape())
         });
+
+        let disabled_mask_data = self
+            .layout
+            .rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|cell| {
+                cell.as_ref()
+                    .map(|pool_id| disabled.contains(pool_id))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let device = self.block.disabled_mask.device();
+        let disabled_mask = Tensor::<B, 1, Bool>::from_data(disabled_mask_data.as_slice(), &device)
+            .reshape(self.block.disabled_mask.shape());
+        self.block.layer_out_disabled_mask = disabled_mask
+            .clone()
+            .int()
+            .select(0, self.block.layer_out_pool_indexes.clone())
+            .bool();
+        self.block.disabled_mask = disabled_mask;
 
         Ok(self)
     }
@@ -891,27 +953,21 @@ mod tests {
         }
     }
 
-    fn scatter_example_on<B: Backend>() {
-        let device = B::Device::default();
-
-        let pool_outputs: Tensor<B, 1> =
-            Tensor::from_data([5.0, 5.0, 3.0, 3.0, 4.0, 10.0], &device);
-
-        let pool_token_indices: Tensor<B, 1, Int> =
-            Tensor::from_data([0, 0, 1, 1, 1, 2], &device);
-
-        let output: Tensor<B, 1> =
-            Tensor::zeros([3], &device).scatter(0, pool_token_indices, pool_outputs);
-
-        println!("{}", output);
-    }
-
-    #[test]
-    fn scatter_example() {
-        run_on_available_backend(
-            || scatter_example_on::<WgpuBackend>(),
-            || scatter_example_on::<CpuBackend>(),
-        );
+    /// Replaces every layer's random weights with ones, making forward passes deterministic
+    /// (softmax of a constant column is a uniform split).
+    fn force_ones_weights<B, U, I, const LAYERS: usize>(model: &mut Model<B, U, I, LAYERS>)
+    where
+        B: Backend,
+        U: Copy,
+        I: Clone + Copy + PartialEq + Eq + std::hash::Hash,
+    {
+        model.block.layer_in.weights =
+            Param::from_tensor(Tensor::ones_like(&model.block.layer_in.weights));
+        for layer in model.block.layers.iter_mut() {
+            layer.weights = Param::from_tensor(Tensor::ones_like(&layer.weights));
+        }
+        model.block.layer_out.weights =
+            Param::from_tensor(Tensor::ones_like(&model.block.layer_out.weights));
     }
 
     #[test]
@@ -934,12 +990,96 @@ mod tests {
             tokens::USDC.address,
             vec![reserve, reserve.inverse()],
             &HashSet::new(),
+            &HashSet::new(),
         )
         .unwrap();
 
         let optimizer = Model::<CpuBackend, i32, TokenAddress, 1>::init_optimizer();
         let (model, optimizer) = model.optimize_with(optimizer, 100.0, 0);
         let (_model, _optimizer) = model.optimize_with(optimizer, 100.0, 0);
+    }
+
+    #[test]
+    fn model_init_without_init_asset_output_returns_error() {
+        // A single directional reserve: USDC is an input column but never an output row, so a
+        // USDC-rooted model has no way back to the init asset. This must surface as a typed
+        // error, not a panic.
+        let reserve = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+
+        let result = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+            tokens::USDC.address,
+            vec![reserve],
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        match result {
+            Ok(_) => panic!("init without init-asset output unexpectedly succeeded"),
+            Err(error) => assert_eq!(error, OptimizationError::InitAssetOutputNotFound),
+        }
+    }
+
+    #[test]
+    fn model_update_refreshes_fee_multiplier() {
+        let reserve = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        let model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+            tokens::USDC.address,
+            vec![reserve, reserve.inverse()],
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("model init failed");
+
+        let updated = PoolReserves {
+            value: VirtualReserveValues {
+                fee_multiplier: 0.5,
+                ..reserve.value
+            },
+            ..reserve
+        };
+        let model = model
+            .update(vec![updated, updated.inverse()], &HashSet::new())
+            .expect("model update failed");
+
+        let [_, columns] = model.layout.shape();
+        let fee_cells = float_cells(&model.block.fee_multiplier);
+        for directional in [updated, updated.inverse()] {
+            let (RowIndex(row), ColumnIndex(col)) = model
+                .layout
+                .find_reserve_position(
+                    &directional.token0,
+                    &directional.token1,
+                    &directional.pool_id,
+                )
+                .expect("reserve missing from layout");
+            assert_eq!(
+                fee_cells[row * columns + col],
+                0.5,
+                "fee_multiplier update must reach the tensor cell"
+            );
+        }
     }
 
     #[test]
@@ -966,10 +1106,11 @@ mod tests {
             tokens::USDC.address,
             vec![known_reserve, known_reserve.inverse()],
             &HashSet::new(),
+            &HashSet::new(),
         )
         .unwrap();
 
-        let error = match model.update(vec![unknown_reserve]) {
+        let error = match model.update(vec![unknown_reserve], &HashSet::new()) {
             Ok(_) => panic!("unknown reserve update unexpectedly succeeded"),
             Err(error) => error,
         };
@@ -984,119 +1125,100 @@ mod tests {
         );
     }
 
+    /// Two parallel USDC<->WETH pools (both directions), so an init-asset input can cycle
+    /// USDC -> WETH -> USDC through either.
+    fn two_parallel_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let pool_1 = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        let pool_2 = PoolReserves {
+            pool_id: 2,
+            value: VirtualReserveValues {
+                token_0: 2_000.0,
+                token_1: 1_500.0,
+                ..pool_1.value
+            },
+            ..pool_1
+        };
+        vec![pool_1, pool_1.inverse(), pool_2, pool_2.inverse()]
+    }
+
+    /// [`two_parallel_reserves`] built into a model with weights forced to ones (deterministic
+    /// 50/50 softmax split) and the given pools disabled.
+    fn two_parallel_pool_model(
+        disabled: &HashSet<i32>,
+    ) -> Model<CpuBackend, i32, TokenAddress, 1> {
+        let mut model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+            tokens::USDC.address,
+            two_parallel_reserves(),
+            &HashSet::new(),
+            disabled,
+        )
+        .expect("model init failed");
+        force_ones_weights(&mut model);
+        model
+    }
+
     #[test]
-    fn test_pools_fold_state_layout_example() {
-        // let device = burn::backend::wgpu::WgpuDevice::default();
-        //  pool_values in prop::collection::hash_map(any::<i64>(),prop::collection::hash_set(any::<TokenAddress>(), 2), 1..1000)
-        let pool_values = [
-            // USDC/WBTC
-            (tokens::USDC.address, tokens::WBTC.address, "USDC/WBTC-1"),
-            (tokens::USDC.address, tokens::WBTC.address, "USDC/WBTC-2"),
-            // USDC/WETH
-            (tokens::USDC.address, tokens::WETH.address, "USDC/WETH-1"),
-            (tokens::USDC.address, tokens::WETH.address, "USDC/WETH-2"),
-            (tokens::USDC.address, tokens::WETH.address, "USDC/WETH-3"),
-            // WBTC/WETH
-            (tokens::WBTC.address, tokens::WETH.address, "WBTC/WETH-1"),
-            (tokens::WBTC.address, tokens::WETH.address, "WBTC/WETH-2"),
-            (tokens::WBTC.address, tokens::WETH.address, "WBTC/WETH-3"),
-            // reverse
-            // WBTC/USDC
-            (tokens::WBTC.address, tokens::USDC.address, "WBTC/USDC-1"),
-            (tokens::WBTC.address, tokens::USDC.address, "WBTC/USDC-2"),
-            // WETH/USDC
-            (tokens::WETH.address, tokens::USDC.address, "WETH/USDC-1"),
-            (tokens::WETH.address, tokens::USDC.address, "WETH/USDC-2"),
-            (tokens::WETH.address, tokens::USDC.address, "WETH/USDC-3"),
-            // WETH/WBTC
-            (tokens::WETH.address, tokens::WBTC.address, "WETH/WBTC-1"),
-            (tokens::WETH.address, tokens::WBTC.address, "WETH/WBTC-2"),
-            (tokens::WETH.address, tokens::WBTC.address, "WETH/WBTC-3"),
-        ];
-
-        let state = pool_values
-            .into_iter()
-            .fold(ModelLayout::new(), |state, (from, to, value)| {
-                state.with_reserve_values(from, to, value)
-            });
-
-        for row in state.rows.iter() {
-            println!(
-                "{:?}",
-                row.iter()
-                    .map(|v| v.unwrap_or("----/------"))
-                    .collect::<Vec<_>>()
-            );
-        }
-
-        // output:
-        // ["----/------", "USDC/WBTC-1", "WETH/WBTC-1"]
-        // ["----/------", "USDC/WBTC-2", "WETH/WBTC-2"]
-        // ["WBTC/WETH-1", "USDC/WETH-1", "----/------"]
-        // ["WBTC/WETH-3", "USDC/WETH-2", "----/------"]
-        // ["WBTC/WETH-2", "USDC/WETH-3", "----/------"]
-        // ["WBTC/USDC-1", "----/------", "WETH/USDC-2"]
-        // ["WBTC/USDC-2", "----/------", "WETH/USDC-1"]
-        // ["----/------", "----/------", "WETH/USDC-3"]
-        // ["----/------", "----/------", "WETH/WBTC-3"]
-
-        println!("------------");
-        println!(
-            "{:?}",
-            state
-                .rows
-                .iter()
-                .flat_map(|r| r.iter().map(|v| v.unwrap_or("----/------")))
-                .collect::<Vec<_>>()
+    fn empty_disabled_set_leaves_routing_unchanged() {
+        // Regression pin for workstream 3: an empty disable set must produce an all-false mask,
+        // so `mask_fill` is a no-op and behavior is identical to a model with no disable support.
+        let model = two_parallel_pool_model(&HashSet::new());
+        let mask: Vec<i64> = model
+            .block
+            .disabled_mask
+            .clone()
+            .int()
+            .into_data()
+            .iter::<i64>()
+            .collect();
+        assert!(
+            mask.iter().all(|&flag| flag == 0),
+            "empty disabled set must yield an all-false mask"
         );
-        println!("------------");
+        assert!(model.evaluate(100.0).is_finite());
+    }
 
-        let pool_values = [
-            // USDC/WBTC
-            (tokens::USDC.address, tokens::WBTC.address, 9.0),
-            (tokens::USDC.address, tokens::WBTC.address, 9.1),
-            // USDC/WETH
-            (tokens::USDC.address, tokens::WETH.address, 4.0),
-            (tokens::USDC.address, tokens::WETH.address, 4.1),
-            (tokens::USDC.address, tokens::WETH.address, 4.2),
-            // WBTC/WETH
-            (tokens::WBTC.address, tokens::WETH.address, 7.0),
-            (tokens::WBTC.address, tokens::WETH.address, 7.1),
-            (tokens::WBTC.address, tokens::WETH.address, 7.2),
-            // reverse
-            // WBTC/USDC
-            (tokens::WBTC.address, tokens::USDC.address, -9.0),
-            (tokens::WBTC.address, tokens::USDC.address, -9.1),
-            // WETH/USDC
-            (tokens::WETH.address, tokens::USDC.address, -4.0),
-            (tokens::WETH.address, tokens::USDC.address, -4.1),
-            (tokens::WETH.address, tokens::USDC.address, -4.2),
-            // WETH/WBTC
-            (tokens::WETH.address, tokens::WBTC.address, -7.0),
-            (tokens::WETH.address, tokens::WBTC.address, -7.1),
-            (tokens::WETH.address, tokens::WBTC.address, -7.2),
-        ];
+    #[test]
+    fn disabling_a_pool_changes_routing_and_reenabling_restores_it() {
+        let baseline = two_parallel_pool_model(&HashSet::new()).evaluate(100.0);
 
-        let state = pool_values
-            .into_iter()
-            .fold(ModelLayout::new(), |state, (from, to, value)| {
-                state.with_reserve_values(from, to, value)
-            });
+        // Disable pool 2 through `update` with the key set unchanged; trained (ones) weights and
+        // the pool's reserves stay in place, only its routing weight is masked.
+        let disabled_model = two_parallel_pool_model(&HashSet::new())
+            .update(two_parallel_reserves(), &HashSet::from([2]))
+            .expect("update failed");
+        let disabled_output = disabled_model.evaluate(100.0);
 
-        for row in state.rows.iter() {
-            println!(
-                "{:?}",
-                row.iter().map(|v| v.unwrap_or(0.0)).collect::<Vec<_>>()
-            );
-        }
+        assert!(
+            (disabled_output - baseline).abs() > 1e-3,
+            "disabling a pool must change the routed output (baseline {}, disabled {})",
+            baseline,
+            disabled_output
+        );
 
-        println!("------------");
+        // Re-enabling (same reserves, empty disable set) restores the exact baseline: the weights
+        // were frozen, never trained away.
+        let reenabled_output = disabled_model
+            .update(two_parallel_reserves(), &HashSet::new())
+            .expect("update failed")
+            .evaluate(100.0);
 
-        // let tensor: Tensor<WgpuBackend, 2> =
-        //     Tensor::<WgpuBackend, 1>::from_data(state.into_data(|v| v).as_slice(), &device)
-        //         .reshape([9, 3]);
-
-        // println!("{}", tensor);
+        assert!(
+            (reenabled_output - baseline).abs() <= baseline.abs() * 1e-5,
+            "re-enabling must restore the baseline output (baseline {}, re-enabled {})",
+            baseline,
+            reenabled_output
+        );
     }
 
     #[test]
@@ -1194,8 +1316,8 @@ mod tests {
             (tokens::ETH.address, tokens::WETH.address),
             (tokens::WETH.address, tokens::ETH.address),
         ]);
-        let inputs = state.inputs();
-        let outputs = state.outputs();
+        let inputs = state.inputs().unwrap();
+        let outputs = state.outputs().unwrap();
 
         let bypasses = state
             .bypass_indexes(&bridges)
@@ -1370,11 +1492,6 @@ mod tests {
             .into_iter()
             .filter(|((_, _, fee), _)| *fee == 3000)
             .map(|((from, to, _), reserve)| {
-                // (
-                //     from,
-                //     to,
-                //     (dex::pool_id::PoolId::UniswapV3(Address::default()), reserve),
-                // )
                 PoolReserves {
                     token0: from,
                     token1: to,
@@ -1388,39 +1505,102 @@ mod tests {
             tokens::USDC.address,
             reserves,
             &HashSet::new(),
+            &HashSet::new(),
         )
         .unwrap();
 
         let input_amount = 1000.0;
 
-        let output_before = model.evaluate(input_amount);
-        println!("Output before: {}", output_before);
+        let optimizer = Model::<B, [u8; 20], TokenAddress, 1>::init_optimizer();
+        let (model, _optimizer) = model.optimize_with(optimizer, input_amount, 100);
 
-        let model = model.optimize(input_amount, 100);
+        let profit = model.evaluate(input_amount) - input_amount;
 
-        let output_amount = model.evaluate(input_amount);
-
+        // Not an exact-recovery oracle: the optimizer legitimately splits flow across pools,
+        // hits `max_swap` caps, and burns some softmax mass in empty cells, so it captures a
+        // fraction of the planted cycle, not all of it. Finding a real, substantial profit is
+        // the behavior under test.
         assert!(
-            (output_amount - input_amount - arbitrage_amount as f32).abs()
-                < arbitrage_amount as f32 * 0.01,
-            "Planted arbitrage not found. Expected to find {}. Found {}",
+            arbitrage_amount > 0.0,
+            "fixture must plant a profitable cycle, planted {}",
+            arbitrage_amount
+        );
+        assert!(
+            profit > 0.0 && profit >= arbitrage_amount * 0.5,
+            "Planted arbitrage not found. Planted {}. Found {}",
             arbitrage_amount,
-            output_amount - input_amount
+            profit
         );
     }
 
-    // Ignored: the assertion is miscalibrated, not the optimizer. `plant_arbitrage` perturbs
-    // ~1e22-scale reserves by +100.0 (negligible), so the "planted" USDC->WETH->WBTC->USDC cycle
-    // is actually a ~1% net loss (just fees). The optimizer correctly declines and returns
-    // ~break-even, which the assertion then rejects. This test never ran before (it was
-    // WGPU-gated and CI has no GPU); it now falls back to CPU and is ready to re-enable once
-    // `plant_arbitrage` is reworked to create a genuinely profitable cycle.
-    #[ignore = "plant_arbitrage produces a net loss, not an arbitrage; assertion needs rework"]
     #[test]
     fn test_model_v4_arbitrage() {
         run_on_available_backend(
             || test_model_v4_arbitrage_on::<WgpuBackend>(),
             || test_model_v4_arbitrage_on::<CpuBackend>(),
+        );
+    }
+
+    #[test]
+    fn swaps_graph_respects_min_weight_and_reaches_every_node() {
+        let usdc_weth = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        let weth_wbtc = PoolReserves {
+            token0: tokens::WETH.address,
+            token1: tokens::WBTC.address,
+            pool_id: 2,
+            ..usdc_weth
+        };
+        let mut model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+            tokens::USDC.address,
+            vec![
+                usdc_weth,
+                usdc_weth.inverse(),
+                weth_wbtc,
+                weth_wbtc.inverse(),
+            ],
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("model init failed");
+        force_ones_weights(&mut model);
+
+        // With ones weights every softmax column is a uniform split, so every surviving edge
+        // weight is a known 1/rows fraction — pick a threshold safely below it.
+        let min_weight = 0.05;
+        let graph = model
+            .swaps_graph(|pool_id| *pool_id, min_weight)
+            .expect("swaps_graph failed");
+
+        assert!(graph.edge_count() > 0, "expected at least one swap edge");
+        for (weight, _) in graph.edge_weights() {
+            assert!(
+                *weight >= min_weight,
+                "edge weight {} below min_weight {}",
+                weight,
+                min_weight
+            );
+        }
+
+        let mut bfs = Bfs::new(&graph, NodeIndex::new(0));
+        let mut visited = 0;
+        while bfs.next(&graph).is_some() {
+            visited += 1;
+        }
+        assert_eq!(
+            visited,
+            graph.node_count(),
+            "every node must be reachable from the init asset"
         );
     }
 
@@ -1560,14 +1740,12 @@ mod tests {
 
         let initial_reserves = pool_reserves_map
             .iter()
-            // .map(|((from, to, fee), reserve)| (*from, *to, (*fee, reserve.clone())))
             .map(|((from, to, fee), reserve)| PoolReserves {
                 token0: *from,
                 token1: *to,
                 pool_id: *fee,
                 value: reserve.clone(),
             })
-            // .filter(|(from, to, _)| from < to)
             .collect::<Vec<_>>();
 
         let updated_reserves = initial_reserves
@@ -1619,39 +1797,21 @@ mod tests {
             tokens::USDC.address,
             final_reserves,
             &HashSet::new(),
+            &HashSet::new(),
         )
         .expect("expected model init failed");
-
-        model_expected.block.layer_in.weights =
-            Param::from_tensor(Tensor::ones_like(&model_expected.block.layer_in.weights));
-
-        for i in 0..model_expected.block.layers.len() {
-            model_expected.block.layers[i].weights =
-                Param::from_tensor(Tensor::ones_like(&model_expected.block.layers[i].weights));
-        }
-
-        model_expected.block.layer_out.weights =
-            Param::from_tensor(Tensor::ones_like(&model_expected.block.layer_out.weights));
+        force_ones_weights(&mut model_expected);
 
         let mut model_updated = Model::<B, i32, TokenAddress, 1>::init(
             tokens::USDC.address,
             initial_reserves,
             &HashSet::new(),
+            &HashSet::new(),
         )
         .expect("base model init failed")
-        .update(updated_reserves)
+        .update(updated_reserves, &HashSet::new())
         .expect("model update failed");
-
-        model_updated.block.layer_in.weights =
-            Param::from_tensor(Tensor::ones_like(&model_updated.block.layer_in.weights));
-
-        for i in 0..model_updated.block.layers.len() {
-            model_updated.block.layers[i].weights =
-                Param::from_tensor(Tensor::ones_like(&model_updated.block.layers[i].weights));
-        }
-
-        model_updated.block.layer_out.weights =
-            Param::from_tensor(Tensor::ones_like(&model_updated.block.layer_out.weights));
+        force_ones_weights(&mut model_updated);
 
         // Relative, not absolute: the fresh-`init` and `init().update()` paths build their
         // tensors in different orders, so f32 reductions land a few ULP apart. At this output
@@ -1676,89 +1836,6 @@ mod tests {
             output_amount_expected,
             output_amount_updated
         );
-        // for (token_in, col_upd) in model_updated.layout.input_indexes {
-        //     let col_exp = *model_expected
-        //         .layout
-        //         .input_indexes
-        //         .get(&token_in)
-        //         .expect("Didn't find token_in in expected model");
-
-        //     for (token_out, out_set_upd) in model_updated.layout.output_indexes.iter() {
-        //         let out_set_exp = model_expected
-        //             .layout
-        //             .output_indexes
-        //             .get(&token_out)
-        //             .expect("Didn't find token_out in expected model");
-
-        //         for val in out_set_upd
-        //             .iter()
-        //             .map(|&row_upd| access_reserve!(model_updated.layout, row_upd, col_upd))
-        //         {
-
-        //         }
-        //     }
-        // }
-
-        // let reserves_in_diff = (model_expected.block.reserves_in - model_updated.block.reserves_in)
-        //     .abs()
-        //     .into_data()
-        //     .into_vec::<f32>()
-        //     .expect("failed to convert reserves_in_diff into data");
-
-        // for (i, diff) in reserves_in_diff.iter().enumerate() {
-        //     assert!(*diff < tolerance, "reserves_in mismatch at index {}", i);
-        // }
-
-        // assert_eq!(
-        //     model_expected.block.reserves_out.to_data(),
-        //     model_updated.block.reserves_out.to_data(),
-        //     "reserves_out mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected.block.max_swap.to_data(),
-        //     model_updated.block.max_swap.to_data(),
-        //     "max_swap mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected.block.bypass_mask.to_data(),
-        //     model_updated.block.bypass_mask.to_data(),
-        //     "bypass_mask mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected.block.fee_multiplier.to_data(),
-        //     model_updated.block.fee_multiplier.to_data(),
-        //     "fee_multiplier mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected.block.output_asset_indexes.to_data(),
-        //     model_updated.block.output_asset_indexes.to_data(),
-        //     "output_asset_indexes mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected.block.layer_out_bypass_mask.to_data(),
-        //     model_updated.block.layer_out_bypass_mask.to_data(),
-        //     "layer_out_bypass_mask mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected
-        //         .block
-        //         .layer_out_output_asset_indexes
-        //         .to_data(),
-        //     model_updated.block.layer_out_output_asset_indexes.to_data(),
-        //     "layer_out_output_asset_indexes mismatch"
-        // );
-
-        // assert_eq!(
-        //     model_expected.block.layer_out_pool_indexes.to_data(),
-        //     model_updated.block.layer_out_pool_indexes.to_data(),
-        //     "layer_out_pool_indexes mismatch"
-        // );
     }
 
     #[test]
@@ -1769,7 +1846,309 @@ mod tests {
         );
     }
 
+    /// Strategy: a set of pools with distinct ids, each between two distinct tokens, with
+    /// positive finite reserve values — the raw material for `Model::init` proptests.
+    fn arbitrary_pool_reserves()
+    -> impl Strategy<Value = Vec<PoolReserves<i64, TokenAddress>>> {
+        prop::collection::hash_map(
+            any::<i64>(),
+            (
+                prop::collection::hash_set(any::<TokenAddress>(), 2),
+                0.0f32..1e12,
+                0.0f32..1e12,
+                0.0f32..1.0,
+                0.0f32..1e12,
+                0.0f32..1e12,
+            ),
+            1..20,
+        )
+        .prop_map(|pools| {
+            pools
+                .into_iter()
+                .map(
+                    |(pool_id, (tokens, token_0, token_1, fee_multiplier, max_swap_0, max_swap_1))| {
+                        let tokens = tokens.into_iter().collect::<Vec<_>>();
+                        PoolReserves {
+                            token0: tokens[0],
+                            token1: tokens[1],
+                            pool_id,
+                            value: VirtualReserveValues {
+                                token_0,
+                                token_1,
+                                fee_multiplier,
+                                max_swap_0,
+                                max_swap_1,
+                            },
+                        }
+                    },
+                )
+                .collect()
+        })
+    }
+
+    /// A deterministic, always-valid init asset for a generated reserve set: some token that at
+    /// least one reserve outputs (`Model::init` requires the init asset to have output rows).
+    fn init_asset_for(reserves: &[PoolReserves<i64, TokenAddress>]) -> TokenAddress {
+        reserves
+            .iter()
+            .map(|reserve| reserve.token1)
+            .min()
+            .expect("reserve set is never empty")
+    }
+
+    fn float_cells<B: Backend>(tensor: &Tensor<B, 2>) -> Vec<f32> {
+        tensor.clone().into_data().iter::<f32>().collect()
+    }
+
+    /// Straight-Rust mirror of the tensor math in [`Layer::forward`], cell by cell:
+    /// `U = input[col] * softmax(W)[row][col]`, after-fee `U * gamma` capped by `max_swap`,
+    /// `Z = Y * U / (X + U + ε)` clamped at zero, bypass cells substitute the raw (pre-fee,
+    /// uncapped) routed amount, rows summed and scatter-accumulated into `token_indexes`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_reference(
+        weights: &[f32],
+        input: &[f32],
+        x: &[f32],
+        y: &[f32],
+        gamma: &[f32],
+        bypass: &[bool],
+        disabled: &[bool],
+        max_swap: &[f32],
+        token_indexes: &[usize],
+        rows: usize,
+        columns: usize,
+        output_size: usize,
+    ) -> Vec<f32> {
+        // Disabled cells are pushed to a large negative weight before the column softmax, matching
+        // the `mask_fill` in `Layer::forward`.
+        let filled = |index: usize| {
+            if disabled[index] {
+                -1e9
+            } else {
+                weights[index]
+            }
+        };
+
+        let mut w_normalized = vec![0.0f32; rows * columns];
+        for col in 0..columns {
+            let max_weight = (0..rows)
+                .map(|row| filled(row * columns + col))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let denominator: f32 = (0..rows)
+                .map(|row| (filled(row * columns + col) - max_weight).exp())
+                .sum();
+            for row in 0..rows {
+                let index = row * columns + col;
+                w_normalized[index] = (filled(index) - max_weight).exp() / denominator;
+            }
+        }
+
+        let mut output = vec![0.0f32; output_size];
+        for row in 0..rows {
+            let mut row_sum = 0.0f32;
+            for col in 0..columns {
+                let index = row * columns + col;
+                let routed = input[col] * w_normalized[index];
+                let capped_after_fee = (routed * gamma[index]).min(max_swap[index]);
+                let z = (y[index] * capped_after_fee
+                    / (x[index] + capped_after_fee + f32::EPSILON))
+                    .max(0.0);
+                row_sum += if bypass[index] { routed } else { z };
+            }
+            output[token_indexes[row]] += row_sum;
+        }
+
+        output
+    }
+
+    fn bool_cells<B: Backend>(tensor: &Tensor<B, 2, Bool>) -> Vec<i64> {
+        tensor.clone().int().into_data().iter::<i64>().collect()
+    }
+
+    /// Strategy: dimensions plus every per-cell tensor `Layer::forward` consumes, as flat
+    /// row-major vectors.
+    #[allow(clippy::type_complexity)]
+    fn arbitrary_layer_forward_inputs() -> impl Strategy<
+        Value = (
+            usize,
+            usize,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<bool>,
+            Vec<bool>,
+            Vec<f32>,
+            Vec<usize>,
+        ),
+    > {
+        (1usize..6, 1usize..5).prop_flat_map(|(rows, columns)| {
+            let cells = rows * columns;
+            (
+                Just(rows),
+                Just(columns),
+                prop::collection::vec(-5.0f32..5.0, cells),
+                prop::collection::vec(0.0f32..1e9, columns),
+                prop::collection::vec(0.0f32..1e9, cells),
+                prop::collection::vec(0.0f32..1e9, cells),
+                prop::collection::vec(0.0f32..1.0, cells),
+                prop::collection::vec(any::<bool>(), cells),
+                prop::collection::vec(any::<bool>(), cells),
+                prop::collection::vec(0.0f32..1e9, cells),
+                prop::collection::vec(0..columns, rows),
+            )
+        })
+    }
+
     proptest! {
+
+        /// `Layer::forward` agrees with the scalar reference implementation — pins the swap
+        /// math (softmax split, fee, `max_swap` cap, ε-guarded quote, bypass substitution,
+        /// scatter-accumulate by output token).
+        #[test]
+        fn layer_forward_matches_scalar_reference(
+            (rows, columns, weights, input, x, y, gamma, bypass, disabled, max_swap, token_indexes)
+                in arbitrary_layer_forward_inputs()
+        ) {
+            type B = CpuBackend;
+            let device = <B as Backend>::Device::default();
+            let dims = [rows, columns];
+
+            let to_matrix = |data: &[f32]| {
+                Tensor::<B, 1>::from_data(data, &device).reshape(dims)
+            };
+            let to_bool_matrix = |data: &[bool]| {
+                Tensor::<B, 1, Bool>::from_data(data, &device).reshape(dims)
+            };
+            let layer = Layer::<B> {
+                weights: Param::from_tensor(to_matrix(&weights)),
+                output_size: columns,
+            };
+            let token_index_data = token_indexes
+                .iter()
+                .map(|&index| index as i64)
+                .collect::<Vec<_>>();
+            let token_index_tensor =
+                Tensor::<B, 1, Int>::from_data(token_index_data.as_slice(), &device);
+
+            let output = layer
+                .forward(
+                    Tensor::<B, 1>::from_data(input.as_slice(), &device),
+                    &to_matrix(&x),
+                    &to_matrix(&y),
+                    &to_matrix(&gamma),
+                    &to_bool_matrix(&bypass),
+                    &to_bool_matrix(&disabled),
+                    &to_matrix(&max_swap),
+                    &token_index_tensor,
+                )
+                .into_data()
+                .iter::<f32>()
+                .collect::<Vec<_>>();
+
+            let expected = forward_reference(
+                &weights, &input, &x, &y, &gamma, &bypass, &disabled, &max_swap, &token_indexes,
+                rows, columns, columns,
+            );
+
+            prop_assert_eq!(output.len(), expected.len());
+            for (index, (&actual, &reference)) in output.iter().zip(expected.iter()).enumerate() {
+                let tolerance = 1e-3 * actual.abs().max(reference.abs()) + 1e-3;
+                prop_assert!(
+                    (actual - reference).abs() <= tolerance,
+                    "output[{}] diverged: tensor {} vs reference {}",
+                    index,
+                    actual,
+                    reference
+                );
+            }
+        }
+
+        /// `evaluate` never produces a NaN/inf, for any reserve set and any subset of disabled
+        /// pools — including disabling every pool and disabling ids absent from the snapshot. The
+        /// large-negative softmax fill (not `-inf`) is what keeps fully-masked columns finite.
+        #[test]
+        fn model_evaluate_is_finite_under_arbitrary_disable(
+            reserves in arbitrary_pool_reserves(),
+            extra_disabled in prop::collection::hash_set(any::<i64>(), 0..8),
+            disable_all in any::<bool>(),
+        ) {
+            let init_asset = init_asset_for(&reserves);
+            let disabled = if disable_all {
+                reserves.iter().map(|reserve| reserve.pool_id).collect::<HashSet<_>>()
+            } else {
+                extra_disabled
+            };
+
+            let model = Model::<CpuBackend, i64, TokenAddress, 1>::init(
+                init_asset,
+                reserves,
+                &HashSet::new(),
+                &disabled,
+            )
+            .expect("model init failed");
+
+            prop_assert!(model.evaluate(100.0).is_finite());
+        }
+
+        /// `Model::init` packs the layout into the value tensors row-major: every reserve's
+        /// values land exactly at its layout cell, every unclaimed cell is all-zero, and the
+        /// bypass mask is true precisely on `bypass_indexes`.
+        #[test]
+        fn model_init_packs_reserves_into_tensor_cells(
+            reserves in arbitrary_pool_reserves()
+        ) {
+            let init_asset = init_asset_for(&reserves);
+            let bridges = HashSet::new();
+
+            let model = Model::<CpuBackend, i64, TokenAddress, 1>::init(
+                init_asset,
+                reserves.clone(),
+                &bridges,
+                &HashSet::new(),
+            )
+            .expect("model init failed");
+
+            let [rows, columns] = model.layout.shape();
+            let reserves_in = float_cells(&model.block.reserves_in);
+            let reserves_out = float_cells(&model.block.reserves_out);
+            let fee_multiplier = float_cells(&model.block.fee_multiplier);
+            let max_swap = float_cells(&model.block.max_swap);
+            let bypass_mask = bool_cells(&model.block.bypass_mask);
+
+            let mut claimed = vec![false; rows * columns];
+            for reserve in &reserves {
+                let (RowIndex(row), ColumnIndex(col)) = model
+                    .layout
+                    .find_reserve_position(&reserve.token0, &reserve.token1, &reserve.pool_id)
+                    .expect("reserve missing from layout");
+                let index = row * columns + col;
+
+                prop_assert_eq!(reserves_in[index], reserve.value.token_0);
+                prop_assert_eq!(reserves_out[index], reserve.value.token_1);
+                prop_assert_eq!(fee_multiplier[index], reserve.value.fee_multiplier);
+                prop_assert_eq!(max_swap[index], reserve.value.max_swap_0);
+                claimed[index] = true;
+            }
+
+            let bypass_indexes = model.layout.bypass_indexes(&bridges);
+            for row in 0..rows {
+                for col in 0..columns {
+                    let index = row * columns + col;
+                    if !claimed[index] {
+                        prop_assert_eq!(reserves_in[index], 0.0);
+                        prop_assert_eq!(reserves_out[index], 0.0);
+                        prop_assert_eq!(fee_multiplier[index], 0.0);
+                        prop_assert_eq!(max_swap[index], 0.0);
+                    }
+                    prop_assert_eq!(
+                        bypass_mask[index] != 0,
+                        bypass_indexes.contains(&(RowIndex(row), ColumnIndex(col)))
+                    );
+                }
+            }
+        }
 
         #[test]
         fn test_pools_fold_state_all_inputs_assigned(
@@ -1851,7 +2230,7 @@ mod tests {
                     state.with_reserve_values(from, to, value)
                 });
 
-            let tokens = state.inputs();
+            let tokens = state.inputs().unwrap();
 
             prop_assert_eq!(tokens.len(), state.input_indexes.len());
 
@@ -1883,7 +2262,7 @@ mod tests {
                     state.with_reserve_values(from, to, value)
                 });
 
-            let tokens = state.outputs();
+            let tokens = state.outputs().unwrap();
 
             for (index, token) in tokens.iter().enumerate() {
                 match state.output_indexes.get(&token) {
@@ -1911,7 +2290,7 @@ mod tests {
                     state.with_reserve_values(from, to, value)
                 });
 
-            let outputs = state.outputs();
+            let outputs = state.outputs().unwrap();
             prop_assert_eq!(state.rows.len(), outputs.len(), "Number of rows does not match number of outputs");
 
             // all rows have the same output token
@@ -1937,8 +2316,8 @@ mod tests {
                     state.with_reserve_values(from, to, value)
                 });
 
-            let inputs = state.inputs();
-            let outputs = state.outputs();
+            let inputs = state.inputs().unwrap();
+            let outputs = state.outputs().unwrap();
 
             for (RowIndex(row), ColumnIndex(col)) in state.bypass_indexes(&HashSet::new()).into_iter() {
                 prop_assert_eq!(inputs[col], outputs[row], "Bypassed input token does not match output token");

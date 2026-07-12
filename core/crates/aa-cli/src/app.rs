@@ -1563,6 +1563,7 @@ mod tests {
             output_amount: 1_012.5,
             profit_amount: 12.5,
             reserves_count: 4,
+            disabled_count: 0,
             iterations_completed: 10,
         };
 

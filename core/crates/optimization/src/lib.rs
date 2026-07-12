@@ -1,6 +1,5 @@
 mod error;
 mod execution;
-#[allow(dead_code)]
 mod model;
 mod pool_reserves;
 mod routing_filter;
