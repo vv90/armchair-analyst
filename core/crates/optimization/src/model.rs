@@ -422,6 +422,77 @@ pub enum ReconcileOutcome {
     Refreshed,
 }
 
+/// One routed flow through a single pool cell at one stage of the block, recovered from the trained
+/// weights by [`Model::extract_flows`]. It is the amount-bearing sibling of the edges
+/// [`Model::swaps_graph`] emits: the same per-cell traversal, but recording the routed amounts (not
+/// just the weights) so a trained model can be inspected or later turned into executable swaps.
+///
+/// `stage` numbers the block hops: `0` = `layer_in` (init asset out of the root), `1..=LAYERS` = the
+/// middle layers, `LAYERS + 1` = `layer_out` (back into the init asset). `pool_id` is `None` for an
+/// empty or bypass cell (a bypass cell carries the token straight through, `token_in == token_out`).
+/// `amount_in` is the post-split, pre-fee amount routed into the cell; `amount_out` is the pool quote
+/// after fee and `max_swap` cap (or the raw carried amount for a bypass cell); `weight` is the
+/// cell's post-softmax share of its input token. Diagnostic and read-only — not on the hot path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlowRecord<U, I> {
+    pub stage: usize,
+    pub token_in: I,
+    pub token_out: I,
+    pub pool_id: Option<U>,
+    pub amount_in: f32,
+    pub amount_out: f32,
+    pub weight: f32,
+}
+
+/// Aggregate view of a [`FlowRecord`] set: how much input each pool and each token absorbed, plus
+/// the entropy of the pool-input distribution and its perplexity (`effective_pools = exp(entropy)`),
+/// a scale-free "how many pools is the flow really spread across" number. Pure function of the flows.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // constructed by tests / the deferred run-surface, not the prod path yet
+pub struct FlowSummary<U, I> {
+    pub pool_inputs: HashMap<U, f32>,
+    pub token_flows: HashMap<I, f32>,
+    pub route_entropy: f32,
+    pub effective_pools: f32,
+}
+
+#[allow(dead_code)] // exercised by tests until the run surface consumes it (Step 2 half b)
+impl<U: Copy + Eq + std::hash::Hash, I: Copy + Eq + std::hash::Hash> FlowSummary<U, I> {
+    /// Folds a flow set into per-pool and per-token input totals and the pool-input entropy.
+    pub fn from_flows(flows: &[FlowRecord<U, I>]) -> Self {
+        let mut pool_inputs: HashMap<U, f32> = HashMap::new();
+        let mut token_flows: HashMap<I, f32> = HashMap::new();
+        for flow in flows {
+            if let Some(pool_id) = flow.pool_id {
+                *pool_inputs.entry(pool_id).or_default() += flow.amount_in;
+            }
+            *token_flows.entry(flow.token_in).or_default() += flow.amount_in;
+        }
+
+        let total: f32 = pool_inputs.values().copied().sum();
+        // Shannon entropy (nats) of the normalized pool-input distribution; 0 when no pool carried
+        // flow. `p * ln p -> 0` as `p -> 0`, so zero-share pools are skipped rather than producing
+        // `NaN`.
+        let route_entropy = if total > 0.0 {
+            -pool_inputs
+                .values()
+                .map(|amount| amount / total)
+                .filter(|share| *share > 0.0)
+                .map(|share| share * share.ln())
+                .sum::<f32>()
+        } else {
+            0.0
+        };
+
+        FlowSummary {
+            pool_inputs,
+            token_flows,
+            route_entropy,
+            effective_pools: route_entropy.exp(),
+        }
+    }
+}
+
 impl<
     B: AutodiffBackend,
     U: Copy,
@@ -673,6 +744,133 @@ impl<
         rows
     }
 
+    /// Re-derives the block forward for `input` and records every routed cell as a [`FlowRecord`],
+    /// labelling it with the layout's `token_in`/`token_out`/`pool_id`. This is the inspectable,
+    /// amount-bearing view of a trained model: what the softmax weights actually route where. Every
+    /// cell of every stage is returned (including zero-share and empty cells) so the per-stage
+    /// column shares sum to one exactly; callers filter by `amount_in`/`weight` as needed. Read-only
+    /// and pure — meant for offline analysis, not the optimization hot path.
+    #[allow(dead_code)]
+    pub fn extract_flows(&self, input: B::FloatElem) -> Result<Vec<FlowRecord<U, I>>, OptimizationError> {
+        let inputs = self.layout.inputs()?;
+        let outputs = self.layout.outputs()?;
+        let init_asset_index = self.block.init_asset_index as usize;
+        let init_asset = *inputs
+            .get(init_asset_index)
+            .ok_or(OptimizationError::InvalidInitAssetIndex)?;
+        let columns = inputs.len();
+
+        // Pool id stored at layout cell (row, col), or `None` for an empty/bypass cell.
+        let pool_id_at = |row: usize, col: usize| -> Option<U> {
+            self.layout.rows.get(row).and_then(|cells| cells.get(col).copied().flatten())
+        };
+
+        let mut records = Vec::new();
+
+        // Stage 0 — `layer_in`: the single init-asset column routes the scalar input out to every
+        // pool that consumes the init asset. Its weights are `[rows, 1]`, so `col` is always the
+        // init-asset column.
+        let (layer_in_x, layer_in_y, layer_in_gamma, layer_in_bypass, layer_in_disabled, layer_in_max_swap) =
+            self.block.layer_in_params();
+        let (weight, amount_in, amount_out, mut carried) = stage_flows(
+            self.block.layer_in.weights.val(),
+            &layer_in_x,
+            &layer_in_y,
+            &layer_in_gamma,
+            &layer_in_bypass,
+            &layer_in_disabled,
+            &layer_in_max_swap,
+            &self.block.output_asset_indexes,
+            Tensor::from([input]),
+            columns,
+        );
+        for (row, token_out) in outputs.iter().enumerate() {
+            records.push(FlowRecord {
+                stage: 0,
+                token_in: init_asset,
+                token_out: *token_out,
+                pool_id: pool_id_at(row, init_asset_index),
+                amount_in: *amount_in.get(row).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                amount_out: *amount_out.get(row).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                weight: *weight.get(row).ok_or(OptimizationError::InvalidLayoutIndex)?,
+            });
+        }
+
+        // Stages 1..=LAYERS — the middle layers over the full `[rows, columns]` layout.
+        for (layer_offset, layer) in self.block.layers.iter().enumerate() {
+            let (weight, amount_in, amount_out, next) = stage_flows(
+                layer.weights.val(),
+                &self.block.reserves_in,
+                &self.block.reserves_out,
+                &self.block.fee_multiplier,
+                &self.block.bypass_mask,
+                &self.block.disabled_mask,
+                &self.block.max_swap,
+                &self.block.output_asset_indexes,
+                carried,
+                columns,
+            );
+            for (row, token_out) in outputs.iter().enumerate() {
+                for (col, token_in) in inputs.iter().enumerate() {
+                    let cell = row * columns + col;
+                    records.push(FlowRecord {
+                        stage: layer_offset + 1,
+                        token_in: *token_in,
+                        token_out: *token_out,
+                        pool_id: pool_id_at(row, col),
+                        amount_in: *amount_in.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                        amount_out: *amount_out.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                        weight: *weight.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                    });
+                }
+            }
+            carried = next;
+        }
+
+        // Final stage — `layer_out`: only the pools that output the init asset (selected by
+        // `layer_out_pool_indexes`) route back into it.
+        let layer_out_rows = self
+            .block
+            .layer_out_pool_indexes
+            .to_data()
+            .iter::<i32>()
+            .map(|index| index as usize)
+            .collect::<Vec<_>>();
+        let select_rows = |source: &Tensor<B, 2>| {
+            source
+                .clone()
+                .select(0, self.block.layer_out_pool_indexes.clone())
+        };
+        let (weight, amount_in, amount_out, _carried) = stage_flows(
+            self.block.layer_out.weights.val(),
+            &select_rows(&self.block.reserves_in),
+            &select_rows(&self.block.reserves_out),
+            &select_rows(&self.block.fee_multiplier),
+            &self.block.layer_out_bypass_mask,
+            &self.block.layer_out_disabled_mask,
+            &select_rows(&self.block.max_swap),
+            &self.block.layer_out_output_asset_indexes,
+            carried,
+            columns,
+        );
+        for (out_row, layout_row) in layer_out_rows.iter().enumerate() {
+            for (col, token_in) in inputs.iter().enumerate() {
+                let cell = out_row * columns + col;
+                records.push(FlowRecord {
+                    stage: LAYERS + 1,
+                    token_in: *token_in,
+                    token_out: init_asset,
+                    pool_id: pool_id_at(*layout_row, col),
+                    amount_in: *amount_in.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                    amount_out: *amount_out.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                    weight: *weight.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                });
+            }
+        }
+
+        Ok(records)
+    }
+
     // Not wired into the runner yet: this is the route-extraction surface for turning trained
     // weights into an executable swap path. Exercised by tests until the execution layer
     // exposes it.
@@ -857,6 +1055,58 @@ fn cold_grow_2d<B: Backend>(
     } else {
         widened
     }
+}
+
+/// Re-runs one block stage the way [`Layer::forward`] does, but returns the per-cell tensors as
+/// host vectors (row-major `[rows, columns]`) instead of only their per-row sum, alongside the
+/// scattered `[output_size]` input vector for the next stage. This is a deliberate second copy of
+/// the swap math — kept honest by `extract_flows_reproduces_evaluate`, which pins that summing these
+/// cells reproduces [`Model::evaluate`]. Returns `(weight, amount_in, amount_out, next_input)`.
+#[allow(clippy::too_many_arguments)]
+fn stage_flows<B: Backend>(
+    weights: Tensor<B, 2>,
+    x: &Tensor<B, 2>,
+    y: &Tensor<B, 2>,
+    gamma: &Tensor<B, 2>,
+    bypass_mask: &Tensor<B, 2, Bool>,
+    disabled_mask: &Tensor<B, 2, Bool>,
+    max_swap: &Tensor<B, 2>,
+    token_indexes: &Tensor<B, 1, Int>,
+    input: Tensor<B, 1>,
+    output_size: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Tensor<B, 1>) {
+    let device = weights.device();
+    let shape = weights.shape();
+    let [out_dim, _columns] = weights.dims();
+
+    let masked_weights = weights.mask_fill(disabled_mask.clone(), -1e9);
+    let w_normalized = softmax(masked_weights, 0);
+
+    let input_amounts: Tensor<B, 2> = input.expand(shape.clone()).mul(w_normalized.clone());
+    let capped_after_fee = input_amounts
+        .clone()
+        .mul(gamma.clone())
+        .min_pair(max_swap.clone());
+    let denominator = x
+        .clone()
+        .add(capped_after_fee.clone())
+        .add_scalar(f32::EPSILON);
+    let amount_out = y
+        .clone()
+        .mul(capped_after_fee.div(denominator))
+        .clamp_min(0.0)
+        .mask_where(bypass_mask.clone(), input_amounts.clone());
+
+    let out = amount_out.clone().sum_dim(1).reshape([out_dim]);
+    let next_input =
+        Tensor::zeros([output_size], &device).select_assign(0, token_indexes.clone(), out);
+
+    (
+        w_normalized.into_data().iter::<f32>().collect(),
+        input_amounts.into_data().iter::<f32>().collect(),
+        amount_out.into_data().iter::<f32>().collect(),
+        next_input,
+    )
 }
 
 impl<
@@ -3004,6 +3254,107 @@ mod tests {
             let (model, _optimizer) = model.optimize_with(optimizer, input, 200);
             let profit = model.evaluate(input) - input;
             assert!(profit > 0.0, "planted arbitrage was not captured: profit {profit}");
+        }
+    }
+
+    /// Step 2 of `optimization.md` (extraction half): the pure, read-only surface that turns trained
+    /// weights into an inspectable list of routed flows. Tests exercise it on the deterministic
+    /// two-parallel-pool model (ones weights, `LAYERS = 1`), independent of any run-side plumbing.
+    mod flow_extraction {
+        use super::*;
+
+        /// Final block stage index for the model under test — `layer_out`, which for `LAYERS = 1` is
+        /// stage 2 (0 = layer_in, 1 = the middle layer, 2 = layer_out).
+        fn final_stage(flows: &[FlowRecord<i32, TokenAddress>]) -> usize {
+            flows
+                .iter()
+                .map(|flow| flow.stage)
+                .max()
+                .expect("flow set is never empty")
+        }
+
+        #[test]
+        fn extract_flows_reproduces_evaluate() {
+            // The equivalence guard behind the whole extractor: because it is a second copy of the
+            // swap math, summing the final stage's per-cell outputs (all of which land back in the
+            // init asset) must reproduce `evaluate` — otherwise the two copies have drifted.
+            let model = two_parallel_pool_model(&HashSet::new());
+            let input = 1_000.0;
+            let flows = model.extract_flows(input).expect("extract_flows failed");
+            let last = final_stage(&flows);
+            let recovered: f32 = flows
+                .iter()
+                .filter(|flow| flow.stage == last)
+                .map(|flow| flow.amount_out)
+                .sum();
+            let evaluated = model.evaluate(input);
+            let tolerance = evaluated.abs() * 1e-4 + 1e-6;
+            assert!(
+                (recovered - evaluated).abs() <= tolerance,
+                "extracted flows ({recovered}) must reproduce evaluate ({evaluated})"
+            );
+        }
+
+        #[test]
+        fn extract_flows_normalizes_weight_per_stage_and_token() {
+            // Conservation / normalization invariant: the softmax is over pools per input token, so
+            // within each stage the weights of a given `token_in` must sum to one — every unit of an
+            // available token is fully allocated across the pools that can consume it.
+            let model = two_parallel_pool_model(&HashSet::new());
+            let flows = model.extract_flows(1_000.0).expect("extract_flows failed");
+
+            let mut weight_by_group: HashMap<(usize, TokenAddress), f32> = HashMap::new();
+            for flow in &flows {
+                *weight_by_group.entry((flow.stage, flow.token_in)).or_insert(0.0) += flow.weight;
+            }
+            assert!(!weight_by_group.is_empty(), "expected at least one flow group");
+            for ((stage, _token), total) in weight_by_group {
+                assert!(
+                    (total - 1.0).abs() <= 1e-4,
+                    "stage {stage} weights for a token must sum to 1, got {total}"
+                );
+            }
+        }
+
+        #[test]
+        fn flow_summary_reports_bounded_effective_pools() {
+            // The perplexity of the pool-input distribution is bounded by [1, #pools that carried
+            // flow]; uniform routing across two parallel pools must land strictly above 1.
+            let model = two_parallel_pool_model(&HashSet::new());
+            let flows = model.extract_flows(1_000.0).expect("extract_flows failed");
+            let summary = FlowSummary::from_flows(&flows);
+
+            assert!(summary.route_entropy >= 0.0, "entropy must be non-negative");
+            let pool_count = summary.pool_inputs.len() as f32;
+            assert!(pool_count >= 2.0, "two-parallel-pool model should route through both pools");
+            assert!(
+                summary.effective_pools >= 1.0 - 1e-4,
+                "effective pools must be at least 1, got {}",
+                summary.effective_pools
+            );
+            assert!(
+                summary.effective_pools <= pool_count + 1e-4,
+                "effective pools ({}) cannot exceed the {pool_count} pools carrying flow",
+                summary.effective_pools
+            );
+            assert!(
+                summary.effective_pools > 1.0,
+                "uniform routing must spread across more than one pool, got {}",
+                summary.effective_pools
+            );
+        }
+
+        #[test]
+        fn extract_flows_is_deterministic() {
+            // Pure function of the model: extracting the same model twice yields identical flows,
+            // in identical order. (Order across two *independent* builds is not pinned — the layout
+            // row order comes from a per-instance hashmap seed — but a given model is stable.)
+            let model = two_parallel_pool_model(&HashSet::new());
+            assert_eq!(
+                model.extract_flows(1_000.0).expect("extract_flows failed"),
+                model.extract_flows(1_000.0).expect("extract_flows failed"),
+                "extract_flows must be deterministic for a given model"
+            );
         }
     }
 }
