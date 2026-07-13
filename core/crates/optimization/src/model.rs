@@ -2822,4 +2822,188 @@ mod tests {
 
 
     }
+
+    /// Step 0 of `optimization.md`: a named, human-readable "golden" universe that freezes the
+    /// current constant-product, closed-route optimizer as the regression baseline. Every later
+    /// change on the roadmap must keep reproducing these outputs in legacy closed-route mode.
+    ///
+    /// Universe: three tokens (USDC = A, WETH = B, WBTC = C), init asset USDC, and four pools
+    /// (USDC/WETH, WETH/WBTC, WBTC/USDC, USDC/WBTC — each supplied in both directions) so the
+    /// optimizer can close a cycle either directly (USDC/WBTC) or via the triangle
+    /// USDC -> WETH -> WBTC -> USDC. With `LAYERS = 1` the block routes exactly three hops
+    /// (layer_in -> one middle layer -> layer_out), which is the length of that triangle.
+    mod golden_baseline {
+        use super::*;
+
+        /// Uniform pool fee (0.30%) shared by the whole golden universe.
+        const FEE: f32 = 0.997;
+        /// Deep reserves so slippage is small at the sizes these tests probe, keeping the planted
+        /// mispricing (not depth) the thing under test.
+        const DEEP: f32 = 1_000_000_000.0;
+
+        fn pool(
+            token0: TokenAddress,
+            token1: TokenAddress,
+            pool_id: i32,
+            reserve0: f32,
+            reserve1: f32,
+        ) -> PoolReserves<i32, TokenAddress> {
+            PoolReserves {
+                token0,
+                token1,
+                pool_id,
+                value: VirtualReserveValues {
+                    token_0: reserve0,
+                    token_1: reserve1,
+                    fee_multiplier: FEE,
+                    max_swap_0: DEEP,
+                    max_swap_1: DEEP,
+                },
+            }
+        }
+
+        /// Expands each pool into both swap directions (the model needs directional reserves).
+        fn universe(
+            pools: [PoolReserves<i32, TokenAddress>; 4],
+        ) -> Vec<PoolReserves<i32, TokenAddress>> {
+            pools
+                .into_iter()
+                .flat_map(|reserve| [reserve, reserve.inverse()])
+                .collect()
+        }
+
+        /// A market with no cross-pool arbitrage: every pool is balanced 1:1, so 1 USDC = 1 WETH
+        /// = 1 WBTC and any closed route can only ever lose the fee/slippage.
+        fn no_arbitrage_universe() -> Vec<PoolReserves<i32, TokenAddress>> {
+            let usdc = tokens::USDC.address;
+            let weth = tokens::WETH.address;
+            let wbtc = tokens::WBTC.address;
+            universe([
+                pool(usdc, weth, 1, DEEP, DEEP),
+                pool(weth, wbtc, 2, DEEP, DEEP),
+                pool(wbtc, usdc, 3, DEEP, DEEP),
+                pool(usdc, wbtc, 4, DEEP, DEEP),
+            ])
+        }
+
+        /// The same universe with WBTC over-valued in the WBTC/USDC pool (1 WBTC -> ~1.05 USDC),
+        /// opening a profitable USDC -> WETH -> WBTC -> USDC cycle.
+        fn obvious_arbitrage_universe() -> Vec<PoolReserves<i32, TokenAddress>> {
+            let usdc = tokens::USDC.address;
+            let weth = tokens::WETH.address;
+            let wbtc = tokens::WBTC.address;
+            universe([
+                pool(usdc, weth, 1, DEEP, DEEP),
+                pool(weth, wbtc, 2, DEEP, DEEP),
+                pool(wbtc, usdc, 3, DEEP, DEEP * 1.05),
+                pool(usdc, wbtc, 4, DEEP, DEEP),
+            ])
+        }
+
+        /// Builds the deterministic (ones-weights) no-arbitrage model on the CPU backend.
+        fn deterministic_no_arbitrage_model() -> Model<CpuBackend, i32, TokenAddress, 1> {
+            let mut model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
+                tokens::USDC.address,
+                no_arbitrage_universe(),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .expect("golden model init failed");
+            force_ones_weights(&mut model);
+            model
+        }
+
+        #[test]
+        fn golden_evaluate_is_deterministic() {
+            // Purity precondition behind every golden snapshot: the forward pass is a pure
+            // function of (weights, reserves), so repeated evaluations — and two identically
+            // built models — must agree exactly.
+            let first_model = deterministic_no_arbitrage_model();
+            let second_model = deterministic_no_arbitrage_model();
+            let baseline = first_model.evaluate(1_000.0);
+            assert_eq!(
+                baseline,
+                first_model.evaluate(1_000.0),
+                "evaluate must be a pure function of the model"
+            );
+            assert_eq!(
+                baseline,
+                second_model.evaluate(1_000.0),
+                "identical universes must evaluate identically"
+            );
+        }
+
+        #[test]
+        fn golden_no_arbitrage_market_never_profits() {
+            // Legacy closed-route mode, uniform routing: a market with no cross-pool arbitrage can
+            // only lose the fee, so the recovered init-asset amount stays strictly below the input
+            // at every size.
+            let model = deterministic_no_arbitrage_model();
+            for input in [1.0, 100.0, 1_000.0, 1_000_000.0] {
+                let output = model.evaluate(input);
+                assert!(output.is_finite(), "evaluate must stay finite at input {input}");
+                assert!(
+                    output < input,
+                    "no-arbitrage market profited at input {input}: {output} >= {input}"
+                );
+            }
+        }
+
+        #[test]
+        fn golden_no_arbitrage_output_is_monotonic_and_sublinear() {
+            // Characterizing property of constant-product routing: more input recovers more output
+            // (monotone increasing) but at a worsening rate (concave / sublinear) because deeper
+            // swaps slip more. Sizes are ~1% of pool depth so the slippage is well above f32 noise.
+            let model = deterministic_no_arbitrage_model();
+            let small = model.evaluate(10_000_000.0);
+            let large = model.evaluate(20_000_000.0);
+            assert!(large > small, "output must increase with input ({small} -> {large})");
+            assert!(
+                large < 2.0 * small,
+                "output must be sublinear in input ({large} >= 2 * {small})"
+            );
+        }
+
+        #[test]
+        fn golden_no_arbitrage_output_snapshot() {
+            // Frozen legacy closed-route output: the deterministic (uniform-routing) evaluate of
+            // the balanced universe on the CPU backend. A change to this constant means the
+            // closed-route forward pass changed behavior and must be justified — that is exactly
+            // the regression this golden fixture exists to catch.
+            let model = deterministic_no_arbitrage_model();
+            let output = model.evaluate(1_000.0);
+            const GOLDEN: f32 = 815.8071;
+            let tolerance = GOLDEN.abs() * 1e-4;
+            assert!(
+                (output - GOLDEN).abs() <= tolerance,
+                "closed-route baseline drifted: got {output}, expected {GOLDEN} +/- {tolerance}"
+            );
+        }
+
+        #[test]
+        fn golden_obvious_arbitrage_is_captured() {
+            // The optimizer must discover the planted USDC -> WETH -> WBTC -> USDC cycle: after
+            // training, the recovered amount exceeds the input (net profit) on the human-readable
+            // universe. Runs on WGPU when present, else the CPU fallback.
+            run_on_available_backend(
+                || assert_obvious_arbitrage_captured::<WgpuBackend>(),
+                || assert_obvious_arbitrage_captured::<CpuBackend>(),
+            );
+        }
+
+        fn assert_obvious_arbitrage_captured<B: AutodiffBackend + Backend<FloatElem = f32>>() {
+            let model = Model::<B, i32, TokenAddress, 1>::init(
+                tokens::USDC.address,
+                obvious_arbitrage_universe(),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .expect("golden model init failed");
+            let input = 1_000.0;
+            let optimizer = Model::<B, i32, TokenAddress, 1>::init_optimizer();
+            let (model, _optimizer) = model.optimize_with(optimizer, input, 200);
+            let profit = model.evaluate(input) - input;
+            assert!(profit > 0.0, "planted arbitrage was not captured: profit {profit}");
+        }
+    }
 }
