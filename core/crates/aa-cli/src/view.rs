@@ -292,6 +292,7 @@ mod tests {
             profit_amount: 1.5,
             reserves_count: 3,
             disabled_count: 0,
+            pool_slots: 3,
             iterations_completed: 7,
         }
     }

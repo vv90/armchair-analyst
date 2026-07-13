@@ -1101,6 +1101,8 @@ mod tests {
             output_amount: 1_012.0,
             profit_amount: 12.0,
             reserves_count: 3,
+            disabled_count: 0,
+            pool_slots: 3,
             iterations_completed: 10,
         };
 
@@ -1135,12 +1137,14 @@ mod tests {
             prop_oneof![
                 Just(OptimizationStepStatus::Initialized),
                 Just(OptimizationStepStatus::Updated),
+                Just(OptimizationStepStatus::Extended),
                 Just(OptimizationStepStatus::Reinitialized),
                 Just(OptimizationStepStatus::Continued),
             ],
             -1.0e6f32..1.0e6f32,
             -1.0e6f32..1.0e6f32,
             -1.0e6f32..1.0e6f32,
+            0usize..100,
             0usize..100,
             0usize..100,
         )
@@ -1151,14 +1155,17 @@ mod tests {
                     output_amount,
                     profit_amount,
                     reserves_count,
-                    iterations_completed,
+                    disabled_count,
+                    pool_slots,
                 )| OptimizationStepResult {
                     status,
                     input_amount,
                     output_amount,
                     profit_amount,
                     reserves_count,
-                    iterations_completed,
+                    disabled_count,
+                    pool_slots,
+                    iterations_completed: 10,
                 },
             )
     }

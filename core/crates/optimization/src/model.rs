@@ -6,11 +6,15 @@ use burn::{
     prelude::*,
     tensor::{Distribution, Slice, activation::softmax, backend::AutodiffBackend},
 };
-use thiserror::Error;
-
 use crate::OptimizationError;
 use crate::pool_reserves::{PoolReserves, VirtualReserveValues};
 use petgraph::prelude::*;
+
+/// Initial pre-softmax weight for a newly grown-in pool's cells. Moderately negative so the pool's
+/// initial routing share is negligible (existing routing is preserved the instant it is added) yet
+/// the softmax gradient stays large enough for the optimizer to discover the pool over subsequent
+/// chunks — unlike the `-1e9` disable fill, whose gradient vanishes by design.
+const COLD_WEIGHT: f32 = -8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ColumnIndex(usize);
@@ -407,14 +411,15 @@ pub struct ModelOptimizer<B: AutodiffBackend, const LAYERS: usize> {
     optimizer: OptimizerAdaptor<Adam, LayerBlock<B, LAYERS>, B>,
 }
 
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum ModelUpdateError<TPool, TToken> {
-    #[error("reserve not found in model layout")]
-    ReserveNotFound {
-        pool_id: TPool,
-        token0: TToken,
-        token1: TToken,
-    },
+/// Whether a [`Model::reconcile`] changed tensor shapes. `Grew` means new pool rows/columns were
+/// appended (existing weights preserved, new cells cold-started) and every weight tensor has a fresh
+/// `ParamId`, so the caller must reset the optimizer. `Refreshed` means values and the mask were
+/// updated in place, so the optimizer state is still valid. Making this explicit keeps a growth from
+/// being silently treated as an in-place refresh (which would desync the optimizer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Grew,
+    Refreshed,
 }
 
 impl<
@@ -661,6 +666,13 @@ impl<
         self.block.forward(input_tensor).into_scalar()
     }
 
+    /// Number of pool output-slots (layout rows) the model currently holds. Under grow-only this is
+    /// monotonic non-decreasing and includes masked (absent/disabled) slots — a run diagnostic.
+    pub fn pool_slots(&self) -> usize {
+        let [rows, _] = self.layout.shape();
+        rows
+    }
+
     // Not wired into the runner yet: this is the route-extraction surface for turning trained
     // weights into an executable swap path. Exercised by tests until the execution layer
     // exposes it.
@@ -823,6 +835,30 @@ impl<
     }
 }
 
+/// Grows a trained weight matrix to `[new_rows, new_cols]`, preserving the old `[old_rows, old_cols]`
+/// block in the top-left and cold-filling the appended rows/columns with [`COLD_WEIGHT`]. Correct
+/// only because the layout fold is append-only, so old cells never move off the top-left block.
+fn cold_grow_2d<B: Backend>(
+    old: Tensor<B, 2>,
+    new_rows: usize,
+    new_cols: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let [old_rows, old_cols] = old.dims();
+    let widened = if new_cols > old_cols {
+        let right = Tensor::<B, 2>::full([old_rows, new_cols - old_cols], COLD_WEIGHT, device);
+        Tensor::cat(vec![old, right], 1)
+    } else {
+        old
+    };
+    if new_rows > old_rows {
+        let bottom = Tensor::<B, 2>::full([new_rows - old_rows, new_cols], COLD_WEIGHT, device);
+        Tensor::cat(vec![widened, bottom], 0)
+    } else {
+        widened
+    }
+}
+
 impl<
     B: Backend,
     U: Copy + PartialEq + Eq + std::hash::Hash,
@@ -830,30 +866,64 @@ impl<
     const LAYERS: usize,
 > Model<B, U, I, LAYERS>
 {
-    /// Re-uploads the reserve values for `reserves` (which must keep the exact same directional
-    /// key set the model was built with) and rebuilds the disabled-pool softmax mask from
-    /// `disabled`. Disabled pools keep their reserves and layout slot — only their routing weight
-    /// is masked — so re-enabling is a later `update` without the id and the trained weights are
-    /// preserved throughout. Ids in `disabled` that this model does not carry (e.g. a pool the
-    /// routing filter pruned upstream) are silently ignored.
-    pub fn update(
-        mut self,
+    /// Reconciles the model to `reserves` without ever reinitializing (grow-only):
+    ///
+    /// - pools already in the layout are value-refreshed in place;
+    /// - pools not yet in the layout are appended (rows/columns grow), their trained-neighbour
+    ///   weights preserved and their own cells cold-started so current routing is essentially
+    ///   unchanged the instant they appear;
+    /// - pools in the layout but absent from `reserves` are masked out of routing (their slot and
+    ///   trained weights retained for a cheap later re-add), together with the externally `disabled`
+    ///   pools. Ids in `disabled` this model does not carry are ignored.
+    ///
+    /// Returns whether the layout grew ([`ReconcileOutcome::Grew`]) so the caller can reset the
+    /// optimizer only when the weight tensors were rebuilt. `bridges` is needed only on growth, to
+    /// recompute the bypass mask over any new cells.
+    pub fn reconcile(
+        self,
         reserves: Vec<PoolReserves<U, I>>,
+        bridges: &HashSet<(I, I)>,
         disabled: &HashSet<U>,
-    ) -> Result<Self, ModelUpdateError<U, I>> {
+    ) -> Result<(Self, ReconcileOutcome), OptimizationError> {
+        let present: HashSet<U> = reserves.iter().map(|reserve| reserve.pool_id).collect();
+        let new_reserves: Vec<PoolReserves<U, I>> = reserves
+            .iter()
+            .filter(|reserve| {
+                self.layout
+                    .find_reserve_position(&reserve.token0, &reserve.token1, &reserve.pool_id)
+                    .is_none()
+            })
+            .copied()
+            .collect();
+
+        if new_reserves.is_empty() {
+            let model = self.refresh(&reserves, &present, disabled)?;
+            Ok((model, ReconcileOutcome::Refreshed))
+        } else {
+            let model = self.grow(reserves, new_reserves, bridges, &present, disabled)?;
+            Ok((model, ReconcileOutcome::Grew))
+        }
+    }
+
+    /// In-place path: no new pools, so tensor shapes are unchanged. Refreshes present pools' values
+    /// via `inplace` (preserving `ParamId`) and rebuilds the softmax mask as `disabled ∪ absent`.
+    fn refresh(
+        mut self,
+        reserves: &[PoolReserves<U, I>],
+        present: &HashSet<U>,
+        disabled: &HashSet<U>,
+    ) -> Result<Self, OptimizationError> {
         let [_, m] = self.layout.shape();
 
         for reserve in reserves {
+            // Present by construction (refresh only runs when no reserve is new), but stay
+            // panic-free: a miss means a corrupted layout, not a normal not-found.
             let Some((RowIndex(row), ColumnIndex(col))) = self.layout.find_reserve_position(
                 &reserve.token0,
                 &reserve.token1,
                 &reserve.pool_id,
             ) else {
-                return Err(ModelUpdateError::ReserveNotFound {
-                    pool_id: reserve.pool_id,
-                    token0: reserve.token0,
-                    token1: reserve.token1,
-                });
+                return Err(OptimizationError::InvalidLayoutIndex);
             };
 
             let index = row * m + col;
@@ -885,11 +955,7 @@ impl<
             .rows
             .iter()
             .flat_map(|row| row.iter())
-            .map(|cell| {
-                cell.as_ref()
-                    .map(|pool_id| disabled.contains(pool_id))
-                    .unwrap_or(false)
-            })
+            .map(|cell| is_masked(cell.as_ref(), present, disabled))
             .collect::<Vec<_>>();
         let device = self.block.disabled_mask.device();
         let disabled_mask = Tensor::<B, 1, Bool>::from_data(disabled_mask_data.as_slice(), &device)
@@ -903,6 +969,202 @@ impl<
 
         Ok(self)
     }
+
+    /// Growth path: append `new_reserves` to the layout and rebuild the block at the larger shape,
+    /// preserving trained weights (top-left block) and cold-starting the appended cells.
+    fn grow(
+        self,
+        all_reserves: Vec<PoolReserves<U, I>>,
+        new_reserves: Vec<PoolReserves<U, I>>,
+        bridges: &HashSet<(I, I)>,
+        present: &HashSet<U>,
+        disabled: &HashSet<U>,
+    ) -> Result<Self, OptimizationError> {
+        let device = &B::Device::default();
+
+        // Snapshot the trained weights and the init-asset output-row order before the layout moves.
+        let old_layer_in_w = self.block.layer_in.weights.val();
+        let old_layers_w: Vec<Tensor<B, 2>> = self
+            .block
+            .layers
+            .iter()
+            .map(|layer| layer.weights.val())
+            .collect();
+        let old_layer_out_w = self.block.layer_out.weights.val();
+        let init_asset_index = self.block.init_asset_index;
+        let old_layer_out_pool_indexes: Vec<usize> = self
+            .block
+            .layer_out_pool_indexes
+            .to_data()
+            .iter::<i64>()
+            .map(|idx| idx as usize)
+            .collect();
+
+        // Grow the layout: existing (row, col) slots never move (append-only fold).
+        let layout = new_reserves.into_iter().fold(self.layout, |layout, reserve| {
+            layout.with_reserve_values(reserve.token0, reserve.token1, reserve.pool_id)
+        });
+        let [rows, cols] = layout.shape();
+        let dims = [rows, cols];
+
+        // Fresh value for every current reserve, keyed by its slot in the grown layout.
+        let mut position_value: HashMap<(usize, usize), VirtualReserveValues> = HashMap::new();
+        for reserve in &all_reserves {
+            if let Some((RowIndex(row), ColumnIndex(col))) =
+                layout.find_reserve_position(&reserve.token0, &reserve.token1, &reserve.pool_id)
+            {
+                position_value.insert((row, col), reserve.value);
+            }
+        }
+
+        let bypass_indexes = layout.bypass_indexes(bridges);
+        let outputs = layout.outputs()?;
+
+        // Build the per-cell value + mask vectors row-major, mirroring `init`'s packing.
+        let buf_size = rows * cols;
+        let mut reserves_in_data = Vec::with_capacity(buf_size);
+        let mut reserves_out_data = Vec::with_capacity(buf_size);
+        let mut fee_multiplier_data = Vec::with_capacity(buf_size);
+        let mut max_swap_data = Vec::with_capacity(buf_size);
+        let mut bypass_mask_data = Vec::with_capacity(buf_size);
+        let mut disabled_mask_data = Vec::with_capacity(buf_size);
+
+        for (row_index, row) in layout.rows.iter().enumerate() {
+            for (col_index, cell) in row.iter().enumerate() {
+                disabled_mask_data.push(is_masked(cell.as_ref(), present, disabled));
+                bypass_mask_data
+                    .push(bypass_indexes.contains(&(RowIndex(row_index), ColumnIndex(col_index))));
+
+                let value = position_value.get(&(row_index, col_index)).copied().unwrap_or(
+                    VirtualReserveValues {
+                        token_0: 0.0,
+                        token_1: 0.0,
+                        fee_multiplier: 0.0,
+                        max_swap_0: 0.0,
+                        max_swap_1: 0.0,
+                    },
+                );
+                reserves_in_data.push(B::FloatElem::from_elem(value.token_0));
+                reserves_out_data.push(B::FloatElem::from_elem(value.token_1));
+                fee_multiplier_data.push(B::FloatElem::from_elem(value.fee_multiplier));
+                max_swap_data.push(B::FloatElem::from_elem(value.max_swap_0));
+            }
+        }
+
+        let reserves_in =
+            Tensor::<B, 1>::from_data(reserves_in_data.as_slice(), device).reshape(dims);
+        let reserves_out =
+            Tensor::<B, 1>::from_data(reserves_out_data.as_slice(), device).reshape(dims);
+        let fee_multiplier =
+            Tensor::<B, 1>::from_data(fee_multiplier_data.as_slice(), device).reshape(dims);
+        let max_swap = Tensor::<B, 1>::from_data(max_swap_data.as_slice(), device).reshape(dims);
+        let bypass_mask =
+            Tensor::<B, 1, Bool>::from_data(bypass_mask_data.as_slice(), device).reshape(dims);
+        let disabled_mask =
+            Tensor::<B, 1, Bool>::from_data(disabled_mask_data.as_slice(), device).reshape(dims);
+
+        // layer_out rows: preserved trained order, then new init-asset-output rows appended, so the
+        // grown layer_out weight rows stay aligned with their pools.
+        let init_asset = *layout
+            .inputs()?
+            .get(init_asset_index as usize)
+            .ok_or(OptimizationError::InvalidInitAssetIndex)?;
+        let old_index_set: HashSet<usize> = old_layer_out_pool_indexes.iter().copied().collect();
+        let mut layer_out_pool_indexes_vec = old_layer_out_pool_indexes;
+        for (row_index, output_token) in outputs.iter().enumerate() {
+            if *output_token == init_asset && !old_index_set.contains(&row_index) {
+                layer_out_pool_indexes_vec.push(row_index);
+            }
+        }
+        let init_asset_pools_count = layer_out_pool_indexes_vec.len();
+        let layer_out_pool_indexes = Tensor::<B, 1, Int>::from_data(
+            layer_out_pool_indexes_vec
+                .iter()
+                .map(|idx| *idx as i64)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            device,
+        );
+
+        let asset_indexes_data = layout.output_token_indexes()?;
+        let output_asset_indexes =
+            Tensor::<B, 1, Int>::from_data(asset_indexes_data.as_slice(), device);
+
+        let layer_out_bypass_mask = bypass_mask
+            .clone()
+            .int()
+            .select(0, layer_out_pool_indexes.clone())
+            .bool();
+        let layer_out_disabled_mask = disabled_mask
+            .clone()
+            .int()
+            .select(0, layer_out_pool_indexes.clone())
+            .bool();
+
+        // Preserve trained weights; cold-fill the appended rows/columns. `cat` produces a non-leaf
+        // autodiff tensor, so `detach` back into a leaf before wrapping as a `Param` — the optimizer
+        // requires parameter tensors to be graph leaves.
+        let layer_in_w = cold_grow_2d(old_layer_in_w, rows, 1, device).detach();
+        let layers: [Layer<B>; LAYERS] = std::array::from_fn(|index| {
+            let grown = old_layers_w
+                .get(index)
+                .cloned()
+                .map(|weights| cold_grow_2d(weights, rows, cols, device))
+                .unwrap_or_else(|| Tensor::<B, 2>::full(dims, COLD_WEIGHT, device));
+            Layer {
+                weights: Param::from_tensor(grown.detach()),
+                output_size: cols,
+            }
+        });
+        let layer_out_w =
+            cold_grow_2d(old_layer_out_w, init_asset_pools_count, cols, device).detach();
+
+        Ok(Model {
+            block: LayerBlock {
+                reserves_in,
+                reserves_out,
+                fee_multiplier,
+                max_swap,
+                init_asset_index,
+                output_asset_indexes,
+                layer_out_output_asset_indexes: Tensor::<B, 1, Int>::full(
+                    [init_asset_pools_count],
+                    0,
+                    device,
+                ),
+                bypass_mask,
+                disabled_mask,
+                layer_out_bypass_mask,
+                layer_out_disabled_mask,
+                layer_out_pool_indexes,
+                layer_in: Layer {
+                    weights: Param::from_tensor(layer_in_w),
+                    output_size: cols,
+                },
+                layers,
+                layer_out: Layer {
+                    weights: Param::from_tensor(layer_out_w),
+                    output_size: 1,
+                },
+            },
+            reserves_in_data,
+            reserves_out_data,
+            fee_multiplier_data,
+            max_swap_data,
+            layout,
+        })
+    }
+}
+
+/// A layout cell is masked out of routing when its pool is externally `disabled` or absent from the
+/// current snapshot (`present`). Empty cells are never masked.
+fn is_masked<U: Copy + Eq + std::hash::Hash>(
+    cell: Option<&U>,
+    present: &HashSet<U>,
+    disabled: &HashSet<U>,
+) -> bool {
+    cell.map(|pool_id| disabled.contains(pool_id) || !present.contains(pool_id))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1059,9 +1321,14 @@ mod tests {
             },
             ..reserve
         };
-        let model = model
-            .update(vec![updated, updated.inverse()], &HashSet::new())
-            .expect("model update failed");
+        let (model, outcome) = model
+            .reconcile(vec![updated, updated.inverse()], &HashSet::new(), &HashSet::new())
+            .expect("model reconcile failed");
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Refreshed,
+            "refreshing existing pools must not grow the layout"
+        );
 
         let [_, columns] = model.layout.shape();
         let fee_cells = float_cells(&model.block.fee_multiplier);
@@ -1083,9 +1350,9 @@ mod tests {
     }
 
     #[test]
-    fn model_update_returns_error_for_unknown_directional_reserve() {
-        type CpuBackend = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
-
+    fn reconcile_with_a_new_pool_grows_the_layout() {
+        // Under grow-only a reserve the model has never seen is not an error — it extends the
+        // layout. Reconciling a snapshot that adds a second pool must report `Grew` and append rows.
         let known_reserve = PoolReserves {
             token0: tokens::USDC.address,
             token1: tokens::WETH.address,
@@ -1098,8 +1365,13 @@ mod tests {
                 max_swap_1: 500.0,
             },
         };
-        let unknown_reserve = PoolReserves {
+        let new_reserve = PoolReserves {
             pool_id: 2,
+            value: VirtualReserveValues {
+                token_0: 2_000.0,
+                token_1: 1_500.0,
+                ..known_reserve.value
+            },
             ..known_reserve
         };
         let model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
@@ -1109,20 +1381,30 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
+        let [rows_before, _] = model.layout.shape();
 
-        let error = match model.update(vec![unknown_reserve], &HashSet::new()) {
-            Ok(_) => panic!("unknown reserve update unexpectedly succeeded"),
-            Err(error) => error,
-        };
+        let (model, outcome) = model
+            .reconcile(
+                vec![
+                    known_reserve,
+                    known_reserve.inverse(),
+                    new_reserve,
+                    new_reserve.inverse(),
+                ],
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .expect("model reconcile failed");
 
-        assert_eq!(
-            error,
-            ModelUpdateError::ReserveNotFound {
-                pool_id: unknown_reserve.pool_id,
-                token0: unknown_reserve.token0,
-                token1: unknown_reserve.token1,
-            }
+        assert_eq!(outcome, ReconcileOutcome::Grew);
+        let [rows_after, _] = model.layout.shape();
+        assert!(
+            rows_after > rows_before,
+            "adding a pool must append rows ({} -> {})",
+            rows_before,
+            rows_after
         );
+        assert!(model.evaluate(100.0).is_finite());
     }
 
     /// Two parallel USDC<->WETH pools (both directions), so an init-asset input can cycle
@@ -1194,9 +1476,9 @@ mod tests {
 
         // Disable pool 2 through `update` with the key set unchanged; trained (ones) weights and
         // the pool's reserves stay in place, only its routing weight is masked.
-        let disabled_model = two_parallel_pool_model(&HashSet::new())
-            .update(two_parallel_reserves(), &HashSet::from([2]))
-            .expect("update failed");
+        let (disabled_model, _) = two_parallel_pool_model(&HashSet::new())
+            .reconcile(two_parallel_reserves(), &HashSet::new(), &HashSet::from([2]))
+            .expect("reconcile failed");
         let disabled_output = disabled_model.evaluate(100.0);
 
         assert!(
@@ -1208,16 +1490,165 @@ mod tests {
 
         // Re-enabling (same reserves, empty disable set) restores the exact baseline: the weights
         // were frozen, never trained away.
-        let reenabled_output = disabled_model
-            .update(two_parallel_reserves(), &HashSet::new())
-            .expect("update failed")
-            .evaluate(100.0);
+        let (reenabled_model, _) = disabled_model
+            .reconcile(two_parallel_reserves(), &HashSet::new(), &HashSet::new())
+            .expect("reconcile failed");
+        let reenabled_output = reenabled_model.evaluate(100.0);
 
         assert!(
             (reenabled_output - baseline).abs() <= baseline.abs() * 1e-5,
             "re-enabling must restore the baseline output (baseline {}, re-enabled {})",
             baseline,
             reenabled_output
+        );
+    }
+
+    /// A third USDC<->WETH pool, distinct from [`two_parallel_reserves`]'s pools 1 and 2 — the pool
+    /// grown in by the growth tests.
+    fn third_pool() -> PoolReserves<i32, TokenAddress> {
+        PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 3,
+            value: VirtualReserveValues {
+                token_0: 3_000.0,
+                token_1: 2_400.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        }
+    }
+
+    /// [`two_parallel_reserves`] plus [`third_pool`] (both directions).
+    fn three_parallel_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let mut reserves = two_parallel_reserves();
+        reserves.push(third_pool());
+        reserves.push(third_pool().inverse());
+        reserves
+    }
+
+    #[test]
+    fn growth_preserves_trained_weights_and_cold_starts_new_cells() {
+        // Ones-weight 2-pool model, then grow in a third pool. By the append-only layout invariant
+        // the old pools keep their (row, col) slots, so their trained weights (all 1.0) must survive
+        // untouched in the top-left block and every appended cell must equal COLD_WEIGHT.
+        let model = two_parallel_pool_model(&HashSet::new());
+        let [old_rows, old_cols] = model.layout.shape();
+
+        let (model, outcome) = model
+            .reconcile(three_parallel_reserves(), &HashSet::new(), &HashSet::new())
+            .expect("reconcile failed");
+        assert_eq!(outcome, ReconcileOutcome::Grew);
+
+        let [_, cols] = model.layout.shape();
+        let layer = model.block.layers.first().expect("model has one middle layer");
+        let weights = float_cells(&layer.weights.val());
+
+        for (index, &weight) in weights.iter().enumerate() {
+            let row = index / cols;
+            let col = index % cols;
+            if row < old_rows && col < old_cols {
+                assert_eq!(weight, 1.0, "trained weight at ({}, {}) must be preserved", row, col);
+            } else {
+                assert_eq!(
+                    weight, COLD_WEIGHT,
+                    "appended cell at ({}, {}) must be cold-started",
+                    row, col
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cold_start_growth_preserves_current_routing() {
+        // The instant a pool is grown in, its cold weight gives it a negligible share, so the
+        // routed output is essentially unchanged from before the growth.
+        let baseline = two_parallel_pool_model(&HashSet::new()).evaluate(100.0);
+
+        let (grown, outcome) = two_parallel_pool_model(&HashSet::new())
+            .reconcile(three_parallel_reserves(), &HashSet::new(), &HashSet::new())
+            .expect("reconcile failed");
+        assert_eq!(outcome, ReconcileOutcome::Grew);
+        let grown_output = grown.evaluate(100.0);
+
+        assert!(
+            (grown_output - baseline).abs() <= baseline.abs() * 1e-2,
+            "cold-start growth must preserve routing (baseline {}, grown {})",
+            baseline,
+            grown_output
+        );
+    }
+
+    #[test]
+    fn a_cold_started_pool_is_trainable() {
+        // Rebuts the vanishing-gradient trap: COLD_WEIGHT must be moderate enough that the optimizer
+        // can still move a newly grown-in pool's weight. (A -1e9 fill would freeze it.)
+        let (grown, _) = two_parallel_pool_model(&HashSet::new())
+            .reconcile(three_parallel_reserves(), &HashSet::new(), &HashSet::new())
+            .expect("reconcile failed");
+
+        let (RowIndex(new_row), _) = grown
+            .layout
+            .find_reserve_position(&tokens::USDC.address, &tokens::WETH.address, &3)
+            .expect("new pool missing from layout");
+        // layer_in weights are [pools, 1]: the flat index is just the row.
+        let weight_before = float_cells(&grown.block.layer_in.weights.val())
+            .into_iter()
+            .nth(new_row)
+            .expect("new row missing from layer_in weights");
+
+        let optimizer = Model::<CpuBackend, i32, TokenAddress, 1>::init_optimizer();
+        let (trained, _) = grown.optimize_with(optimizer, 100.0, 200);
+        let weight_after = float_cells(&trained.block.layer_in.weights.val())
+            .into_iter()
+            .nth(new_row)
+            .expect("new row missing from layer_in weights");
+
+        assert!(
+            (weight_after - weight_before).abs() > 0.1,
+            "a cold-started pool's weight must move under training ({} -> {})",
+            weight_before,
+            weight_after
+        );
+    }
+
+    #[test]
+    fn removing_a_pool_masks_it_and_re_adding_restores_output() {
+        // Grow-only removal: dropping a pool from the snapshot masks it (routing changes, slot kept),
+        // and re-adding it restores the exact prior output because its weights were frozen, not
+        // retrained — the value analog of disable/re-enable but driven by snapshot membership.
+        let baseline = two_parallel_pool_model(&HashSet::new()).evaluate(100.0);
+        let slots = two_parallel_pool_model(&HashSet::new()).pool_slots();
+
+        let pool_one_only: Vec<_> = two_parallel_reserves()
+            .into_iter()
+            .filter(|reserve| reserve.pool_id == 1)
+            .collect();
+        let (dropped, outcome) = two_parallel_pool_model(&HashSet::new())
+            .reconcile(pool_one_only, &HashSet::new(), &HashSet::new())
+            .expect("reconcile failed");
+        assert_eq!(outcome, ReconcileOutcome::Refreshed);
+        assert_eq!(dropped.pool_slots(), slots, "removal must not shrink the layout");
+
+        let dropped_output = dropped.evaluate(100.0);
+        assert!(
+            (dropped_output - baseline).abs() > 1e-3,
+            "masking a pool must change the routed output (baseline {}, dropped {})",
+            baseline,
+            dropped_output
+        );
+
+        let (readded, outcome) = dropped
+            .reconcile(two_parallel_reserves(), &HashSet::new(), &HashSet::new())
+            .expect("reconcile failed");
+        assert_eq!(outcome, ReconcileOutcome::Refreshed);
+        let readded_output = readded.evaluate(100.0);
+        assert!(
+            (readded_output - baseline).abs() <= baseline.abs() * 1e-5,
+            "re-adding a pool must restore the baseline (baseline {}, re-added {})",
+            baseline,
+            readded_output
         );
     }
 
@@ -1795,22 +2226,30 @@ mod tests {
 
         let mut model_expected = Model::<B, i32, TokenAddress, 1>::init(
             tokens::USDC.address,
-            final_reserves,
+            final_reserves.clone(),
             &HashSet::new(),
             &HashSet::new(),
         )
         .expect("expected model init failed");
         force_ones_weights(&mut model_expected);
 
-        let mut model_updated = Model::<B, i32, TokenAddress, 1>::init(
+        // Grow-only reconcile masks any pool absent from the snapshot, so it receives the *full*
+        // updated snapshot (`final_reserves` = the 4 changed pools plus the unchanged remainder),
+        // not just the changed delta. Same key set as init → `Refreshed`, nothing masked.
+        let (mut model_updated, update_outcome) = Model::<B, i32, TokenAddress, 1>::init(
             tokens::USDC.address,
             initial_reserves,
             &HashSet::new(),
             &HashSet::new(),
         )
         .expect("base model init failed")
-        .update(updated_reserves, &HashSet::new())
-        .expect("model update failed");
+        .reconcile(final_reserves, &HashSet::new(), &HashSet::new())
+        .expect("model reconcile failed");
+        assert_eq!(
+            update_outcome,
+            ReconcileOutcome::Refreshed,
+            "same-key reconcile must refresh in place, not grow"
+        );
         force_ones_weights(&mut model_updated);
 
         // Relative, not absolute: the fresh-`init` and `init().update()` paths build their
@@ -2090,6 +2529,63 @@ mod tests {
             .expect("model init failed");
 
             prop_assert!(model.evaluate(100.0).is_finite());
+        }
+
+        /// A grow-only reconcile sequence — arbitrary subsets of a pool universe (adding pools grows
+        /// the layout, dropping them masks the slot) plus arbitrary disable sets — always leaves the
+        /// model finite and its slot count monotonic non-decreasing (never shrinks).
+        #[test]
+        fn reconcile_sequence_stays_finite_and_slots_never_shrink(
+            reserves in arbitrary_pool_reserves(),
+            steps in prop::collection::vec(
+                (
+                    prop::collection::vec(any::<bool>(), 1..24),
+                    prop::collection::hash_set(any::<i64>(), 0..6),
+                ),
+                1..6,
+            ),
+        ) {
+            let init_asset = init_asset_for(&reserves);
+            // Seed from a single reserve that outputs the init asset, so `init` is always valid; the
+            // rest of the universe is grown in across the sequence.
+            let seed = reserves
+                .iter()
+                .find(|reserve| reserve.token1 == init_asset)
+                .copied()
+                .expect("init_asset_for guarantees an outputting reserve");
+
+            let mut model = Model::<CpuBackend, i64, TokenAddress, 1>::init(
+                init_asset,
+                vec![seed],
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .expect("model init failed");
+            let mut previous_slots = model.pool_slots();
+
+            for (keep_flags, disabled) in steps {
+                let mut subset = vec![seed];
+                subset.extend(
+                    reserves
+                        .iter()
+                        .zip(keep_flags.iter())
+                        .filter(|(_, keep)| **keep)
+                        .map(|(reserve, _)| *reserve),
+                );
+
+                let (next, _) = model
+                    .reconcile(subset, &HashSet::new(), &disabled)
+                    .expect("reconcile failed");
+                prop_assert!(next.evaluate(100.0).is_finite());
+                prop_assert!(
+                    next.pool_slots() >= previous_slots,
+                    "slots shrank: {} -> {}",
+                    previous_slots,
+                    next.pool_slots()
+                );
+                previous_slots = next.pool_slots();
+                model = next;
+            }
         }
 
         /// `Model::init` packs the layout into the value tensors row-major: every reserve's

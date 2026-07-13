@@ -13,6 +13,5 @@ pub use execution::{
     OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate,
     reserves_reach_init_asset,
 };
-pub use model::ModelUpdateError;
 pub use pool_reserves::{PoolReserves, VirtualReserveValues};
 pub use utils::Invertible;

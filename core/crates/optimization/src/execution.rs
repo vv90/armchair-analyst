@@ -3,7 +3,9 @@ use std::{collections::HashSet, hash::Hash};
 use burn::tensor::{ElementConversion, backend::AutodiffBackend, cast::ToElement};
 use thiserror::Error;
 
-use crate::{OptimizationError, PoolReserves, model::Model, model::ModelOptimizer};
+use crate::{
+    OptimizationError, PoolReserves, model::Model, model::ModelOptimizer, model::ReconcileOutcome,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OptimizationBackendSelection {
@@ -101,6 +103,7 @@ pub enum OptimizationStepUpdate<TPool: Copy + Eq + Hash, TToken: Copy> {
 pub enum OptimizationStepStatus {
     Initialized,
     Updated,
+    Extended,
     Reinitialized,
     Continued,
 }
@@ -113,6 +116,10 @@ pub struct OptimizationStepResult {
     pub profit_amount: f32,
     pub reserves_count: usize,
     pub disabled_count: usize,
+    /// Total pool output-slots held by the model (layout rows), including masked absent/disabled
+    /// slots. Monotonic non-decreasing under grow-only; the gap from `reserves_count` is the number
+    /// of retained-but-inactive slots.
+    pub pool_slots: usize,
     pub iterations_completed: usize,
 }
 
@@ -414,22 +421,13 @@ where
         model,
         optimizer,
         session_config,
-        reserve_keys,
         ..
     } = session;
 
-    if incoming_keys != reserve_keys {
-        return initialize_optimization_session_with_status(
-            reserves,
-            session_config,
-            step_config,
-            OptimizationStepStatus::Reinitialized,
-            disabled,
-        );
-    }
-
-    match model.update(reserves.clone(), disabled) {
-        Ok(model) => run_optimization_chunk(
+    // Grow-only: never reinitialize on a key-set change. New pools extend the layout (weights
+    // preserved, newcomers cold-started), removed pools are masked out and keep their slots.
+    match model.reconcile(reserves.clone(), &session_config.bridges, disabled) {
+        Ok((model, ReconcileOutcome::Refreshed)) => run_optimization_chunk(
             OptimizationSession {
                 model,
                 optimizer,
@@ -440,6 +438,24 @@ where
             step_config,
             OptimizationStepStatus::Updated,
         ),
+        Ok((model, ReconcileOutcome::Grew)) => {
+            // Growth rebuilds the weight tensors with fresh `ParamId`s, so the old optimizer state
+            // no longer applies. Start a fresh optimizer — the trained weights live in the model,
+            // only Adam's transient moments are reset.
+            let optimizer = Model::<B, TPool, TToken, LAYERS>::init_optimizer();
+            run_optimization_chunk(
+                OptimizationSession {
+                    model,
+                    optimizer,
+                    session_config,
+                    reserve_keys: incoming_keys,
+                    disabled_count: effective_disabled_count(&reserves, disabled),
+                },
+                step_config,
+                OptimizationStepStatus::Extended,
+            )
+        }
+        // Defensive only: a validated snapshot should always reconcile. Rebuild rather than crash.
         Err(_) => initialize_optimization_session_with_status(
             reserves,
             session_config,
@@ -552,6 +568,7 @@ where
         profit_amount: output_amount - step_config.input_amount,
         reserves_count,
         disabled_count,
+        pool_slots: model.pool_slots(),
         iterations_completed: step_config.iterations,
     };
 
@@ -712,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn optimization_runner_cpu_changed_keys_reinitialize_runner() {
+    fn optimization_runner_cpu_added_keys_extend_runner() {
         let (runner, _) = initialized_cpu_runner();
 
         let (_runner, result) = runner
@@ -722,7 +739,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.status, OptimizationStepStatus::Extended);
         assert_eq!(result.reserves_count, 3);
     }
 
@@ -821,8 +838,9 @@ mod tests {
     }
 
     #[test]
-    fn added_reserve_key_reinitializes_session() {
-        let (session, _) = initialized_session();
+    fn added_reserve_key_extends_session() {
+        let (session, init_result) = initialized_session();
+        let slots_before = init_result.pool_slots;
 
         let (_session, result) = run_optimization_step(
             session,
@@ -834,18 +852,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        // Grow-only: an added pool extends the layout in place instead of reinitializing.
+        assert_eq!(result.status, OptimizationStepStatus::Extended);
         assert_eq!(result.reserves_count, 3);
+        assert!(
+            result.pool_slots > slots_before,
+            "adding a pool must grow the slot count ({} -> {})",
+            slots_before,
+            result.pool_slots
+        );
     }
 
     #[test]
-    fn removed_reserve_key_reinitializes_session() {
-        let (session, _) = initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
-            expanded_reserves(),
-            session_config(),
-            &step_config(0),
-        )
+    fn removed_reserve_key_masks_and_keeps_slots() {
+        let (session, init_result) = initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(expanded_reserves(), session_config(), &step_config(0))
         .unwrap();
+        let slots_before = init_result.pool_slots;
 
         let (_session, result) = run_optimization_step(
             session,
@@ -857,37 +884,50 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        // Grow-only never shrinks: the dropped pool is masked out (active count falls to 2) but its
+        // slot is retained, so the session updates in place rather than reinitializing.
+        assert_eq!(result.status, OptimizationStepStatus::Updated);
         assert_eq!(result.reserves_count, 2);
+        assert_eq!(result.pool_slots, slots_before);
     }
 
     #[test]
-    fn reserve_not_found_during_update_reinitializes_session() {
-        let (mut session, _) = initialized_session();
-        let replacement_reserves = vec![reserve(
-            99,
-            tokens::WETH.address,
-            tokens::USDC.address,
-            2_000.0,
-        )];
-        session.reserve_keys = HashSet::from([ReserveKey {
-            pool_id: 99,
-            token0: tokens::WETH.address,
-            token1: tokens::USDC.address,
-        }]);
+    fn re_adding_a_removed_pool_is_a_cheap_in_place_update() {
+        let (session, extend_result) = initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(expanded_reserves(), session_config(), &step_config(0))
+        .unwrap();
+        let slots = extend_result.pool_slots;
 
-        let (_session, result) = run_optimization_step(
+        // Drop the third pool (masked, slot kept) ...
+        let (session, dropped) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
-                reserves: replacement_reserves,
+                reserves: base_reserves(),
                 disabled: HashSet::new(),
             },
             &step_config(0),
         )
         .unwrap();
+        assert_eq!(dropped.status, OptimizationStepStatus::Updated);
+        assert_eq!(dropped.pool_slots, slots);
 
-        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
-        assert_eq!(result.reserves_count, 1);
+        // ... then re-add it: the slot already exists, so this is a refresh, not a growth.
+        let (_session, readded) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves {
+                reserves: expanded_reserves(),
+                disabled: HashSet::new(),
+            },
+            &step_config(0),
+        )
+        .unwrap();
+        assert_eq!(readded.status, OptimizationStepStatus::Updated);
+        assert_eq!(readded.reserves_count, 3);
+        assert_eq!(readded.pool_slots, slots);
     }
 
     #[test]
@@ -932,11 +972,11 @@ mod tests {
     }
 
     #[test]
-    fn reinitialization_carries_the_disabled_set() {
+    fn growth_carries_the_disabled_set() {
         let (session, _) = initialized_session();
 
-        // A changed key set forces reinitialization; the disable request must still be applied to
-        // the freshly built model, and reflected in the diagnostic count.
+        // Adding a pool grows the layout; a disable request in the same step must still be applied
+        // to the grown model and reflected in the diagnostic count.
         let (_session, result) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
@@ -947,7 +987,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.status, OptimizationStepStatus::Reinitialized);
+        assert_eq!(result.status, OptimizationStepStatus::Extended);
         assert_eq!(result.reserves_count, 3);
         assert_eq!(result.disabled_count, 1);
     }
