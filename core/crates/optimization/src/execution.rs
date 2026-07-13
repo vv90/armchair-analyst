@@ -4,7 +4,8 @@ use burn::tensor::{ElementConversion, backend::AutodiffBackend, cast::ToElement}
 use thiserror::Error;
 
 use crate::{
-    OptimizationError, PoolReserves, model::Model, model::ModelOptimizer, model::ReconcileOutcome,
+    OptimizationError, PoolReserves, model::FlowSummary, model::Model, model::ModelOptimizer,
+    model::ReconcileOutcome,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +121,14 @@ pub struct OptimizationStepResult {
     /// slots. Monotonic non-decreasing under grow-only; the gap from `reserves_count` is the number
     /// of retained-but-inactive slots.
     pub pool_slots: usize,
+    /// Shannon entropy (nats) of the optimized routing's pool-input distribution: low means the flow
+    /// collapsed onto a few pools, high means it is spread out. `0.0` when no pool carried flow.
+    pub route_entropy: f32,
+    /// Perplexity of that distribution (`exp(route_entropy)`) — the effective number of pools the
+    /// flow is really spread across, a scale-free companion to `route_entropy`.
+    pub effective_pools: f32,
+    /// Distinct pools that actually carried input in the optimized routing (≤ `reserves_count`).
+    pub routed_pool_count: usize,
     pub iterations_completed: usize,
 }
 
@@ -553,14 +562,25 @@ where
         disabled_count,
     } = session;
     let reserves_count = reserve_keys.len();
-    let (model, optimizer) = model.optimize_with(
-        optimizer,
-        B::FloatElem::from_elem(step_config.input_amount),
-        step_config.iterations,
-    );
-    let output_amount = model
-        .evaluate(B::FloatElem::from_elem(step_config.input_amount))
-        .to_f32();
+    let input_elem = B::FloatElem::from_elem(step_config.input_amount);
+    let (model, optimizer) = model.optimize_with(optimizer, input_elem, step_config.iterations);
+    let output_amount = model.evaluate(input_elem).to_f32();
+
+    // Route diagnostics read off the trained weights, once per completed step (never in the
+    // optimization loop). `extract_flows` only errors on a corrupt layout, which a model that just
+    // optimized and evaluated cannot have, so degrade to neutral values rather than fail the step.
+    let (route_entropy, effective_pools, routed_pool_count) = match model.extract_flows(input_elem) {
+        Ok(flows) => {
+            let summary = FlowSummary::from_flows(&flows);
+            (
+                summary.route_entropy,
+                summary.effective_pools,
+                summary.pool_inputs.len(),
+            )
+        }
+        Err(_) => (0.0, 0.0, 0),
+    };
+
     let result = OptimizationStepResult {
         status,
         input_amount: step_config.input_amount,
@@ -569,6 +589,9 @@ where
         reserves_count,
         disabled_count,
         pool_slots: model.pool_slots(),
+        route_entropy,
+        effective_pools,
+        routed_pool_count,
         iterations_completed: step_config.iterations,
     };
 
@@ -797,6 +820,38 @@ mod tests {
         assert_eq!(result.iterations_completed, 0);
         assert!(result.output_amount.is_finite());
         assert!(result.profit_amount.is_finite());
+    }
+
+    #[test]
+    fn step_result_reports_route_diagnostics() {
+        // Step 2 (surface half): a completed step carries the routing diagnostics read off the
+        // trained weights. Entropy is finite and non-negative; effective pools is `exp(entropy)`,
+        // hence at least one; and the routed-pool count is bounded by the two distinct pools in the
+        // snapshot.
+        let (_session, result) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                expanded_reserves(),
+                session_config(),
+                &step_config(5),
+            )
+            .unwrap();
+
+        assert!(
+            result.route_entropy.is_finite() && result.route_entropy >= 0.0,
+            "route_entropy must be finite and non-negative, got {}",
+            result.route_entropy
+        );
+        assert!(
+            (result.effective_pools - result.route_entropy.exp()).abs() <= 1e-4,
+            "effective_pools ({}) must equal exp(route_entropy) ({})",
+            result.effective_pools,
+            result.route_entropy.exp()
+        );
+        assert!(
+            result.routed_pool_count >= 1 && result.routed_pool_count <= 2,
+            "routed_pool_count must be within the two snapshot pools, got {}",
+            result.routed_pool_count
+        );
     }
 
     #[test]

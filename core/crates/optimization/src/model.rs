@@ -448,15 +448,16 @@ pub struct FlowRecord<U, I> {
 /// the entropy of the pool-input distribution and its perplexity (`effective_pools = exp(entropy)`),
 /// a scale-free "how many pools is the flow really spread across" number. Pure function of the flows.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // constructed by tests / the deferred run-surface, not the prod path yet
 pub struct FlowSummary<U, I> {
     pub pool_inputs: HashMap<U, f32>,
+    // Part of the extractor's summary surface (validated by tests, used by offline callers); the
+    // run diagnostics currently read only `pool_inputs`/entropy, so prod does not read this yet.
+    #[allow(dead_code)]
     pub token_flows: HashMap<I, f32>,
     pub route_entropy: f32,
     pub effective_pools: f32,
 }
 
-#[allow(dead_code)] // exercised by tests until the run surface consumes it (Step 2 half b)
 impl<U: Copy + Eq + std::hash::Hash, I: Copy + Eq + std::hash::Hash> FlowSummary<U, I> {
     /// Folds a flow set into per-pool and per-token input totals and the pool-input entropy.
     pub fn from_flows(flows: &[FlowRecord<U, I>]) -> Self {
@@ -749,8 +750,7 @@ impl<
     /// amount-bearing view of a trained model: what the softmax weights actually route where. Every
     /// cell of every stage is returned (including zero-share and empty cells) so the per-stage
     /// column shares sum to one exactly; callers filter by `amount_in`/`weight` as needed. Read-only
-    /// and pure — meant for offline analysis, not the optimization hot path.
-    #[allow(dead_code)]
+    /// and pure — meant for offline analysis or once-per-step diagnostics, not the hot path.
     pub fn extract_flows(&self, input: B::FloatElem) -> Result<Vec<FlowRecord<U, I>>, OptimizationError> {
         let inputs = self.layout.inputs()?;
         let outputs = self.layout.outputs()?;
@@ -3325,6 +3325,14 @@ mod tests {
             let summary = FlowSummary::from_flows(&flows);
 
             assert!(summary.route_entropy >= 0.0, "entropy must be non-negative");
+            assert!(!summary.token_flows.is_empty(), "per-token flows must be recorded");
+            assert!(
+                summary
+                    .token_flows
+                    .values()
+                    .all(|flow| flow.is_finite() && *flow >= 0.0),
+                "per-token flows must be finite and non-negative"
+            );
             let pool_count = summary.pool_inputs.len() as f32;
             assert!(pool_count >= 2.0, "two-parallel-pool model should route through both pools");
             assert!(

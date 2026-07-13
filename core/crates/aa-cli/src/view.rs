@@ -136,8 +136,12 @@ fn format_lines(
 
 fn format_optimization(result: OptimizationStepResult) -> String {
     format!(
-        "Optimization  status={:?}  profit={}  reserves={}",
-        result.status, result.profit_amount, result.reserves_count
+        "Optimization  status={:?}  profit={}  reserves={}  routed={}  eff_pools={:.2}",
+        result.status,
+        result.profit_amount,
+        result.reserves_count,
+        result.routed_pool_count,
+        result.effective_pools
     )
 }
 
@@ -260,7 +264,7 @@ mod tests {
             format_lines(&observations, Some(result())),
             vec![
                 "Ethereum: Initializing  buffered=0".to_owned(),
-                "Optimization  status=Initialized  profit=1.5  reserves=3".to_owned(),
+                "Optimization  status=Initialized  profit=1.5  reserves=3  routed=3  eff_pools=2.46".to_owned(),
             ]
         );
     }
@@ -280,7 +284,7 @@ mod tests {
     fn format_optimization_renders_status_profit_and_reserves() {
         assert_eq!(
             format_optimization(result()),
-            "Optimization  status=Initialized  profit=1.5  reserves=3"
+            "Optimization  status=Initialized  profit=1.5  reserves=3  routed=3  eff_pools=2.46"
         );
     }
 
@@ -293,6 +297,9 @@ mod tests {
             reserves_count: 3,
             disabled_count: 0,
             pool_slots: 3,
+            route_entropy: 0.9,
+            effective_pools: 2.46,
+            routed_pool_count: 3,
             iterations_completed: 7,
         }
     }

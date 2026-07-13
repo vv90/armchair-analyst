@@ -578,8 +578,14 @@ fn format_input_log(input: &Event) -> String {
         Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
         Event::BootstrapEvent { chain, event } => format_bootstrap_event_log(*chain, event),
         Event::OptimizationStepCompleted { result } => format!(
-            "input optimization_step_completed status={:?} profit={} reserves={} iterations={}",
-            result.status, result.profit_amount, result.reserves_count, result.iterations_completed,
+            "input optimization_step_completed status={:?} profit={} reserves={} routed={} entropy={:.2} eff_pools={:.2} iterations={}",
+            result.status,
+            result.profit_amount,
+            result.reserves_count,
+            result.routed_pool_count,
+            result.route_entropy,
+            result.effective_pools,
+            result.iterations_completed,
         ),
         Event::Tick => "input tick".to_owned(),
     }
@@ -1565,12 +1571,15 @@ mod tests {
             reserves_count: 4,
             disabled_count: 0,
             pool_slots: 4,
+            route_entropy: 1.1,
+            effective_pools: 3.0,
+            routed_pool_count: 3,
             iterations_completed: 10,
         };
 
         assert_eq!(
             format_input_log(&Event::OptimizationStepCompleted { result }),
-            "input optimization_step_completed status=Updated profit=12.5 reserves=4 iterations=10"
+            "input optimization_step_completed status=Updated profit=12.5 reserves=4 routed=3 entropy=1.10 eff_pools=3.00 iterations=10"
         );
     }
 

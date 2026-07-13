@@ -1103,6 +1103,9 @@ mod tests {
             reserves_count: 3,
             disabled_count: 0,
             pool_slots: 3,
+            route_entropy: 0.0,
+            effective_pools: 0.0,
+            routed_pool_count: 0,
             iterations_completed: 10,
         };
 
@@ -1165,6 +1168,9 @@ mod tests {
                     reserves_count,
                     disabled_count,
                     pool_slots,
+                    route_entropy: 0.0,
+                    effective_pools: 0.0,
+                    routed_pool_count: 0,
                     iterations_completed: 10,
                 },
             )
