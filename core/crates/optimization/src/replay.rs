@@ -29,6 +29,7 @@ use std::hash::Hash;
 use thiserror::Error;
 
 use crate::model::FlowRecord;
+use crate::plan::{ExecutionPlan, StepKind};
 use crate::pool_reserves::PoolReserves;
 
 /// Surfaced when a flow set and a reserve snapshot do not belong together. Neither variant can occur
@@ -104,6 +105,67 @@ where
     U: Copy + Eq + Hash,
     I: Copy + Eq + Hash,
 {
+    let steps = flows.iter().map(|flow| ReplayStep {
+        stage: flow.stage,
+        token_in: flow.token_in,
+        token_out: flow.token_out,
+        pool: flow.pool_id,
+        weight: flow.weight,
+    });
+    replay_steps(steps, reserves, init_asset, input)
+}
+
+/// Replays a discrete [`ExecutionPlan`] (the candidate-extraction output) against an f32 reserve book,
+/// the reference oracle for the plan client-evm will execute losslessly. Same weight-driven semantics
+/// as [`replay_flows`]: [`StepKind::Swap`] swaps through and mutates its pool, [`StepKind::Carry`]
+/// carries the token through unchanged. The plan supplies its own `init_asset` and absolute
+/// `entry_amount`.
+pub fn replay_plan<U, I>(
+    plan: &ExecutionPlan<U, I>,
+    reserves: &[PoolReserves<U, I>],
+) -> Result<f32, ReplayError>
+where
+    U: Copy + Eq + Hash,
+    I: Copy + Eq + Hash,
+{
+    let steps = plan.steps.iter().map(|step| ReplayStep {
+        stage: step.stage,
+        token_in: step.token_in,
+        token_out: step.token_out,
+        pool: match step.kind {
+            StepKind::Swap(pool) => Some(pool),
+            StepKind::Carry => None,
+        },
+        weight: step.weight,
+    });
+    replay_steps(steps, reserves, plan.init_asset, plan.entry_amount)
+}
+
+/// The normalized unit both entry points fold over: a weighted hop through an optional pool. `pool`
+/// is `None` for a carry (`token_in == token_out`, the amount passes through) and, for raw flows only,
+/// an empty cell (`token_in != token_out`, whose share is lost — a plan never carries such a step).
+struct ReplayStep<U, I> {
+    stage: usize,
+    token_in: I,
+    token_out: I,
+    pool: Option<U>,
+    weight: f32,
+}
+
+/// Shared sequential replay: build a mutable pool book from `reserves`, seed the whole `input` into
+/// `init_asset`, then fold the steps stage by stage (ascending), reading each stage's start balances
+/// and writing a fresh next-stage map so unrouted balances vanish. Returns the terminal `init_asset`
+/// amount.
+fn replay_steps<U, I>(
+    steps: impl Iterator<Item = ReplayStep<U, I>> + Clone,
+    reserves: &[PoolReserves<U, I>],
+    init_asset: I,
+    input: f32,
+) -> Result<f32, ReplayError>
+where
+    U: Copy + Eq + Hash,
+    I: Copy + Eq + Hash,
+{
     let mut book: HashMap<U, PoolBookEntry<I>> = HashMap::new();
     for reserve in reserves {
         // One entry per pool id; the snapshot may carry both directions (they mirror each other), so
@@ -122,27 +184,27 @@ where
     let mut balances: HashMap<I, f32> = HashMap::new();
     balances.insert(init_asset, input);
 
-    let Some(max_stage) = flows.iter().map(|flow| flow.stage).max() else {
-        // No flows to route: the input never leaves the init asset.
+    let Some(max_stage) = steps.clone().map(|step| step.stage).max() else {
+        // No steps to route: the input never leaves the init asset.
         return Ok(input);
     };
 
     for stage in 0..=max_stage {
         let mut next: HashMap<I, f32> = HashMap::new();
-        for flow in flows.iter().filter(|flow| flow.stage == stage) {
-            let available = balances.get(&flow.token_in).copied().unwrap_or(0.0);
-            let amount_in = available * flow.weight;
+        for step in steps.clone().filter(|step| step.stage == stage) {
+            let available = balances.get(&step.token_in).copied().unwrap_or(0.0);
+            let amount_in = available * step.weight;
             if amount_in <= 0.0 {
                 continue;
             }
-            match flow.pool_id {
+            match step.pool {
                 Some(pool_id) => {
                     let entry = book.get_mut(&pool_id).ok_or(ReplayError::PoolNotFound)?;
-                    let out = entry.swap(flow.token_in, amount_in)?;
-                    *next.entry(flow.token_out).or_default() += out;
+                    let out = entry.swap(step.token_in, amount_in)?;
+                    *next.entry(step.token_out).or_default() += out;
                 }
-                None if flow.token_in == flow.token_out => {
-                    *next.entry(flow.token_out).or_default() += amount_in;
+                None if step.token_in == step.token_out => {
+                    *next.entry(step.token_out).or_default() += amount_in;
                 }
                 None => {}
             }

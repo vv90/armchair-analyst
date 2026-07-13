@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 burn = { version = "0.19.0", features = ["wgpu", "ndarray", "train"] }
-petgraph = "0.8.2"
 thiserror = "2.0.17"
 
 [dev-dependencies]

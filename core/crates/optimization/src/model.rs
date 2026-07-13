@@ -8,7 +8,6 @@ use burn::{
 };
 use crate::OptimizationError;
 use crate::pool_reserves::{PoolReserves, VirtualReserveValues};
-use petgraph::prelude::*;
 
 /// Initial pre-softmax weight for a newly grown-in pool's cells. Moderately negative so the pool's
 /// initial routing share is negligible (existing routing is preserved the instant it is added) yet
@@ -423,9 +422,9 @@ pub enum ReconcileOutcome {
 }
 
 /// One routed flow through a single pool cell at one stage of the block, recovered from the trained
-/// weights by [`Model::extract_flows`]. It is the amount-bearing sibling of the edges
-/// [`Model::swaps_graph`] emits: the same per-cell traversal, but recording the routed amounts (not
-/// just the weights) so a trained model can be inspected or later turned into executable swaps.
+/// weights by [`Model::extract_flows`]. It records the routed amounts (not just the weights) so a
+/// trained model can be inspected or folded into an executable [`crate::plan::ExecutionPlan`] by
+/// [`crate::plan::build_plan`].
 ///
 /// `stage` numbers the block hops: `0` = `layer_in` (init asset out of the root), `1..=LAYERS` = the
 /// middle layers, `LAYERS + 1` = `layer_out` (back into the init asset). `pool_id` is `None` for an
@@ -869,167 +868,6 @@ impl<
         }
 
         Ok(records)
-    }
-
-    // Not wired into the runner yet: this is the route-extraction surface for turning trained
-    // weights into an executable swap path. Exercised by tests until the execution layer
-    // exposes it.
-    #[allow(dead_code)]
-    pub fn swaps_graph<L1: Default, F: Fn(&U) -> L1>(
-        &self,
-        layout_value_map: F,
-        min_weight: f32,
-    ) -> Result<Graph<I, (f32, L1), Directed>, OptimizationError> {
-        let graph: Graph<I, (f32, L1), Directed> = Graph::new();
-
-        let inputs = self.layout.inputs()?;
-        let outputs = self.layout.outputs()?;
-
-        let init_asset = inputs
-            .get(self.block.init_asset_index as usize)
-            .ok_or(OptimizationError::InvalidInitAssetIndex)?;
-
-        let (graph, init_asset_node_index) = {
-            let mut graph = graph;
-            let init_asset_node_index = graph.add_node(*init_asset);
-            (graph, init_asset_node_index)
-        };
-
-        let layer_in_layout = self
-            .layout
-            .rows
-            .iter()
-            .map(|row| {
-                row.get(self.block.init_asset_index as usize)
-                    .ok_or(OptimizationError::InvalidLayoutIndex)
-            })
-            .collect::<Result<Vec<_>, OptimizationError>>()?;
-
-        let check_and_map_layout_value =
-            |token_in: I, token_out: I, layout_value: &Option<U>| -> Option<(I, I, L1)> {
-                layout_value
-                    .as_ref()
-                    .map(&layout_value_map)
-                    .or_else(|| {
-                        if token_in == token_out {
-                            Some(L1::default())
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|layout_value| (token_in, token_out, layout_value))
-            };
-
-        let (graph, layer_in_outputs) = softmax(self.block.layer_in.weights.val(), 0)
-            .to_data()
-            .iter::<f32>()
-            .zip(outputs.iter())
-            .zip(layer_in_layout.into_iter())
-            .filter(|((weight, _), _)| *weight >= min_weight)
-            .filter_map(|((weight, token_out), layout_value)| {
-                check_and_map_layout_value(*init_asset, *token_out, layout_value)
-                    .map(|(_, token_out, val)| (token_out, (weight, val)))
-            })
-            .fold(
-                (graph, HashMap::<I, NodeIndex>::new()),
-                |(mut graph, mut layer_outputs), (token_out, value)| {
-                    let node_index = layer_outputs
-                        .entry(token_out)
-                        .or_insert_with(|| graph.add_node(token_out));
-
-                    graph.add_edge(init_asset_node_index, *node_index, value);
-                    (graph, layer_outputs)
-                },
-            );
-
-        let (graph, layers_output) = self.block.layers.iter().fold(
-            (graph, layer_in_outputs),
-            |(graph, layer_inputs), layer| {
-                let layer_normalized_weights = softmax(layer.weights.val(), 0).to_data();
-
-                let (graph, layer_outputs) = layer_normalized_weights
-                    .iter::<f32>()
-                    .zip(outputs.iter().flat_map(|token_out| {
-                        inputs.iter().map(|token_in| (*token_in, *token_out))
-                    }))
-                    .zip(self.layout.rows.iter().flat_map(|row| row.iter()))
-                    .filter(|((weight, _), _)| *weight >= min_weight)
-                    .filter_map(|((weight, (token_in, token_out)), layout_value)| {
-                        layer_inputs.get(&token_in).map(|node_index_in| {
-                            (
-                                *node_index_in,
-                                (token_in, token_out),
-                                (weight, layout_value),
-                            )
-                        })
-                    })
-                    .filter_map(
-                        |(node_index_in, (token_in, token_out), (weight, layout_value))| {
-                            check_and_map_layout_value(token_in, token_out, layout_value).map(
-                                |(_, token_out, val)| (node_index_in, token_out, (weight, val)),
-                            )
-                        },
-                    )
-                    .fold(
-                        (graph, HashMap::<I, NodeIndex>::new()),
-                        |(mut graph, mut layer_outputs), (node_index_in, token_out, value)| {
-                            let node_index_out = layer_outputs
-                                .entry(token_out)
-                                .or_insert_with(|| graph.add_node(token_out));
-
-                            graph.add_edge(node_index_in, *node_index_out, value);
-                            (graph, layer_outputs)
-                        },
-                    );
-
-                (graph, layer_outputs)
-            },
-        );
-
-        let output_pool_indexes = self.block.layer_out_pool_indexes.to_data();
-        let layer_out_layout = output_pool_indexes
-            .iter::<i32>()
-            .map(|output_index| {
-                let r = self
-                    .layout
-                    .rows
-                    .get(output_index as usize)
-                    .ok_or(OptimizationError::InvalidOutputIndex);
-                r
-            })
-            .collect::<Result<Vec<_>, OptimizationError>>()?;
-
-        let (graph, output_asset_node_index) = {
-            let mut graph = graph;
-            let output_asset_node_index = graph.add_node(*init_asset);
-            (graph, output_asset_node_index)
-        };
-
-        let graph = softmax(self.block.layer_out.weights.val(), 0)
-            .to_data()
-            .iter::<f32>()
-            .zip(
-                output_pool_indexes
-                    .iter::<i32>()
-                    .flat_map(|_| inputs.iter().copied()),
-            )
-            .zip(layer_out_layout.into_iter().flatten())
-            .filter(|((weight, _), _)| *weight >= min_weight)
-            .filter_map(|((weight, token_in), layout_value)| {
-                layers_output
-                    .get(&token_in)
-                    .map(|node_index_in| (*node_index_in, token_in, (weight, layout_value)))
-            })
-            .filter_map(|(node_index_in, token_in, (weight, layout_value))| {
-                check_and_map_layout_value(token_in, *init_asset, layout_value)
-                    .map(|(_, _, val)| (node_index_in, (weight, val)))
-            })
-            .fold(graph, |mut graph, (node_index_in, value)| {
-                graph.add_edge(node_index_in, output_asset_node_index, value);
-                graph
-            });
-
-        Ok(graph)
     }
 }
 
@@ -2219,69 +2057,6 @@ mod tests {
         run_on_available_backend(
             || test_model_v4_arbitrage_on::<WgpuBackend>(),
             || test_model_v4_arbitrage_on::<CpuBackend>(),
-        );
-    }
-
-    #[test]
-    fn swaps_graph_respects_min_weight_and_reaches_every_node() {
-        let usdc_weth = PoolReserves {
-            token0: tokens::USDC.address,
-            token1: tokens::WETH.address,
-            pool_id: 1,
-            value: VirtualReserveValues {
-                token_0: 1_000.0,
-                token_1: 1_000.0,
-                fee_multiplier: 0.997,
-                max_swap_0: 500.0,
-                max_swap_1: 500.0,
-            },
-        };
-        let weth_wbtc = PoolReserves {
-            token0: tokens::WETH.address,
-            token1: tokens::WBTC.address,
-            pool_id: 2,
-            ..usdc_weth
-        };
-        let mut model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
-            tokens::USDC.address,
-            vec![
-                usdc_weth,
-                usdc_weth.inverse(),
-                weth_wbtc,
-                weth_wbtc.inverse(),
-            ],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .expect("model init failed");
-        force_ones_weights(&mut model);
-
-        // With ones weights every softmax column is a uniform split, so every surviving edge
-        // weight is a known 1/rows fraction — pick a threshold safely below it.
-        let min_weight = 0.05;
-        let graph = model
-            .swaps_graph(|pool_id| *pool_id, min_weight)
-            .expect("swaps_graph failed");
-
-        assert!(graph.edge_count() > 0, "expected at least one swap edge");
-        for (weight, _) in graph.edge_weights() {
-            assert!(
-                *weight >= min_weight,
-                "edge weight {} below min_weight {}",
-                weight,
-                min_weight
-            );
-        }
-
-        let mut bfs = Bfs::new(&graph, NodeIndex::new(0));
-        let mut visited = 0;
-        while bfs.next(&graph).is_some() {
-            visited += 1;
-        }
-        assert_eq!(
-            visited,
-            graph.node_count(),
-            "every node must be reachable from the init asset"
         );
     }
 

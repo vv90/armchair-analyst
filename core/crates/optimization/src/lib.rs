@@ -1,6 +1,7 @@
 mod error;
 mod execution;
 mod model;
+mod plan;
 mod pool_reserves;
 mod replay;
 mod routing_filter;
@@ -15,6 +16,7 @@ pub use execution::{
     reserves_reach_init_asset,
 };
 pub use model::FlowRecord;
+pub use plan::{ExecutableStep, ExecutionPlan, StepKind, build_plan};
 pub use pool_reserves::{PoolReserves, VirtualReserveValues};
-pub use replay::{ReplayError, replay_flows};
+pub use replay::{ReplayError, replay_flows, replay_plan};
 pub use utils::Invertible;
