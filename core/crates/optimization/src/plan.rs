@@ -349,8 +349,16 @@ mod tests {
         assert_eq!(step.kind, StepKind::Swap(7));
         // Weight renormalizes to 1.0 (sole survivor); advisory amounts are the raw sum.
         assert!((step.weight - 1.0).abs() <= 1e-6);
-        assert!((step.amount_in - 100.0).abs() <= 1e-4, "amount_in {}", step.amount_in);
-        assert!((step.amount_out - 97.0).abs() <= 1e-4, "amount_out {}", step.amount_out);
+        assert!(
+            (step.amount_in - 100.0).abs() <= 1e-4,
+            "amount_in {}",
+            step.amount_in
+        );
+        assert!(
+            (step.amount_out - 97.0).abs() <= 1e-4,
+            "amount_out {}",
+            step.amount_out
+        );
     }
 
     proptest! {

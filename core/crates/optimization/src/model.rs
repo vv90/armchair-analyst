@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::OptimizationError;
+use crate::pool_reserves::{PoolReserves, VirtualReserveValues};
 use burn::{
     module::Param,
     optim::{Adam, AdamConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
     prelude::*,
     tensor::{Distribution, Slice, activation::softmax, backend::AutodiffBackend},
 };
-use crate::OptimizationError;
-use crate::pool_reserves::{PoolReserves, VirtualReserveValues};
 
 /// Initial pre-softmax weight for a newly grown-in pool's cells. Moderately negative so the pool's
 /// initial routing share is negligible (existing routing is preserved the instant it is added) yet
@@ -641,8 +641,10 @@ impl<
                             .unwrap_or(false),
                     );
 
-                    let reserve =
-                        cell.as_ref().map(|(_, r)| r).unwrap_or(&VirtualReserveValues {
+                    let reserve = cell
+                        .as_ref()
+                        .map(|(_, r)| r)
+                        .unwrap_or(&VirtualReserveValues {
                             token_0: 0.0,
                             token_1: 0.0,
                             fee_multiplier: 0.0,
@@ -750,7 +752,10 @@ impl<
     /// cell of every stage is returned (including zero-share and empty cells) so the per-stage
     /// column shares sum to one exactly; callers filter by `amount_in`/`weight` as needed. Read-only
     /// and pure — meant for offline analysis or once-per-step diagnostics, not the hot path.
-    pub fn extract_flows(&self, input: B::FloatElem) -> Result<Vec<FlowRecord<U, I>>, OptimizationError> {
+    pub fn extract_flows(
+        &self,
+        input: B::FloatElem,
+    ) -> Result<Vec<FlowRecord<U, I>>, OptimizationError> {
         let inputs = self.layout.inputs()?;
         let outputs = self.layout.outputs()?;
         let init_asset_index = self.block.init_asset_index as usize;
@@ -761,7 +766,10 @@ impl<
 
         // Pool id stored at layout cell (row, col), or `None` for an empty/bypass cell.
         let pool_id_at = |row: usize, col: usize| -> Option<U> {
-            self.layout.rows.get(row).and_then(|cells| cells.get(col).copied().flatten())
+            self.layout
+                .rows
+                .get(row)
+                .and_then(|cells| cells.get(col).copied().flatten())
         };
 
         let mut records = Vec::new();
@@ -769,8 +777,14 @@ impl<
         // Stage 0 — `layer_in`: the single init-asset column routes the scalar input out to every
         // pool that consumes the init asset. Its weights are `[rows, 1]`, so `col` is always the
         // init-asset column.
-        let (layer_in_x, layer_in_y, layer_in_gamma, layer_in_bypass, layer_in_disabled, layer_in_max_swap) =
-            self.block.layer_in_params();
+        let (
+            layer_in_x,
+            layer_in_y,
+            layer_in_gamma,
+            layer_in_bypass,
+            layer_in_disabled,
+            layer_in_max_swap,
+        ) = self.block.layer_in_params();
         let (weight, amount_in, amount_out, mut carried) = stage_flows(
             self.block.layer_in.weights.val(),
             &layer_in_x,
@@ -789,9 +803,15 @@ impl<
                 token_in: init_asset,
                 token_out: *token_out,
                 pool_id: pool_id_at(row, init_asset_index),
-                amount_in: *amount_in.get(row).ok_or(OptimizationError::InvalidLayoutIndex)?,
-                amount_out: *amount_out.get(row).ok_or(OptimizationError::InvalidLayoutIndex)?,
-                weight: *weight.get(row).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                amount_in: *amount_in
+                    .get(row)
+                    .ok_or(OptimizationError::InvalidLayoutIndex)?,
+                amount_out: *amount_out
+                    .get(row)
+                    .ok_or(OptimizationError::InvalidLayoutIndex)?,
+                weight: *weight
+                    .get(row)
+                    .ok_or(OptimizationError::InvalidLayoutIndex)?,
             });
         }
 
@@ -817,9 +837,15 @@ impl<
                         token_in: *token_in,
                         token_out: *token_out,
                         pool_id: pool_id_at(row, col),
-                        amount_in: *amount_in.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
-                        amount_out: *amount_out.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
-                        weight: *weight.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                        amount_in: *amount_in
+                            .get(cell)
+                            .ok_or(OptimizationError::InvalidLayoutIndex)?,
+                        amount_out: *amount_out
+                            .get(cell)
+                            .ok_or(OptimizationError::InvalidLayoutIndex)?,
+                        weight: *weight
+                            .get(cell)
+                            .ok_or(OptimizationError::InvalidLayoutIndex)?,
                     });
                 }
             }
@@ -860,9 +886,15 @@ impl<
                     token_in: *token_in,
                     token_out: init_asset,
                     pool_id: pool_id_at(*layout_row, col),
-                    amount_in: *amount_in.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
-                    amount_out: *amount_out.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
-                    weight: *weight.get(cell).ok_or(OptimizationError::InvalidLayoutIndex)?,
+                    amount_in: *amount_in
+                        .get(cell)
+                        .ok_or(OptimizationError::InvalidLayoutIndex)?,
+                    amount_out: *amount_out
+                        .get(cell)
+                        .ok_or(OptimizationError::InvalidLayoutIndex)?,
+                    weight: *weight
+                        .get(cell)
+                        .ok_or(OptimizationError::InvalidLayoutIndex)?,
                 });
             }
         }
@@ -1089,9 +1121,11 @@ impl<
             .collect();
 
         // Grow the layout: existing (row, col) slots never move (append-only fold).
-        let layout = new_reserves.into_iter().fold(self.layout, |layout, reserve| {
-            layout.with_reserve_values(reserve.token0, reserve.token1, reserve.pool_id)
-        });
+        let layout = new_reserves
+            .into_iter()
+            .fold(self.layout, |layout, reserve| {
+                layout.with_reserve_values(reserve.token0, reserve.token1, reserve.pool_id)
+            });
         let [rows, cols] = layout.shape();
         let dims = [rows, cols];
 
@@ -1123,15 +1157,16 @@ impl<
                 bypass_mask_data
                     .push(bypass_indexes.contains(&(RowIndex(row_index), ColumnIndex(col_index))));
 
-                let value = position_value.get(&(row_index, col_index)).copied().unwrap_or(
-                    VirtualReserveValues {
+                let value = position_value
+                    .get(&(row_index, col_index))
+                    .copied()
+                    .unwrap_or(VirtualReserveValues {
                         token_0: 0.0,
                         token_1: 0.0,
                         fee_multiplier: 0.0,
                         max_swap_0: 0.0,
                         max_swap_1: 0.0,
-                    },
-                );
+                    });
                 reserves_in_data.push(B::FloatElem::from_elem(value.token_0));
                 reserves_out_data.push(B::FloatElem::from_elem(value.token_1));
                 fee_multiplier_data.push(B::FloatElem::from_elem(value.fee_multiplier));
@@ -1410,7 +1445,11 @@ mod tests {
             ..reserve
         };
         let (model, outcome) = model
-            .reconcile(vec![updated, updated.inverse()], &HashSet::new(), &HashSet::new())
+            .reconcile(
+                vec![updated, updated.inverse()],
+                &HashSet::new(),
+                &HashSet::new(),
+            )
             .expect("model reconcile failed");
         assert_eq!(
             outcome,
@@ -1524,9 +1563,7 @@ mod tests {
 
     /// [`two_parallel_reserves`] built into a model with weights forced to ones (deterministic
     /// 50/50 softmax split) and the given pools disabled.
-    fn two_parallel_pool_model(
-        disabled: &HashSet<i32>,
-    ) -> Model<CpuBackend, i32, TokenAddress, 1> {
+    fn two_parallel_pool_model(disabled: &HashSet<i32>) -> Model<CpuBackend, i32, TokenAddress, 1> {
         let mut model = Model::<CpuBackend, i32, TokenAddress, 1>::init(
             tokens::USDC.address,
             two_parallel_reserves(),
@@ -1565,7 +1602,11 @@ mod tests {
         // Disable pool 2 through `update` with the key set unchanged; trained (ones) weights and
         // the pool's reserves stay in place, only its routing weight is masked.
         let (disabled_model, _) = two_parallel_pool_model(&HashSet::new())
-            .reconcile(two_parallel_reserves(), &HashSet::new(), &HashSet::from([2]))
+            .reconcile(
+                two_parallel_reserves(),
+                &HashSet::new(),
+                &HashSet::from([2]),
+            )
             .expect("reconcile failed");
         let disabled_output = disabled_model.evaluate(100.0);
 
@@ -1630,14 +1671,22 @@ mod tests {
         assert_eq!(outcome, ReconcileOutcome::Grew);
 
         let [_, cols] = model.layout.shape();
-        let layer = model.block.layers.first().expect("model has one middle layer");
+        let layer = model
+            .block
+            .layers
+            .first()
+            .expect("model has one middle layer");
         let weights = float_cells(&layer.weights.val());
 
         for (index, &weight) in weights.iter().enumerate() {
             let row = index / cols;
             let col = index % cols;
             if row < old_rows && col < old_cols {
-                assert_eq!(weight, 1.0, "trained weight at ({}, {}) must be preserved", row, col);
+                assert_eq!(
+                    weight, 1.0,
+                    "trained weight at ({}, {}) must be preserved",
+                    row, col
+                );
             } else {
                 assert_eq!(
                     weight, COLD_WEIGHT,
@@ -1717,7 +1766,11 @@ mod tests {
             .reconcile(pool_one_only, &HashSet::new(), &HashSet::new())
             .expect("reconcile failed");
         assert_eq!(outcome, ReconcileOutcome::Refreshed);
-        assert_eq!(dropped.pool_slots(), slots, "removal must not shrink the layout");
+        assert_eq!(
+            dropped.pool_slots(),
+            slots,
+            "removal must not shrink the layout"
+        );
 
         let dropped_output = dropped.evaluate(100.0);
         assert!(
@@ -2010,13 +2063,11 @@ mod tests {
         let reserves = pool_reserves_map
             .into_iter()
             .filter(|((_, _, fee), _)| *fee == 3000)
-            .map(|((from, to, _), reserve)| {
-                PoolReserves {
-                    token0: from,
-                    token1: to,
-                    pool_id: [0u8; 20],
-                    value: reserve,
-                }
+            .map(|((from, to, _), reserve)| PoolReserves {
+                token0: from,
+                token1: to,
+                pool_id: [0u8; 20],
+                value: reserve,
             })
             .collect::<Vec<_>>();
 
@@ -2312,8 +2363,7 @@ mod tests {
 
     /// Strategy: a set of pools with distinct ids, each between two distinct tokens, with
     /// positive finite reserve values — the raw material for `Model::init` proptests.
-    fn arbitrary_pool_reserves()
-    -> impl Strategy<Value = Vec<PoolReserves<i64, TokenAddress>>> {
+    fn arbitrary_pool_reserves() -> impl Strategy<Value = Vec<PoolReserves<i64, TokenAddress>>> {
         prop::collection::hash_map(
             any::<i64>(),
             (
@@ -2330,7 +2380,10 @@ mod tests {
             pools
                 .into_iter()
                 .map(
-                    |(pool_id, (tokens, token_0, token_1, fee_multiplier, max_swap_0, max_swap_1))| {
+                    |(
+                        pool_id,
+                        (tokens, token_0, token_1, fee_multiplier, max_swap_0, max_swap_1),
+                    )| {
                         let tokens = tokens.into_iter().collect::<Vec<_>>();
                         PoolReserves {
                             token0: tokens[0],
@@ -2966,7 +3019,10 @@ mod tests {
             let model = deterministic_no_arbitrage_model();
             for input in [1.0, 100.0, 1_000.0, 1_000_000.0] {
                 let output = model.evaluate(input);
-                assert!(output.is_finite(), "evaluate must stay finite at input {input}");
+                assert!(
+                    output.is_finite(),
+                    "evaluate must stay finite at input {input}"
+                );
                 assert!(
                     output < input,
                     "no-arbitrage market profited at input {input}: {output} >= {input}"
@@ -2982,7 +3038,10 @@ mod tests {
             let model = deterministic_no_arbitrage_model();
             let small = model.evaluate(10_000_000.0);
             let large = model.evaluate(20_000_000.0);
-            assert!(large > small, "output must increase with input ({small} -> {large})");
+            assert!(
+                large > small,
+                "output must increase with input ({small} -> {large})"
+            );
             assert!(
                 large < 2.0 * small,
                 "output must be sublinear in input ({large} >= 2 * {small})"
@@ -3028,7 +3087,10 @@ mod tests {
             let optimizer = Model::<B, i32, TokenAddress, 1>::init_optimizer();
             let (model, _optimizer) = model.optimize_with(optimizer, input, 200);
             let profit = model.evaluate(input) - input;
-            assert!(profit > 0.0, "planted arbitrage was not captured: profit {profit}");
+            assert!(
+                profit > 0.0,
+                "planted arbitrage was not captured: profit {profit}"
+            );
         }
     }
 
@@ -3080,9 +3142,14 @@ mod tests {
 
             let mut weight_by_group: HashMap<(usize, TokenAddress), f32> = HashMap::new();
             for flow in &flows {
-                *weight_by_group.entry((flow.stage, flow.token_in)).or_insert(0.0) += flow.weight;
+                *weight_by_group
+                    .entry((flow.stage, flow.token_in))
+                    .or_insert(0.0) += flow.weight;
             }
-            assert!(!weight_by_group.is_empty(), "expected at least one flow group");
+            assert!(
+                !weight_by_group.is_empty(),
+                "expected at least one flow group"
+            );
             for ((stage, _token), total) in weight_by_group {
                 assert!(
                     (total - 1.0).abs() <= 1e-4,
@@ -3100,7 +3167,10 @@ mod tests {
             let summary = FlowSummary::from_flows(&flows);
 
             assert!(summary.route_entropy >= 0.0, "entropy must be non-negative");
-            assert!(!summary.token_flows.is_empty(), "per-token flows must be recorded");
+            assert!(
+                !summary.token_flows.is_empty(),
+                "per-token flows must be recorded"
+            );
             assert!(
                 summary
                     .token_flows
@@ -3109,7 +3179,10 @@ mod tests {
                 "per-token flows must be finite and non-negative"
             );
             let pool_count = summary.pool_inputs.len() as f32;
-            assert!(pool_count >= 2.0, "two-parallel-pool model should route through both pools");
+            assert!(
+                pool_count >= 2.0,
+                "two-parallel-pool model should route through both pools"
+            );
             assert!(
                 summary.effective_pools >= 1.0 - 1e-4,
                 "effective pools must be at least 1, got {}",

@@ -75,8 +75,14 @@ where
             continue;
         }
         if seen_pools.insert(reserve.pool_id) {
-            adjacency.entry(reserve.token0).or_default().push(reserve.token1);
-            adjacency.entry(reserve.token1).or_default().push(reserve.token0);
+            adjacency
+                .entry(reserve.token0)
+                .or_default()
+                .push(reserve.token1);
+            adjacency
+                .entry(reserve.token1)
+                .or_default()
+                .push(reserve.token0);
         }
     }
 
@@ -164,10 +170,24 @@ mod tests {
     }
 
     /// Builds both directional reserves of a single pool (they share `pool_id`).
-    fn pool(token0: TokenAddress, token1: TokenAddress, pool_id: u32) -> Vec<PoolReserves<u32, TokenAddress>> {
+    fn pool(
+        token0: TokenAddress,
+        token1: TokenAddress,
+        pool_id: u32,
+    ) -> Vec<PoolReserves<u32, TokenAddress>> {
         vec![
-            PoolReserves { token0, token1, pool_id, value: value() },
-            PoolReserves { token0: token1, token1: token0, pool_id, value: value() },
+            PoolReserves {
+                token0,
+                token1,
+                pool_id,
+                value: value(),
+            },
+            PoolReserves {
+                token0: token1,
+                token1: token0,
+                pool_id,
+                value: value(),
+            },
         ]
     }
 
@@ -175,10 +195,7 @@ mod tests {
         HashSet::new()
     }
 
-    fn has_pool(
-        reserves: &[PoolReserves<u32, TokenAddress>],
-        pool_id: u32,
-    ) -> bool {
+    fn has_pool(reserves: &[PoolReserves<u32, TokenAddress>], pool_id: u32) -> bool {
         reserves.iter().any(|reserve| reserve.pool_id == pool_id)
     }
 
@@ -247,7 +264,10 @@ mod tests {
 
         // Without the bridge the Arbitrum component is unreachable from init.
         let without_bridge = routable_reserves(reserves, usdc, &no_bridges());
-        assert!(!has_pool(&without_bridge, 4), "unbridged component must be dropped");
+        assert!(
+            !has_pool(&without_bridge, 4),
+            "unbridged component must be dropped"
+        );
         assert!(!has_pool(&without_bridge, 5));
     }
 
@@ -270,7 +290,10 @@ mod tests {
         let pruned = routable_reserves(reserves, usdc, &bridges);
 
         assert!(has_pool(&pruned, 1));
-        assert!(!has_pool(&pruned, 4), "dead-end chain behind a bridge must be dropped");
+        assert!(
+            !has_pool(&pruned, 4),
+            "dead-end chain behind a bridge must be dropped"
+        );
     }
 
     #[test]
@@ -309,7 +332,10 @@ mod tests {
         let reserves = pool(usdc, weth, 1);
         let pruned = routable_reserves(reserves.clone(), usdc, &no_bridges());
 
-        assert_eq!(pruned, reserves, "fallback must leave the snapshot untouched");
+        assert_eq!(
+            pruned, reserves,
+            "fallback must leave the snapshot untouched"
+        );
     }
 
     #[test]

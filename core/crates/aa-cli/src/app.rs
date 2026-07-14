@@ -976,7 +976,9 @@ fn spawn_optimization_subscription(
             default_optimization_session_config(),
             default_optimization_step_config(),
             sender,
-            |result| Event::OptimizationStepCompleted { result },
+            // The emitted plan is not consumed yet: the app-boundary verification chunk (lossless
+            // replay against fresh kernel state) is where it gains a consumer.
+            |result, _plan| Event::OptimizationStepCompleted { result },
         );
 
         match result {

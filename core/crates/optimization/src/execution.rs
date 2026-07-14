@@ -4,9 +4,30 @@ use burn::tensor::{ElementConversion, backend::AutodiffBackend, cast::ToElement}
 use thiserror::Error;
 
 use crate::{
-    OptimizationError, PoolReserves, model::FlowSummary, model::Model, model::ModelOptimizer,
+    OptimizationError, PoolReserves,
+    model::FlowSummary,
+    model::Model,
+    model::ModelOptimizer,
     model::ReconcileOutcome,
+    plan::{ExecutionPlan, build_plan},
 };
+
+/// Steps routing less than this fraction of their stage balance are dust: their advisory amounts
+/// are near zero and they only add noise to downstream plan verification. `build_plan`
+/// renormalizes the surviving weights, so the pruned share is redistributed rather than stranded.
+const PLAN_MIN_WEIGHT: f32 = 0.01;
+
+/// The outcome every step-producing function returns: the advanced value (session or runner),
+/// the scalar step result, and the executable plan recovered from the trained weights (`None` only
+/// when flow extraction degraded on a corrupt layout).
+type StepOutcome<X, TPool, TToken, E> = Result<
+    (
+        X,
+        OptimizationStepResult,
+        Option<ExecutionPlan<TPool, TToken>>,
+    ),
+    E,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OptimizationBackendSelection {
@@ -169,13 +190,8 @@ where
         reserves: Vec<PoolReserves<TPool, TToken>>,
         session_config: OptimizationSessionConfig<TToken>,
         step_config: OptimizationStepConfig,
-    ) -> Result<
-        (
-            OptimizationRunner<TPool, TToken, LAYERS>,
-            OptimizationStepResult,
-        ),
-        OptimizationInitError,
-    > {
+    ) -> StepOutcome<OptimizationRunner<TPool, TToken, LAYERS>, TPool, TToken, OptimizationInitError>
+    {
         let backend = match backend {
             OptimizationBackendSelection::Cpu => OptimizationBackendUsed::Cpu,
             selection => select_backend(selection, wgpu_backend_available())?,
@@ -183,7 +199,7 @@ where
 
         match backend {
             OptimizationBackendUsed::Wgpu => {
-                let (runner, result) =
+                let (runner, result, plan) =
                     TypedOptimizationRunner::<WgpuBackend, TPool, TToken, LAYERS>::init(
                         reserves,
                         session_config,
@@ -196,10 +212,11 @@ where
                         inner: OptimizationRunnerInner::Wgpu(Box::new(runner)),
                     },
                     result,
+                    plan,
                 ))
             }
             OptimizationBackendUsed::Cpu => {
-                let (runner, result) =
+                let (runner, result, plan) =
                     TypedOptimizationRunner::<CpuBackend, TPool, TToken, LAYERS>::init(
                         reserves,
                         session_config,
@@ -212,6 +229,7 @@ where
                         inner: OptimizationRunnerInner::Cpu(Box::new(runner)),
                     },
                     result,
+                    plan,
                 ))
             }
         }
@@ -220,32 +238,29 @@ where
     pub fn run(
         self,
         update: OptimizationStepUpdate<TPool, TToken>,
-    ) -> Result<
-        (
-            OptimizationRunner<TPool, TToken, LAYERS>,
-            OptimizationStepResult,
-        ),
-        OptimizationStepError,
-    > {
+    ) -> StepOutcome<OptimizationRunner<TPool, TToken, LAYERS>, TPool, TToken, OptimizationStepError>
+    {
         match self.inner {
             OptimizationRunnerInner::Wgpu(runner) => {
-                let (runner, result) = runner.run(update)?;
+                let (runner, result, plan) = runner.run(update)?;
 
                 Ok((
                     OptimizationRunner {
                         inner: OptimizationRunnerInner::Wgpu(Box::new(runner)),
                     },
                     result,
+                    plan,
                 ))
             }
             OptimizationRunnerInner::Cpu(runner) => {
-                let (runner, result) = runner.run(update)?;
+                let (runner, result, plan) = runner.run(update)?;
 
                 Ok((
                     OptimizationRunner {
                         inner: OptimizationRunnerInner::Cpu(Box::new(runner)),
                     },
                     result,
+                    plan,
                 ))
             }
         }
@@ -269,14 +284,13 @@ where
         reserves: Vec<PoolReserves<TPool, TToken>>,
         session_config: OptimizationSessionConfig<TToken>,
         step_config: OptimizationStepConfig,
-    ) -> Result<
-        (
-            TypedOptimizationRunner<B, TPool, TToken, LAYERS>,
-            OptimizationStepResult,
-        ),
+    ) -> StepOutcome<
+        TypedOptimizationRunner<B, TPool, TToken, LAYERS>,
+        TPool,
+        TToken,
         OptimizationStepError,
     > {
-        let (session, result) = initialize_optimization_session::<B, TPool, TToken, LAYERS>(
+        let (session, result, plan) = initialize_optimization_session::<B, TPool, TToken, LAYERS>(
             reserves,
             session_config,
             &step_config,
@@ -288,20 +302,21 @@ where
                 step_config,
             },
             result,
+            plan,
         ))
     }
 
     fn run(
         self,
         update: OptimizationStepUpdate<TPool, TToken>,
-    ) -> Result<
-        (
-            TypedOptimizationRunner<B, TPool, TToken, LAYERS>,
-            OptimizationStepResult,
-        ),
+    ) -> StepOutcome<
+        TypedOptimizationRunner<B, TPool, TToken, LAYERS>,
+        TPool,
+        TToken,
         OptimizationStepError,
     > {
-        let (session, result) = run_optimization_step(self.session, update, &self.step_config)?;
+        let (session, result, plan) =
+            run_optimization_step(self.session, update, &self.step_config)?;
 
         Ok((
             TypedOptimizationRunner {
@@ -309,6 +324,7 @@ where
                 step_config: self.step_config,
             },
             result,
+            plan,
         ))
     }
 }
@@ -349,13 +365,7 @@ fn initialize_optimization_session<B, TPool, TToken, const LAYERS: usize>(
     reserves: Vec<PoolReserves<TPool, TToken>>,
     session_config: OptimizationSessionConfig<TToken>,
     step_config: &OptimizationStepConfig,
-) -> Result<
-    (
-        OptimizationSession<B, TPool, TToken, LAYERS>,
-        OptimizationStepResult,
-    ),
-    OptimizationStepError,
->
+) -> StepOutcome<OptimizationSession<B, TPool, TToken, LAYERS>, TPool, TToken, OptimizationStepError>
 where
     B: AutodiffBackend,
     TPool: Copy + PartialEq + Eq + Hash,
@@ -381,13 +391,7 @@ fn run_optimization_step<B, TPool, TToken, const LAYERS: usize>(
     session: OptimizationSession<B, TPool, TToken, LAYERS>,
     update: OptimizationStepUpdate<TPool, TToken>,
     step_config: &OptimizationStepConfig,
-) -> Result<
-    (
-        OptimizationSession<B, TPool, TToken, LAYERS>,
-        OptimizationStepResult,
-    ),
-    OptimizationStepError,
->
+) -> StepOutcome<OptimizationSession<B, TPool, TToken, LAYERS>, TPool, TToken, OptimizationStepError>
 where
     B: AutodiffBackend,
     TPool: Copy + PartialEq + Eq + Hash,
@@ -408,13 +412,7 @@ fn run_optimization_step_with_reserves<B, TPool, TToken, const LAYERS: usize>(
     reserves: Vec<PoolReserves<TPool, TToken>>,
     disabled: &HashSet<TPool>,
     step_config: &OptimizationStepConfig,
-) -> Result<
-    (
-        OptimizationSession<B, TPool, TToken, LAYERS>,
-        OptimizationStepResult,
-    ),
-    OptimizationStepError,
->
+) -> StepOutcome<OptimizationSession<B, TPool, TToken, LAYERS>, TPool, TToken, OptimizationStepError>
 where
     B: AutodiffBackend,
     TPool: Copy + PartialEq + Eq + Hash,
@@ -500,13 +498,7 @@ fn initialize_optimization_session_with_status<B, TPool, TToken, const LAYERS: u
     step_config: &OptimizationStepConfig,
     status: OptimizationStepStatus,
     disabled: &HashSet<TPool>,
-) -> Result<
-    (
-        OptimizationSession<B, TPool, TToken, LAYERS>,
-        OptimizationStepResult,
-    ),
-    OptimizationStepError,
->
+) -> StepOutcome<OptimizationSession<B, TPool, TToken, LAYERS>, TPool, TToken, OptimizationStepError>
 where
     B: AutodiffBackend,
     TPool: Copy + PartialEq + Eq + Hash,
@@ -540,13 +532,7 @@ fn run_optimization_chunk<B, TPool, TToken, const LAYERS: usize>(
     session: OptimizationSession<B, TPool, TToken, LAYERS>,
     step_config: &OptimizationStepConfig,
     status: OptimizationStepStatus,
-) -> Result<
-    (
-        OptimizationSession<B, TPool, TToken, LAYERS>,
-        OptimizationStepResult,
-    ),
-    OptimizationStepError,
->
+) -> StepOutcome<OptimizationSession<B, TPool, TToken, LAYERS>, TPool, TToken, OptimizationStepError>
 where
     B: AutodiffBackend,
     TPool: Copy + PartialEq + Eq + Hash,
@@ -566,20 +552,29 @@ where
     let (model, optimizer) = model.optimize_with(optimizer, input_elem, step_config.iterations);
     let output_amount = model.evaluate(input_elem).to_f32();
 
-    // Route diagnostics read off the trained weights, once per completed step (never in the
-    // optimization loop). `extract_flows` only errors on a corrupt layout, which a model that just
-    // optimized and evaluated cannot have, so degrade to neutral values rather than fail the step.
-    let (route_entropy, effective_pools, routed_pool_count) = match model.extract_flows(input_elem) {
-        Ok(flows) => {
-            let summary = FlowSummary::from_flows(&flows);
-            (
-                summary.route_entropy,
-                summary.effective_pools,
-                summary.pool_inputs.len(),
-            )
-        }
-        Err(_) => (0.0, 0.0, 0),
-    };
+    // Route diagnostics and the executable plan read off the trained weights, once per completed
+    // step (never in the optimization loop). `extract_flows` only errors on a corrupt layout, which
+    // a model that just optimized and evaluated cannot have, so degrade to neutral values and no
+    // plan rather than fail the step.
+    let (route_entropy, effective_pools, routed_pool_count, plan) =
+        match model.extract_flows(input_elem) {
+            Ok(flows) => {
+                let summary = FlowSummary::from_flows(&flows);
+                let plan = build_plan(
+                    &flows,
+                    session_config.init_asset,
+                    step_config.input_amount,
+                    PLAN_MIN_WEIGHT,
+                );
+                (
+                    summary.route_entropy,
+                    summary.effective_pools,
+                    summary.pool_inputs.len(),
+                    Some(plan),
+                )
+            }
+            Err(_) => (0.0, 0.0, 0, None),
+        };
 
     let result = OptimizationStepResult {
         status,
@@ -604,6 +599,7 @@ where
             disabled_count,
         },
         result,
+        plan,
     ))
 }
 
@@ -704,6 +700,7 @@ mod tests {
 
     use crate::{
         Invertible, PoolReserves, VirtualReserveValues,
+        plan::StepKind,
         tokens::test::{self as tokens, TokenAddress},
     };
 
@@ -713,7 +710,7 @@ mod tests {
 
     #[test]
     fn optimization_runner_cpu_init_returns_initialized_result() {
-        let (runner, result) = OptimizationRunner::<i32, TokenAddress, 1>::init(
+        let (runner, result, _) = OptimizationRunner::<i32, TokenAddress, 1>::init(
             OptimizationBackendSelection::Cpu,
             base_reserves(),
             session_config(),
@@ -730,7 +727,7 @@ mod tests {
     fn optimization_runner_cpu_continue_returns_continued_result() {
         let (runner, _) = initialized_cpu_runner();
 
-        let (_runner, result) = runner.run(OptimizationStepUpdate::Continue).unwrap();
+        let (_runner, result, _) = runner.run(OptimizationStepUpdate::Continue).unwrap();
 
         assert_eq!(result.status, OptimizationStepStatus::Continued);
         assert_eq!(result.reserves_count, 2);
@@ -740,7 +737,7 @@ mod tests {
     fn optimization_runner_cpu_same_keys_update_existing_runner() {
         let (runner, _) = initialized_cpu_runner();
 
-        let (_runner, result) = runner
+        let (_runner, result, _) = runner
             .run(OptimizationStepUpdate::NewReserves {
                 reserves: scaled_base_reserves(1.01),
                 disabled: HashSet::new(),
@@ -755,7 +752,7 @@ mod tests {
     fn optimization_runner_cpu_added_keys_extend_runner() {
         let (runner, _) = initialized_cpu_runner();
 
-        let (_runner, result) = runner
+        let (_runner, result, _) = runner
             .run(OptimizationStepUpdate::NewReserves {
                 reserves: expanded_reserves(),
                 disabled: HashSet::new(),
@@ -807,13 +804,13 @@ mod tests {
 
     #[test]
     fn initialize_session_returns_initialized_result() {
-        let (_session, result) =
-            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
-                base_reserves(),
-                session_config(),
-                &step_config(0),
-            )
-            .unwrap();
+        let (_session, result, _) = initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(base_reserves(), session_config(), &step_config(0))
+        .unwrap();
 
         assert_eq!(result.status, OptimizationStepStatus::Initialized);
         assert_eq!(result.reserves_count, 2);
@@ -828,7 +825,7 @@ mod tests {
         // trained weights. Entropy is finite and non-negative; effective pools is `exp(entropy)`,
         // hence at least one; and the routed-pool count is bounded by the two distinct pools in the
         // snapshot.
-        let (_session, result) =
+        let (_session, result, _) =
             initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
                 expanded_reserves(),
                 session_config(),
@@ -855,10 +852,73 @@ mod tests {
     }
 
     #[test]
+    fn completed_step_emits_plan_pinned_to_the_configs() {
+        let (_session, _result, plan) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                base_reserves(),
+                session_config(),
+                &step_config(0),
+            )
+            .unwrap();
+
+        let plan = plan.expect("a completed step must emit a plan");
+        assert_eq!(plan.init_asset, session_config().init_asset);
+        assert_eq!(plan.entry_amount, step_config(0).input_amount);
+    }
+
+    #[test]
+    fn plan_swap_pools_come_from_the_snapshot() {
+        // Wiring check only — `build_plan`'s own semantics are pinned by the plan module's tests.
+        let (_session, _result, plan) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                triangle_reserves(),
+                session_config(),
+                &step_config(5),
+            )
+            .unwrap();
+
+        let plan = plan.expect("a completed step must emit a plan");
+        let snapshot_pools: HashSet<i32> = triangle_reserves()
+            .iter()
+            .map(|reserve| reserve.pool_id)
+            .collect();
+        for step in &plan.steps {
+            if let StepKind::Swap(pool) = step.kind {
+                assert!(
+                    snapshot_pools.contains(&pool),
+                    "plan names pool {pool} absent from the snapshot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn continue_and_update_steps_emit_plans() {
+        // The plan is emitted per completed step, not only at initialization.
+        let (session, _) = initialized_session();
+
+        let (session, _result, continued_plan) =
+            run_optimization_step(session, OptimizationStepUpdate::Continue, &step_config(0))
+                .unwrap();
+        assert!(continued_plan.is_some(), "Continue step must emit a plan");
+
+        let (_session, _result, updated_plan) = run_optimization_step(
+            session,
+            OptimizationStepUpdate::NewReserves {
+                reserves: scaled_base_reserves(1.01),
+                disabled: HashSet::new(),
+            },
+            &step_config(0),
+        )
+        .unwrap();
+        assert!(updated_plan.is_some(), "Updated step must emit a plan");
+    }
+
+    #[test]
     fn new_reserves_with_same_key_set_updates_existing_session() {
         let (session, _) = initialized_session();
 
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: scaled_base_reserves(1.01),
@@ -878,7 +938,7 @@ mod tests {
         let mut reserves = scaled_base_reserves(1.01);
         reserves.reverse();
 
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves,
@@ -897,7 +957,7 @@ mod tests {
         let (session, init_result) = initialized_session();
         let slots_before = init_result.pool_slots;
 
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: expanded_reserves(),
@@ -920,16 +980,16 @@ mod tests {
 
     #[test]
     fn removed_reserve_key_masks_and_keeps_slots() {
-        let (session, init_result) = initialize_optimization_session::<
-            CpuBackend,
-            i32,
-            TokenAddress,
-            1,
-        >(expanded_reserves(), session_config(), &step_config(0))
-        .unwrap();
+        let (session, init_result, _) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                expanded_reserves(),
+                session_config(),
+                &step_config(0),
+            )
+            .unwrap();
         let slots_before = init_result.pool_slots;
 
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: base_reserves(),
@@ -948,17 +1008,17 @@ mod tests {
 
     #[test]
     fn re_adding_a_removed_pool_is_a_cheap_in_place_update() {
-        let (session, extend_result) = initialize_optimization_session::<
-            CpuBackend,
-            i32,
-            TokenAddress,
-            1,
-        >(expanded_reserves(), session_config(), &step_config(0))
-        .unwrap();
+        let (session, extend_result, _) =
+            initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
+                expanded_reserves(),
+                session_config(),
+                &step_config(0),
+            )
+            .unwrap();
         let slots = extend_result.pool_slots;
 
         // Drop the third pool (masked, slot kept) ...
-        let (session, dropped) = run_optimization_step(
+        let (session, dropped, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: base_reserves(),
@@ -971,7 +1031,7 @@ mod tests {
         assert_eq!(dropped.pool_slots, slots);
 
         // ... then re-add it: the slot already exists, so this is a refresh, not a growth.
-        let (_session, readded) = run_optimization_step(
+        let (_session, readded, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: expanded_reserves(),
@@ -989,7 +1049,7 @@ mod tests {
     fn disabling_a_pool_keeps_key_set_and_updates_without_reinitializing() {
         let (session, _) = initialized_session();
 
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: base_reserves(),
@@ -1010,7 +1070,7 @@ mod tests {
     fn disabled_id_absent_from_snapshot_is_ignored() {
         let (session, _) = initialized_session();
 
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: base_reserves(),
@@ -1032,7 +1092,7 @@ mod tests {
 
         // Adding a pool grows the layout; a disable request in the same step must still be applied
         // to the grown model and reflected in the diagnostic count.
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: expanded_reserves(),
@@ -1051,7 +1111,7 @@ mod tests {
     fn continue_runs_existing_session_without_reserve_update() {
         let (session, _) = initialized_session();
 
-        let (_session, result) =
+        let (_session, result, _) =
             run_optimization_step(session, OptimizationStepUpdate::Continue, &step_config(0))
                 .unwrap();
 
@@ -1136,14 +1196,22 @@ mod tests {
 
     #[test]
     fn reserves_reach_init_asset_is_true_when_a_pool_outputs_the_init_asset() {
-        assert!(reserves_reach_init_asset(&base_reserves(), &session_config()));
+        assert!(reserves_reach_init_asset(
+            &base_reserves(),
+            &session_config()
+        ));
     }
 
     #[test]
     fn reserves_reach_init_asset_is_false_when_no_pool_outputs_the_init_asset() {
         // Same snapshot that drives `missing_init_asset_output_returns_typed_error`: a step fed this
         // would abort with `InitAssetOutputNotFound`, so the predicate must flag it as not-yet-ready.
-        let reserves = vec![reserve(1, tokens::USDC.address, tokens::WETH.address, 1_000.0)];
+        let reserves = vec![reserve(
+            1,
+            tokens::USDC.address,
+            tokens::WETH.address,
+            1_000.0,
+        )];
 
         assert!(!reserves_reach_init_asset(&reserves, &session_config()));
     }
@@ -1160,28 +1228,31 @@ mod tests {
         OptimizationSession<CpuBackend, i32, TokenAddress, 1>,
         OptimizationStepResult,
     ) {
-        initialize_optimization_session(base_reserves(), session_config(), &step_config(0)).unwrap()
+        let (session, result, _) =
+            initialize_optimization_session(base_reserves(), session_config(), &step_config(0))
+                .unwrap();
+        (session, result)
     }
 
     fn initialized_cpu_runner() -> (
         OptimizationRunner<i32, TokenAddress, 1>,
         OptimizationStepResult,
     ) {
-        OptimizationRunner::init(
+        let (runner, result, _) = OptimizationRunner::init(
             OptimizationBackendSelection::Cpu,
             base_reserves(),
             session_config(),
             step_config(0),
         )
-        .unwrap()
+        .unwrap();
+        (runner, result)
     }
 
     fn expect_init_error(
-        result: Result<
-            (
-                OptimizationRunner<i32, TokenAddress, 1>,
-                OptimizationStepResult,
-            ),
+        result: StepOutcome<
+            OptimizationRunner<i32, TokenAddress, 1>,
+            i32,
+            TokenAddress,
             OptimizationInitError,
         >,
     ) -> OptimizationInitError {
@@ -1192,11 +1263,10 @@ mod tests {
     }
 
     fn expect_step_error(
-        result: Result<
-            (
-                OptimizationSession<CpuBackend, i32, TokenAddress, 1>,
-                OptimizationStepResult,
-            ),
+        result: StepOutcome<
+            OptimizationSession<CpuBackend, i32, TokenAddress, 1>,
+            i32,
+            TokenAddress,
             OptimizationStepError,
         >,
     ) -> OptimizationStepError {
@@ -1313,7 +1383,7 @@ mod tests {
 
     #[test]
     fn unroutable_leaf_pools_are_pruned_before_optimization() {
-        let (_session, result) =
+        let (_session, result, _) =
             initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
                 triangle_with_leaf_reserves(),
                 session_config(),
@@ -1327,7 +1397,7 @@ mod tests {
 
     #[test]
     fn stable_topology_with_unroutable_pools_keeps_updating() {
-        let (session, init_result) =
+        let (session, init_result, _) =
             initialize_optimization_session::<CpuBackend, i32, TokenAddress, 1>(
                 triangle_with_leaf_reserves(),
                 session_config(),
@@ -1340,7 +1410,7 @@ mod tests {
         // The next snapshot carries the same (leaf-padded) topology with only value
         // changes. Pruning is deterministic, so the surviving keys match and the
         // session updates in place instead of reinitializing.
-        let (_session, result) = run_optimization_step(
+        let (_session, result, _) = run_optimization_step(
             session,
             OptimizationStepUpdate::NewReserves {
                 reserves: scaled(triangle_with_leaf_reserves(), 1.01),

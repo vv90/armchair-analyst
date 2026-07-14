@@ -170,15 +170,16 @@ where
     for reserve in reserves {
         // One entry per pool id; the snapshot may carry both directions (they mirror each other), so
         // the first-seen orientation is authoritative and `swap` resolves direction by token.
-        book.entry(reserve.pool_id).or_insert_with(|| PoolBookEntry {
-            token0: reserve.token0,
-            token1: reserve.token1,
-            reserve0: reserve.value.token_0,
-            reserve1: reserve.value.token_1,
-            fee: reserve.value.fee_multiplier,
-            max_swap_0: reserve.value.max_swap_0,
-            max_swap_1: reserve.value.max_swap_1,
-        });
+        book.entry(reserve.pool_id)
+            .or_insert_with(|| PoolBookEntry {
+                token0: reserve.token0,
+                token1: reserve.token1,
+                reserve0: reserve.value.token_0,
+                reserve1: reserve.value.token_1,
+                fee: reserve.value.fee_multiplier,
+                max_swap_0: reserve.value.max_swap_0,
+                max_swap_1: reserve.value.max_swap_1,
+            });
     }
 
     let mut balances: HashMap<I, f32> = HashMap::new();
@@ -302,7 +303,8 @@ mod tests {
         let input = 1_000.0;
 
         let flows = model.extract_flows(input).expect("extract_flows failed");
-        let exact = replay_flows(&flows, &reserves, tokens::USDC.address, input).expect("replay failed");
+        let exact =
+            replay_flows(&flows, &reserves, tokens::USDC.address, input).expect("replay failed");
         let predicted = model.evaluate(input);
 
         let tolerance = predicted.abs().max(exact.abs()) * 1e-3 + 1e-3;
@@ -323,10 +325,14 @@ mod tests {
         let input = 1_000.0;
 
         let flows = model.extract_flows(input).expect("extract_flows failed");
-        let exact = replay_flows(&flows, &reserves, tokens::USDC.address, input).expect("replay failed");
+        let exact =
+            replay_flows(&flows, &reserves, tokens::USDC.address, input).expect("replay failed");
 
         assert!(exact > 0.0, "replay recovered nothing: {exact}");
-        assert!(exact < input, "no-arbitrage replay profited: {exact} >= {input}");
+        assert!(
+            exact < input,
+            "no-arbitrage replay profited: {exact} >= {input}"
+        );
     }
 
     #[test]

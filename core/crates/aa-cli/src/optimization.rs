@@ -3,7 +3,7 @@ use std::sync::mpsc::Sender;
 
 use client_evm::{PoolRef, TokenAddress, multi_chain_kernel::OptimizationPoolReserves};
 use optimization::{
-    OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
+    ExecutionPlan, OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
     OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
     OptimizationStepResult, OptimizationStepUpdate, reserves_reach_init_asset,
 };
@@ -25,14 +25,14 @@ pub fn run_optimization<T>(
     session_config: OptimizationSessionConfig<TokenAddress>,
     step_config: OptimizationStepConfig,
     result_sender: Sender<T>,
-    map_result: impl Fn(OptimizationStepResult) -> T,
+    map_result: impl Fn(OptimizationStepResult, Option<ExecutionPlan<PoolRef, TokenAddress>>) -> T,
 ) -> Result<(), RunOptimizationError> {
     // Wait for the first snapshot that can actually initialize. With cross-chain merging, the first
     // snapshot may arrive from a faster chain before the chain that owns the `init_asset` (quote
     // token) has reported, so the init asset is absent and init fails with `InitAssetOutputNotFound`.
     // That is a transient "not ready yet" condition, not a fatal error: drop the snapshot and wait
     // for the next one. Every other init error stays fatal.
-    let (mut runner, result) = loop {
+    let (mut runner, result, plan) = loop {
         let snapshot = receiver
             .wait_take()
             .map_err(RunOptimizationError::Receive)?;
@@ -50,7 +50,7 @@ pub fn run_optimization<T>(
         }
     };
 
-    if result_sender.send(map_result(result)).is_err() {
+    if result_sender.send(map_result(result, plan)).is_err() {
         return Ok(());
     }
 
@@ -71,9 +71,9 @@ pub fn run_optimization<T>(
             },
             None => OptimizationStepUpdate::Continue,
         };
-        let (next_runner, result) = runner.run(update).map_err(RunOptimizationError::Step)?;
+        let (next_runner, result, plan) = runner.run(update).map_err(RunOptimizationError::Step)?;
 
-        if result_sender.send(map_result(result)).is_err() {
+        if result_sender.send(map_result(result, plan)).is_err() {
             return Ok(());
         }
 
@@ -107,7 +107,7 @@ mod tests {
             session_config(),
             step_config(),
             result_sender,
-            |result| result,
+            |result, _plan| result,
         )
         .unwrap_err();
 
@@ -131,7 +131,7 @@ mod tests {
             session_config(),
             step_config(),
             result_sender,
-            |result| result,
+            |result, _plan| result,
         )
         .unwrap_err();
 
@@ -160,7 +160,7 @@ mod tests {
             session_config(),
             step_config(),
             result_sender,
-            |result| result,
+            |result, _plan| result,
         );
 
         assert_eq!(outcome, Ok(()));
@@ -183,7 +183,7 @@ mod tests {
             session_config(),
             step_config(),
             result_sender,
-            |result| result,
+            |result, _plan| result,
         );
 
         // The unready snapshot was skipped (no fatal Init error); the wait then ends cleanly on close.
@@ -193,6 +193,29 @@ mod tests {
             Err(RunOptimizationError::Receive(LatestReceiveError::Closed))
         );
         assert!(result_receiver.recv().is_err());
+    }
+
+    #[test]
+    fn map_result_receives_the_emitted_plan() {
+        let (sender, receiver) = latest_slot();
+
+        sender.send(snapshot(1)).unwrap();
+        sender.close().unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let _ = run_optimization(
+            receiver,
+            OptimizationBackendSelection::Cpu,
+            session_config(),
+            step_config(),
+            result_sender,
+            |result, plan| (result, plan),
+        );
+
+        let (result, plan) = result_receiver.recv().unwrap();
+        assert_eq!(result.status, OptimizationStepStatus::Initialized);
+        let plan = plan.expect("a completed step must emit a plan");
+        assert_eq!(plan.init_asset, session_config().init_asset);
     }
 
     fn snapshot(last_byte: u8) -> OptimizationPoolReserves {
