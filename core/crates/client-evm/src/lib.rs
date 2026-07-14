@@ -9,6 +9,7 @@ pub mod endpoints;
 mod erc20;
 mod error;
 pub mod kernel;
+mod lossless_replay;
 pub mod multi_chain_kernel;
 mod pool_log;
 mod pool_state;
@@ -45,6 +46,9 @@ pub use kernel::pool_registry::{
 pub use kernel::token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall, TokenMetadataFailure,
     TokenMetadataResult, TokenRegistry,
+};
+pub use lossless_replay::{
+    LosslessOutcome, LosslessPool, LosslessReplayError, replay_plan_lossless,
 };
 pub use pool_log::{PoolLog, PoolLogEvent, decode_pool_log, derive_pool_state};
 pub use pool_state::{
