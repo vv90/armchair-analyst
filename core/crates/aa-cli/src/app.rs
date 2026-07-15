@@ -10,7 +10,7 @@ use client_evm::{
     POLYGON_USDC_TOKEN_ADDRESS,
     GetLogsRange, GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
     PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RangeLogBlock, RequestId,
-    TokenAddress, TokenMetadataResult, WsSubscriptionEndpoint,
+    TokenAddress, TokenMetadataResult, TokenWhitelist, WsSubscriptionEndpoint,
     bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
@@ -41,6 +41,7 @@ use crate::{
     latest_slot::{LatestReceiveError, LatestReceiver, LatestSender, latest_slot},
     logger::Logger,
     optimization::{RunOptimizationError, run_optimization},
+    utils::CliError,
     view::View,
 };
 
@@ -55,6 +56,13 @@ pub(crate) struct ClientEvmRuntime {
     graph_endpoints: GraphEndpoints,
     metadata_cache: MetadataCache,
     optimization_sender: OnceLock<LatestSender<OptimizationPoolReserves>>,
+    /// The optimizer's session config, built at startup (with any token whitelist already applied
+    /// to its `whitelist` field and bridges) and handed to the optimization worker on spawn.
+    optimization_session_config: OptimizationSessionConfig<TokenAddress>,
+    /// The token whitelist, when configured: pools over non-whitelisted tokens are gated at
+    /// metadata resolution ([`ClientEvmRuntime::cached_pool_metadata`]) so the kernel rejects
+    /// them before they are ever tracked. `None` admits every pool (whitelisting disabled).
+    token_whitelist: Option<TokenWhitelist>,
     view: View,
     logger: Logger,
     /// Wall-clock millis of the last emitted gauge line, throttling it to roughly once per second so
@@ -85,6 +93,8 @@ impl ClientEvmRuntime {
         endpoints: ChainEndpoints,
         graph_endpoints: GraphEndpoints,
         metadata_cache: MetadataCache,
+        optimization_session_config: OptimizationSessionConfig<TokenAddress>,
+        token_whitelist: Option<TokenWhitelist>,
         logger: Logger,
         view: View,
     ) -> ClientEvmRuntime {
@@ -95,6 +105,8 @@ impl ClientEvmRuntime {
             graph_endpoints,
             metadata_cache,
             optimization_sender: OnceLock::new(),
+            optimization_session_config,
+            token_whitelist,
             view,
             logger,
             last_gauge_millis: AtomicU64::new(0),
@@ -139,6 +151,9 @@ impl ClientEvmRuntime {
         at: BlockHash,
         candidates: HashSet<ProtocolPoolKey>,
     ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError> {
+        // The whitelist gate runs on the way out — after the cache stored the true `Ok` results —
+        // so gating decisions never persist: widening the whitelist on a later run re-admits
+        // previously gated pools as cache hits.
         resolve_pool_metadata_with(
             chain,
             candidates,
@@ -150,6 +165,10 @@ impl ClientEvmRuntime {
                 fetch_v4_pool_metadata(&self.agent, self.graph_endpoints(), chain, v4_misses)
             },
         )
+        .map(|results| match &self.token_whitelist {
+            Some(whitelist) => whitelist.gate_pool_metadata_results(chain, results),
+            None => results,
+        })
     }
 
     /// Token-metadata counterpart of [`ClientEvmRuntime::cached_pool_metadata`].
@@ -279,6 +298,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                 if self.optimization_sender.set(slot_sender).is_ok() {
                     drop(spawn_optimization_subscription(
                         slot_receiver,
+                        self.optimization_session_config.clone(),
                         sender.clone(),
                         self.logger.clone(),
                     ));
@@ -575,6 +595,8 @@ pub(crate) fn start_runtime(
     endpoints: ChainEndpoints,
     graph_endpoints: GraphEndpoints,
     metadata_cache: MetadataCache,
+    optimization_session_config: OptimizationSessionConfig<TokenAddress>,
+    token_whitelist: Option<TokenWhitelist>,
     logger: Logger,
     view: View,
 ) -> JoinHandle<()> {
@@ -584,6 +606,8 @@ pub(crate) fn start_runtime(
             endpoints,
             graph_endpoints,
             metadata_cache,
+            optimization_session_config,
+            token_whitelist,
             logger,
             view,
         ),
@@ -1016,6 +1040,7 @@ fn spawn_tick_subscription(sender: Sender<Event>, interval: time::Duration) -> J
 
 fn spawn_optimization_subscription(
     receiver: LatestReceiver<OptimizationPoolReserves>,
+    session_config: OptimizationSessionConfig<TokenAddress>,
     sender: Sender<Event>,
     logger: Logger,
 ) -> JoinHandle<()> {
@@ -1023,7 +1048,7 @@ fn spawn_optimization_subscription(
         let result = run_optimization(
             receiver,
             default_optimization_backend(),
-            default_optimization_session_config(),
+            session_config,
             default_optimization_step_config(),
             sender,
             |result, plan| Event::OptimizationStepCompleted { result, plan },
@@ -1041,11 +1066,50 @@ fn default_optimization_backend() -> OptimizationBackendSelection {
     OptimizationBackendSelection::Auto
 }
 
-fn default_optimization_session_config() -> OptimizationSessionConfig<TokenAddress> {
-    OptimizationSessionConfig {
-        init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
-        bridges: default_optimization_bridges(),
+/// Builds the optimizer's session config, applying the token whitelist when one is configured:
+/// the init asset must be whitelisted (hard error otherwise — nothing could route), and bridges
+/// with a non-whitelisted endpoint are dropped rather than rejected, so a deliberately narrow
+/// whitelist (e.g. a single chain) still starts. Returns the dropped pairs for startup logging.
+pub(crate) fn optimization_session_config(
+    whitelist: Option<&TokenWhitelist>,
+) -> Result<
+    (
+        OptimizationSessionConfig<TokenAddress>,
+        Vec<(TokenAddress, TokenAddress)>,
+    ),
+    CliError,
+> {
+    let bridges = default_optimization_bridges();
+
+    let Some(whitelist) = whitelist else {
+        return Ok((
+            OptimizationSessionConfig {
+                init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+                bridges,
+                whitelist: None,
+            },
+            Vec::new(),
+        ));
+    };
+
+    if !whitelist.allows(ETHEREUM_USDC_TOKEN_ADDRESS) {
+        return Err(CliError::InitAssetNotWhitelisted {
+            init_asset: format!("{ETHEREUM_USDC_TOKEN_ADDRESS:?}"),
+        });
     }
+
+    let (bridges, dropped): (HashSet<_>, HashSet<_>) = bridges
+        .into_iter()
+        .partition(|&(a, b)| whitelist.allows(a) && whitelist.allows(b));
+
+    Ok((
+        OptimizationSessionConfig {
+            init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+            bridges,
+            whitelist: Some(whitelist.token_set().clone()),
+        },
+        dropped.into_iter().collect(),
+    ))
 }
 
 /// Synthetic 1:1 connections the optimizer treats as fungible passthroughs. Bridges are directional,
@@ -1465,6 +1529,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -1488,6 +1554,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -1505,6 +1573,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::single(ChainKey::Ethereum, "thegraph", "http://graph.invalid"),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -1584,6 +1654,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -1848,6 +1920,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             cache,
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -1972,6 +2046,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             cache,
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -1986,12 +2062,87 @@ mod tests {
     }
 
     #[test]
+    fn cached_pool_metadata_gates_pools_over_non_whitelisted_tokens() {
+        let cache = in_memory_metadata_cache();
+        let v4 = v4_pool_candidate(7);
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(v4, Ok(pool_metadata(7)))]),
+            )
+            .expect("store cached v4 pool");
+
+        // The cache holds the true Ok metadata, but the whitelist (init asset only) does not
+        // allow this pool's tokens — the gate must reject it on the way out, exactly as if
+        // metadata resolution had failed, without the cache entry being disturbed.
+        let whitelist = whitelist_of(&[ETHEREUM_USDC_TOKEN_ADDRESS]);
+        let runtime = ClientEvmRuntime::new(
+            test_subscriptions(),
+            test_endpoints(),
+            GraphEndpoints::empty(),
+            cache,
+            test_session_config(),
+            Some(whitelist),
+            Logger::sink(),
+            View::sink(),
+        );
+
+        let result = runtime
+            .cached_pool_metadata(ChainKey::Ethereum, hash(1), HashSet::from([v4]))
+            .expect("resolve succeeds");
+
+        assert_eq!(
+            result.get(&v4),
+            Some(&Err(client_evm::PoolMetadataFailure::TokenNotWhitelisted {
+                token: pool_metadata(7).token0
+            }))
+        );
+    }
+
+    #[test]
+    fn cached_pool_metadata_passes_pools_over_whitelisted_tokens() {
+        let cache = in_memory_metadata_cache();
+        let v4 = v4_pool_candidate(7);
+        cache
+            .store_pool_metadata(
+                ChainKey::Ethereum,
+                &HashMap::from([(v4, Ok(pool_metadata(7)))]),
+            )
+            .expect("store cached v4 pool");
+
+        let metadata = pool_metadata(7);
+        let whitelist = whitelist_of(&[
+            ETHEREUM_USDC_TOKEN_ADDRESS,
+            TokenAddress(metadata.token0, ChainKey::Ethereum),
+            TokenAddress(metadata.token1, ChainKey::Ethereum),
+        ]);
+        let runtime = ClientEvmRuntime::new(
+            test_subscriptions(),
+            test_endpoints(),
+            GraphEndpoints::empty(),
+            cache,
+            test_session_config(),
+            Some(whitelist),
+            Logger::sink(),
+            View::sink(),
+        );
+
+        let result = runtime
+            .cached_pool_metadata(ChainKey::Ethereum, hash(1), HashSet::from([v4]))
+            .expect("resolve succeeds");
+
+        assert_eq!(result.get(&v4), Some(&Ok(pool_metadata(7))));
+    }
+
+    #[test]
     fn run_optimization_effect_returns_no_events() {
         let runtime = ClientEvmRuntime::new(
             test_subscriptions(),
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -2004,7 +2155,7 @@ mod tests {
 
     #[test]
     fn default_session_config_bridges_the_chain_usdc_quote_tokens() {
-        let config = default_optimization_session_config();
+        let config = test_session_config();
 
         // Ethereum USDC is the single global quote/init asset; the bidirectional 1:1 bridge to
         // Arbitrum USDC lets the solver close cross-chain cycles back to it.
@@ -2023,7 +2174,7 @@ mod tests {
 
     #[test]
     fn default_session_config_bridges_native_eth_and_weth_both_ways() {
-        let config = default_optimization_session_config();
+        let config = test_session_config();
 
         // Wrapping is 1:1, so native ETH (v4 `token0 = address(0)`) and WETH (v3) must be a
         // two-sided bridge on every chain; otherwise v4 native-ETH pools are isolated from WETH
@@ -2044,6 +2195,86 @@ mod tests {
         );
     }
 
+    /// Builds a validated whitelist allowing exactly `tokens`, going through the same
+    /// file-schema path production uses.
+    fn whitelist_of(tokens: &[TokenAddress]) -> TokenWhitelist {
+        let mut chains: std::collections::BTreeMap<String, client_evm::ChainTokens> =
+            std::collections::BTreeMap::new();
+        for token in tokens {
+            chains
+                .entry(client_evm::drpc_network_path(token.1).to_string())
+                .or_insert_with(|| client_evm::ChainTokens { tokens: Vec::new() })
+                .tokens
+                .push(client_evm::TokenEntry {
+                    address: token.0,
+                    symbol: None,
+                    decimals: None,
+                    examined_at: None,
+                    tvl_usd: None,
+                });
+        }
+        client_evm::TokenWhitelistFile {
+            generated_at: None,
+            examiner: None,
+            chains,
+        }
+        .into_whitelist()
+        .expect("valid whitelist")
+    }
+
+    #[test]
+    fn session_config_without_whitelist_reproduces_the_default() {
+        let (config, dropped) =
+            optimization_session_config(None).expect("whitelist-free config");
+
+        assert_eq!(config.init_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
+        assert_eq!(config.bridges, default_optimization_bridges());
+        assert_eq!(config.whitelist, None);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn session_config_rejects_a_whitelist_without_the_init_asset() {
+        let whitelist = whitelist_of(&[ETHEREUM_NATIVE_TOKEN_ADDRESS]);
+
+        assert!(matches!(
+            optimization_session_config(Some(&whitelist)),
+            Err(CliError::InitAssetNotWhitelisted { .. })
+        ));
+    }
+
+    #[test]
+    fn session_config_drops_bridges_with_a_non_whitelisted_endpoint() {
+        let allowed = [
+            ETHEREUM_USDC_TOKEN_ADDRESS,
+            ARBITRUM_USDC_TOKEN_ADDRESS,
+            ETHEREUM_NATIVE_TOKEN_ADDRESS,
+        ];
+        let whitelist = whitelist_of(&allowed);
+
+        let (config, dropped) =
+            optimization_session_config(Some(&whitelist)).expect("whitelisted config");
+
+        // Only the Ethereum⇄Arbitrum USDC pair survives: every other bridge touches a token
+        // outside the whitelist (including ETH↔WETH, since WETH isn't allowed).
+        assert_eq!(
+            config.bridges,
+            HashSet::from([
+                (ETHEREUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS),
+                (ARBITRUM_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+            ])
+        );
+        assert_eq!(
+            dropped.len(),
+            default_optimization_bridges().len() - config.bridges.len()
+        );
+        assert_eq!(
+            config.whitelist,
+            Some(HashSet::from(allowed)),
+            "the optimizer receives exactly the whitelisted token set"
+        );
+    }
+
     #[test]
     fn empty_optimization_snapshot_is_dropped() {
         let runtime = ClientEvmRuntime::new(
@@ -2051,6 +2282,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -2072,6 +2305,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -2094,6 +2329,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -2113,6 +2350,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -2130,6 +2369,8 @@ mod tests {
             test_endpoints(),
             GraphEndpoints::empty(),
             in_memory_metadata_cache(),
+            test_session_config(),
+            None,
             Logger::sink(),
             View::sink(),
         );
@@ -2155,7 +2396,12 @@ mod tests {
     fn optimization_worker_exits_cleanly_when_slot_closes_before_initialization() {
         let (slot_sender, slot_receiver) = crate::latest_slot::latest_slot();
         let (sender, _receiver) = mpsc::channel();
-        let handle = spawn_optimization_subscription(slot_receiver, sender, Logger::sink());
+        let handle = spawn_optimization_subscription(
+            slot_receiver,
+            test_session_config(),
+            sender,
+            Logger::sink(),
+        );
 
         drop(slot_sender);
 
@@ -2952,5 +3198,11 @@ mod tests {
 
     fn in_memory_metadata_cache() -> MetadataCache {
         MetadataCache::in_memory().expect("in-memory metadata cache")
+    }
+
+    fn test_session_config() -> OptimizationSessionConfig<TokenAddress> {
+        let (config, _dropped) =
+            optimization_session_config(None).expect("whitelist-free session config");
+        config
     }
 }

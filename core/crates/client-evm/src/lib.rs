@@ -1,6 +1,6 @@
 //! Integration logic for EVM-based chains.
 
-pub use alloy::primitives::{BlockHash, Bloom};
+pub use alloy::primitives::{Address, BlockHash, Bloom};
 
 pub mod bootstrap;
 pub mod chain;
@@ -16,6 +16,7 @@ mod pool_state;
 mod request_tracking;
 mod tick;
 mod tick_math;
+pub mod token_whitelist;
 mod tokens;
 pub mod uniswap_v3;
 pub mod uniswap_v4;
@@ -56,7 +57,10 @@ pub use pool_state::{
     ProtocolPoolKey,
 };
 pub use tick_math::TickMathError;
-pub use uniswap_v4_subgraph::fetch_v4_pool_metadata;
+pub use token_whitelist::{
+    ChainTokens, TokenEntry, TokenWhitelist, TokenWhitelistError, TokenWhitelistFile,
+};
+pub use uniswap_v4_subgraph::{fetch_v4_pool_metadata, send_graphql_request};
 pub use tokens::{
     ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS,
     AVALANCHE_NATIVE_TOKEN_ADDRESS, AVALANCHE_USDC_TOKEN_ADDRESS, AVALANCHE_WETH_TOKEN_ADDRESS,

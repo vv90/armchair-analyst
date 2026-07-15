@@ -79,7 +79,11 @@ fn pool_id_query_string(id: &PoolId) -> String {
 /// non-2xx response is captured as [`ClientEvmError::HttpStatus`] (carrying the body's actual reason —
 /// rate limit, gateway down) rather than an opaque transport error; genuine transport faults surface as
 /// [`ClientEvmError::HttpTransport`]. Mirrors the JSON-RPC client's `send_rpc_request`.
-fn send_graphql_request(
+///
+/// Public for the offline `aa-token-vetting` tool, which runs its own queries against the same
+/// subgraph endpoints (composed with [`crate::EndpointPool::with_failover`] like
+/// [`fetch_v4_pool_metadata`] does).
+pub fn send_graphql_request(
     agent: &ureq::Agent,
     endpoint: &str,
     request: &Value,

@@ -100,6 +100,9 @@ struct OptimizationSession<
 pub struct OptimizationSessionConfig<TToken> {
     pub init_asset: TToken,
     pub bridges: HashSet<(TToken, TToken)>,
+    /// Tokens the optimizer may route through; a pool is admitted only if both of its tokens are
+    /// in the set. `None` disables whitelisting (every token allowed).
+    pub whitelist: Option<HashSet<TToken>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -371,11 +374,7 @@ where
     TPool: Copy + PartialEq + Eq + Hash,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
-    let reserves = crate::routing_filter::routable_reserves(
-        reserves,
-        session_config.init_asset,
-        &session_config.bridges,
-    );
+    let reserves = crate::routing_filter::admissible_reserves(reserves, &session_config);
     // First init has no disable signal — that arrives with `NewReserves` updates once the session
     // is running — so it starts with every pool active.
     initialize_optimization_session_with_status(
@@ -418,11 +417,7 @@ where
     TPool: Copy + PartialEq + Eq + Hash,
     TToken: Clone + Copy + PartialEq + Eq + Hash,
 {
-    let reserves = crate::routing_filter::routable_reserves(
-        reserves,
-        session.session_config.init_asset,
-        &session.session_config.bridges,
-    );
+    let reserves = crate::routing_filter::admissible_reserves(reserves, &session.session_config);
     let incoming_keys = validate_reserve_snapshot(&reserves, &session.session_config, step_config)?;
     let OptimizationSession {
         model,
@@ -619,13 +614,9 @@ where
     TPool: Copy + Eq + Hash,
     TToken: Copy + Eq + Hash,
 {
-    crate::routing_filter::routable_reserves(
-        reserves.to_vec(),
-        session_config.init_asset,
-        &session_config.bridges,
-    )
-    .iter()
-    .any(|reserve| reserve.token1 == session_config.init_asset)
+    crate::routing_filter::admissible_reserves(reserves.to_vec(), session_config)
+        .iter()
+        .any(|reserve| reserve.token1 == session_config.init_asset)
 }
 
 fn validate_reserve_snapshot<TPool, TToken>(
@@ -1280,6 +1271,7 @@ mod tests {
         OptimizationSessionConfig {
             init_asset: tokens::USDC.address,
             bridges: HashSet::new(),
+            whitelist: None,
         }
     }
 

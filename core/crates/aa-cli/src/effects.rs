@@ -6,9 +6,12 @@ use client_evm::{
 };
 
 use crate::{
-    app::start_runtime,
+    app::{optimization_session_config, start_runtime},
     logger::Logger,
-    utils::{CliError, load_config_with, metadata_cache_path_with, summarize_endpoints},
+    utils::{
+        CliError, load_config_with, load_token_whitelist_with, metadata_cache_path_with,
+        summarize_endpoints, summarize_token_whitelist,
+    },
     view::View,
 };
 
@@ -33,6 +36,11 @@ fn run() -> Result<(), CliError> {
     // the run logger exists so the live provider composition lands alongside the bootstrap events.
     let startup_summary = summarize_endpoints(&resolved);
 
+    let whitelist =
+        load_token_whitelist_with(|name| env::var(name).ok(), |path| std::fs::read_to_string(path))?;
+    let (session_config, dropped_bridges) = optimization_session_config(whitelist.as_ref())?;
+    let whitelist_summary = summarize_token_whitelist(whitelist.as_ref(), &dropped_bridges);
+
     let endpoints = assemble_chain_endpoints(&resolved.rpc_http).map_err(endpoint_config_error)?;
     let subscriptions = ChainSubscriptions::new(resolved.rpc_ws).map_err(endpoint_config_error)?;
     // Empty when no subgraph is configured (or its key was skipped), in which case v4 metadata
@@ -43,7 +51,7 @@ fn run() -> Result<(), CliError> {
     let logger = Logger::create_for_run().map_err(|error| CliError::LogInitFailed {
         message: error.to_string(),
     })?;
-    for line in &startup_summary {
+    for line in startup_summary.iter().chain(&whitelist_summary) {
         logger.log(line);
     }
     let view = View::for_run();
@@ -52,6 +60,8 @@ fn run() -> Result<(), CliError> {
         endpoints,
         graph_endpoints,
         metadata_cache,
+        session_config,
+        whitelist,
         logger,
         view.clone(),
     );

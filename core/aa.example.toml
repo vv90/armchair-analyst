@@ -31,7 +31,10 @@
 #   export AA_GRAPH_API_KEY=...          # optional — omit to disable v4 metadata resolution
 #
 # Other env (not endpoints):
-#   AA_METADATA_CACHE_PATH  on-disk metadata cache path (default: metadata-cache.redb)
+#   AA_METADATA_CACHE_PATH   on-disk metadata cache path (default: metadata-cache.redb)
+#   AA_TOKEN_WHITELIST_FILE  per-chain token whitelist TOML written by the vetting tool
+#                            (optional — unset allows all tokens; a present file is authoritative:
+#                            chains without a section allow none)
 
 # ---------------------------------------------------------------------------------------------------
 # RPC providers

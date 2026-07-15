@@ -256,6 +256,7 @@ mod tests {
         OptimizationSessionConfig {
             init_asset: token(),
             bridges: HashSet::new(),
+            whitelist: None,
         }
     }
 

@@ -1,12 +1,20 @@
 use std::{collections::BTreeMap, error, fmt, io, path::PathBuf};
 
-use client_evm::{ChainKey, EndpointSpec, chain_key_for_network_path};
+use client_evm::{
+    ACTIVE_CHAINS, ChainKey, EndpointSpec, TokenAddress, TokenWhitelist, TokenWhitelistFile,
+    chain_key_for_network_path, drpc_network_path,
+};
 use serde::Deserialize;
 
 /// Path to the unified TOML config file holding every mutable endpoint setting (RPC providers, their
 /// WebSocket URLs, and Uniswap v4 subgraphs). Required — the runtime has no built-in endpoint defaults.
 pub(crate) const CONFIG_FILE_ENV: &str = "AA_CONFIG_FILE";
 pub(crate) const METADATA_CACHE_PATH_ENV: &str = "AA_METADATA_CACHE_PATH";
+/// Path to the per-chain token whitelist artifact (written offline by the vetting tool). Optional:
+/// unset/blank disables whitelisting entirely (every token allowed). A file that is set but
+/// unreadable or invalid is a startup error — a malformed whitelist must never silently mean
+/// allow-all.
+pub(crate) const TOKEN_WHITELIST_FILE_ENV: &str = "AA_TOKEN_WHITELIST_FILE";
 
 /// Prefix for a provider's derived key env var on `[[rpc]]` entries (`AA_RPC_KEY_<NAME>`).
 const RPC_KEY_PREFIX: &str = "AA_RPC_KEY_";
@@ -40,6 +48,12 @@ pub(crate) enum CliError {
     EndpointConfigFailed {
         message: String,
     },
+    WhitelistConfigFailed {
+        message: String,
+    },
+    InitAssetNotWhitelisted {
+        init_asset: String,
+    },
 }
 
 impl fmt::Display for CliError {
@@ -63,6 +77,15 @@ impl fmt::Display for CliError {
             Self::EndpointConfigFailed { message } => {
                 write!(formatter, "failed to load endpoints config: {message}")
             }
+            Self::WhitelistConfigFailed { message } => {
+                write!(formatter, "failed to load token whitelist: {message}")
+            }
+            Self::InitAssetNotWhitelisted { init_asset } => {
+                write!(
+                    formatter,
+                    "token whitelist does not allow the optimization init asset {init_asset}"
+                )
+            }
         }
     }
 }
@@ -79,6 +102,92 @@ where
         .and_then(normalize_config_value)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_METADATA_CACHE_PATH))
+}
+
+/// Loads the token whitelist artifact named by [`TOKEN_WHITELIST_FILE_ENV`]. `Ok(None)` when the
+/// env var is unset or blank (whitelisting disabled); any failure to read, parse, or validate a
+/// *configured* file is an error rather than a silent allow-all.
+pub(crate) fn load_token_whitelist_with<Env, ReadFile>(
+    mut read_env: Env,
+    read_file: ReadFile,
+) -> Result<Option<TokenWhitelist>, CliError>
+where
+    Env: FnMut(&str) -> Option<String>,
+    ReadFile: FnOnce(&str) -> io::Result<String>,
+{
+    let Some(path) = read_env(TOKEN_WHITELIST_FILE_ENV).and_then(normalize_config_value) else {
+        return Ok(None);
+    };
+
+    let content = read_file(&path).map_err(|error| CliError::WhitelistConfigFailed {
+        message: format!("failed to read {path}: {error}"),
+    })?;
+
+    let file: TokenWhitelistFile =
+        toml::from_str(&content).map_err(|error| CliError::WhitelistConfigFailed {
+            message: error.to_string(),
+        })?;
+
+    file.into_whitelist()
+        .map(Some)
+        .map_err(|error| CliError::WhitelistConfigFailed {
+            message: error.to_string(),
+        })
+}
+
+/// Startup log lines describing the token-whitelist configuration: one status line (per-chain
+/// allowed-token counts, or `disabled`), then a warning per active chain with no whitelisted
+/// tokens (nothing on it can be optimized), per present chain missing the native zero-address
+/// token (its v4 native-currency pools can't route), and per bridge pair dropped because an
+/// endpoint isn't whitelisted.
+pub(crate) fn summarize_token_whitelist(
+    whitelist: Option<&TokenWhitelist>,
+    dropped_bridges: &[(TokenAddress, TokenAddress)],
+) -> Vec<String> {
+    let Some(whitelist) = whitelist else {
+        return vec!["token_whitelist disabled".to_string()];
+    };
+
+    let counts = whitelist.chain_counts();
+    let per_chain = ACTIVE_CHAINS
+        .iter()
+        .map(|&chain| {
+            format!(
+                "{}={}",
+                drpc_network_path(chain),
+                counts.get(&chain).copied().unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut lines = vec![format!("token_whitelist enabled {per_chain}")];
+
+    for &chain in ACTIVE_CHAINS {
+        if !counts.contains_key(&chain) {
+            lines.push(format!(
+                "warn token_whitelist_empty_chain chain={} no tokens allowed on this chain",
+                drpc_network_path(chain)
+            ));
+        } else if !whitelist.allows_native(chain) {
+            lines.push(format!(
+                "warn token_whitelist_missing_native_token chain={} v4 native-currency pools cannot route",
+                drpc_network_path(chain)
+            ));
+        }
+    }
+
+    for &(from, to) in dropped_bridges {
+        lines.push(format!(
+            "warn token_whitelist_dropped_bridge from={}:{} to={}:{}",
+            drpc_network_path(from.1),
+            from.0,
+            drpc_network_path(to.1),
+            to.0
+        ));
+    }
+
+    lines
 }
 
 /// The per-chain HTTP/WS URLs for one `[[rpc]]` provider on one chain. `http` feeds the failover pool;
@@ -933,5 +1042,152 @@ mod tests {
 
     fn never_prompt() -> impl FnMut(&str) -> Result<String, CliError> {
         |_prompt: &str| panic!("prompt must not be called")
+    }
+
+    const WHITELIST: &str = r#"
+        generated_at = "2026-07-15T12:00:00Z"
+        examiner = "approve-all/0.1.0"
+
+        [chains.ethereum]
+        tokens = [
+            { address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", symbol = "USDC" },
+            { address = "0x0000000000000000000000000000000000000000", symbol = "ETH" },
+        ]
+    "#;
+
+    #[test]
+    fn absent_whitelist_env_disables_whitelisting() {
+        let result =
+            load_token_whitelist_with(env_from([]), |_| panic!("file must not be read"));
+
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn blank_whitelist_env_disables_whitelisting() {
+        let result = load_token_whitelist_with(
+            env_from([(TOKEN_WHITELIST_FILE_ENV, "  ")]),
+            |_| panic!("file must not be read"),
+        );
+
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn valid_whitelist_file_loads() {
+        let whitelist = load_token_whitelist_with(
+            env_from([(TOKEN_WHITELIST_FILE_ENV, "token-whitelist.toml")]),
+            |path| {
+                assert_eq!(path, "token-whitelist.toml");
+                Ok(WHITELIST.to_owned())
+            },
+        )
+        .expect("whitelist loads")
+        .expect("whitelist enabled");
+
+        assert!(whitelist.allows(client_evm::ETHEREUM_USDC_TOKEN_ADDRESS));
+        assert!(whitelist.allows_native(ChainKey::Ethereum));
+        assert!(!whitelist.allows(client_evm::ARBITRUM_USDC_TOKEN_ADDRESS));
+    }
+
+    #[test]
+    fn unreadable_whitelist_file_is_an_error() {
+        let result = load_token_whitelist_with(
+            env_from([(TOKEN_WHITELIST_FILE_ENV, "missing.toml")]),
+            |_| Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
+        );
+
+        assert!(matches!(result, Err(CliError::WhitelistConfigFailed { .. })));
+    }
+
+    #[test]
+    fn malformed_whitelist_toml_is_an_error() {
+        let result = load_token_whitelist_with(
+            env_from([(TOKEN_WHITELIST_FILE_ENV, "token-whitelist.toml")]),
+            |_| Ok("chains = 42".to_owned()),
+        );
+
+        assert!(matches!(result, Err(CliError::WhitelistConfigFailed { .. })));
+    }
+
+    #[test]
+    fn unknown_whitelist_chain_slug_is_an_error() {
+        let toml = r#"
+            [chains.etherium]
+            tokens = [{ address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" }]
+        "#;
+        let result = load_token_whitelist_with(
+            env_from([(TOKEN_WHITELIST_FILE_ENV, "token-whitelist.toml")]),
+            |_| Ok(toml.to_owned()),
+        );
+
+        assert!(matches!(result, Err(CliError::WhitelistConfigFailed { .. })));
+    }
+
+    fn loaded_whitelist(toml: &str) -> TokenWhitelist {
+        load_token_whitelist_with(
+            env_from([(TOKEN_WHITELIST_FILE_ENV, "token-whitelist.toml")]),
+            |_| Ok(toml.to_owned()),
+        )
+        .expect("whitelist loads")
+        .expect("whitelist enabled")
+    }
+
+    #[test]
+    fn disabled_whitelist_summary_is_a_single_line() {
+        assert_eq!(
+            summarize_token_whitelist(None, &[]),
+            vec!["token_whitelist disabled".to_string()]
+        );
+    }
+
+    #[test]
+    fn whitelist_summary_counts_every_active_chain_and_warns_on_empty_ones() {
+        let whitelist = loaded_whitelist(WHITELIST);
+        let lines = summarize_token_whitelist(Some(&whitelist), &[]);
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some(
+                "token_whitelist enabled ethereum=2 arbitrum=0 base=0 optimism=0 polygon=0 \
+                 bnb=0 avalanche=0"
+            )
+        );
+        // Every active chain but Ethereum is absent from the file → one warning each.
+        assert_eq!(lines.len(), 1 + (ACTIVE_CHAINS.len() - 1));
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line.starts_with("warn token_whitelist_empty_chain"))
+        );
+    }
+
+    #[test]
+    fn whitelist_summary_warns_when_a_present_chain_lacks_the_native_token() {
+        let toml = r#"
+            [chains.ethereum]
+            tokens = [{ address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" }]
+        "#;
+        let whitelist = loaded_whitelist(toml);
+        let lines = summarize_token_whitelist(Some(&whitelist), &[]);
+
+        assert!(lines.iter().any(|line| {
+            line.starts_with("warn token_whitelist_missing_native_token chain=ethereum")
+        }));
+    }
+
+    #[test]
+    fn whitelist_summary_reports_dropped_bridges() {
+        let whitelist = loaded_whitelist(WHITELIST);
+        let dropped = [(
+            client_evm::ETHEREUM_USDC_TOKEN_ADDRESS,
+            client_evm::ARBITRUM_USDC_TOKEN_ADDRESS,
+        )];
+        let lines = summarize_token_whitelist(Some(&whitelist), &dropped);
+
+        assert!(lines.iter().any(|line| {
+            line.starts_with("warn token_whitelist_dropped_bridge from=ethereum:0x")
+                && line.contains("to=arbitrum:0x")
+        }));
     }
 }

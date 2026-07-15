@@ -4,6 +4,7 @@ members = [
     "crates/aa-cli",
     "crates/aa-framework",
     "crates/aa-kernel",
+    "crates/aa-token-vetting",
     "crates/client-evm",
     "crates/optimization",
 ]

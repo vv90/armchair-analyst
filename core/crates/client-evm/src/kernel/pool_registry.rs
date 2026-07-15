@@ -104,6 +104,9 @@ pub enum PoolMetadataFailure {
     HookedPool { hooks: Address },
     PoolIdMismatch,
     InvalidTickSpacing { tick_spacing: i32 },
+    // Policy rejection: the pool's metadata resolved fine, but a token is outside the configured
+    // whitelist (`crate::token_whitelist::TokenWhitelist::gate_pool_metadata_results`).
+    TokenNotWhitelisted { token: Address },
 }
 
 pub type PoolMetadataResult = Result<PoolMetadata, PoolMetadataFailure>;
