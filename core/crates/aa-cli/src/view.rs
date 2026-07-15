@@ -5,7 +5,7 @@ use std::{
 
 use client_evm::{
     ChainKey,
-    multi_chain_kernel::{ChainObservation, ChainProgress, State},
+    multi_chain_kernel::{ChainObservation, ChainProgress, PlanVerification, State},
 };
 use optimization::OptimizationStepResult;
 use ratatui::{
@@ -59,7 +59,11 @@ impl View {
         };
 
         let observations = state.observe();
-        let lines = format_lines(&observations, state.latest_optimization_result());
+        let lines = format_lines(
+            &observations,
+            state.latest_optimization_result(),
+            state.latest_plan_verification(),
+        );
 
         let terminal = match slot {
             Some(terminal) => terminal,
@@ -115,6 +119,7 @@ fn paragraph(lines: Vec<String>) -> Paragraph<'static> {
 fn format_lines(
     observations: &[(ChainKey, ChainObservation)],
     optimization: Option<OptimizationStepResult>,
+    verification: Option<PlanVerification>,
 ) -> Vec<String> {
     let mut lines: Vec<String> = observations
         .iter()
@@ -128,21 +133,47 @@ fn format_lines(
         .collect();
 
     if let Some(result) = optimization {
-        lines.push(format_optimization(result));
+        lines.push(format_optimization(result, verification));
     }
 
     lines
 }
 
-fn format_optimization(result: OptimizationStepResult) -> String {
+fn format_optimization(
+    result: OptimizationStepResult,
+    verification: Option<PlanVerification>,
+) -> String {
     format!(
-        "Optimization  status={:?}  profit={}  reserves={}  routed={}  eff_pools={:.2}",
+        "Optimization  status={:?}  profit={}  reserves={}  routed={}  eff_pools={:.2}{}",
         result.status,
         result.profit_amount,
         result.reserves_count,
         result.routed_pool_count,
-        result.effective_pools
+        result.effective_pools,
+        format_verification(verification),
     )
+}
+
+/// The lossless-replay verdict on the latest result's plan, appended to the optimization line so
+/// the verified profit sits next to the claimed one. Empty when the step carried no plan.
+fn format_verification(verification: Option<PlanVerification>) -> String {
+    match verification {
+        None => String::new(),
+        Some(PlanVerification::Verified {
+            profit,
+            hit_tick_limit,
+        }) => format!(
+            "  verified={profit}{}",
+            if hit_tick_limit {
+                " (tick limited)"
+            } else {
+                ""
+            }
+        ),
+        Some(PlanVerification::Unverifiable(failure)) => {
+            format!("  verified=unverifiable({failure:?})")
+        }
+    }
 }
 
 fn format_chain(chain: ChainKey) -> &'static str {
@@ -197,7 +228,7 @@ mod tests {
         )];
 
         assert_eq!(
-            format_lines(&observations, None),
+            format_lines(&observations, None, None),
             vec!["Ethereum: Initializing  buffered=42"]
         );
     }
@@ -210,7 +241,7 @@ mod tests {
         )];
 
         assert_eq!(
-            format_lines(&observations, None),
+            format_lines(&observations, None, None),
             vec!["Arbitrum: Initializing  buffered=0"]
         );
     }
@@ -229,7 +260,7 @@ mod tests {
         )];
 
         assert_eq!(
-            format_lines(&observations, None),
+            format_lines(&observations, None, None),
             vec!["Ethereum: Active  pools=37  behind=2  window=64  inflight=5  ws_miss=1"]
         );
     }
@@ -248,7 +279,7 @@ mod tests {
         )];
 
         assert_eq!(
-            format_lines(&observations, None),
+            format_lines(&observations, None, None),
             vec!["Ethereum: Active  pools=0  behind=?  window=?  inflight=0  ws_miss=0"]
         );
     }
@@ -261,7 +292,7 @@ mod tests {
         )];
 
         assert_eq!(
-            format_lines(&observations, Some(result())),
+            format_lines(&observations, Some(result()), None),
             vec![
                 "Ethereum: Initializing  buffered=0".to_owned(),
                 "Optimization  status=Initialized  profit=1.5  reserves=3  routed=3  eff_pools=2.46".to_owned(),
@@ -283,8 +314,32 @@ mod tests {
     #[test]
     fn format_optimization_renders_status_profit_and_reserves() {
         assert_eq!(
-            format_optimization(result()),
+            format_optimization(result(), None),
             "Optimization  status=Initialized  profit=1.5  reserves=3  routed=3  eff_pools=2.46"
+        );
+    }
+
+    #[test]
+    fn format_optimization_puts_the_verified_profit_next_to_the_claimed_one() {
+        assert_eq!(
+            format_optimization(
+                result(),
+                Some(PlanVerification::Verified {
+                    profit: 1.25,
+                    hit_tick_limit: false,
+                }),
+            ),
+            "Optimization  status=Initialized  profit=1.5  reserves=3  routed=3  eff_pools=2.46  verified=1.25"
+        );
+        assert_eq!(
+            format_optimization(
+                result(),
+                Some(PlanVerification::Verified {
+                    profit: -0.5,
+                    hit_tick_limit: true,
+                }),
+            ),
+            "Optimization  status=Initialized  profit=1.5  reserves=3  routed=3  eff_pools=2.46  verified=-0.5 (tick limited)"
         );
     }
 

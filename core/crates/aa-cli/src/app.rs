@@ -16,13 +16,14 @@ use client_evm::{
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
     kernel,
     multi_chain_kernel::{
-        ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, State,
-        Subscription, SubscriptionData, transition,
+        ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, PlanVerification,
+        State, Subscription, SubscriptionData, transition,
     },
     plan_ws_subscriptions, subscribe_new_heads, subscribe_pool_events,
 };
 use optimization::{
     OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
+    OptimizationStepResult,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -73,6 +74,9 @@ pub(crate) struct ClientEvmRuntime {
     transitions_since_gauge: AtomicU64,
     /// Slowest transition since the last gauge line, in micros (`max_ms=` on the gauge).
     max_transition_micros: AtomicU64,
+    /// The last plan verification logged, so `observe_state` emits a verification line only when
+    /// the kernel's verdict changes rather than on every transition.
+    last_verification: Mutex<Option<PlanVerification>>,
 }
 
 impl ClientEvmRuntime {
@@ -99,6 +103,7 @@ impl ClientEvmRuntime {
             last_input_line: Mutex::new(String::new()),
             transitions_since_gauge: AtomicU64::new(0),
             max_transition_micros: AtomicU64::new(0),
+            last_verification: Mutex::new(None),
         }
     }
 
@@ -309,6 +314,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
     fn observe_state(&self, state: &<ClientEvmApp as Application>::State) {
         self.record_transition_duration();
         self.view.render(state);
+        self.log_verification(state);
         self.log_gauge(state);
     }
 }
@@ -527,6 +533,26 @@ impl ClientEvmRuntime {
             .log(&format_gauge_log(&state.observe(), events, max_transition_millis));
     }
 
+    /// Logs the kernel's latest plan-verification verdict next to the claimed profit, once per
+    /// change (verdicts repeat across transitions until the next completed optimization step).
+    /// Runs on the single transition thread, so the cell needs only interior mutability.
+    fn log_verification(&self, state: &State) {
+        let verification = state.latest_plan_verification();
+        let Ok(mut last) = self.last_verification.lock() else {
+            return;
+        };
+        if *last == verification {
+            return;
+        }
+        *last = verification;
+        if let (Some(result), Some(verification)) =
+            (state.latest_optimization_result(), verification)
+        {
+            self.logger
+                .log(&format_verification_log(result, verification));
+        }
+    }
+
     fn send_optimization_input(&self, input: OptimizationPoolReserves) {
         if input.reserves.is_empty() {
             return;
@@ -577,8 +603,8 @@ fn format_input_log(input: &Event) -> String {
         Event::SubscriptionData { chain, data } => format_subscription_data_log(*chain, data),
         Event::ChainEvent { chain, event } => format_chain_event_log(*chain, event),
         Event::BootstrapEvent { chain, event } => format_bootstrap_event_log(*chain, event),
-        Event::OptimizationStepCompleted { result } => format!(
-            "input optimization_step_completed status={:?} profit={} reserves={} routed={} entropy={:.2} eff_pools={:.2} iterations={}",
+        Event::OptimizationStepCompleted { result, plan } => format!(
+            "input optimization_step_completed status={:?} profit={} reserves={} routed={} entropy={:.2} eff_pools={:.2} iterations={} plan_steps={}",
             result.status,
             result.profit_amount,
             result.reserves_count,
@@ -586,8 +612,32 @@ fn format_input_log(input: &Event) -> String {
             result.route_entropy,
             result.effective_pools,
             result.iterations_completed,
+            plan.as_ref().map_or(0, |plan| plan.steps.len()),
         ),
         Event::Tick => "input tick".to_owned(),
+    }
+}
+
+/// One log line putting the lossless-replay verdict next to the optimizer's claimed profit for the
+/// same step (and entry size). Emitted once per verdict change by `log_verification`.
+fn format_verification_log(
+    result: OptimizationStepResult,
+    verification: PlanVerification,
+) -> String {
+    match verification {
+        PlanVerification::Verified {
+            profit,
+            hit_tick_limit,
+        } => format!(
+            "optimization plan_verification claimed={} verified={}{}",
+            result.profit_amount,
+            profit,
+            if hit_tick_limit { " tick_limited" } else { "" },
+        ),
+        PlanVerification::Unverifiable(failure) => format!(
+            "optimization plan_verification claimed={} unverifiable={failure:?}",
+            result.profit_amount,
+        ),
     }
 }
 
@@ -976,9 +1026,7 @@ fn spawn_optimization_subscription(
             default_optimization_session_config(),
             default_optimization_step_config(),
             sender,
-            // The emitted plan is not consumed yet: the app-boundary verification chunk (lossless
-            // replay against fresh kernel state) is where it gains a consumer.
-            |result, _plan| Event::OptimizationStepCompleted { result },
+            |result, plan| Event::OptimizationStepCompleted { result, plan },
         );
 
         match result {
@@ -1580,8 +1628,55 @@ mod tests {
         };
 
         assert_eq!(
-            format_input_log(&Event::OptimizationStepCompleted { result }),
-            "input optimization_step_completed status=Updated profit=12.5 reserves=4 routed=3 entropy=1.10 eff_pools=3.00 iterations=10"
+            format_input_log(&Event::OptimizationStepCompleted { result, plan: None }),
+            "input optimization_step_completed status=Updated profit=12.5 reserves=4 routed=3 entropy=1.10 eff_pools=3.00 iterations=10 plan_steps=0"
+        );
+    }
+
+    #[test]
+    fn verification_log_puts_verified_next_to_claimed() {
+        let result = optimization::OptimizationStepResult {
+            status: optimization::OptimizationStepStatus::Updated,
+            input_amount: 1_000.0,
+            output_amount: 1_012.5,
+            profit_amount: 12.5,
+            reserves_count: 4,
+            disabled_count: 0,
+            pool_slots: 4,
+            route_entropy: 1.1,
+            effective_pools: 3.0,
+            routed_pool_count: 3,
+            iterations_completed: 10,
+        };
+
+        assert_eq!(
+            format_verification_log(
+                result,
+                PlanVerification::Verified {
+                    profit: 11.25,
+                    hit_tick_limit: false,
+                },
+            ),
+            "optimization plan_verification claimed=12.5 verified=11.25"
+        );
+        assert_eq!(
+            format_verification_log(
+                result,
+                PlanVerification::Verified {
+                    profit: -0.5,
+                    hit_tick_limit: true,
+                },
+            ),
+            "optimization plan_verification claimed=12.5 verified=-0.5 tick_limited"
+        );
+        assert_eq!(
+            format_verification_log(
+                result,
+                PlanVerification::Unverifiable(
+                    client_evm::multi_chain_kernel::PlanVerificationFailure::InitAssetUnknown,
+                ),
+            ),
+            "optimization plan_verification claimed=12.5 unverifiable=InitAssetUnknown"
         );
     }
 

@@ -5,13 +5,16 @@ use std::{
 };
 
 use alloy::primitives::{BlockHash, Bloom, U256};
-use optimization::{Invertible, OptimizationStepResult, PoolReserves, VirtualReserveValues};
+use optimization::{
+    ExecutionPlan, Invertible, OptimizationStepResult, PoolReserves, StepKind, VirtualReserveValues,
+};
 use thiserror::Error;
 
 use crate::{
-    PoolFee, PoolRef, PoolLog, PoolMetadata, PoolState, PoolStateError, TokenAddress,
-    TokenAmountConversionError, TokenDecimals, bootstrap, chain::ChainKey, kernel,
-    u256_token_amount_to_f32,
+    LosslessPool, LosslessReplayError, PoolFee, PoolLog, PoolMetadata, PoolRef, PoolState,
+    PoolStateError, TokenAddress, TokenAmountConversionError, TokenDecimals, bootstrap,
+    chain::ChainKey, kernel, replay_plan_lossless, u256_token_amount_to_f32,
+    utils::f32_token_amount_to_u256,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +59,10 @@ pub enum ChainObservation {
 pub struct State {
     chains: BTreeMap<ChainKey, ChainLifecycle>,
     latest_optimization_result: Option<OptimizationStepResult>,
+    /// The lossless-replay verdict on the plan that arrived with `latest_optimization_result` —
+    /// written only alongside it, so a stale result/verification pairing is unrepresentable.
+    /// `None` when the latest step carried no plan.
+    latest_plan_verification: Option<PlanVerification>,
     /// Latest fold-frontier block per chain for which optimization reserves were dispatched.
     /// Added so `RunOptimization` fires only when a chain's optimization fold frontier advances.
     last_optimized_block: BTreeMap<ChainKey, BlockHash>,
@@ -163,6 +170,29 @@ pub struct OptimizationPoolReserves {
     pub reserves: Vec<PoolReserves<PoolRef, TokenAddress>>,
 }
 
+/// The lossless replay's verdict on the plan emitted with an optimization step, computed against the
+/// freshest kernel state at the moment the step completed — the optimizer's claimed profit judged
+/// against the market *now*, not against its own input snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PlanVerification {
+    /// The lossless replay ran: `profit` = output − entry in decimal-normalized init-asset units
+    /// (the same scale as the claimed `profit_amount`); `hit_tick_limit` marks a hop clamped at its
+    /// tick boundary, making `profit` a conservative lower-fidelity bound rather than exact.
+    Verified { profit: f32, hit_tick_limit: bool },
+    Unverifiable(PlanVerificationFailure),
+}
+
+/// Why a plan could not be judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanVerificationFailure {
+    /// The init asset's chain is not active or its decimals are not verified.
+    InitAssetUnknown,
+    /// The f32 entry (or the output back-projection) has no representation.
+    AmountConversion,
+    /// The replay failed: a pool without resolvable lossless state, or a malformed plan step.
+    Replay(LosslessReplayError),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolReserveValueKind {
     Reserve0,
@@ -216,6 +246,7 @@ impl State {
             State {
                 chains: chain_map,
                 latest_optimization_result: None,
+                latest_plan_verification: None,
                 last_optimized_block: BTreeMap::new(),
             },
             effects,
@@ -226,6 +257,13 @@ impl State {
     /// Added so read models can surface optimization progress without inspecting the worker thread.
     pub fn latest_optimization_result(&self) -> Option<OptimizationStepResult> {
         self.latest_optimization_result
+    }
+
+    /// Reports the lossless-replay verdict on the latest optimization result's emitted plan —
+    /// `None` when that step carried no plan. Added so read models can put the verified profit
+    /// next to the optimizer's claimed one.
+    pub fn latest_plan_verification(&self) -> Option<PlanVerification> {
+        self.latest_plan_verification
     }
 
     /// Reports whether a configured chain is initializing (bootstrapping) or active.
@@ -562,6 +600,9 @@ pub enum Event {
     },
     OptimizationStepCompleted {
         result: OptimizationStepResult,
+        /// The executable plan recovered from the step's trained weights; `None` when flow
+        /// extraction degraded. Verified losslessly against the state at event-processing time.
+        plan: Option<ExecutionPlan<PoolRef, TokenAddress>>,
     },
     Tick,
 }
@@ -601,25 +642,110 @@ pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
         Event::SubscriptionData { chain, data } => subscription_data(state, chain, data),
         Event::ChainEvent { chain, event } => chain_event(state, chain, event),
         Event::BootstrapEvent { chain, event } => bootstrap_event(state, chain, event),
-        Event::OptimizationStepCompleted { result } => optimization_step_completed(state, result),
+        Event::OptimizationStepCompleted { result, plan } => {
+            optimization_step_completed(state, result, plan)
+        }
         Event::Tick => tick(state),
     }
 }
 
-/// Records the latest optimization step result reported by the optimization worker.
-/// Added so optimization progress reaches the kernel state without disturbing chain lifecycle;
-/// it never produces effects and leaves the chain map untouched.
+/// Records the latest optimization step result reported by the optimization worker, and — when the
+/// step carried a plan — its lossless-replay verdict against the current state, in lockstep.
+/// It never produces effects and leaves the chain map untouched.
 fn optimization_step_completed(
     state: State,
     result: OptimizationStepResult,
+    plan: Option<ExecutionPlan<PoolRef, TokenAddress>>,
 ) -> (State, Vec<Effect>) {
+    let verification = plan.map(|plan| verify_plan(&state, &plan));
     (
         State {
             latest_optimization_result: Some(result),
+            latest_plan_verification: verification,
             ..state
         },
         Vec::new(),
     )
+}
+
+/// Judges an emitted plan by lossless replay against the current kernel state: the plan's own
+/// advisory entry (so claimed and verified profit are compared at the same size) converted to raw
+/// units, swapped through [`LosslessPool`]s resolved from the freshest per-chain fold, and the
+/// terminal output projected back to the claimed profit's decimal-normalized scale.
+fn verify_plan(state: &State, plan: &ExecutionPlan<PoolRef, TokenAddress>) -> PlanVerification {
+    let TokenAddress(_, init_chain) = plan.init_asset;
+    let Some(ChainLifecycle::Active(init_chain_state)) = state.chains.get(&init_chain) else {
+        return PlanVerification::Unverifiable(PlanVerificationFailure::InitAssetUnknown);
+    };
+    let Some(decimals) = init_chain_state
+        .verified_token_metadata(plan.init_asset)
+        .map(|metadata| metadata.decimals)
+    else {
+        return PlanVerification::Unverifiable(PlanVerificationFailure::InitAssetUnknown);
+    };
+
+    let Ok(entry) = f32_token_amount_to_u256(plan.entry_amount, decimals) else {
+        return PlanVerification::Unverifiable(PlanVerificationFailure::AmountConversion);
+    };
+
+    let book = lossless_pools_for_plan(state, plan);
+    let outcome = match replay_plan_lossless(plan, |pool| book.get(&pool).cloned(), entry) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return PlanVerification::Unverifiable(PlanVerificationFailure::Replay(error));
+        }
+    };
+
+    // Back-project the exact output onto the claimed profit's scale. Subtracting the advisory
+    // entry rather than re-projecting the converted one skews by at most the ≤1-raw-unit
+    // conversion floor — immaterial at gate precision.
+    let Ok(output) = u256_token_amount_to_f32(outcome.output, decimals) else {
+        return PlanVerification::Unverifiable(PlanVerificationFailure::AmountConversion);
+    };
+    PlanVerification::Verified {
+        profit: output - plan.entry_amount,
+        hit_tick_limit: outcome.hit_tick_limit,
+    }
+}
+
+/// Resolves lossless pool states for every distinct pool the plan swaps through — the
+/// `pool_reserves_for_optimization` lookup minus the f32 projection, batched so each involved
+/// chain's optimization fold runs once (never per pool). An unresolvable pool (inactive chain,
+/// unseeded state, unverified metadata, inconsistent tick state) is simply absent and surfaces as
+/// [`LosslessReplayError::PoolNotFound`] at replay.
+fn lossless_pools_for_plan(
+    state: &State,
+    plan: &ExecutionPlan<PoolRef, TokenAddress>,
+) -> HashMap<PoolRef, LosslessPool> {
+    let mut pools_by_chain: BTreeMap<ChainKey, Vec<PoolRef>> = BTreeMap::new();
+    for step in &plan.steps {
+        if let StepKind::Swap(pool) = step.kind {
+            pools_by_chain.entry(pool.chain()).or_default().push(pool);
+        }
+    }
+
+    let mut book = HashMap::new();
+    for (chain, pools) in pools_by_chain {
+        let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&chain) else {
+            continue;
+        };
+        let overlay = chain_state.optimization_update(chain).pool_states;
+        for pool in pools {
+            let Some(pool_state) = overlay
+                .get(&pool)
+                .or_else(|| chain_state.finalized_pool_snapshots().get(&pool))
+            else {
+                continue;
+            };
+            let Some(metadata) = chain_state.verified_pool_metadata(pool) else {
+                continue;
+            };
+            if let Ok(entry) = LosslessPool::from_pool_state(pool_state, metadata, chain) {
+                book.insert(pool, entry);
+            }
+        }
+    }
+    book
 }
 
 /// Runs `f` on `chain`'s lifecycle entry (removed for ownership; reinserted unless `f` returns
@@ -1109,10 +1235,14 @@ mod tests {
             iterations_completed: 10,
         };
 
-        let (state, effects) = transition(state, Event::OptimizationStepCompleted { result });
+        let (state, effects) = transition(
+            state,
+            Event::OptimizationStepCompleted { result, plan: None },
+        );
 
         assert!(effects.is_empty());
         assert_eq!(state.latest_optimization_result(), Some(result));
+        assert_eq!(state.latest_plan_verification(), None);
         assert_eq!(state.observe(), before);
     }
 
@@ -1124,15 +1254,165 @@ mod tests {
         ) {
             let state = active_state_at(ChainKey::Ethereum, hash(1));
 
-            let (state, _effects) =
-                transition(state, Event::OptimizationStepCompleted { result: first });
+            let (state, _effects) = transition(
+                state,
+                Event::OptimizationStepCompleted { result: first, plan: None },
+            );
             prop_assert_eq!(state.latest_optimization_result(), Some(first));
 
-            let (state, effects) =
-                transition(state, Event::OptimizationStepCompleted { result: second });
+            let (state, effects) = transition(
+                state,
+                Event::OptimizationStepCompleted { result: second, plan: None },
+            );
             prop_assert!(effects.is_empty());
             prop_assert_eq!(state.latest_optimization_result(), Some(second));
         }
+    }
+
+    /// A deep pool priced mid-tick (the WBTC/USDC state pinned in pool_state.rs's tests), so both
+    /// swap limits are comfortably non-zero. `balanced_pool_state` sits exactly on the tick-0
+    /// boundary, where the downward swap limit is zero and any hop in that direction clamps to
+    /// nothing — useless for a round-trip verification.
+    fn mid_tick_pool_state() -> PoolState {
+        PoolState {
+            sqrt_price_x96: U160::from_limbs([17134602959287796597, 139272449984, 0]),
+            liquidity: 50170120777514,
+            tick: I24::from_limbs([69583]),
+        }
+    }
+
+    /// A single-chain state with one seeded, verified, mid-tick 0.3%-fee pool between two
+    /// zero-decimal tokens — normalized amounts equal raw units, so verification arithmetic is
+    /// directly readable.
+    fn verification_state() -> State {
+        projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::from([(pool(10), mid_tick_pool_state())]),
+            HashMap::from([(
+                pool(10),
+                pool_metadata(token(1), token(2), UniswapV3Fee::Fee3000),
+            )]),
+            HashMap::from([(token(1), token_metadata(0)), (token(2), token_metadata(0))]),
+        )
+    }
+
+    fn plan_swap_step(
+        stage: usize,
+        token_in: TokenAddress,
+        token_out: TokenAddress,
+        pool: PoolRef,
+    ) -> optimization::ExecutableStep<PoolRef, TokenAddress> {
+        optimization::ExecutableStep {
+            stage,
+            token_in,
+            token_out,
+            kind: StepKind::Swap(pool),
+            weight: 1.0,
+            amount_in: 0.0,
+            amount_out: 0.0,
+        }
+    }
+
+    fn round_trip_plan(through: PoolRef) -> ExecutionPlan<PoolRef, TokenAddress> {
+        ExecutionPlan {
+            init_asset: token(1),
+            entry_amount: 100.0,
+            steps: vec![
+                plan_swap_step(0, token(1), token(2), through),
+                plan_swap_step(1, token(2), token(1), through),
+            ],
+        }
+    }
+
+    fn completed_step_event(plan: Option<ExecutionPlan<PoolRef, TokenAddress>>) -> Event {
+        Event::OptimizationStepCompleted {
+            result: OptimizationStepResult {
+                status: OptimizationStepStatus::Updated,
+                input_amount: 100.0,
+                output_amount: 100.0,
+                profit_amount: 0.0,
+                reserves_count: 1,
+                disabled_count: 0,
+                pool_slots: 1,
+                route_entropy: 0.0,
+                effective_pools: 0.0,
+                routed_pool_count: 0,
+                iterations_completed: 1,
+            },
+            plan,
+        }
+    }
+
+    #[test]
+    fn round_trip_plan_verifies_with_fee_loss() {
+        let state = verification_state();
+
+        let (state, effects) =
+            transition(state, completed_step_event(Some(round_trip_plan(pool(10)))));
+
+        assert!(effects.is_empty());
+        let Some(PlanVerification::Verified {
+            profit,
+            hit_tick_limit,
+        }) = state.latest_plan_verification()
+        else {
+            panic!(
+                "expected a verified plan, got {:?}",
+                state.latest_plan_verification()
+            );
+        };
+        // A no-arbitrage round trip through one balanced pool loses exactly fees and integer
+        // floors: strictly negative, but a small fraction of the 100-unit entry.
+        assert!(profit < 0.0, "round trip must lose fees, got {profit}");
+        assert!(profit > -10.0, "loss must stay fee-sized, got {profit}");
+        assert!(!hit_tick_limit);
+    }
+
+    #[test]
+    fn plan_through_unresolvable_pool_is_unverifiable_pool_not_found() {
+        let state = verification_state();
+
+        let (state, _effects) =
+            transition(state, completed_step_event(Some(round_trip_plan(pool(99)))));
+
+        assert_eq!(
+            state.latest_plan_verification(),
+            Some(PlanVerification::Unverifiable(
+                PlanVerificationFailure::Replay(LosslessReplayError::PoolNotFound)
+            ))
+        );
+    }
+
+    #[test]
+    fn plan_with_unverified_init_asset_is_unverifiable_init_asset_unknown() {
+        let state = verification_state();
+        let mut plan = round_trip_plan(pool(10));
+        plan.init_asset = token(9); // no verified token metadata
+
+        let (state, _effects) = transition(state, completed_step_event(Some(plan)));
+
+        assert_eq!(
+            state.latest_plan_verification(),
+            Some(PlanVerification::Unverifiable(
+                PlanVerificationFailure::InitAssetUnknown
+            ))
+        );
+    }
+
+    #[test]
+    fn step_without_plan_clears_the_previous_verification() {
+        let state = verification_state();
+        let (state, _effects) =
+            transition(state, completed_step_event(Some(round_trip_plan(pool(10)))));
+        assert!(state.latest_plan_verification().is_some());
+
+        let (state, _effects) = transition(state, completed_step_event(None));
+
+        // The result and its verification stay in lockstep: a planless step stores the result
+        // and clears the stale verdict rather than leaving it paired with the wrong result.
+        assert!(state.latest_optimization_result().is_some());
+        assert_eq!(state.latest_plan_verification(), None);
     }
 
     fn optimization_step_result_strategy() -> impl Strategy<Value = OptimizationStepResult> {
@@ -1891,6 +2171,7 @@ mod tests {
         let state = State {
             chains,
             latest_optimization_result: None,
+            latest_plan_verification: None,
             last_optimized_block: BTreeMap::new(),
         };
 
@@ -1975,6 +2256,7 @@ mod tests {
         State {
             chains,
             latest_optimization_result: None,
+            latest_plan_verification: None,
             last_optimized_block: BTreeMap::new(),
         }
     }
@@ -2411,6 +2693,7 @@ mod tests {
         State {
             chains: BTreeMap::from([(chain, ChainLifecycle::Active(chain_state))]),
             latest_optimization_result: None,
+            latest_plan_verification: None,
             last_optimized_block: BTreeMap::new(),
         }
     }
@@ -2645,6 +2928,7 @@ mod tests {
         State {
             chains: BTreeMap::from([(chain, ChainLifecycle::Active(chain_state))]),
             latest_optimization_result: None,
+            latest_plan_verification: None,
             last_optimized_block: BTreeMap::new(),
         }
     }

@@ -10,6 +10,9 @@ pub enum TokenAmountConversionError {
 
     #[error("token amount exceeds f32 range after scaling: raw={raw}, decimals={decimals}")]
     F32Overflow { raw: U256, decimals: u8 },
+
+    #[error("f32 token amount has no raw integer representation: {amount}")]
+    NonConvertibleF32 { amount: String },
 }
 
 pub fn u256_token_amount_to_f32(
@@ -34,6 +37,30 @@ pub fn u256_token_amount_to_f32(
             decimals: decimals.value(),
         })
     }
+}
+
+/// Converts a decimal-normalized `f32` token amount back into raw integer units — the inverse of
+/// [`u256_token_amount_to_f32`]. Errors on non-finite or negative input and on scaled results at or
+/// beyond `u128` range (raw amounts that large do not occur for real tokens); the sub-unit fractional
+/// remainder is floored away, so the result never overstates the amount.
+pub fn f32_token_amount_to_u256(
+    amount: f32,
+    decimals: TokenDecimals,
+) -> Result<U256, TokenAmountConversionError> {
+    let non_convertible = || TokenAmountConversionError::NonConvertibleF32 {
+        amount: amount.to_string(),
+    };
+
+    if !amount.is_finite() || amount < 0.0 {
+        return Err(non_convertible());
+    }
+
+    let scaled = f64::from(amount) * u256_to_f64(decimal_scale(decimals))?;
+    if !scaled.is_finite() || scaled >= u128::MAX as f64 {
+        return Err(non_convertible());
+    }
+
+    Ok(U256::from(scaled as u128))
 }
 
 fn u256_token_amount_to_f64(
@@ -155,7 +182,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn f32_amount_scales_by_decimals_and_floors_the_sub_unit_remainder() {
+        let raw = f32_token_amount_to_u256(1.5, token_decimals(6)).unwrap();
+        assert_eq!(raw, U256::from(1_500_000u64));
+
+        // 0.1 is not exactly representable; the sub-unit remainder must floor, never round up.
+        let raw = f32_token_amount_to_u256(0.1, token_decimals(0)).unwrap();
+        assert_eq!(raw, U256::ZERO);
+    }
+
+    #[test]
+    fn f32_amount_to_u256_rejects_non_finite_and_negative_amounts() {
+        for amount in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            let result = f32_token_amount_to_u256(amount, token_decimals(18));
+            assert_eq!(
+                result,
+                Err(TokenAmountConversionError::NonConvertibleF32 {
+                    amount: amount.to_string(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn f32_amount_to_u256_rejects_amounts_beyond_u128_range() {
+        let result = f32_token_amount_to_u256(f32::MAX, token_decimals(18));
+
+        assert_eq!(
+            result,
+            Err(TokenAmountConversionError::NonConvertibleF32 {
+                amount: f32::MAX.to_string(),
+            })
+        );
+    }
+
     proptest! {
+        /// The inverse conversion round-trips through raw units within f32 relative tolerance plus
+        /// one floored raw unit (10^-decimals in normalized terms).
+        #[test]
+        fn positive_f32_amounts_round_trip_through_raw_units(
+            amount in 1.0e-3f32..1.0e12,
+            decimals in 6u8..=18,
+        ) {
+            let raw = f32_token_amount_to_u256(amount, token_decimals(decimals)).unwrap();
+            let back = u256_token_amount_to_f32(raw, token_decimals(decimals)).unwrap();
+
+            let floor_slack = 10.0f32.powi(-i32::from(decimals));
+            prop_assert!(
+                (back - amount).abs() <= amount * 1.0e-5 + floor_slack,
+                "amount {amount} raw {raw} back {back}",
+            );
+        }
+
         #[test]
         fn finite_u128_amounts_convert_to_non_negative_finite_values(
             raw in any::<u128>(),
