@@ -98,6 +98,7 @@ mod tests {
             decimals: Some(6),
             tvl_usd: Some(1000.0),
             volume_usd: None,
+            trusted_listing: true,
         }
     }
 

@@ -1,0 +1,301 @@
+generated_at = "2026-07-15T20:42:52Z"
+examiner = "contract-examiner/0.1.0"
+
+[[chains.arbitrum.tokens]]
+address = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+symbol = "USDC"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 14343049.984698
+
+[[chains.arbitrum.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "ETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 6895989.62028973
+
+[[chains.arbitrum.tokens]]
+address = "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f"
+symbol = "WBTC"
+decimals = 8
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 4920762.238560429
+
+[[chains.arbitrum.tokens]]
+address = "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+symbol = "USDT"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 3502498.929194
+
+[[chains.arbitrum.tokens]]
+address = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+symbol = "WETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 28050.151215728765
+
+[[chains.avalanche.tokens]]
+address = "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7"
+symbol = "USDt"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 11058786.233816
+
+[[chains.avalanche.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "AVAX"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 81904.7808118087
+
+[[chains.avalanche.tokens]]
+address = "0x49d5c2bdffac6ce2bfdb6640f4f80f226bc10bab"
+symbol = "WETH.e"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 61844.94053997714
+
+[[chains.avalanche.tokens]]
+address = "0x50b7545627a5162f82a992c33b87adc75187b218"
+symbol = "WBTC.e"
+decimals = 8
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 8558.63822452558
+
+[[chains.avalanche.tokens]]
+address = "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e"
+symbol = "USDC"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.base.tokens]]
+address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+symbol = "USDC"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 2303675.680887
+
+[[chains.base.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "ETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 1985131.5341524251
+
+[[chains.base.tokens]]
+address = "0x4200000000000000000000000000000000000006"
+symbol = "WETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 1542914.6853590084
+
+[[chains.base.tokens]]
+address = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
+symbol = "cbBTC"
+decimals = 8
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.bnb.tokens]]
+address = "0x55d398326f99059ff775485246999027b3197955"
+symbol = "USDT"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 19699364.310499955
+
+[[chains.bnb.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "BNB"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 3372859.1537599675
+
+[[chains.bnb.tokens]]
+address = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
+symbol = "USDC"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 1193146.5836730264
+
+[[chains.bnb.tokens]]
+address = "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c"
+symbol = "BTCB"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 770839.7549720327
+
+[[chains.bnb.tokens]]
+address = "0x2170ed0880ac9a755fd29b2688956bd959f933f8"
+symbol = "ETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 252296.8340836812
+
+[[chains.bnb.tokens]]
+address = "0xf8a0bf9cf54bb92f17374d9e9a321e6a111a51bd"
+symbol = "LINK"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 17807.60198240122
+
+[[chains.ethereum.tokens]]
+address = "0x56072c95faa701256059aa122697b133aded9279"
+symbol = "SKY"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 8318927.318605039
+
+[[chains.ethereum.tokens]]
+address = "0x55296f69f40ea6d20e478533c15a6b08b654e758"
+symbol = "XYO"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 619844.2298569736
+
+[[chains.ethereum.tokens]]
+address = "0xd533a949740bb3306d119cc777fa900ba034cd52"
+symbol = "CRV"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 585911.291622894
+
+[[chains.ethereum.tokens]]
+address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+symbol = "WETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 432681.0876565622
+
+[[chains.ethereum.tokens]]
+address = "0x4691937a7508860f876c9c0a2a617e7d9e945d4b"
+symbol = "WOO"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 311601.33961952326
+
+[[chains.ethereum.tokens]]
+address = "0xc00e94cb662c3520282e6f5717214004a7f26888"
+symbol = "COMP"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 192514.0780042263
+
+[[chains.ethereum.tokens]]
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+symbol = "USDC"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+symbol = "USDT"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "ETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0x5a98fcbea516cf06857215779fd812ca3bef1b32"
+symbol = "LDO"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"
+symbol = "WBTC"
+decimals = 8
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+symbol = "UNI"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+symbol = "DAI"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.ethereum.tokens]]
+address = "0xf939e0a03fb07f59a73314e73794be0e57ac1b4e"
+symbol = "crvUSD"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.optimism.tokens]]
+address = "0x0b2c639c533813f4aa9d7837caf62653d097ff85"
+symbol = "USDC"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 13664721.867424
+
+[[chains.optimism.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "ETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 218655.88623144772
+
+[[chains.optimism.tokens]]
+address = "0x68f180fcce6836688e9084f035309e29bf0a2095"
+symbol = "WBTC"
+decimals = 8
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 141462.75473435168
+
+[[chains.optimism.tokens]]
+address = "0x4200000000000000000000000000000000000006"
+symbol = "WETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 36633.19161171579
+
+[[chains.optimism.tokens]]
+address = "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"
+symbol = "DAI"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 9500.129591936531
+
+[[chains.optimism.tokens]]
+address = "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58"
+symbol = "USDT"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.polygon.tokens]]
+address = "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6"
+symbol = "WBTC"
+decimals = 8
+examined_at = "2026-07-15T20:42:52Z"
+tvl_usd = 634520.4596111024
+
+[[chains.polygon.tokens]]
+address = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f"
+symbol = "USDT"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.polygon.tokens]]
+address = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+symbol = "USDC"
+decimals = 6
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.polygon.tokens]]
+address = "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"
+symbol = "WETH"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"
+
+[[chains.polygon.tokens]]
+address = "0x0000000000000000000000000000000000000000"
+decimals = 18
+examined_at = "2026-07-15T20:42:52Z"

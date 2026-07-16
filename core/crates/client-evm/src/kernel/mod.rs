@@ -6,6 +6,10 @@ pub(crate) mod pending_requests;
 pub(crate) mod pool_registry;
 pub(crate) mod token_registry;
 pub(crate) mod blocks_graph;
+/// Heavy regime-exploration suite (provider failures, WS stalls, resource constraints); every test
+/// is `#[ignore]`d so the main suite never runs it — see the module docs for the run command.
+#[cfg(test)]
+mod regimes;
 
 use self::{pending_requests::*, pool_registry::*, token_registry::*};
 use crate::{ChainKey, PoolLog, pool_state::*, tick::Tick, uniswap_v4};

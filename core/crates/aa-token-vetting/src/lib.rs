@@ -34,7 +34,7 @@ impl fmt::Display for VettingError {
             Self::UsageFailed { message } => {
                 write!(
                     formatter,
-                    "{message}\nusage: aa-token-vetting [--out <path>] [--top <N>] [--allow-missing-chains]"
+                    "{message}\nusage: aa-token-vetting [--out <path>] [--report <path>] [--top <N>] [--gecko-pages <N>] [--allow-missing-chains]"
                 )
             }
             Self::DiscoveryFailed { chain, message } => {
