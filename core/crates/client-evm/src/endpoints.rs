@@ -10,7 +10,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Mutex,
+        Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -129,9 +129,17 @@ impl EndpointPool {
     }
 
     /// Builds a single-endpoint pool. Convenience for callers (and tests) that have exactly one URL.
+    /// Constructed directly rather than through `new` so it is infallible.
     pub fn single(label: impl Into<String>, url: impl Into<String>) -> EndpointPool {
-        EndpointPool::new(vec![EndpointSpec::new(label, url, 1)])
-            .expect("single endpoint spec is always non-empty")
+        EndpointPool {
+            endpoints: vec![Endpoint {
+                url: url.into(),
+                label: label.into(),
+            }],
+            order: vec![0],
+            cursor: AtomicUsize::new(0),
+            health: Mutex::new(vec![Health::healthy()]),
+        }
     }
 
     /// Runs `attempt` against endpoints from the pool, failing over to an untried alternative on any
@@ -154,8 +162,11 @@ impl EndpointPool {
         for _ in 0..pool_size {
             let now = Instant::now();
             let idx = self.pick_excluding(&tried, now);
+            let Some(endpoint) = self.endpoints.get(idx) else {
+                break;
+            };
 
-            match attempt(&self.endpoints[idx].url) {
+            match attempt(&endpoint.url) {
                 Ok(value) => {
                     self.report_success(idx);
                     return Ok(value);
@@ -163,7 +174,7 @@ impl EndpointPool {
                 Err(error) if is_retryable(&error) => {
                     self.report_failure(idx, now);
                     if wrap {
-                        trace.push(FailoverAttempt::record(&self.endpoints[idx].label, &error));
+                        trace.push(FailoverAttempt::record(&endpoint.label, &error));
                     }
                     tried.push(idx);
                     last_error = Some(error);
@@ -176,7 +187,7 @@ impl EndpointPool {
                     if !wrap {
                         return Err(error);
                     }
-                    trace.push(FailoverAttempt::record(&self.endpoints[idx].label, &error));
+                    trace.push(FailoverAttempt::record(&endpoint.label, &error));
                     return Err(failover_exhausted(&trace, pool_size, true));
                 }
             }
@@ -185,7 +196,12 @@ impl EndpointPool {
         if wrap {
             Err(failover_exhausted(&trace, pool_size, false))
         } else {
-            Err(last_error.expect("with_failover runs at least one attempt"))
+            match last_error {
+                Some(error) => Err(error),
+                // Constructors guarantee a non-empty pool, so at least one attempt always runs and
+                // records its error above; this arm is a panic-free stand-in for that invariant.
+                None => Err(failover_exhausted(&trace, pool_size, false)),
+            }
         }
     }
 
@@ -193,17 +209,21 @@ impl EndpointPool {
     /// down. Falls back to the untried endpoint whose cooldown expires soonest, so a request never
     /// stalls even when every endpoint is penalized.
     fn pick_excluding(&self, tried: &[usize], now: Instant) -> usize {
-        let health = self.health.lock().expect("endpoint health mutex poisoned");
+        // Health cooldowns are plain data, so a poisoned lock (a panic mid-update elsewhere) is
+        // recovered rather than propagated — selection must never take down the request path.
+        let health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
         let len = self.order.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
 
         let mut fallback: Option<(usize, Instant)> = None;
         for offset in 0..len {
-            let idx = self.order[(start + offset) % len];
+            let Some(&idx) = self.order.get((start + offset) % len) else {
+                continue;
+            };
             if tried.contains(&idx) {
                 continue;
             }
-            match health[idx].cooldown_until {
+            match health.get(idx).and_then(|entry| entry.cooldown_until) {
                 None => return idx,
                 Some(until) if until <= now => return idx,
                 Some(until) => {
@@ -216,7 +236,8 @@ impl EndpointPool {
 
         fallback
             .map(|(idx, _)| idx)
-            .unwrap_or_else(|| self.order[start % len])
+            .or_else(|| self.order.get(start % len).copied())
+            .unwrap_or_default()
     }
 
     /// Test/inspection helper: the next pick assuming nothing has been tried in this request.
@@ -226,15 +247,18 @@ impl EndpointPool {
     }
 
     fn report_success(&self, idx: usize) {
-        let mut health = self.health.lock().expect("endpoint health mutex poisoned");
-        health[idx] = Health::healthy();
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = health.get_mut(idx) {
+            *entry = Health::healthy();
+        }
     }
 
     fn report_failure(&self, idx: usize, now: Instant) {
-        let mut health = self.health.lock().expect("endpoint health mutex poisoned");
-        let entry = &mut health[idx];
-        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-        entry.cooldown_until = Some(now + backoff_duration(entry.consecutive_failures));
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = health.get_mut(idx) {
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            entry.cooldown_until = Some(now + backoff_duration(entry.consecutive_failures));
+        }
     }
 }
 
@@ -493,13 +517,19 @@ fn smooth_weighted_order(weights: &[u32]) -> Vec<usize> {
         for (value, &weight) in current.iter_mut().zip(weights) {
             *value += i64::from(weight);
         }
-        let selected = current
+        // `total > 0` implies `weights` (and so `current`) is non-empty, so the max always exists;
+        // the guard keeps the loop panic-free instead of asserting it.
+        let Some(selected) = current
             .iter()
             .enumerate()
             .max_by_key(|&(_, &value)| value)
             .map(|(index, _)| index)
-            .expect("weights is non-empty when total > 0");
-        current[selected] -= total;
+        else {
+            break;
+        };
+        if let Some(value) = current.get_mut(selected) {
+            *value -= total;
+        }
         order.push(selected);
     }
 

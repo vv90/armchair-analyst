@@ -86,6 +86,10 @@ struct FinalizedRefreshPolicy {
 
 /// Compile-time-checked stride literal: a zero fails const evaluation (a build error), never the
 /// runtime — every use below is a `const` item.
+#[expect(
+    clippy::panic,
+    reason = "const-eval only: a zero literal fails the build, not the runtime"
+)]
 const fn nonzero_stride(value: usize) -> NonZeroUsize {
     match NonZeroUsize::new(value) {
         Some(stride) => stride,
