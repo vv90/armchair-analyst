@@ -9,6 +9,19 @@ pub enum ChainKey {
     Avalanche,
 }
 
+/// Every chain the client knows how to speak to, active or not. Slug resolution
+/// ([`chain_key_for_network_path`]) stays total over this set so config and whitelist sections for
+/// temporarily deactivated chains remain valid rather than becoming startup errors.
+const ALL_CHAINS: &[ChainKey] = &[
+    ChainKey::Ethereum,
+    ChainKey::Arbitrum,
+    ChainKey::Base,
+    ChainKey::Optimism,
+    ChainKey::Polygon,
+    ChainKey::Bnb,
+    ChainKey::Avalanche,
+];
+
 /// The chains the runtime tracks. The canonical, unique source of the active-chain set: the runtime
 /// seeds one bootstrapping chain and one new-heads subscription per entry, so adding a chain here is
 /// the single switch that activates it.
@@ -17,8 +30,11 @@ pub const ACTIVE_CHAINS: &[ChainKey] = &[
     ChainKey::Arbitrum,
     ChainKey::Base,
     ChainKey::Optimism,
-    ChainKey::Polygon,
-    ChainKey::Bnb,
+    // Polygon and Bnb are temporarily deactivated: every mainnet run 2026-07-10..16 showed the
+    // same chronic stall on both (frontier frozen, behind climbing, provider getLogs refused or
+    // silently dropped). Re-enable once per-provider backoff / archive-capable getLogs lands.
+    // ChainKey::Polygon,
+    // ChainKey::Bnb,
     ChainKey::Avalanche,
 ];
 
@@ -38,10 +54,12 @@ pub fn drpc_network_path(chain: ChainKey) -> &'static str {
     }
 }
 
-/// Inverse of [`drpc_network_path`]: resolves an active chain from its network slug. Used to map the
-/// per-chain keys of the endpoints config file onto [`ChainKey`]. Unknown slugs return `None`.
+/// Inverse of [`drpc_network_path`]: resolves a known chain from its network slug. Used to map the
+/// per-chain keys of the endpoints config file onto [`ChainKey`]. Total over [`ALL_CHAINS`] (not
+/// just the active set) so deactivating a chain never invalidates existing config/whitelist files;
+/// unknown slugs return `None`.
 pub fn chain_key_for_network_path(path: &str) -> Option<ChainKey> {
-    ACTIVE_CHAINS
+    ALL_CHAINS
         .iter()
         .copied()
         .find(|&chain| drpc_network_path(chain) == path)
@@ -80,9 +98,9 @@ mod tests {
     }
 
     #[test]
-    fn every_active_chain_has_a_unique_slug_that_roundtrips() {
+    fn every_known_chain_has_a_unique_slug_that_roundtrips() {
         let mut slugs = std::collections::HashSet::new();
-        for &chain in ACTIVE_CHAINS {
+        for &chain in ALL_CHAINS {
             let slug = drpc_network_path(chain);
             assert!(slugs.insert(slug), "duplicate network slug: {slug}");
             assert_eq!(chain_key_for_network_path(slug), Some(chain));

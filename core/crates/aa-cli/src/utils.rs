@@ -1149,8 +1149,7 @@ mod tests {
         assert_eq!(
             lines.first().map(String::as_str),
             Some(
-                "token_whitelist enabled ethereum=2 arbitrum=0 base=0 optimism=0 polygon=0 \
-                 bnb=0 avalanche=0"
+                "token_whitelist enabled ethereum=2 arbitrum=0 base=0 optimism=0 avalanche=0"
             )
         );
         // Every active chain but Ethereum is absent from the file → one warning each.
