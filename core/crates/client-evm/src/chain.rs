@@ -27,7 +27,10 @@ const ALL_CHAINS: &[ChainKey] = &[
 /// the single switch that activates it.
 pub const ACTIVE_CHAINS: &[ChainKey] = &[
     ChainKey::Ethereum,
-    ChainKey::Arbitrum,
+    // Arbitrum is temporarily deactivated: its high-rate, frequently-duplicated head stream
+    // saturated the transition thread on every mainnet run. Re-enable once the fold/walk cost per
+    // head is bounded (see the run-diagnostics work).
+    // ChainKey::Arbitrum,
     ChainKey::Base,
     ChainKey::Optimism,
     // Polygon and Bnb are temporarily deactivated: every mainnet run 2026-07-10..16 showed the
