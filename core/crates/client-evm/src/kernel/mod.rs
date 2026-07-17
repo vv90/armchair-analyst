@@ -285,6 +285,34 @@ impl State {
         })
     }
 
+    /// Bench/test seam: forces the full optimization fold read — the O(window) walk the multi-chain
+    /// wrapper runs post-transition (`optimization_update_if_changed`) — by treating nothing as
+    /// dispatched, so the frontier never matches `last_dispatched` and the fold never early-outs.
+    /// Non-consuming (`&self`), so a scaling benchmark builds one window and measures the read
+    /// repeatedly without a `Clone` on `State`. Compiled only under the `test-support` feature.
+    #[cfg(feature = "test-support")]
+    pub fn bench_optimization_fold(&self, chain: ChainKey) -> Option<OptimizationStateUpdate> {
+        self.optimization_update_if_changed(chain, None)
+    }
+
+    /// Bench/test seam: the tip-hole scheduling scan — the `path × trusted-addresses` bloom-touch
+    /// checks that dominated runs 2-4 — read-only and identical to the scheduler's candidate
+    /// derivation (trusted = verified addresses ∪ v4 PoolManager; `Unknown` + bloom-touching +
+    /// depth ≥ [`STREAM_SETTLE_DEPTH`]). Returns the hole count so the walk cannot be optimized
+    /// away. Compiled only under the `test-support` feature.
+    #[cfg(feature = "test-support")]
+    pub fn bench_unknown_hole_scan(&self, chain: ChainKey) -> usize {
+        let mut trusted = self.pool_registry.verified_addresses(chain);
+        if let Some(manager) = uniswap_v4::pool_manager_address(chain) {
+            trusted.insert(manager);
+        }
+        let pending = self.pending_requests.pending_block_log_hashes();
+        self.blocks
+            .graph
+            .unknown_log_hole_hashes(&trusted, &pending, STREAM_SETTLE_DEPTH)
+            .len()
+    }
+
     /// Counts canonical blocks the tip is ahead of `reference_hash` on a connected path.
     /// Added so read models can measure fetch progress from an already-known frontier block
     /// (such as the last dispatched optimization block) without rebuilding the complete

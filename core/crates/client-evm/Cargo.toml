@@ -20,6 +20,15 @@ test-support = []
 
 [dev-dependencies]
 proptest = "1"
+criterion = "0.5"
+
+# Scaling microbenchmarks for the kernel's O(window) read paths. `required-features` gates the
+# target on `test-support` (which exposes the non-consuming bench read shims on `State`), so a plain
+# `cargo bench` skips it and `cargo bench --features test-support --bench kernel_scaling` runs it.
+[[bench]]
+name = "kernel_scaling"
+harness = false
+required-features = ["test-support"]
 
 [lints]
 workspace = true
