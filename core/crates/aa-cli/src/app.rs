@@ -1,17 +1,21 @@
 use aa_framework::{Application, ApplicationError, Runtime, Transition};
 use client_evm::{
-    ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS,
-    AVALANCHE_USDC_TOKEN_ADDRESS,
-    AnyIssuedRequest, AnyRequestId, BlockHash, BASE_NATIVE_TOKEN_ADDRESS, BASE_USDC_TOKEN_ADDRESS,
-    BASE_WETH_TOKEN_ADDRESS, BNB_USDC_TOKEN_ADDRESS, ChainEndpoints,
-    ChainKey, ChainSubscriptions, ClientEvent, ClientEvmError, ClientHead,
-    ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
-    OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
-    POLYGON_USDC_TOKEN_ADDRESS,
-    GetLogsRange, GraphEndpoints, MetadataCache, POOL_LOG_BATCH_WINDOW, ProtocolPoolKey, PoolLog,
-    PoolDataResult, PoolMetadata, PoolMetadataResult, PoolRef, RangeLogBlock, RequestId,
-    TokenAddress, TokenMetadataResult, TokenWhitelist, WsSubscriptionEndpoint,
-    bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
+    ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDT_TOKEN_ADDRESS,
+    ARBITRUM_WBTC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS, AVALANCHE_USDC_TOKEN_ADDRESS,
+    AVALANCHE_USDT_TOKEN_ADDRESS, AVALANCHE_WBTC_TOKEN_ADDRESS, AVALANCHE_WETH_TOKEN_ADDRESS,
+    AnyIssuedRequest, AnyRequestId, BASE_CBBTC_TOKEN_ADDRESS, BASE_NATIVE_TOKEN_ADDRESS,
+    BASE_USDC_TOKEN_ADDRESS, BASE_WETH_TOKEN_ADDRESS, BNB_BTCB_TOKEN_ADDRESS,
+    BNB_USDC_TOKEN_ADDRESS, BNB_USDT_TOKEN_ADDRESS, BNB_WETH_TOKEN_ADDRESS, BlockHash,
+    ChainEndpoints, ChainKey, ChainSubscriptions, ClientEvent, ClientEvmError, ClientHead,
+    ETHEREUM_DAI_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS,
+    ETHEREUM_USDT_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS,
+    GetLogsRange, GraphEndpoints, MetadataCache, OPTIMISM_DAI_TOKEN_ADDRESS,
+    OPTIMISM_NATIVE_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_USDT_TOKEN_ADDRESS,
+    OPTIMISM_WBTC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS, POLYGON_USDC_TOKEN_ADDRESS,
+    POLYGON_USDT_TOKEN_ADDRESS, POLYGON_WBTC_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS,
+    POOL_LOG_BATCH_WINDOW, PoolDataResult, PoolLog, PoolMetadata, PoolMetadataResult, PoolRef,
+    ProtocolPoolKey, RangeLogBlock, RequestId, TokenAddress, TokenMetadataResult, TokenWhitelist,
+    WsSubscriptionEndpoint, bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
     kernel,
@@ -1119,11 +1123,13 @@ pub(crate) fn optimization_session_config(
 /// * Cross-chain USDC: lets the single `init_asset` (Ethereum USDC) traverse every other chain's pools
 ///   and close cross-chain cycles back to it. Ethereum USDC is the hub; each chain's native USDC bridges
 ///   to and from it, so all chains' USDC are mutually reachable.
+/// * Cross-chain exposure equivalents: Ethereum USDT, WBTC, and WETH are hubs for the vetted
+///   chain-specific variants; Ethereum DAI connects to Optimism DAI. BTC variants include cbBTC on
+///   Base and BTCB on BNB Chain.
 /// * Native ETH ↔ WETH: wrapping is 1:1, so this unifies v4 native-ETH pools (`token0 = address(0)`)
 ///   with v3 WETH liquidity; without it, native-ETH pools would be an isolated island in the graph.
 ///   Registered per chain (native ETH and WETH are distinct `(Address, ChainKey)` tokens on each chain),
-///   and there is intentionally no cross-chain ETH bridge (only USDC connects the chains). This bridge
-///   is registered ONLY for chains whose native gas token is ETH (Ethereum, Arbitrum, Base, Optimism).
+///   and registered ONLY for chains whose native gas token is ETH (Ethereum, Arbitrum, Base, Optimism).
 ///   Polygon (POL), BNB (BNB) and Avalanche (AVAX) have a non-ETH native token, so their `WETH` is an
 ///   ordinary bridged ERC20 that is NOT 1:1 with the native token — bridging it to native would be wrong,
 ///   so it is omitted and that liquidity connects through pools instead.
@@ -1142,6 +1148,46 @@ fn default_optimization_bridges() -> HashSet<(TokenAddress, TokenAddress)> {
         (BNB_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
         (ETHEREUM_USDC_TOKEN_ADDRESS, AVALANCHE_USDC_TOKEN_ADDRESS),
         (AVALANCHE_USDC_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS),
+        // Cross-chain USDT exposure hub.
+        (ETHEREUM_USDT_TOKEN_ADDRESS, ARBITRUM_USDT_TOKEN_ADDRESS),
+        (ARBITRUM_USDT_TOKEN_ADDRESS, ETHEREUM_USDT_TOKEN_ADDRESS),
+        (ETHEREUM_USDT_TOKEN_ADDRESS, OPTIMISM_USDT_TOKEN_ADDRESS),
+        (OPTIMISM_USDT_TOKEN_ADDRESS, ETHEREUM_USDT_TOKEN_ADDRESS),
+        (ETHEREUM_USDT_TOKEN_ADDRESS, POLYGON_USDT_TOKEN_ADDRESS),
+        (POLYGON_USDT_TOKEN_ADDRESS, ETHEREUM_USDT_TOKEN_ADDRESS),
+        (ETHEREUM_USDT_TOKEN_ADDRESS, BNB_USDT_TOKEN_ADDRESS),
+        (BNB_USDT_TOKEN_ADDRESS, ETHEREUM_USDT_TOKEN_ADDRESS),
+        (ETHEREUM_USDT_TOKEN_ADDRESS, AVALANCHE_USDT_TOKEN_ADDRESS),
+        (AVALANCHE_USDT_TOKEN_ADDRESS, ETHEREUM_USDT_TOKEN_ADDRESS),
+        // Cross-chain BTC exposure hub.
+        (ETHEREUM_WBTC_TOKEN_ADDRESS, ARBITRUM_WBTC_TOKEN_ADDRESS),
+        (ARBITRUM_WBTC_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS),
+        (ETHEREUM_WBTC_TOKEN_ADDRESS, BASE_CBBTC_TOKEN_ADDRESS),
+        (BASE_CBBTC_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS),
+        (ETHEREUM_WBTC_TOKEN_ADDRESS, OPTIMISM_WBTC_TOKEN_ADDRESS),
+        (OPTIMISM_WBTC_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS),
+        (ETHEREUM_WBTC_TOKEN_ADDRESS, POLYGON_WBTC_TOKEN_ADDRESS),
+        (POLYGON_WBTC_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS),
+        (ETHEREUM_WBTC_TOKEN_ADDRESS, BNB_BTCB_TOKEN_ADDRESS),
+        (BNB_BTCB_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS),
+        (ETHEREUM_WBTC_TOKEN_ADDRESS, AVALANCHE_WBTC_TOKEN_ADDRESS),
+        (AVALANCHE_WBTC_TOKEN_ADDRESS, ETHEREUM_WBTC_TOKEN_ADDRESS),
+        // Cross-chain ETH exposure hub.
+        (ETHEREUM_WETH_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS),
+        (ARBITRUM_WETH_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        (ETHEREUM_WETH_TOKEN_ADDRESS, BASE_WETH_TOKEN_ADDRESS),
+        (BASE_WETH_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        (ETHEREUM_WETH_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS),
+        (OPTIMISM_WETH_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        (ETHEREUM_WETH_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS),
+        (POLYGON_WETH_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        (ETHEREUM_WETH_TOKEN_ADDRESS, BNB_WETH_TOKEN_ADDRESS),
+        (BNB_WETH_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        (ETHEREUM_WETH_TOKEN_ADDRESS, AVALANCHE_WETH_TOKEN_ADDRESS),
+        (AVALANCHE_WETH_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
+        // Cross-chain DAI exposure.
+        (ETHEREUM_DAI_TOKEN_ADDRESS, OPTIMISM_DAI_TOKEN_ADDRESS),
+        (OPTIMISM_DAI_TOKEN_ADDRESS, ETHEREUM_DAI_TOKEN_ADDRESS),
         // Native ETH ↔ WETH, only on ETH-native chains.
         (ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
         (ETHEREUM_WETH_TOKEN_ADDRESS, ETHEREUM_NATIVE_TOKEN_ADDRESS),
@@ -2177,8 +2223,8 @@ mod tests {
         let config = test_session_config();
 
         // Wrapping is 1:1, so native ETH (v4 `token0 = address(0)`) and WETH (v3) must be a
-        // two-sided bridge on every chain; otherwise v4 native-ETH pools are isolated from WETH
-        // liquidity. There is intentionally no cross-chain ETH bridge (only USDC connects chains).
+        // two-sided bridge on every ETH-native chain; otherwise v4 native-ETH pools are isolated
+        // from WETH liquidity.
         for (native, weth) in [
             (ETHEREUM_NATIVE_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS),
             (ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS),
@@ -2187,12 +2233,52 @@ mod tests {
             assert!(config.bridges.contains(&(weth, native)));
         }
 
-        // No cross-chain ETH/WETH conduit.
+        // Native currencies are never bridged directly across chains.
         assert!(
             !config
                 .bridges
                 .contains(&(ETHEREUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_NATIVE_TOKEN_ADDRESS))
         );
+    }
+
+    #[test]
+    fn default_session_config_includes_cross_chain_exposure_bridges_both_ways() {
+        let config = test_session_config();
+        let pairs = [
+            // USDT exposure.
+            (ETHEREUM_USDT_TOKEN_ADDRESS, ARBITRUM_USDT_TOKEN_ADDRESS),
+            (ETHEREUM_USDT_TOKEN_ADDRESS, OPTIMISM_USDT_TOKEN_ADDRESS),
+            (ETHEREUM_USDT_TOKEN_ADDRESS, POLYGON_USDT_TOKEN_ADDRESS),
+            (ETHEREUM_USDT_TOKEN_ADDRESS, BNB_USDT_TOKEN_ADDRESS),
+            (ETHEREUM_USDT_TOKEN_ADDRESS, AVALANCHE_USDT_TOKEN_ADDRESS),
+            // BTC exposure.
+            (ETHEREUM_WBTC_TOKEN_ADDRESS, ARBITRUM_WBTC_TOKEN_ADDRESS),
+            (ETHEREUM_WBTC_TOKEN_ADDRESS, BASE_CBBTC_TOKEN_ADDRESS),
+            (ETHEREUM_WBTC_TOKEN_ADDRESS, OPTIMISM_WBTC_TOKEN_ADDRESS),
+            (ETHEREUM_WBTC_TOKEN_ADDRESS, POLYGON_WBTC_TOKEN_ADDRESS),
+            (ETHEREUM_WBTC_TOKEN_ADDRESS, BNB_BTCB_TOKEN_ADDRESS),
+            (ETHEREUM_WBTC_TOKEN_ADDRESS, AVALANCHE_WBTC_TOKEN_ADDRESS),
+            // ETH exposure through wrapped ETH variants.
+            (ETHEREUM_WETH_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS),
+            (ETHEREUM_WETH_TOKEN_ADDRESS, BASE_WETH_TOKEN_ADDRESS),
+            (ETHEREUM_WETH_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS),
+            (ETHEREUM_WETH_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS),
+            (ETHEREUM_WETH_TOKEN_ADDRESS, BNB_WETH_TOKEN_ADDRESS),
+            (ETHEREUM_WETH_TOKEN_ADDRESS, AVALANCHE_WETH_TOKEN_ADDRESS),
+            // DAI exposure.
+            (ETHEREUM_DAI_TOKEN_ADDRESS, OPTIMISM_DAI_TOKEN_ADDRESS),
+        ];
+
+        for (ethereum, remote) in pairs {
+            assert!(
+                config.bridges.contains(&(ethereum, remote)),
+                "missing outbound bridge {ethereum:?} -> {remote:?}"
+            );
+            assert!(
+                config.bridges.contains(&(remote, ethereum)),
+                "missing return bridge {remote:?} -> {ethereum:?}"
+            );
+        }
     }
 
     /// Builds a validated whitelist allowing exactly `tokens`, going through the same

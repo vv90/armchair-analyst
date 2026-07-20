@@ -909,7 +909,7 @@ mod tests {
             2
         );
         assert_eq!(
-            endpoints.pool(ChainKey::Arbitrum).expect("arbitrum pool").endpoints.len(),
+            endpoints.pool(ChainKey::Base).expect("base pool").endpoints.len(),
             1
         );
     }
@@ -917,7 +917,7 @@ mod tests {
     #[test]
     fn assemble_chain_errors_when_an_active_chain_has_no_specs() {
         let mut specs = rpc_specs();
-        specs.remove(&ChainKey::Arbitrum);
+        specs.remove(&ChainKey::Base);
 
         assert!(matches!(
             assemble_chain_endpoints(&specs),
@@ -948,7 +948,7 @@ mod tests {
             vec!["wss://lb.drpc.org/x/key"]
         );
 
-        ws.remove(&ChainKey::Arbitrum);
+        ws.remove(&ChainKey::Base);
         assert!(matches!(
             ChainSubscriptions::new(ws),
             Err(ClientEvmError::InvalidConfig {
@@ -1019,13 +1019,13 @@ mod tests {
 
     #[test]
     fn assemble_graph_builds_a_pool_for_each_v4_enabled_chain_with_specs() {
-        // Both Ethereum and Arbitrum are v4-enabled, so specs for each yield a pool.
+        // Both Ethereum and Base are active and v4-enabled, so specs for each yield a pool.
         let mut specs = graph_specs();
         specs.insert(
-            ChainKey::Arbitrum,
+            ChainKey::Base,
             vec![EndpointSpec::new(
                 "thegraph",
-                "https://gateway.thegraph.com/api/key/subgraphs/id/arb-v4",
+                "https://gateway.thegraph.com/api/key/subgraphs/id/base-v4",
                 1,
             )],
         );
@@ -1036,7 +1036,7 @@ mod tests {
             1
         );
         assert_eq!(
-            endpoints.pool(ChainKey::Arbitrum).expect("arbitrum pool").endpoints.len(),
+            endpoints.pool(ChainKey::Base).expect("base pool").endpoints.len(),
             1
         );
     }

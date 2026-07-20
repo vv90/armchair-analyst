@@ -193,6 +193,11 @@ pub enum PlanVerificationFailure {
     InitAssetUnknown,
     /// The f32 entry (or the output back-projection) has no representation.
     AmountConversion,
+    /// A bridge endpoint's chain is not active or its decimals are not verified.
+    BridgeTokenUnknown,
+    /// A bridge's endpoints have unequal verified decimals: the lossless replay's raw-unit 1:1
+    /// transfer would misscale. (Rescaling by `10^Δ` is a documented follow-up.)
+    BridgeDecimalsMismatch,
     /// The replay failed: a pool without resolvable lossless state, or a malformed plan step.
     Replay(LosslessReplayError),
 }
@@ -677,16 +682,12 @@ fn optimization_step_completed(
 /// units, swapped through [`LosslessPool`]s resolved from the freshest per-chain fold, and the
 /// terminal output projected back to the claimed profit's decimal-normalized scale.
 fn verify_plan(state: &State, plan: &ExecutionPlan<PoolRef, TokenAddress>) -> PlanVerification {
-    let TokenAddress(_, init_chain) = plan.init_asset;
-    let Some(ChainLifecycle::Active(init_chain_state)) = state.chains.get(&init_chain) else {
+    let Some(decimals) = verified_decimals(state, plan.init_asset) else {
         return PlanVerification::Unverifiable(PlanVerificationFailure::InitAssetUnknown);
     };
-    let Some(decimals) = init_chain_state
-        .verified_token_metadata(plan.init_asset)
-        .map(|metadata| metadata.decimals)
-    else {
-        return PlanVerification::Unverifiable(PlanVerificationFailure::InitAssetUnknown);
-    };
+    if let Err(failure) = check_bridge_steps(state, plan) {
+        return PlanVerification::Unverifiable(failure);
+    }
 
     let Ok(entry) = f32_token_amount_to_u256(plan.entry_amount, decimals) else {
         return PlanVerification::Unverifiable(PlanVerificationFailure::AmountConversion);
@@ -710,6 +711,45 @@ fn verify_plan(state: &State, plan: &ExecutionPlan<PoolRef, TokenAddress>) -> Pl
         profit: output - plan.entry_amount,
         hit_tick_limit: outcome.hit_tick_limit,
     }
+}
+
+/// Resolves a token's verified decimals: its chain must be active and its token metadata verified.
+/// The init-asset resolution and the bridge gate share this lookup.
+fn verified_decimals(state: &State, token: TokenAddress) -> Option<TokenDecimals> {
+    let TokenAddress(_, chain) = token;
+    let Some(ChainLifecycle::Active(chain_state)) = state.chains.get(&chain) else {
+        return None;
+    };
+    chain_state
+        .verified_token_metadata(token)
+        .map(|metadata| metadata.decimals)
+}
+
+/// Establishes the lossless replay's bridge precondition: every [`StepKind::Bridge`] step needs
+/// both endpoints' decimals verified and equal — the replay's raw-unit 1:1 transfer only represents
+/// the model's token-unit identity when the scales match. Unequal decimals surface as
+/// [`PlanVerificationFailure::BridgeDecimalsMismatch`] (rescaling by `10^Δ` is a follow-up, not
+/// silently misscaled today); an unresolvable endpoint as
+/// [`PlanVerificationFailure::BridgeTokenUnknown`].
+fn check_bridge_steps(
+    state: &State,
+    plan: &ExecutionPlan<PoolRef, TokenAddress>,
+) -> Result<(), PlanVerificationFailure> {
+    for step in &plan.steps {
+        if !matches!(step.kind, StepKind::Bridge) {
+            continue;
+        }
+        let (Some(decimals_in), Some(decimals_out)) = (
+            verified_decimals(state, step.token_in),
+            verified_decimals(state, step.token_out),
+        ) else {
+            return Err(PlanVerificationFailure::BridgeTokenUnknown);
+        };
+        if decimals_in != decimals_out {
+            return Err(PlanVerificationFailure::BridgeDecimalsMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// Resolves lossless pool states for every distinct pool the plan swaps through — the
@@ -1400,6 +1440,136 @@ mod tests {
             state.latest_plan_verification(),
             Some(PlanVerification::Unverifiable(
                 PlanVerificationFailure::InitAssetUnknown
+            ))
+        );
+    }
+
+    /// [`verification_state`] plus a third token and a second pool, with the only t2→t3 edge being
+    /// a bridge: pool 10 = t1/t2, pool 11 = t1/t3 share the same mid-tick state, so a
+    /// t1→t2 ⇒bridge⇒ t3→t1 loop's swap rates cancel and only fees are lost. `token3_decimals`
+    /// controls the bridge-endpoint decimals for the mismatch case.
+    fn bridged_verification_state(token3_decimals: u8) -> State {
+        projection_state(
+            ChainKey::Ethereum,
+            hash(1),
+            HashMap::from([
+                (pool(10), mid_tick_pool_state()),
+                (pool(11), mid_tick_pool_state()),
+            ]),
+            HashMap::from([
+                (
+                    pool(10),
+                    pool_metadata(token(1), token(2), UniswapV3Fee::Fee3000),
+                ),
+                (
+                    pool(11),
+                    pool_metadata(token(1), token(3), UniswapV3Fee::Fee3000),
+                ),
+            ]),
+            HashMap::from([
+                (token(1), token_metadata(0)),
+                (token(2), token_metadata(0)),
+                (token(3), token_metadata(token3_decimals)),
+            ]),
+        )
+    }
+
+    fn plan_bridge_step(
+        stage: usize,
+        token_in: TokenAddress,
+        token_out: TokenAddress,
+    ) -> optimization::ExecutableStep<PoolRef, TokenAddress> {
+        optimization::ExecutableStep {
+            stage,
+            token_in,
+            token_out,
+            kind: StepKind::Bridge,
+            weight: 1.0,
+            amount_in: 0.0,
+            amount_out: 0.0,
+        }
+    }
+
+    /// t1 → t2 through pool 10, bridge t2 → `bridge_target`, then back to t1 through pool 11.
+    fn bridged_round_trip_plan(
+        bridge_target: TokenAddress,
+    ) -> ExecutionPlan<PoolRef, TokenAddress> {
+        ExecutionPlan {
+            init_asset: token(1),
+            entry_amount: 100.0,
+            steps: vec![
+                plan_swap_step(0, token(1), token(2), pool(10)),
+                plan_bridge_step(1, token(2), bridge_target),
+                plan_swap_step(2, bridge_target, token(1), pool(11)),
+            ],
+        }
+    }
+
+    #[test]
+    fn bridged_plan_verifies_with_fee_loss() {
+        // The bridge hop rides the whole exact pipeline: the loop's two swap rates cancel (both
+        // pools share one mid-tick state) and the bridge is zero-cost, so the verdict is Verified
+        // with a fee-sized loss — never Unverifiable, never a dropped share.
+        let state = bridged_verification_state(0);
+
+        let (state, effects) = transition(
+            state,
+            completed_step_event(Some(bridged_round_trip_plan(token(3)))),
+        );
+
+        assert!(effects.is_empty());
+        let Some(PlanVerification::Verified {
+            profit,
+            hit_tick_limit,
+        }) = state.latest_plan_verification()
+        else {
+            panic!(
+                "expected a verified bridged plan, got {:?}",
+                state.latest_plan_verification()
+            );
+        };
+        assert!(
+            profit < 0.0,
+            "bridged round trip must lose fees, got {profit}"
+        );
+        assert!(profit > -10.0, "loss must stay fee-sized, got {profit}");
+        assert!(!hit_tick_limit);
+    }
+
+    #[test]
+    fn bridge_with_mismatched_decimals_is_unverifiable() {
+        // The lossless bridge transfer is raw-unit 1:1, which misscales across unequal decimals —
+        // the gate rejects before replay instead of reporting a wrongly-scaled profit.
+        let state = bridged_verification_state(6);
+
+        let (state, _effects) = transition(
+            state,
+            completed_step_event(Some(bridged_round_trip_plan(token(3)))),
+        );
+
+        assert_eq!(
+            state.latest_plan_verification(),
+            Some(PlanVerification::Unverifiable(
+                PlanVerificationFailure::BridgeDecimalsMismatch
+            ))
+        );
+    }
+
+    #[test]
+    fn bridge_with_unknown_endpoint_is_unverifiable() {
+        // A bridge endpoint without verified token metadata cannot establish the equal-decimals
+        // precondition, so the plan is unverifiable rather than replayed on an assumption.
+        let state = bridged_verification_state(0);
+
+        let (state, _effects) = transition(
+            state,
+            completed_step_event(Some(bridged_round_trip_plan(token(9)))),
+        );
+
+        assert_eq!(
+            state.latest_plan_verification(),
+            Some(PlanVerification::Unverifiable(
+                PlanVerificationFailure::BridgeTokenUnknown
             ))
         );
     }

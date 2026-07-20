@@ -560,6 +560,7 @@ where
                     session_config.init_asset,
                     step_config.input_amount,
                     PLAN_MIN_WEIGHT,
+                    &session_config.bridges,
                 );
                 (
                     summary.route_entropy,

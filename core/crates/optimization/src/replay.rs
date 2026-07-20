@@ -94,7 +94,10 @@ impl<I: Copy + PartialEq> PoolBookEntry<I> {
 /// a stage, `amount_in = balance(token_in) × weight`; a `Some(pool_id)` cell swaps through — and
 /// mutates — its book entry, a bypass cell (`token_in == token_out`, no pool) carries the amount
 /// through, and an empty cell (no pool, distinct tokens) contributes nothing, losing its softmax share
-/// just as the zero-reserve forward cell does.
+/// just as the zero-reserve forward cell does. Raw flows carry no bridge information, so a bridge
+/// cell of a bridged model also reads as an empty cell here and loses its share — bridged models are
+/// validated through [`replay_plan`], where [`crate::plan::build_plan`] has already classified bridge
+/// cells with the configured bridge set.
 pub fn replay_flows<U, I>(
     flows: &[FlowRecord<U, I>],
     reserves: &[PoolReserves<U, I>],
@@ -109,7 +112,11 @@ where
         stage: flow.stage,
         token_in: flow.token_in,
         token_out: flow.token_out,
-        pool: flow.pool_id,
+        action: match flow.pool_id {
+            Some(pool) => ReplayAction::Swap(pool),
+            None if flow.token_in == flow.token_out => ReplayAction::Pass,
+            None => ReplayAction::Drop,
+        },
         weight: flow.weight,
     });
     replay_steps(steps, reserves, init_asset, input)
@@ -118,8 +125,9 @@ where
 /// Replays a discrete [`ExecutionPlan`] (the candidate-extraction output) against an f32 reserve book,
 /// the reference oracle for the plan client-evm will execute losslessly. Same weight-driven semantics
 /// as [`replay_flows`]: [`StepKind::Swap`] swaps through and mutates its pool, [`StepKind::Carry`]
-/// carries the token through unchanged. The plan supplies its own `init_asset` and absolute
-/// `entry_amount`.
+/// carries the token through unchanged, and [`StepKind::Bridge`] converts its weighted input 1:1 into
+/// `token_out` — zero cost in token units, matching the forward's bypass-masked bridge cells. The plan
+/// supplies its own `init_asset` and absolute `entry_amount`.
 pub fn replay_plan<U, I>(
     plan: &ExecutionPlan<U, I>,
     reserves: &[PoolReserves<U, I>],
@@ -132,23 +140,37 @@ where
         stage: step.stage,
         token_in: step.token_in,
         token_out: step.token_out,
-        pool: match step.kind {
-            StepKind::Swap(pool) => Some(pool),
-            StepKind::Carry => None,
+        action: match step.kind {
+            StepKind::Swap(pool) => ReplayAction::Swap(pool),
+            StepKind::Carry if step.token_in == step.token_out => ReplayAction::Pass,
+            // A well-formed plan only carries a token to itself; drop the share of a malformed
+            // cross-token carry rather than fabricating a conversion (the lossless twin mirrors this).
+            StepKind::Carry => ReplayAction::Drop,
+            StepKind::Bridge => ReplayAction::Pass,
         },
         weight: step.weight,
     });
     replay_steps(steps, reserves, plan.init_asset, plan.entry_amount)
 }
 
-/// The normalized unit both entry points fold over: a weighted hop through an optional pool. `pool`
-/// is `None` for a carry (`token_in == token_out`, the amount passes through) and, for raw flows only,
-/// an empty cell (`token_in != token_out`, whose share is lost — a plan never carries such a step).
+/// What a [`ReplayStep`] does with its weighted input. Classification happens at the entry-point
+/// boundaries ([`replay_flows`], [`replay_plan`]), so the fold itself is guard-free.
+enum ReplayAction<U> {
+    /// Swap through — and mutate — the named pool's book entry.
+    Swap(U),
+    /// Credit `token_out` with the full weighted input: a well-formed carry (same token) or a bridge
+    /// (distinct tokens, zero-cost 1:1 in token units).
+    Pass,
+    /// Contribute nothing; the softmax share is lost (raw-flow padding, malformed cross-token carry).
+    Drop,
+}
+
+/// The normalized unit both entry points fold over: a weighted hop performing one [`ReplayAction`].
 struct ReplayStep<U, I> {
     stage: usize,
     token_in: I,
     token_out: I,
-    pool: Option<U>,
+    action: ReplayAction<U>,
     weight: f32,
 }
 
@@ -198,16 +220,16 @@ where
             if amount_in <= 0.0 {
                 continue;
             }
-            match step.pool {
-                Some(pool_id) => {
+            match step.action {
+                ReplayAction::Swap(pool_id) => {
                     let entry = book.get_mut(&pool_id).ok_or(ReplayError::PoolNotFound)?;
                     let out = entry.swap(step.token_in, amount_in)?;
                     *next.entry(step.token_out).or_default() += out;
                 }
-                None if step.token_in == step.token_out => {
+                ReplayAction::Pass => {
                     *next.entry(step.token_out).or_default() += amount_in;
                 }
-                None => {}
+                ReplayAction::Drop => {}
             }
         }
         balances = next;
@@ -396,6 +418,117 @@ mod tests {
         assert!(
             exact > naive + 1.0,
             "same-pool round trip must beat the naive double-quote: {exact} vs {naive}"
+        );
+    }
+
+    /// Builds a full-weight `ExecutableStep` for hand-assembled plans (advisory amounts zeroed).
+    fn plan_step(
+        stage: usize,
+        token_in: TokenAddress,
+        token_out: TokenAddress,
+        kind: StepKind<i32>,
+    ) -> crate::plan::ExecutableStep<i32, TokenAddress> {
+        crate::plan::ExecutableStep {
+            stage,
+            token_in,
+            token_out,
+            kind,
+            weight: 1.0,
+            amount_in: 0.0,
+            amount_out: 0.0,
+        }
+    }
+
+    #[test]
+    fn bridged_plan_replays_to_hand_computed_golden() {
+        // A bridge hop is an exact 1:1 zero-cost conversion in token units: swap USDC->WETH through
+        // pool 1, bridge WETH->WBTC, swap WBTC->USDC through pool 2. Pinned against an independent
+        // scalar computation of the two constant-product hops with the bridge passing its amount
+        // through untouched.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let wbtc = tokens::WBTC.address;
+        let (ra, rb) = (1_000_000.0, 2_000_000.0);
+        let (rc, rd) = (3_000_000.0, 1_500_000.0);
+        let reserves = vec![pool(usdc, weth, 1, ra, rb), pool(wbtc, usdc, 2, rc, rd)];
+        let input = 1_000.0;
+        let plan = ExecutionPlan {
+            init_asset: usdc,
+            entry_amount: input,
+            steps: vec![
+                plan_step(0, usdc, weth, StepKind::Swap(1)),
+                plan_step(1, weth, wbtc, StepKind::Bridge),
+                plan_step(2, wbtc, usdc, StepKind::Swap(2)),
+            ],
+        };
+
+        // Independent hand computation: two capped-after-fee constant-product quotes; the bridge
+        // contributes nothing but the identity.
+        let eps = f32::EPSILON;
+        let cap0 = input * FEE;
+        let out_weth = rb * cap0 / (ra + cap0 + eps);
+        let bridged_wbtc = out_weth; // 1:1, zero cost
+        let cap2 = bridged_wbtc * FEE;
+        let expected = rd * cap2 / (rc + cap2 + eps);
+
+        let replayed = replay_plan(&plan, &reserves).expect("replay_plan failed");
+
+        assert!(
+            (replayed - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+            "bridged plan replay {replayed} did not match hand-computed {expected}"
+        );
+    }
+
+    #[test]
+    fn malformed_cross_token_carry_still_loses_its_share() {
+        // A well-formed plan only carries a token to itself. A malformed cross-token Carry must lose
+        // its share (never fabricate a conversion), while the same shape as a Bridge passes 1:1 —
+        // the invariant the lossless twin mirrors.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let round_trip = |kind_out: StepKind<i32>, kind_back: StepKind<i32>| ExecutionPlan {
+            init_asset: usdc,
+            entry_amount: 1_000.0,
+            steps: vec![
+                plan_step(0, usdc, weth, kind_out),
+                plan_step(1, weth, usdc, kind_back),
+            ],
+        };
+
+        let carried = replay_plan(&round_trip(StepKind::Carry, StepKind::Carry), &[])
+            .expect("replay_plan failed");
+        assert_eq!(
+            carried, 0.0,
+            "malformed cross-token carries must lose their share"
+        );
+
+        let bridged = replay_plan(&round_trip(StepKind::Bridge, StepKind::Bridge), &[])
+            .expect("replay_plan failed");
+        assert_eq!(bridged, 1_000.0, "a bridge round trip is zero-cost");
+    }
+
+    #[test]
+    fn raw_flow_padding_cell_still_loses_its_share() {
+        // Raw flows carry no bridge information, so a pool-less distinct-token cell stays padding in
+        // `replay_flows` and its share is lost — bridged models are validated through `replay_plan`,
+        // where `build_plan` has already classified bridge cells against the configured set.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let flows = vec![FlowRecord {
+            stage: 0,
+            token_in: usdc,
+            token_out: weth,
+            pool_id: None::<i32>,
+            amount_in: 0.0,
+            amount_out: 0.0,
+            weight: 1.0,
+        }];
+
+        let exact = replay_flows(&flows, &[], usdc, 1_000.0).expect("replay failed");
+
+        assert_eq!(
+            exact, 0.0,
+            "padding cell must lose its share in raw-flow replay"
         );
     }
 

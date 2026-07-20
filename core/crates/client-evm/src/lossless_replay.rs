@@ -18,6 +18,11 @@
 //! do not accrete into virtual liquidity) that skews conservative — a later same-direction hop sees
 //! slightly worse reserves — so the gate never overstates. Remaining fee/rounding deltas versus
 //! on-chain `SwapMath` are a few wei (a later fidelity tier), irrelevant to a profitability gate.
+//!
+//! A [`StepKind::Bridge`] step is a raw-unit 1:1 transfer — the integer image of the oracle's
+//! zero-cost token-unit pass. That identity only holds when both endpoints have equal decimals;
+//! `verify_plan` (the kernel caller) gates on verified-equal decimals before invoking this fold, so
+//! the precondition is established outside rather than threaded through as a resolver.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -221,6 +226,13 @@ pub fn replay_plan_lossless(
                     *slot = slot.saturating_add(amount_in);
                 }
                 StepKind::Carry => {}
+                // Raw-unit 1:1 transfer across a configured bridge pair, mirroring the oracle's
+                // zero-cost token-unit pass. Only correct for equal-decimal endpoints, which
+                // `verify_plan` gates before this fold runs; the token-unit f32 oracle needs no gate.
+                StepKind::Bridge => {
+                    let slot = next.entry(step.token_out).or_insert(U256::ZERO);
+                    *slot = slot.saturating_add(amount_in);
+                }
             }
         }
         balances = next;
@@ -568,6 +580,88 @@ mod tests {
         assert_eq!(outcome.output, U256::ZERO);
     }
 
+    fn bridge_step(
+        stage: usize,
+        token_in: TokenAddress,
+        token_out: TokenAddress,
+        weight: f32,
+    ) -> ExecutableStep<PoolRef, TokenAddress> {
+        ExecutableStep {
+            stage,
+            token_in,
+            token_out,
+            kind: StepKind::Bridge,
+            weight,
+            amount_in: 0.0,
+            amount_out: 0.0,
+        }
+    }
+
+    #[test]
+    fn bridged_plan_matches_f32_oracle() {
+        // A bridge hop is a raw-unit 1:1 transfer: swap a→b through P, bridge b→c, swap c→a
+        // through Q. Differential against the f32 oracle on the same numbers.
+        let (a, b, c) = (token(1), token(2), token(3));
+        let (p, q) = (pool_ref(11), pool_ref(12));
+        let book = vec![
+            (p, pool(a, b, 1_000_000_000, 2_000_000_000)),
+            (q, pool(c, a, 3_000_000_000, 1_500_000_000)),
+        ];
+        let plan = ExecutionPlan {
+            init_asset: a,
+            entry_amount: 100_000.0,
+            steps: vec![
+                swap_step(0, a, b, p, 1.0),
+                bridge_step(1, b, c, 1.0),
+                swap_step(2, c, a, q, 1.0),
+            ],
+        };
+        let reserves: Vec<_> = book
+            .iter()
+            .map(|(id, entry)| f32_reserves_from(*id, entry))
+            .collect();
+
+        let outcome = replay_plan_lossless(&plan, resolver(book), U256::from(100_000u64)).unwrap();
+        let oracle = replay_plan(&plan, &reserves).unwrap();
+
+        assert_relative_eq(outcome.output, oracle, 1e-3);
+    }
+
+    #[test]
+    fn malformed_cross_token_carry_drops_bridge_passes() {
+        // The same cross-token round-trip shape: as malformed `Carry` steps the shares are lost
+        // (never a fabricated conversion); as `Bridge` steps it is a zero-cost identity round trip.
+        // Pins the two folds' invariants aligned with the f32 oracle's.
+        let (a, b) = (token(1), token(2));
+        let cross = |kind: StepKind<PoolRef>, stage, token_in, token_out| ExecutableStep {
+            stage,
+            token_in,
+            token_out,
+            kind,
+            weight: 1.0,
+            amount_in: 0.0,
+            amount_out: 0.0,
+        };
+        let round_trip = |kind: StepKind<PoolRef>| ExecutionPlan {
+            init_asset: a,
+            entry_amount: 1_000.0,
+            steps: vec![cross(kind, 0, a, b), cross(kind, 1, b, a)],
+        };
+        let entry = U256::from(1_000u64);
+
+        let carried =
+            replay_plan_lossless(&round_trip(StepKind::Carry), resolver(vec![]), entry).unwrap();
+        assert_eq!(
+            carried.output,
+            U256::ZERO,
+            "malformed cross-token carries must lose their share"
+        );
+
+        let bridged =
+            replay_plan_lossless(&round_trip(StepKind::Bridge), resolver(vec![]), entry).unwrap();
+        assert_eq!(bridged.output, entry, "a bridge round trip is zero-cost");
+    }
+
     /// A fixed reuse-inclusive plan shape over two pools, driven by proptest inputs. Exercises
     /// same-direction reuse of P (stages 0 and 1), reuse of Q (stages 1 and 2), and carries.
     fn reuse_plan(split: f32) -> ExecutionPlan<PoolRef, TokenAddress> {
@@ -585,6 +679,42 @@ mod tests {
                 carry_step(2, a, 1.0),
             ],
         }
+    }
+
+    /// A fixed bridge-inclusive plan shape over three tokens and two pools (P: a↔b, Q: c↔a, with
+    /// b→c only reachable via bridge). Exercises bridge hops feeding and fed by swaps, P reuse
+    /// (stages 0 and 1), Q reuse (stages 2 and 3), and a carry.
+    fn bridged_plan(split: f32) -> ExecutionPlan<PoolRef, TokenAddress> {
+        let (a, b, c) = (token(1), token(2), token(3));
+        let (p, q) = (pool_ref(11), pool_ref(12));
+        ExecutionPlan {
+            init_asset: a,
+            entry_amount: 0.0,
+            steps: vec![
+                swap_step(0, a, b, p, split),
+                carry_step(0, a, 1.0 - split),
+                swap_step(1, a, b, p, 1.0),
+                bridge_step(1, b, c, 1.0),
+                swap_step(2, c, a, q, 1.0),
+                bridge_step(2, b, c, 1.0),
+                carry_step(3, a, 1.0),
+                swap_step(3, c, a, q, 1.0),
+            ],
+        }
+    }
+
+    /// The two-pool book for [`bridged_plan`] (P: a↔b, Q: c↔a).
+    fn bridged_book(
+        reserve_p0: u128,
+        reserve_p1: u128,
+        reserve_q0: u128,
+        reserve_q1: u128,
+    ) -> Vec<(PoolRef, LosslessPool)> {
+        let (a, b, c) = (token(1), token(2), token(3));
+        vec![
+            (pool_ref(11), pool(a, b, reserve_p0, reserve_p1)),
+            (pool_ref(12), pool(c, a, reserve_q0, reserve_q1)),
+        ]
     }
 
     proptest! {
@@ -624,6 +754,39 @@ mod tests {
             // ≤6 hops, ≤1 floored unit each, amplified ≤2× by each of ≤3 later hops: ≤48 units.
             prop_assert!(
                 (lossless - oracle).abs() <= 1e-2 * scale + 48.0,
+                "lossless {lossless} vs oracle {oracle}",
+            );
+        }
+
+        /// The bridged plan shape tracks the oracle too: bridge hops are exact 1:1 in both domains
+        /// (only the weight fixed-point differs), so the slack story matches the reuse case with the
+        /// deeper 4-stage shape (≤8 hops, each floored unit amplified ≤2× by each later hop).
+        #[test]
+        fn differential_bridged_plan_tracks_oracle(
+            reserve_p0 in 1_000_000_000u64..1_000_000_000_000,
+            ratio_p in 0.5f64..2.0,
+            reserve_q0 in 1_000_000_000u64..1_000_000_000_000,
+            ratio_q in 0.5f64..2.0,
+            entry in 100_000u64..1_000_000,
+            split in 0.0f32..=1.0,
+        ) {
+            let reserve_p1 = (reserve_p0 as f64 * ratio_p) as u128;
+            let reserve_q1 = (reserve_q0 as f64 * ratio_q) as u128;
+            let book = bridged_book(reserve_p0.into(), reserve_p1, reserve_q0.into(), reserve_q1);
+            let mut plan = bridged_plan(split);
+            plan.entry_amount = entry as f32;
+            let reserves: Vec<_> = book
+                .iter()
+                .map(|(id, entry)| f32_reserves_from(*id, entry))
+                .collect();
+
+            let outcome = replay_plan_lossless(&plan, resolver(book), U256::from(entry)).unwrap();
+            let oracle = replay_plan(&plan, &reserves).unwrap();
+
+            let lossless = to_f32(outcome.output);
+            let scale = lossless.abs().max(oracle.abs()).max(1.0);
+            prop_assert!(
+                (lossless - oracle).abs() <= 1e-2 * scale + 96.0,
                 "lossless {lossless} vs oracle {oracle}",
             );
         }
@@ -676,6 +839,15 @@ mod tests {
             let outcome = replay_plan_lossless(&plan, resolver(book), U256::from(entry));
 
             prop_assert!(outcome.is_ok());
+
+            // Same numeric inputs through the bridge-inclusive shape (its book pairs c↔a for Q).
+            let bridged_outcome = replay_plan_lossless(
+                &bridged_plan(split),
+                resolver(bridged_book(reserve_p0, reserve_p1, reserve_q0, reserve_q1)),
+                U256::from(entry),
+            );
+
+            prop_assert!(bridged_outcome.is_ok());
         }
     }
 }

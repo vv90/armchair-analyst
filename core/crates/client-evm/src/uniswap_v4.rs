@@ -386,7 +386,10 @@ mod tests {
     #[test]
     fn is_v4_pool_manager_recognizes_only_known_managers() {
         assert!(is_v4_pool_manager(ETHEREUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
-        assert!(is_v4_pool_manager(ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
+        assert!(is_v4_pool_manager(BASE_UNISWAP_V4_POOL_MANAGER_ADDRESS));
+        // Arbitrum is temporarily deactivated (see `ACTIVE_CHAINS`), so its manager is not
+        // recognized: no Arbitrum logs arrive, and recognition is scoped to the active set.
+        assert!(!is_v4_pool_manager(ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
         assert!(!is_v4_pool_manager(Address::ZERO));
         assert!(!is_v4_pool_manager(address!(
             "00000000000000000000000000000000deadbeef"
