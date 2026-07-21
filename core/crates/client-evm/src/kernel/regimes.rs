@@ -612,6 +612,7 @@ fn run(scenario: Scenario) -> Report {
 
     let (state, seed_effects) = State::activate_from_seed(
         block_hash(ANCHOR_NUMBER),
+        ANCHOR_NUMBER,
         HashMap::new(),
         verified_pool_registry(),
         verified_token_registry(),
@@ -671,6 +672,7 @@ fn run(scenario: Scenario) -> Report {
                 harness.apply(
                     Event::FinalizedBlockObserved {
                         block_hash: block_hash(target),
+                        number: target,
                     },
                     CostKind::Other,
                 );
@@ -1162,6 +1164,7 @@ fn regime_partial_ws_delivery_is_trusted_then_counted_as_ws_miss() {
 fn regime_orphaned_streamed_log_flood_stays_bounded() {
     let (mut state, _) = State::activate_from_seed(
         block_hash(ANCHOR_NUMBER),
+        ANCHOR_NUMBER,
         HashMap::new(),
         verified_pool_registry(),
         verified_token_registry(),

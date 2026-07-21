@@ -153,6 +153,7 @@ fn log_event(number: u64, pools: u64) -> Event {
 fn base_state(pools: u64) -> State {
     let (state, _) = State::activate_from_seed(
         block_hash(ANCHOR),
+        ANCHOR,
         HashMap::new(),
         verified_pool_registry(pools),
         verified_token_registry(pools),

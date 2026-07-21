@@ -260,6 +260,7 @@ impl Runtime<ClientEvmApp> for ClientEvmRuntime {
                     Ok(Some(header)) => vec![Event::FinalizedHeaderReceived {
                         chain,
                         block_hash: header.inner.hash,
+                        number: header.inner.number,
                     }],
                     Ok(None) => vec![Event::FinalizedHeaderUnavailable { chain }],
                     Err(_) => vec![Event::FinalizedHeaderUnavailable { chain }],
@@ -622,8 +623,14 @@ pub(crate) fn start_runtime(
 
 fn format_input_log(input: &Event) -> String {
     match input {
-        Event::FinalizedHeaderReceived { chain, block_hash } => {
-            format!("input finalized_header_received chain={chain:?} block={block_hash}")
+        Event::FinalizedHeaderReceived {
+            chain,
+            block_hash,
+            number,
+        } => {
+            format!(
+                "input finalized_header_received chain={chain:?} block={block_hash} number={number}"
+            )
         }
         Event::FinalizedHeaderUnavailable { chain } => {
             format!("input finalized_header_unavailable chain={chain:?}")
@@ -764,8 +771,10 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
         } => format!(
             "input chain={chain:?} head_observed hash={hash} parent={parent_hash} number={number}"
         ),
-        kernel::Event::FinalizedBlockObserved { block_hash } => {
-            format!("input chain={chain:?} finalized_block_observed hash={block_hash}")
+        kernel::Event::FinalizedBlockObserved { block_hash, number } => {
+            format!(
+                "input chain={chain:?} finalized_block_observed hash={block_hash} number={number}"
+            )
         }
         kernel::Event::BlockHeaderReceived {
             request_id,
@@ -1718,8 +1727,9 @@ mod tests {
             format_input_log(&Event::FinalizedHeaderReceived {
                 chain: ChainKey::Ethereum,
                 block_hash,
+                number: 42,
             }),
-            format!("input finalized_header_received chain=Ethereum block={block_hash}")
+            format!("input finalized_header_received chain=Ethereum block={block_hash} number=42")
         );
         assert_eq!(
             format_input_log(&Event::FinalizedHeaderUnavailable {
@@ -2858,7 +2868,7 @@ mod tests {
     ) -> (kernel::Effect, RequestId<GetBlockHeader>) {
         let finalized_hash = hash(1);
         let observed_hash = hash(3);
-        let state = kernel::State::init(finalized_hash);
+        let state = kernel::State::init(finalized_hash, 1);
 
         let (_state, effects) = kernel::transition(
             ChainKey::Ethereum,

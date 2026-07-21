@@ -65,9 +65,13 @@ struct Blocks {
 impl Blocks {
     /// A fresh empty graph anchored at `finalized_hash` with the given finalized base (empty recent
     /// region, anchor = finalized) — the `State::init` / test-constructor starting point.
-    fn new(finalized_hash: BlockHash, finalized_snapshot: HashMap<PoolRef, PoolState>) -> Blocks {
+    fn new(
+        finalized_hash: BlockHash,
+        finalized_number: u64,
+        finalized_snapshot: HashMap<PoolRef, PoolState>,
+    ) -> Blocks {
         Blocks {
-            graph: blocks_graph::BlocksGraph::new(finalized_hash),
+            graph: blocks_graph::BlocksGraph::new(finalized_hash, finalized_number),
             finalized_snapshot,
         }
     }
@@ -118,9 +122,9 @@ impl State {
     /// Creates kernel state anchored at a finalized hash with no pending requests, recent blocks,
     /// or finalized pool snapshots.
     /// Added as the pure state-machine entry point for runtimes that will feed events and execute effects.
-    pub fn init(finalized_hash: BlockHash) -> State {
+    pub fn init(finalized_hash: BlockHash, finalized_number: u64) -> State {
         State {
-            blocks: Blocks::new(finalized_hash, HashMap::new()),
+            blocks: Blocks::new(finalized_hash, finalized_number, HashMap::new()),
             pending_requests: PendingRequests::new(),
             pool_registry: TrustedPoolRegistry::new(),
             token_registry: TokenRegistry::new(),
@@ -135,6 +139,7 @@ impl State {
     /// Added so a chain starts warm from the bootstrap outcome instead of warming up from an empty finalized state.
     pub fn activate_from_seed(
         finalized_hash: BlockHash,
+        finalized_number: u64,
         finalized_pool_snapshots: HashMap<PoolRef, PoolState>,
         pool_registry: TrustedPoolRegistry,
         token_registry: TokenRegistry,
@@ -147,7 +152,8 @@ impl State {
         // proof of emptiness — both registry-independent, since the range query is topics-only).
         // The first live head that lands on the seeded chain makes the whole window foldable at
         // once, so the optimization read serves recent state without a per-block header walk.
-        let log_graph = blocks_graph::BlocksGraph::from_seed(finalized_hash, seed_blocks);
+        let log_graph =
+            blocks_graph::BlocksGraph::from_seed(finalized_hash, finalized_number, seed_blocks);
 
         // Seed blocks can reference ancestors that were not themselves seeded: a no-log block is
         // absent from the candidate window, so the segment above it floats. Request a header for
@@ -333,7 +339,7 @@ impl State {
         token_registry: TokenRegistry,
     ) -> State {
         State {
-            blocks: Blocks::new(finalized_hash, finalized_pool_snapshots),
+            blocks: Blocks::new(finalized_hash, 0, finalized_pool_snapshots),
             pending_requests: PendingRequests::new(),
             pool_registry,
             token_registry,
@@ -467,7 +473,38 @@ impl State {
     /// advances only over the foldable canonical prefix (fold-on-demand, reorg-safety decisions
     /// (c)/(d)), folding the now-final logs into the finalized snapshot and pruning everything
     /// that no longer descends from the new anchor.
-    fn with_finalized_block_observed(mut self, chain: ChainKey, block_hash: BlockHash) -> State {
+    ///
+    /// Returns `Err(FinalityReorg)` when the observed finality *conflicts* with the current anchor:
+    /// a finalized block at the anchor's exact height (`number == anchor_number`) with a different
+    /// hash. That is a provable finality fork — exactly one block occupies a given height on any
+    /// chain — so the anchor is orphaned and the kernel cannot advance onto the new chain (it does
+    /// not descend from the anchor). The caller re-initializes at the new finalized block, preserving
+    /// the verified registries (see the `FinalizedBlockObserved` arm). Every non-conflicting
+    /// observation — forward advance, a lagging lower-height report, or an idempotent re-observation
+    /// of the current anchor — returns `Ok` and flows through the normal `finalized_to` path.
+    fn with_finalized_block_observed(
+        mut self,
+        chain: ChainKey,
+        block_hash: BlockHash,
+        number: u64,
+    ) -> Result<State, Box<FinalityReorg>> {
+        // A conflicting finalized block at the anchor's exact height orphans the anchor: re-init.
+        if number == self.blocks.graph.anchor_number()
+            && block_hash != self.blocks.graph.anchor_hash()
+        {
+            let State {
+                pool_registry,
+                token_registry,
+                ..
+            } = self;
+            return Err(Box::new(FinalityReorg {
+                new_finalized_hash: block_hash,
+                new_finalized_number: number,
+                pool_registry,
+                token_registry,
+            }));
+        }
+
         let v4_manager = uniswap_v4::pool_manager_address(chain);
         // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
         // discovered after bootstrap (the graph is registry-free; identity comes from here).
@@ -495,7 +532,7 @@ impl State {
             graph,
             finalized_snapshot,
         };
-        self
+        Ok(self)
     }
 }
 
@@ -542,6 +579,7 @@ pub enum Event {
     },
     FinalizedBlockObserved {
         block_hash: BlockHash,
+        number: u64,
     },
     BlockHeaderReceived {
         request_id: RequestId<GetBlockHeader>,
@@ -906,6 +944,19 @@ fn request_missing_header(
     )
 }
 
+/// A provable finality reorg: the observed finalized block conflicts with the current anchor at its
+/// exact height, so the anchor is orphaned and the kernel must re-initialize at the new finalized
+/// block. Carries everything the re-init needs — the coupled new finalized `(hash, number)` and the
+/// verified registries, which are reorg-invariant and preserved so metadata is not re-fetched.
+/// Produced by [`State::with_finalized_block_observed`]; consumed by the `FinalizedBlockObserved`
+/// transition arm.
+pub(crate) struct FinalityReorg {
+    pub new_finalized_hash: BlockHash,
+    pub new_finalized_number: u64,
+    pub pool_registry: TrustedPoolRegistry,
+    pub token_registry: TokenRegistry,
+}
+
 /// One kernel transition, telling the caller whether anything happened. `Inert` is a
 /// proof-carrying claim: state returned bit-identical, no effects, every derived read (fold
 /// frontier, schedules, path lengths) unchanged — the multi-chain wrapper may skip all
@@ -977,13 +1028,31 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
                 _ => schedule_unknown_canonical_requests(chain, state, vec![]),
             }
         }
-        Event::FinalizedBlockObserved { block_hash } => {
-            let state = state.with_finalized_block_observed(chain, block_hash);
-            // WS-primary: any hole short of the target just stalled the fold — issue its
-            // authoritative ranged verification now. The anchor then advances on a later finality
-            // observation (the refresh predicate re-fires every retry stride) once the responses
-            // complete the holes; a fully-advanced target schedules nothing.
-            schedule_missing_log_range_requests(chain, block_hash, state, vec![])
+        Event::FinalizedBlockObserved { block_hash, number } => {
+            match state.with_finalized_block_observed(chain, block_hash, number) {
+                // WS-primary: any hole short of the target just stalled the fold — issue its
+                // authoritative ranged verification now. The anchor then advances on a later
+                // finality observation (the refresh predicate re-fires every retry stride) once the
+                // responses complete the holes; a fully-advanced target schedules nothing.
+                Ok(state) => schedule_missing_log_range_requests(chain, block_hash, state, vec![]),
+                // The anchor was orphaned by a finality reorg at its exact height: re-initialize at
+                // the new finalized block, preserving the reorg-invariant verified registries so
+                // metadata is not re-fetched. The empty-at-new-anchor state's verified pools lack a
+                // finalized snapshot, so the idle-gated seed scheduler re-populates their reserves on
+                // the next scheduling pass. `activate_from_seed` builds a fresh request set, so the
+                // orphaned fork's in-flight requests are abandoned.
+                Err(reorg) => {
+                    let reorg = *reorg;
+                    State::activate_from_seed(
+                        reorg.new_finalized_hash,
+                        reorg.new_finalized_number,
+                        HashMap::new(),
+                        reorg.pool_registry,
+                        reorg.token_registry,
+                        Vec::new(),
+                    )
+                }
+            }
         }
         Event::BlockHeaderReceived {
             request_id,
@@ -1752,6 +1821,13 @@ mod tests {
             },
             GeneratedEvent::FinalizedObserved { hash_index } => Event::FinalizedBlockObserved {
                 block_hash: hash_for_node(hash_index),
+                // Height is coupled to the hash the same way as `HeadObserved`/`BlockHeaderReceived`
+                // (`number == hash_index`). That coupling is exactly what makes the exact-height reorg
+                // predicate safe here: `number == anchor_number` can only hold for the block whose
+                // index equals the anchor's, which is the anchor itself — so a generated finality
+                // observation never trips a false conflict. The conflict → re-init path has its own
+                // dedicated behavioral test.
+                number: hash_index as u64,
             },
             GeneratedEvent::BlockLogsRangeReceived {
                 request_id,
@@ -1834,7 +1910,7 @@ mod tests {
     fn state_init_from_finalized_state_starts_with_empty_tracking() {
         let finalized_hash = BlockHash::with_last_byte(1);
 
-        let state = State::init(finalized_hash);
+        let state = State::init(finalized_hash, 0);
 
         assert_empty_initial_state_at(&state, finalized_hash);
         assert!(state.blocks.finalized_snapshot.is_empty());
@@ -2088,7 +2164,7 @@ mod tests {
     /// This gives tests empty registries, no pending work, and deterministic tick state.
     fn empty_state_at(finalized_hash: BlockHash) -> State {
         State {
-            blocks: Blocks::new(finalized_hash, HashMap::new()),
+            blocks: Blocks::new(finalized_hash, 0, HashMap::new()),
             pending_requests: PendingRequests::new(),
             pool_registry: TrustedPoolRegistry::new(),
             token_registry: TokenRegistry::new(),
@@ -2159,7 +2235,7 @@ mod tests {
     /// graphs in step (Increment 4 migration; the legacy planting dies with the legacy graph).
     /// The observed head lands on the last planted hash (or stays at the anchor for an empty chain).
     fn plant_chain(state: &mut State, finalized_hash: BlockHash, hashes: &[BlockHash]) {
-        let mut graph = Blocks::new(finalized_hash, HashMap::new()).graph;
+        let mut graph = Blocks::new(finalized_hash, 0, HashMap::new()).graph;
         let mut parent_hash = finalized_hash;
         for (index, &hash) in hashes.iter().enumerate() {
             graph = graph.admitted(hash, parent_hash, (index + 1) as u64, bloom_matching_any());
@@ -2182,7 +2258,7 @@ mod tests {
             .enumerate()
             .map(|(index, candidate)| swap_log(*candidate, index as u64, &pool_state(9)))
             .collect();
-        state.blocks.graph = Blocks::new(finalized_hash, HashMap::new())
+        state.blocks.graph = Blocks::new(finalized_hash, 0, HashMap::new())
             .graph
             .admitted(block_hash, finalized_hash, 1, bloom_matching_any())
             .with_complete_logs(block_hash, logs)
@@ -2788,6 +2864,7 @@ mod tests {
 
         let (state, effects) = State::activate_from_seed(
             finalized_hash,
+            0,
             HashMap::from([(pool, snapshot.clone())]),
             pool_registry,
             token_registry,
@@ -2833,6 +2910,7 @@ mod tests {
 
         let (state, activation_effects) = State::activate_from_seed(
             finalized_hash,
+            0,
             HashMap::new(),
             pool_registry,
             token_registry,
@@ -2896,6 +2974,7 @@ mod tests {
 
         let (state, activation_effects) = State::activate_from_seed(
             finalized_hash,
+            0,
             HashMap::new(),
             pool_registry,
             token_registry,
@@ -2958,6 +3037,7 @@ mod tests {
         // Seed: anchor <- filler <- seed_hash, then a head built on the seed.
         let (state, _effects) = State::activate_from_seed(
             finalized_hash,
+            0,
             HashMap::new(),
             pool_registry,
             token_registry,
@@ -3198,6 +3278,7 @@ mod tests {
 
         State::activate_from_seed(
             anchor.hash,
+            anchor.number,
             pool_snapshots,
             pool_registry,
             token_registry,
@@ -4068,7 +4149,7 @@ mod tests {
         let head_hash = BlockHash::with_last_byte(2);
         let mut state = empty_state_at(finalized_hash);
         // A block whose authoritative logs are already complete must not be refetched.
-        state.blocks.graph = Blocks::new(finalized_hash, HashMap::new())
+        state.blocks.graph = Blocks::new(finalized_hash, 0, HashMap::new())
             .graph
             .admitted(head_hash, finalized_hash, 1, bloom_matching_any())
             .with_complete_logs(head_hash, Vec::new())
@@ -4797,7 +4878,7 @@ mod tests {
                 .map(|(index, candidate)| swap_log(*candidate, index as u64, &pool_state(9)))
                 .collect()
         };
-        let graph = Blocks::new(finalized_hash, HashMap::new()).graph.admitted(
+        let graph = Blocks::new(finalized_hash, 0, HashMap::new()).graph.admitted(
             block_hash,
             finalized_hash,
             1,
@@ -4988,7 +5069,7 @@ mod tests {
         let mut state = empty_state_at(finalized_hash);
         // A deep block with an unrelated-address bloom: below the settle window, so only the gate
         // decides — and nothing trusted blooms here.
-        let mut graph = Blocks::new(finalized_hash, HashMap::new()).graph.admitted(
+        let mut graph = Blocks::new(finalized_hash, 0, HashMap::new()).graph.admitted(
             block_hash,
             finalized_hash,
             1,
@@ -5122,7 +5203,7 @@ mod tests {
         let second_hash = BlockHash::with_last_byte(3);
         let mut state = empty_state_at(finalized_hash);
 
-        state.blocks.graph = Blocks::new(finalized_hash, HashMap::new())
+        state.blocks.graph = Blocks::new(finalized_hash, 0, HashMap::new())
             .graph
             .admitted(first_hash, second_hash, 2, bloom_matching_any())
             .admitted(second_hash, first_hash, 3, bloom_matching_any())
@@ -5412,6 +5493,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
+                number: block_number_for(target_hash),
             },
         );
 
@@ -5428,6 +5510,76 @@ mod tests {
         assert!(!graph.contains(target_hash));
         assert!(graph.contains(tip_hash));
         assert_eq!(graph.observed_head_hash(), tip_hash);
+        assert_state_invariants(&state);
+    }
+
+    // A finalized block observed at the anchor's EXACT height but with a different hash is a provable
+    // finality reorg: exactly one block occupies a given height, so the anchor is orphaned. The kernel
+    // re-initializes at the new finalized block — dropping all recent-block and snapshot state that no
+    // longer descends from a valid anchor — while preserving the reorg-invariant verified registries.
+    #[test]
+    fn finalized_block_observed_at_anchor_height_with_conflicting_hash_reanchors() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let advanced_hash = BlockHash::with_last_byte(4);
+        let tip_hash = BlockHash::with_last_byte(5);
+        let fork_hash = BlockHash::with_last_byte(9);
+        let candidate = pool_candidate_address(6);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
+        let snapshot = pool_state(7);
+        let mut state = empty_state_at(finalized_hash);
+
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
+
+        // Advance the anchor to a genuine finalized block at height 4, folding a swap into the base.
+        let state = observe_complete_block(
+            state,
+            advanced_hash,
+            finalized_hash,
+            vec![swap_log(candidate, 0, &snapshot)],
+        );
+        let state = state_with_more_observed_heads(state, advanced_hash, &[tip_hash]);
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: advanced_hash,
+                number: block_number_for(advanced_hash),
+            },
+        );
+        assert_eq!(state.blocks.graph.anchor_hash(), advanced_hash);
+        assert_eq!(state.blocks.graph.anchor_number(), 4);
+        assert!(!state.blocks.finalized_snapshot.is_empty());
+        assert!(state.blocks.graph.contains(tip_hash));
+
+        // A DIFFERENT block is now reported finalized at that same height 4: the anchor is orphaned.
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: fork_hash,
+                number: 4,
+            },
+        );
+
+        let graph = &state.blocks.graph;
+        // Re-anchored at the new finalized block, with the coupled height carried through.
+        assert_eq!(graph.anchor_hash(), fork_hash);
+        assert_eq!(graph.anchor_number(), 4);
+        assert_eq!(graph.observed_head_hash(), fork_hash);
+        // Recent-block and snapshot state tied to the orphaned fork is dropped.
+        assert!(state.blocks.finalized_snapshot.is_empty());
+        assert!(!graph.contains(advanced_hash));
+        assert!(!graph.contains(tip_hash));
+        // Verified pool metadata is reorg-invariant and preserved (not re-fetched).
+        assert!(
+            state
+                .pool_registry
+                .verified_pools(ChainKey::Ethereum)
+                .contains(&pool)
+        );
         assert_state_invariants(&state);
     }
 
@@ -5468,6 +5620,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
+                number: block_number_for(target_hash),
             },
         );
 
@@ -5530,6 +5683,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
+                number: block_number_for(target_hash),
             },
         );
 
@@ -5572,6 +5726,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
+                number: block_number_for(target_hash),
             },
         );
 
@@ -5601,6 +5756,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: side_hash,
+                number: block_number_for(side_hash),
             },
         );
 
@@ -5673,6 +5829,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
+                number: block_number_for(target_hash),
             },
         );
 
@@ -7399,7 +7556,7 @@ mod tests {
             let mut parent_hash = finalized_hash;
             let mut last_hash = finalized_hash;
             let mut pool_metadata_results = HashMap::new();
-            let mut graph = Blocks::new(finalized_hash, HashMap::new()).graph;
+            let mut graph = Blocks::new(finalized_hash, 0, HashMap::new()).graph;
 
             for (block_index, candidate_bytes) in block_candidate_bytes.iter().enumerate() {
                 let block_hash = hash_for_node(block_index + 1);
@@ -8190,7 +8347,7 @@ mod tests {
         let anchor = BlockHash::with_last_byte(1);
         let seeded = pool_state(9);
 
-        let blocks = Blocks::new(anchor, HashMap::new()).with_finalized_pool_seeds(
+        let blocks = Blocks::new(anchor, 0, HashMap::new()).with_finalized_pool_seeds(
             anchor,
             HashMap::from([(pool_address(4), Ok(seeded.clone()))]),
         );
@@ -8205,7 +8362,7 @@ mod tests {
     fn with_finalized_pool_seeds_skips_failed_reads() {
         let anchor = BlockHash::with_last_byte(1);
 
-        let blocks = Blocks::new(anchor, HashMap::new()).with_finalized_pool_seeds(
+        let blocks = Blocks::new(anchor, 0, HashMap::new()).with_finalized_pool_seeds(
             anchor,
             HashMap::from([(
                 pool_address(4),
@@ -8221,7 +8378,7 @@ mod tests {
         let anchor = BlockHash::with_last_byte(1);
         let stale = BlockHash::with_last_byte(2);
 
-        let blocks = Blocks::new(anchor, HashMap::new()).with_finalized_pool_seeds(
+        let blocks = Blocks::new(anchor, 0, HashMap::new()).with_finalized_pool_seeds(
             stale,
             HashMap::from([(pool_address(4), Ok(pool_state(9)))]),
         );
@@ -8261,7 +8418,7 @@ mod tests {
                 })
                 .collect::<HashMap<_, _>>();
 
-            let blocks = Blocks::new(anchor, base.clone())
+            let blocks = Blocks::new(anchor, 0, base.clone())
                 .with_finalized_pool_seeds(at, results.clone());
 
             if at == anchor {
@@ -8314,6 +8471,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: unknown_hash,
+                number: block_number_for(unknown_hash),
             },
         );
         let request_id = assert_single_logs_range_request_effect(
@@ -8330,6 +8488,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: unknown_hash,
+                number: block_number_for(unknown_hash),
             },
         );
         assert_no_logs_range_request_effect(&effects);
@@ -8390,6 +8549,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: unknown_hash,
+                number: block_number_for(unknown_hash),
             },
         );
         assert_no_logs_range_request_effect(&effects);
@@ -8547,6 +8707,7 @@ mod tests {
             state,
             Event::FinalizedBlockObserved {
                 block_hash: target_hash,
+                number: block_number_for(target_hash),
             },
         );
 

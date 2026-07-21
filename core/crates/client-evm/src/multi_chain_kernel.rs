@@ -587,6 +587,7 @@ pub enum Event {
     FinalizedHeaderReceived {
         chain: ChainKey,
         block_hash: BlockHash,
+        number: u64,
     },
     FinalizedHeaderUnavailable {
         chain: ChainKey,
@@ -644,9 +645,11 @@ pub enum Effect {
 /// Added as the single runtime entry point that keeps chain lifecycle handling and effect wrapping centralized.
 pub fn transition(state: State, event: Event) -> (State, Vec<Effect>) {
     match event {
-        Event::FinalizedHeaderReceived { chain, block_hash } => {
-            finalized_header_received(state, chain, block_hash)
-        }
+        Event::FinalizedHeaderReceived {
+            chain,
+            block_hash,
+            number,
+        } => finalized_header_received(state, chain, block_hash, number),
         Event::FinalizedHeaderUnavailable { chain } => finalized_header_unavailable(state, chain),
         Event::SubscriptionData { chain, data } => subscription_data(state, chain, data),
         Event::ChainEvent { chain, event } => chain_event(state, chain, event),
@@ -820,13 +823,14 @@ fn finalized_header_received(
     state: State,
     chain: ChainKey,
     block_hash: BlockHash,
+    number: u64,
 ) -> (State, Vec<Effect>) {
     with_chain_lifecycle(state, chain, |lifecycle| match lifecycle {
         ChainLifecycle::Active(chain_state) => {
             let (chain_state, effects) = kernel::transition(
                 chain,
                 chain_state,
-                kernel::Event::FinalizedBlockObserved { block_hash },
+                kernel::Event::FinalizedBlockObserved { block_hash, number },
             );
             (
                 Some(ChainLifecycle::Active(chain_state)),
@@ -938,6 +942,7 @@ fn activate_bootstrap_outcome(
 
     kernel::State::activate_from_seed(
         anchor.hash,
+        anchor.number,
         pool_snapshots,
         pool_registry,
         token_registry,
@@ -2102,6 +2107,7 @@ mod tests {
             Event::FinalizedHeaderReceived {
                 chain,
                 block_hash: compacted_hash,
+                number: block_number_for(compacted_hash),
             },
         );
 
@@ -3093,6 +3099,7 @@ mod tests {
         // No seed blocks, so activation issues no reconnection effects.
         let (chain_state, _effects) = kernel::State::activate_from_seed(
             finalized_hash,
+            block_number_for(finalized_hash),
             HashMap::new(),
             TrustedPoolRegistry::new(),
             crate::TokenRegistry::new(),
