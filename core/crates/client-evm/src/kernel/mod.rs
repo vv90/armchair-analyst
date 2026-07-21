@@ -474,24 +474,29 @@ impl State {
     /// (c)/(d)), folding the now-final logs into the finalized snapshot and pruning everything
     /// that no longer descends from the new anchor.
     ///
-    /// Returns `Err(FinalityReorg)` when the observed finality *conflicts* with the current anchor:
-    /// a finalized block at the anchor's exact height (`number == anchor_number`) with a different
-    /// hash. That is a provable finality fork — exactly one block occupies a given height on any
-    /// chain — so the anchor is orphaned and the kernel cannot advance onto the new chain (it does
-    /// not descend from the anchor). The caller re-initializes at the new finalized block, preserving
-    /// the verified registries (see the `FinalizedBlockObserved` arm). Every non-conflicting
-    /// observation — forward advance, a lagging lower-height report, or an idempotent re-observation
-    /// of the current anchor — returns `Ok` and flows through the normal `finalized_to` path.
+    /// Returns `Err(FinalityReorg)` when the observed finality *provably conflicts* with the chain
+    /// we are anchored on — a finalized block whose height is occupied by a *different*, canonically
+    /// connected block we hold (the anchor at its own height, or a block on the `anchor →
+    /// observed_head` chain above it). Exactly one block occupies a given height on any chain, so the
+    /// anchored chain is not the final one and the kernel cannot advance onto the new chain (it does
+    /// not descend from the anchor). This catches both an orphaned anchor at its exact height and a
+    /// higher divergent fork where finality lands above the anchor on a block we do not hold as
+    /// connected. The caller re-initializes at the new finalized block, preserving the verified
+    /// registries (see the `FinalizedBlockObserved` arm). Every non-conflicting observation — a
+    /// forward advance onto a connected block, a lagging lower-height report, an idempotent
+    /// re-observation of the current anchor, or a finalized block not yet backfilled to a canonical
+    /// witness — returns `Ok` and flows through the normal `finalized_to` path (which itself no-ops
+    /// until the target is a connected canonical block). See
+    /// [`BlocksGraph::conflicts_with_finalized`].
     fn with_finalized_block_observed(
         mut self,
         chain: ChainKey,
         block_hash: BlockHash,
         number: u64,
     ) -> Result<State, Box<FinalityReorg>> {
-        // A conflicting finalized block at the anchor's exact height orphans the anchor: re-init.
-        if number == self.blocks.graph.anchor_number()
-            && block_hash != self.blocks.graph.anchor_hash()
-        {
+        // A finalized block conflicting with a canonical block we hold at its height orphans the
+        // anchored chain: re-init at the new finalized block.
+        if self.blocks.graph.conflicts_with_finalized(block_hash, number) {
             let State {
                 pool_registry,
                 token_registry,
@@ -1035,8 +1040,9 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
                 // finality observation (the refresh predicate re-fires every retry stride) once the
                 // responses complete the holes; a fully-advanced target schedules nothing.
                 Ok(state) => schedule_missing_log_range_requests(chain, block_hash, state, vec![]),
-                // The anchor was orphaned by a finality reorg at its exact height: re-initialize at
-                // the new finalized block, preserving the reorg-invariant verified registries so
+                // The anchored chain was orphaned by a finality reorg (a different final block at a
+                // height we hold canonically — the anchor's own height or above it): re-initialize
+                // at the new finalized block, preserving the reorg-invariant verified registries so
                 // metadata is not re-fetched. The empty-at-new-anchor state's verified pools lack a
                 // finalized snapshot, so the idle-gated seed scheduler re-populates their reserves on
                 // the next scheduling pass. `activate_from_seed` builds a fresh request set, so the
@@ -5580,6 +5586,86 @@ mod tests {
                 .verified_pools(ChainKey::Ethereum)
                 .contains(&pool)
         );
+        assert_state_invariants(&state);
+    }
+
+    // Higher divergent fork: finality lands ABOVE the anchor, on a block we do not hold as
+    // connected, while our canonical chain carries a *different* block at that height. The
+    // generalized predicate (canonical witness at the finalized height, not just the anchor's exact
+    // height) proves the anchored chain is not final and re-anchors — the case the exact-height-only
+    // predicate missed.
+    #[test]
+    fn finalized_block_observed_above_anchor_on_divergent_fork_reanchors() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let a2 = BlockHash::with_last_byte(2);
+        let a3 = BlockHash::with_last_byte(3);
+        let fork_hash = BlockHash::with_last_byte(9);
+        let candidate = pool_candidate_address(6);
+        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
+
+        // Anchor stays at genesis height 0; the canonical connected chain extends to height 3.
+        let mut state = state_with_observed_chain(finalized_hash, &[a2, a3]);
+        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
+        );
+        assert_eq!(state.blocks.graph.anchor_number(), 0);
+        assert!(state.blocks.graph.contains(a3));
+
+        // A DIFFERENT block is reported finalized at height 3 — above the anchor, on a fork we never
+        // held as connected. `3 > anchor_number` looks like a benign forward advance, but our
+        // canonical block at height 3 (`a3`) proves the conflict.
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: fork_hash,
+                number: 3,
+            },
+        );
+
+        let graph = &state.blocks.graph;
+        assert_eq!(graph.anchor_hash(), fork_hash);
+        assert_eq!(graph.anchor_number(), 3);
+        assert_eq!(graph.observed_head_hash(), fork_hash);
+        assert!(state.blocks.finalized_snapshot.is_empty());
+        assert!(!graph.contains(a2));
+        assert!(!graph.contains(a3));
+        assert!(
+            state
+                .pool_registry
+                .verified_pools(ChainKey::Ethereum)
+                .contains(&pool)
+        );
+        assert_state_invariants(&state);
+    }
+
+    // A finalized block above the anchor that we do NOT yet hold as connected (no canonical witness
+    // at its height) is the benign not-yet-backfilled case: no conflict, the normal finalized_to
+    // path no-ops and the kernel waits for backfill rather than re-anchoring.
+    #[test]
+    fn finalized_block_observed_above_anchor_without_canonical_witness_is_noop() {
+        let finalized_hash = BlockHash::with_last_byte(1);
+        let a2 = BlockHash::with_last_byte(2);
+        let future_hash = BlockHash::with_last_byte(7);
+
+        // Canonical chain reaches only height 2; nothing is held at height 7.
+        let state = state_with_observed_chain(finalized_hash, &[a2]);
+        let anchor_before = state.blocks.graph.anchor_hash();
+
+        let (state, _effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::FinalizedBlockObserved {
+                block_hash: future_hash,
+                number: 7,
+            },
+        );
+
+        let graph = &state.blocks.graph;
+        // No re-anchor: the anchor is unchanged and the connected chain is intact.
+        assert_eq!(graph.anchor_hash(), anchor_before);
+        assert!(graph.contains(a2));
         assert_state_invariants(&state);
     }
 

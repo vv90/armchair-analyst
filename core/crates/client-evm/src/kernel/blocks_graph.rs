@@ -784,6 +784,54 @@ impl BlocksGraph {
         self.anchor.number
     }
 
+    /// Whether an observed finalized block `(hash, number)` **provably** conflicts with the chain
+    /// this graph is anchored on — the finality-reorg detector, generalized from the anchor's exact
+    /// height to the whole canonical connected chain (`anchor → observed_head`).
+    ///
+    /// `false` (no conflict) when either:
+    /// - the finalized block is itself a connected node — it descends from the anchor, so it is a
+    ///   normal forward advance or a connected side-fork the finalization no-ops on (decision (d)),
+    ///   never a re-init; or
+    /// - we hold no canonical witness at `number` — the canonical chain hasn't reached that height
+    ///   (a divergent fork's blocks are `Pending`, not connected), so we cannot prove a conflict and
+    ///   wait for backfill.
+    ///
+    /// `true` only when we hold a canonical block at the finalized height (the anchor at its own
+    /// height, else a connected block on the `anchor → observed_head` chain) whose hash *differs*
+    /// from the finalized hash: two distinct blocks cannot both be final at one height, so the chain
+    /// we are anchored on is not the final one and the kernel must re-init at the new finalized
+    /// block. Catches the orphaned anchor at its exact height *and* a higher divergent fork where
+    /// finality lands above the anchor on a block we do not hold as connected.
+    pub(crate) fn conflicts_with_finalized(&self, hash: BlockHash, number: u64) -> bool {
+        // A finalized block we already hold as connected descends from the anchor: not a conflict
+        // (the normal finalized_to path advances onto it, or no-ops on a connected side-fork).
+        if self.connected(hash).is_some() {
+            return false;
+        }
+        // The canonical witness at the finalized height: the anchor itself at its own height (the
+        // anchor is not a node), else the canonical connected block at that height. Absent ⇒
+        // unprovable, so no conflict.
+        let witness = if number == self.anchor_number() {
+            Some(self.anchor_hash())
+        } else {
+            self.canonical_hash_at_height(number)
+        };
+        matches!(witness, Some(witness) if witness != hash)
+    }
+
+    /// The hash of the canonical connected block at height `number` (`anchor → observed_head`),
+    /// or `None` when the canonical chain does not reach that height. Linear scan over the canonical
+    /// path; the finalized-observe arm this serves is low-frequency (not an admission hot path).
+    fn canonical_hash_at_height(&self, number: u64) -> Option<BlockHash> {
+        self.canonical_oldest_to_newest()
+            .into_iter()
+            .find_map(|ConnectedHash(hash)| {
+                self.connected(hash)
+                    .filter(|node| node.data.number == number)
+                    .map(|_| hash)
+            })
+    }
+
     /// Whether `hash` is an admitted block (connected or pending; the anchor is not a node). The
     /// kernel uses it to route a streamed log to the block versus the pre-head staging buffer, and
     /// to drain that buffer only once the block actually entered the graph.
