@@ -26,7 +26,8 @@ mod utils;
 pub use chain::{ACTIVE_CHAINS, ChainKey, chain_key_for_network_path, drpc_network_path};
 pub use client::{
     ClientEvent, ClientHead, MetadataCache, MetadataCacheError, POOL_LOG_BATCH_WINDOW,
-    RangeLogBlock, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
+    RangeLogBlock, consolidate_pool_logs, fetch_block_header, fetch_canonical_block_header_at,
+    fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, plan_ws_subscriptions,
     subscribe_new_heads, subscribe_pool_events, WsSubscriptionEndpoint,
@@ -37,8 +38,8 @@ pub use endpoints::{
 };
 pub use error::{ClientEvmError, ConfigScope};
 pub use kernel::pending_requests::{
-    AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetLogsRange, GetPoolData,
-    GetPoolMetadata, GetTokenMetadata, IssuedRequest, RequestId,
+    AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetCanonicalHeaderAtHeight,
+    GetLogsRange, GetPoolData, GetPoolMetadata, GetTokenMetadata, IssuedRequest, RequestId,
 };
 pub use kernel::pool_registry::{
     PoolFee, PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult,

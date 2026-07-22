@@ -85,6 +85,55 @@ pub fn pool_candidate_block_range_chunk(chain: ChainKey) -> u64 {
     }
 }
 
+/// The per-chain finality depth: an approximate block distance from the observed tip back to a
+/// safely-final block, denominated in blocks. The single source of truth for "how far behind the
+/// tip is finality" — consumed both by the finalized-refresh look-back window
+/// (`multi_chain_kernel::finalized_refresh_policy`) and by the pending-buffer cap
+/// ([`max_pending_blocks`]). Values are provisional for every chain except Ethereum (tune before
+/// relying on finalized pruning for the others):
+/// - Ethereum: ~2 epochs.
+/// - Arbitrum: ~one block per ~0.25s, inherits L1 finality → larger block-denominated window.
+/// - Base/Optimism: OP-stack rollups (~2s blocks); shallow unsafe-head reorgs, finality follows L1.
+/// - Polygon PoS: historically the deepest probabilistic reorgs of this set → largest window.
+/// - BNB: ~3s blocks, fast finality with occasional short reorgs.
+/// - Avalanche: near-instant finality → smallest window.
+pub fn approx_finalized_block_age(chain: ChainKey) -> usize {
+    match chain {
+        ChainKey::Ethereum => 64,
+        ChainKey::Arbitrum => 1_000,
+        ChainKey::Base => 200,
+        ChainKey::Optimism => 200,
+        ChainKey::Polygon => 400,
+        ChainKey::Bnb => 150,
+        ChainKey::Avalanche => 80,
+    }
+}
+
+/// How many distinct competing forks the pending buffer is sized to hold simultaneously without
+/// refusing admission. A cost/robustness bound, not a correctness one: honest-but-inconsistent
+/// multi-provider fan-out produces only a couple of concurrent forks (bounded by provider width);
+/// a run past this many distinct forks is the adversarial/liveness-failure regime the cap guards
+/// against. Paired with [`approx_finalized_block_age`] to size [`max_pending_blocks`].
+pub const MAX_SIMULTANEOUS_FORKS: usize = 4;
+
+/// Headroom multiplier over the finality depth for the pending-buffer cap. Chosen so the cap
+/// (`PENDING_CAP_FORK_MARGIN × finality_depth`) comfortably exceeds
+/// `MAX_SIMULTANEOUS_FORKS × finality_depth` — i.e. every one of `MAX_SIMULTANEOUS_FORKS` shallow
+/// forks can hold its full finality-depth worth of pending ancestors at once and still not hit the
+/// cap. See [`max_pending_blocks`].
+pub const PENDING_CAP_FORK_MARGIN: usize = 8;
+
+/// The per-chain cap on the block graph's pending (not-yet-connected) staging area. Sized generously
+/// above the chain's finality depth so that a fork diverging at/below finality can backfill its
+/// ancestors all the way down to the anchor's height — where the orphaned-anchor detector fires —
+/// instead of exhausting the buffer partway down (which a fixed, too-small cap did on
+/// large-finality chains). Bounded in normal operation by
+/// `finality_depth × simultaneous_forks < PENDING_CAP_FORK_MARGIN × finality_depth`; hitting the cap
+/// is an anomaly (network finality stall or adversarial fork-spam), not steady state.
+pub fn max_pending_blocks(chain: ChainKey) -> usize {
+    PENDING_CAP_FORK_MARGIN * approx_finalized_block_age(chain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +172,29 @@ mod tests {
             assert!(
                 pool_candidate_block_range_chunk(chain) > 0,
                 "chain {chain:?} has a zero pool-candidate chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn approx_finalized_block_age_is_pinned_per_chain() {
+        assert_eq!(approx_finalized_block_age(ChainKey::Ethereum), 64);
+        assert_eq!(approx_finalized_block_age(ChainKey::Arbitrum), 1_000);
+        assert_eq!(approx_finalized_block_age(ChainKey::Base), 200);
+        assert_eq!(approx_finalized_block_age(ChainKey::Optimism), 200);
+        assert_eq!(approx_finalized_block_age(ChainKey::Polygon), 400);
+        assert_eq!(approx_finalized_block_age(ChainKey::Bnb), 150);
+        assert_eq!(approx_finalized_block_age(ChainKey::Avalanche), 80);
+    }
+
+    #[test]
+    fn pending_cap_safely_exceeds_finality_depth_times_max_forks_for_every_chain() {
+        for &chain in ALL_CHAINS {
+            assert!(
+                max_pending_blocks(chain) > MAX_SIMULTANEOUS_FORKS * approx_finalized_block_age(chain),
+                "chain {chain:?}: pending cap {} must exceed {MAX_SIMULTANEOUS_FORKS} × finality depth {}",
+                max_pending_blocks(chain),
+                approx_finalized_block_age(chain),
             );
         }
     }

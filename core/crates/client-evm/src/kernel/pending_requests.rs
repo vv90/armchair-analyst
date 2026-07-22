@@ -104,6 +104,17 @@ impl From<MissingRange> for GetLogsRange {
     }
 }
 
+/// Reads the canonical block header at an explicit height (`eth_getBlockByNumber`), the
+/// orphaned-anchor detector's authoritative probe: a genuinely-final anchor's block at
+/// `anchor_number` never changes, so a returned hash differing from `anchor_hash` proves the anchor
+/// was orphaned and the kernel must re-init. Distinct from [`GetBlockHeader`] (which reads a
+/// specific hash via `eth_getBlockByHash`) because the probe asks "what block is canonical at this
+/// height" — the very question a by-hash read cannot pose.
+#[derive(Clone)]
+pub struct GetCanonicalHeaderAtHeight {
+    pub number: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnyRequestId {
     BlockHeader(RequestId<GetBlockHeader>),
@@ -112,6 +123,7 @@ pub enum AnyRequestId {
     TokenMetadata(RequestId<GetTokenMetadata>),
     PoolData(RequestId<GetPoolData>),
     LogsRange(RequestId<GetLogsRange>),
+    CanonicalHeader(RequestId<GetCanonicalHeaderAtHeight>),
 }
 
 impl fmt::Debug for AnyRequestId {
@@ -129,6 +141,9 @@ impl fmt::Debug for AnyRequestId {
             }
             AnyRequestId::PoolData(request_id) => write!(formatter, "pool_data#{request_id:?}"),
             AnyRequestId::LogsRange(request_id) => write!(formatter, "logs_range#{request_id:?}"),
+            AnyRequestId::CanonicalHeader(request_id) => {
+                write!(formatter, "canonical_header#{request_id:?}")
+            }
         }
     }
 }
@@ -140,6 +155,7 @@ pub enum AnyIssuedRequest {
     TokenMetadata(IssuedRequest<GetTokenMetadata>),
     PoolData(IssuedRequest<GetPoolData>),
     LogsRange(IssuedRequest<GetLogsRange>),
+    CanonicalHeader(IssuedRequest<GetCanonicalHeaderAtHeight>),
 }
 
 pub struct PendingRequests {
@@ -150,6 +166,7 @@ pub struct PendingRequests {
     token_metadata: RequestCollection<GetTokenMetadata>,
     pool_data: RequestCollection<GetPoolData>,
     logs_range: RequestCollection<GetLogsRange>,
+    canonical_header: RequestCollection<GetCanonicalHeaderAtHeight>,
 }
 
 impl PendingRequests {
@@ -162,6 +179,7 @@ impl PendingRequests {
             token_metadata: RequestCollection::new(),
             pool_data: RequestCollection::new(),
             logs_range: RequestCollection::new(),
+            canonical_header: RequestCollection::new(),
         }
     }
     pub fn take<R>(self, request_id: &RequestId<R>) -> (Self, Option<PendingPayload<R>>)
@@ -200,6 +218,11 @@ impl PendingRequests {
                     .into_iter()
                     .map(AnyRequestId::LogsRange),
             )
+            .chain(
+                expired_request_ids::<Self, GetCanonicalHeaderAtHeight>(self, tick)
+                    .into_iter()
+                    .map(AnyRequestId::CanonicalHeader),
+            )
             .collect()
     }
 
@@ -221,6 +244,14 @@ impl PendingRequests {
             + self.token_metadata.values().count()
             + self.pool_data.values().count()
             + self.logs_range.values().count()
+            + self.canonical_header.values().count()
+    }
+
+    /// Whether an orphaned-anchor finality probe ([`GetCanonicalHeaderAtHeight`]) is already in
+    /// flight. The detector is per-chain-singleton: the trigger dedups on this so a fork descending
+    /// past the anchor's height emits one probe, not one per admitted block.
+    pub(crate) fn has_pending_finality_probe(&self) -> bool {
+        self.canonical_header.values().next().is_some()
     }
 
     pub(crate) fn pending_block_log_hashes(&self) -> HashSet<BlockHash> {
@@ -349,6 +380,9 @@ impl PendingRequests {
             AnyRequestId::LogsRange(request_id) => {
                 self.retry_typed(request_id, tick, AnyIssuedRequest::LogsRange)
             }
+            AnyRequestId::CanonicalHeader(request_id) => {
+                self.retry_typed(request_id, tick, AnyIssuedRequest::CanonicalHeader)
+            }
         }
     }
 
@@ -403,6 +437,7 @@ impl PendingRequests {
             AnyRequestId::TokenMetadata(request_id) => self.contains(&request_id),
             AnyRequestId::PoolData(request_id) => self.contains(&request_id),
             AnyRequestId::LogsRange(request_id) => self.contains(&request_id),
+            AnyRequestId::CanonicalHeader(request_id) => self.contains(&request_id),
         }
     }
 
@@ -454,6 +489,11 @@ impl PendingRequests {
             )
             .chain(
                 self.logs_range
+                    .values()
+                    .map(|request| request.dispatched_at),
+            )
+            .chain(
+                self.canonical_header
                     .values()
                     .map(|request| request.dispatched_at),
             )
@@ -524,6 +564,16 @@ impl RequestStore<GetLogsRange> for PendingRequests {
 
     fn request_collection_mut(&mut self) -> &mut RequestCollection<GetLogsRange> {
         &mut self.logs_range
+    }
+}
+
+impl RequestStore<GetCanonicalHeaderAtHeight> for PendingRequests {
+    fn request_collection(&self) -> &RequestCollection<GetCanonicalHeaderAtHeight> {
+        &self.canonical_header
+    }
+
+    fn request_collection_mut(&mut self) -> &mut RequestCollection<GetCanonicalHeaderAtHeight> {
+        &mut self.canonical_header
     }
 }
 

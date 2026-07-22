@@ -403,6 +403,24 @@ impl Provider {
                 );
                 let _ = at;
             }
+            AnyIssuedRequest::CanonicalHeader(issued) => {
+                let decision = decide(policies.header, now, tip, None);
+                let request_id = issued.request_id;
+                let number = issued.request_payload.number;
+                self.settle(
+                    "canonical_header",
+                    decision,
+                    AnyRequestId::CanonicalHeader(request_id),
+                    // The deterministic world's canonical block at a height is `block_hash(number)`,
+                    // so the probe answers with the true chain — an orphaned anchor's height then
+                    // resolves to a differing hash and drives re-init.
+                    || Event::CanonicalHeaderAtHeightReceived {
+                        request_id,
+                        hash: block_hash(number),
+                        number,
+                    },
+                );
+            }
         }
     }
 }

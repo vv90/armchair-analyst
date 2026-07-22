@@ -29,7 +29,8 @@ use super::{
     ClientEvent, ClientHead,
     subscription::LogBatchBuffer,
     client_utils::{
-        build_block_header_request, build_block_logs_request, build_block_number_request,
+        build_block_header_by_number_request, build_block_header_request, build_block_logs_request,
+        build_block_number_request,
         build_finalized_block_header_request, build_new_heads_subscribe_request,
         build_pool_events_subscribe_request, build_pool_logs_range_request,
         parse_block_header_response, parse_block_header_response_by_id, parse_block_logs_response,
@@ -826,6 +827,24 @@ pub fn fetch_finalized_block_header(
 ) -> Result<Option<ClientHead>, ClientEvmError> {
     let pool = endpoints.pool(chain)?;
     let request = build_finalized_block_header_request(HTTP_REQUEST_ID);
+    pool.with_failover(|endpoint| {
+        let response_value = send_rpc_request(agent, endpoint, &request)?;
+        parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)
+    })
+}
+
+/// Reads the canonical block header at an explicit `number` (`eth_getBlockByNumber`), the
+/// orphaned-anchor detector's authoritative probe. Decodes without an expected hash (the probe's
+/// purpose is to learn the canonical hash at the height, then compare it to the anchor); `None`
+/// means the height is not yet available on the answering endpoint.
+pub fn fetch_canonical_block_header_at(
+    agent: &ureq::Agent,
+    endpoints: &ChainEndpoints,
+    chain: ChainKey,
+    number: u64,
+) -> Result<Option<ClientHead>, ClientEvmError> {
+    let pool = endpoints.pool(chain)?;
+    let request = build_block_header_by_number_request(HTTP_REQUEST_ID, number);
     pool.with_failover(|endpoint| {
         let response_value = send_rpc_request(agent, endpoint, &request)?;
         parse_block_header_response_by_id(&response_value, HTTP_REQUEST_ID)

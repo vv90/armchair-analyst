@@ -354,18 +354,19 @@ impl BlocksGraph {
 
     /// How many blocks are currently `Pending` (the bounded staging area, invariant B1). O(n) over
     /// the node set; bounded, so a cached count is a possible later optimization, not needed now.
-    fn pending_count(&self) -> usize {
+    pub(crate) fn pending_count(&self) -> usize {
         self.nodes
             .values()
             .filter(|node| matches!(node, Node::Pending(_)))
             .count()
     }
 
-    /// Admit a block from a header (production entry point), bounding the pending staging area at
-    /// [`MAX_PENDING_BLOCKS`]. Returns the [`Admission`] outcome so callers that branch on it (the
-    /// kernel's head path routes `SelfParent` to a direct header fetch) match the type instead of
-    /// re-deriving the refusal from raw fields. See [`BlocksGraph::with_block_capped`] for the
-    /// semantics.
+    /// Admit a block at the default flat pending cap ([`MAX_PENDING_BLOCKS`]). Test-only: production
+    /// admission threads the per-chain cap through [`BlocksGraph::with_block_capped`]
+    /// ([`crate::chain::max_pending_blocks`]); this convenience wrapper keeps the many graph tests
+    /// terse. Returns the [`Admission`] outcome so callers that branch on it match the type instead
+    /// of re-deriving the refusal from raw fields.
+    #[cfg(test)]
     pub(crate) fn with_block(
         self,
         hash: BlockHash,
@@ -376,13 +377,14 @@ impl BlocksGraph {
         self.with_block_capped(hash, parent, number, bloom, MAX_PENDING_BLOCKS)
     }
 
-    /// Kernel admission entry for callers that don't branch on the outcome: [`with_block`],
+    /// Test-only admission wrapper for callers that don't branch on the outcome: [`with_block`],
     /// discarding the [`Admission`]. Every refusal keeps the (unchanged) graph — reorg-safety
     /// decision (b) in `KERNEL_BLOCKS_GRAPH_REORG_SAFETY.md`: a `ConflictingParent` (provably bad
     /// data) is refused and the first-seen block kept, not reset; every other refusal
     /// (self-parent, anchor-readmit, duplicate, pending-buffer-full) is already a benign no-op.
     /// The kernel is pure, so a refusal is silently dropped (no telemetry channel); finalization
     /// ultimately prunes any poisoned fork.
+    #[cfg(test)]
     pub(crate) fn admitted(
         self,
         hash: BlockHash,
@@ -404,7 +406,7 @@ impl BlocksGraph {
     /// cap gates only the pending branch — a connecting admission (and the promotion it triggers,
     /// which only shrinks the pending set) is never refused. `with_block` calls this with
     /// [`MAX_PENDING_BLOCKS`]; tests drive it at a small cap.
-    fn with_block_capped(
+    pub(crate) fn with_block_capped(
         self,
         hash: BlockHash,
         parent: BlockHash,
@@ -784,59 +786,19 @@ impl BlocksGraph {
         self.anchor.number
     }
 
-    /// Whether an observed finalized block `(hash, number)` **provably** conflicts with the chain
-    /// this graph is anchored on — the finality-reorg detector, generalized from the anchor's exact
-    /// height to the whole canonical connected chain (`anchor → observed_head`).
-    ///
-    /// `false` (no conflict) when either:
-    /// - the finalized block is itself a connected node — it descends from the anchor, so it is a
-    ///   normal forward advance or a connected side-fork the finalization no-ops on (decision (d)),
-    ///   never a re-init; or
-    /// - we hold no canonical witness at `number` — the canonical chain hasn't reached that height
-    ///   (a divergent fork's blocks are `Pending`, not connected), so we cannot prove a conflict and
-    ///   wait for backfill.
-    ///
-    /// `true` only when we hold a canonical block at the finalized height (the anchor at its own
-    /// height, else a connected block on the `anchor → observed_head` chain) whose hash *differs*
-    /// from the finalized hash: two distinct blocks cannot both be final at one height, so the chain
-    /// we are anchored on is not the final one and the kernel must re-init at the new finalized
-    /// block. Catches the orphaned anchor at its exact height *and* a higher divergent fork where
-    /// finality lands above the anchor on a block we do not hold as connected.
-    pub(crate) fn conflicts_with_finalized(&self, hash: BlockHash, number: u64) -> bool {
-        // A finalized block we already hold as connected descends from the anchor: not a conflict
-        // (the normal finalized_to path advances onto it, or no-ops on a connected side-fork).
-        if self.connected(hash).is_some() {
-            return false;
-        }
-        // The canonical witness at the finalized height: the anchor itself at its own height (the
-        // anchor is not a node), else the canonical connected block at that height. Absent ⇒
-        // unprovable, so no conflict.
-        let witness = if number == self.anchor_number() {
-            Some(self.anchor_hash())
-        } else {
-            self.canonical_hash_at_height(number)
-        };
-        matches!(witness, Some(witness) if witness != hash)
-    }
-
-    /// The hash of the canonical connected block at height `number` (`anchor → observed_head`),
-    /// or `None` when the canonical chain does not reach that height. Linear scan over the canonical
-    /// path; the finalized-observe arm this serves is low-frequency (not an admission hot path).
-    fn canonical_hash_at_height(&self, number: u64) -> Option<BlockHash> {
-        self.canonical_oldest_to_newest()
-            .into_iter()
-            .find_map(|ConnectedHash(hash)| {
-                self.connected(hash)
-                    .filter(|node| node.data.number == number)
-                    .map(|_| hash)
-            })
-    }
-
     /// Whether `hash` is an admitted block (connected or pending; the anchor is not a node). The
     /// kernel uses it to route a streamed log to the block versus the pre-head staging buffer, and
     /// to drain that buffer only once the block actually entered the graph.
     pub(crate) fn contains(&self, hash: BlockHash) -> bool {
         self.nodes.contains_key(&hash)
+    }
+
+    /// Whether `hash` is admitted but not yet connected to the anchor. The orphaned-anchor detector
+    /// keys on this: a block that lands `Pending` at/just-above the anchor's height diverges at or
+    /// below finality (a block whose parent is the anchor connects immediately), signalling an
+    /// orphaned anchor.
+    pub(crate) fn is_pending(&self, hash: BlockHash) -> bool {
+        matches!(self.nodes.get(&hash), Some(Node::Pending(_)))
     }
 
     /// The per-block payloads on the canonical path `anchor → target`, oldest→newest. `target` is

@@ -319,6 +319,15 @@ impl State {
             .len()
     }
 
+    /// The count of `Pending` (not-yet-connected) blocks in the graph's bounded staging area — the
+    /// quantity the per-chain cap ([`crate::chain::max_pending_blocks`]) bounds. Exposed so tests
+    /// and the bounded-pending property tests can observe the staging area without reaching into the
+    /// graph.
+    #[cfg(test)]
+    pub(crate) fn pending_block_count(&self) -> usize {
+        self.blocks.graph.pending_count()
+    }
+
     /// Counts canonical blocks the tip is ahead of `reference_hash` on a connected path.
     /// Added so read models can measure fetch progress from an already-known frontier block
     /// (such as the last dispatched optimization block) without rebuilding the complete
@@ -412,8 +421,12 @@ impl State {
         parent_hash: BlockHash,
         number: u64,
         bloom: Bloom,
+        max_pending: usize,
     ) -> (State, blocks_graph::Admission) {
-        let (graph, admission) = self.blocks.graph.with_block(hash, parent_hash, number, bloom);
+        let (graph, admission) =
+            self.blocks
+                .graph
+                .with_block_capped(hash, parent_hash, number, bloom, max_pending);
         // A self-parent observation is garbage input and leaves the head unchanged; every other
         // outcome — admit, duplicate, anchor-readmit — advances the head, which
         // `with_observed_head` matches (it updates only for a present or anchor hash).
@@ -432,9 +445,14 @@ impl State {
         parent_hash: BlockHash,
         number: u64,
         bloom: Bloom,
+        max_pending: usize,
     ) -> State {
-        self.map_graph(move |graph| graph.admitted(hash, parent_hash, number, bloom))
-            .with_streamed_logs_drained(hash)
+        self.map_graph(move |graph| {
+            graph
+                .with_block_capped(hash, parent_hash, number, bloom, max_pending)
+                .0
+        })
+        .with_streamed_logs_drained(hash)
     }
 
     /// `LogObserved` feed: best-effort streamed logs (a no-op if the block is not yet admitted;
@@ -474,42 +492,15 @@ impl State {
     /// (c)/(d)), folding the now-final logs into the finalized snapshot and pruning everything
     /// that no longer descends from the new anchor.
     ///
-    /// Returns `Err(FinalityReorg)` when the observed finality *provably conflicts* with the chain
-    /// we are anchored on — a finalized block whose height is occupied by a *different*, canonically
-    /// connected block we hold (the anchor at its own height, or a block on the `anchor →
-    /// observed_head` chain above it). Exactly one block occupies a given height on any chain, so the
-    /// anchored chain is not the final one and the kernel cannot advance onto the new chain (it does
-    /// not descend from the anchor). This catches both an orphaned anchor at its exact height and a
-    /// higher divergent fork where finality lands above the anchor on a block we do not hold as
-    /// connected. The caller re-initializes at the new finalized block, preserving the verified
-    /// registries (see the `FinalizedBlockObserved` arm). Every non-conflicting observation — a
-    /// forward advance onto a connected block, a lagging lower-height report, an idempotent
-    /// re-observation of the current anchor, or a finalized block not yet backfilled to a canonical
-    /// witness — returns `Ok` and flows through the normal `finalized_to` path (which itself no-ops
-    /// until the target is a connected canonical block). See
-    /// [`BlocksGraph::conflicts_with_finalized`].
-    fn with_finalized_block_observed(
-        mut self,
-        chain: ChainKey,
-        block_hash: BlockHash,
-        number: u64,
-    ) -> Result<State, Box<FinalityReorg>> {
-        // A finalized block conflicting with a canonical block we hold at its height orphans the
-        // anchored chain: re-init at the new finalized block.
-        if self.blocks.graph.conflicts_with_finalized(block_hash, number) {
-            let State {
-                pool_registry,
-                token_registry,
-                ..
-            } = self;
-            return Err(Box::new(FinalityReorg {
-                new_finalized_hash: block_hash,
-                new_finalized_number: number,
-                pool_registry,
-                token_registry,
-            }));
-        }
-
+    /// Infallible: a finalized observation never re-anchors onto a competing fork here. An orphaned
+    /// anchor is detected out-of-band by the admission-time finality probe
+    /// ([`with_finality_probe_if_orphan_suspected`] →
+    /// [`Event::CanonicalHeaderAtHeightReceived`]), whose authoritative by-number answer — not a
+    /// passively-observed finalized sample — is the sole re-init authority. Every observation here
+    /// (forward advance onto a connected block, a lagging lower-height report, an idempotent
+    /// re-observation, or a not-yet-backfilled target) flows through the normal `finalized_to` path,
+    /// which no-ops until the target is a connected canonical block.
+    fn with_finalized_block_observed(mut self, chain: ChainKey, block_hash: BlockHash) -> State {
         let v4_manager = uniswap_v4::pool_manager_address(chain);
         // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
         // discovered after bootstrap (the graph is registry-free; identity comes from here).
@@ -537,7 +528,7 @@ impl State {
             graph,
             finalized_snapshot,
         };
-        Ok(self)
+        self
     }
 }
 
@@ -595,6 +586,14 @@ pub enum Event {
     },
     BlockHeaderNotFound {
         request_id: RequestId<GetBlockHeader>,
+    },
+    /// The authoritative canonical block header at an explicit height ([`GetCanonicalHeaderAtHeight`])
+    /// — the orphaned-anchor probe's answer. When `number` is still the anchor's height and `hash`
+    /// differs from the anchor, the anchor was orphaned and the kernel re-inits at the true block.
+    CanonicalHeaderAtHeightReceived {
+        request_id: RequestId<GetCanonicalHeaderAtHeight>,
+        hash: BlockHash,
+        number: u64,
     },
     BlockLogsReceived {
         request_id: RequestId<GetBlockLogs>,
@@ -949,17 +948,43 @@ fn request_missing_header(
     )
 }
 
-/// A provable finality reorg: the observed finalized block conflicts with the current anchor at its
-/// exact height, so the anchor is orphaned and the kernel must re-initialize at the new finalized
-/// block. Carries everything the re-init needs — the coupled new finalized `(hash, number)` and the
-/// verified registries, which are reorg-invariant and preserved so metadata is not re-fetched.
-/// Produced by [`State::with_finalized_block_observed`]; consumed by the `FinalizedBlockObserved`
-/// transition arm.
-pub(crate) struct FinalityReorg {
-    pub new_finalized_hash: BlockHash,
-    pub new_finalized_number: u64,
-    pub pool_registry: TrustedPoolRegistry,
-    pub token_registry: TokenRegistry,
+/// Emits the orphaned-anchor finality probe when the just-admitted block landed `Pending` at or just
+/// above the anchor's height. Rationale: connectivity is defined against the anchor, so a block whose
+/// parent is the anchor connects immediately — a `Pending` block at `anchor_number + 1` therefore
+/// cannot descend from the anchor, and its fork diverges at/below finality (the orphaned-anchor
+/// signature). Below-finality pending blocks (`number <= anchor_number`) likewise. Shallow reorgs
+/// diverge *above* the anchor and reconnect there, so they never produce such a node and never fire.
+/// The probe (`getBlockByNumber(anchor_number)`) is the sole re-init authority — a `Pending` block is
+/// only evidence, not finality — and is deduped to one in flight per chain, so a fork descending
+/// toward the anchor issues one probe, not one per admitted block.
+fn with_finality_probe_if_orphan_suspected(
+    mut state: State,
+    admitted_hash: BlockHash,
+    number: u64,
+    mut effects: Vec<Effect>,
+) -> (State, Vec<Effect>) {
+    let anchor_number = state.blocks.graph.anchor_number();
+    let suspect = number <= anchor_number.saturating_add(1)
+        && state.blocks.graph.is_pending(admitted_hash)
+        && !state.pending_requests.has_pending_finality_probe();
+    if !suspect {
+        return (state, effects);
+    }
+
+    let request_payload = GetCanonicalHeaderAtHeight {
+        number: anchor_number,
+    };
+    let (pending_requests, request_id) = state
+        .pending_requests
+        .with_new_request(request_payload.clone(), state.tick);
+    state.pending_requests = pending_requests;
+    effects.push(Effect::Request(AnyIssuedRequest::CanonicalHeader(
+        IssuedRequest {
+            request_id,
+            request_payload,
+        },
+    )));
+    (state, effects)
 }
 
 /// One kernel transition, telling the caller whether anything happened. `Inert` is a
@@ -1000,8 +1025,13 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
             // follow-up work — header backfill, log fetches, candidate/token validation — from
             // the graph itself.
             let head_before = state.blocks.graph.observed_head_hash();
-            let (state, admission) =
-                state.with_log_head_observed(hash, parent_hash, number, logs_bloom);
+            let (state, admission) = state.with_log_head_observed(
+                hash,
+                parent_hash,
+                number,
+                logs_bloom,
+                crate::chain::max_pending_blocks(chain),
+            );
             match admission {
                 blocks_graph::Admission::SelfParent => {
                     // A self-parent head is provably-garbage input (a hash commits to its
@@ -1030,35 +1060,23 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
                 blocks_graph::Admission::DuplicateBlock if hash == head_before => {
                     return TransitionOutcome::Inert(state);
                 }
-                _ => schedule_unknown_canonical_requests(chain, state, vec![]),
-            }
-        }
-        Event::FinalizedBlockObserved { block_hash, number } => {
-            match state.with_finalized_block_observed(chain, block_hash, number) {
-                // WS-primary: any hole short of the target just stalled the fold — issue its
-                // authoritative ranged verification now. The anchor then advances on a later
-                // finality observation (the refresh predicate re-fires every retry stride) once the
-                // responses complete the holes; a fully-advanced target schedules nothing.
-                Ok(state) => schedule_missing_log_range_requests(chain, block_hash, state, vec![]),
-                // The anchored chain was orphaned by a finality reorg (a different final block at a
-                // height we hold canonically — the anchor's own height or above it): re-initialize
-                // at the new finalized block, preserving the reorg-invariant verified registries so
-                // metadata is not re-fetched. The empty-at-new-anchor state's verified pools lack a
-                // finalized snapshot, so the idle-gated seed scheduler re-populates their reserves on
-                // the next scheduling pass. `activate_from_seed` builds a fresh request set, so the
-                // orphaned fork's in-flight requests are abandoned.
-                Err(reorg) => {
-                    let reorg = *reorg;
-                    State::activate_from_seed(
-                        reorg.new_finalized_hash,
-                        reorg.new_finalized_number,
-                        HashMap::new(),
-                        reorg.pool_registry,
-                        reorg.token_registry,
-                        Vec::new(),
-                    )
+                _ => {
+                    let (state, effects) = schedule_unknown_canonical_requests(chain, state, vec![]);
+                    with_finality_probe_if_orphan_suspected(state, hash, number, effects)
                 }
             }
+        }
+        Event::FinalizedBlockObserved {
+            block_hash,
+            number: _,
+        } => {
+            // WS-primary: advance the anchor over the foldable canonical prefix (a no-op until the
+            // target is a connected canonical block), then issue authoritative ranged verification
+            // for any hole short of the target that stalled the fold — the anchor advances on a
+            // later finality observation once the responses complete the holes. Orphaned-anchor
+            // re-init lives on the admission-time finality probe, not here.
+            let state = state.with_finalized_block_observed(chain, block_hash);
+            schedule_missing_log_range_requests(chain, block_hash, state, vec![])
         }
         Event::BlockHeaderReceived {
             request_id,
@@ -1069,7 +1087,13 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
         } => {
             // Admit without advancing the head (a backfilled header is ancestry, not a tip
             // signal), refuse-and-keep on any bad input — see the `HeadObserved` arm.
-            let state = state.with_log_header_received(hash, parent_hash, number, logs_bloom);
+            let state = state.with_log_header_received(
+                hash,
+                parent_hash,
+                number,
+                logs_bloom,
+                crate::chain::max_pending_blocks(chain),
+            );
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
             let mut state = State {
                 pending_requests,
@@ -1098,7 +1122,8 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
                 _ => vec![],
             };
 
-            schedule_unknown_canonical_requests(chain, state, effects)
+            let (state, effects) = schedule_unknown_canonical_requests(chain, state, effects);
+            with_finality_probe_if_orphan_suspected(state, hash, number, effects)
         }
         Event::BlockHeaderNotFound { request_id } => {
             // Reorg-safety decision (e): refuse-and-keep, no reset. Drop the request only —
@@ -1115,6 +1140,42 @@ pub(crate) fn transition_outcome(chain: ChainKey, state: State, event: Event) ->
                 },
                 vec![],
             )
+        }
+        Event::CanonicalHeaderAtHeightReceived {
+            request_id,
+            hash,
+            number,
+        } => {
+            // The authoritative canonical block at `number`. A genuinely-final anchor's block never
+            // changes, so a *different* hash at the anchor's *current* height proves the anchor was
+            // orphaned: re-init at the true block, preserving the reorg-invariant registries (only
+            // reserves re-seed). A matching hash confirms the anchor; a stale probe (the anchor
+            // advanced past `number` via a legitimate forward finalization while the probe was in
+            // flight) no-ops via the height guard. Either way the in-flight probe clears.
+            let (pending_requests, _payload) = state.pending_requests.take(&request_id);
+            let state = State {
+                pending_requests,
+                ..state
+            };
+            let orphaned =
+                number == state.blocks.graph.anchor_number() && hash != state.blocks.graph.anchor_hash();
+            if orphaned {
+                let State {
+                    pool_registry,
+                    token_registry,
+                    ..
+                } = state;
+                State::activate_from_seed(
+                    hash,
+                    number,
+                    HashMap::new(),
+                    pool_registry,
+                    token_registry,
+                    Vec::new(),
+                )
+            } else {
+                (state, vec![])
+            }
         }
         Event::BlockLogsReceived { request_id, logs } => {
             let (pending_requests, request_payload) = state.pending_requests.take(&request_id);
@@ -1762,6 +1823,17 @@ mod tests {
                     assert_eq!(pending_request.payload.to_block(), request_payload.to_block());
                     assert_eq!(pending_request.payload.covered(), request_payload.covered());
                 }
+                Effect::Request(AnyIssuedRequest::CanonicalHeader(IssuedRequest {
+                    request_id,
+                    request_payload,
+                })) => {
+                    let pending_request = state
+                        .pending_requests
+                        .get(request_id)
+                        .expect("emitted canonical-header probe must be recorded as pending");
+
+                    assert_eq!(pending_request.payload.number, request_payload.number);
+                }
             }
         }
     }
@@ -1980,6 +2052,7 @@ mod tests {
             AnyRequestId::TokenMetadata(request_id) => request_id.raw_for_test(),
             AnyRequestId::PoolData(request_id) => request_id.raw_for_test(),
             AnyRequestId::LogsRange(request_id) => request_id.raw_for_test(),
+            AnyRequestId::CanonicalHeader(request_id) => request_id.raw_for_test(),
         }
     }
 
@@ -2073,6 +2146,7 @@ mod tests {
                 Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                 Effect::Request(AnyIssuedRequest::LogsRange(_)) => {}
+                Effect::Request(AnyIssuedRequest::CanonicalHeader(_)) => {}
             }
         }
 
@@ -2160,6 +2234,7 @@ mod tests {
                 Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                 Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                 Effect::Request(AnyIssuedRequest::LogsRange(_)) => {}
+                Effect::Request(AnyIssuedRequest::CanonicalHeader(_)) => {}
             }
         }
 
@@ -2201,6 +2276,69 @@ mod tests {
             parent_hash = hash;
         }
         state
+    }
+
+    /// A distinct fork-block hash for the pending-cap tests: encodes `index` in the low bytes under a
+    /// `0xF0` prefix, so it collides with neither `with_last_byte` anchors nor other indices, and the
+    /// set can grow past 256 (unlike `with_last_byte`).
+    fn fork_block_hash(index: u64) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xF0;
+        bytes[24..].copy_from_slice(&index.to_be_bytes());
+        BlockHash::from(bytes)
+    }
+
+    /// A distinct block hash on fork `fork` at depth `block` — for the bounded-pending property test.
+    /// `0xC0` prefix keeps it clear of anchors (`with_last_byte`), absent roots (`0xAB`), and the
+    /// single-fork helper (`0xF0`); `fork`/`block` in separate byte lanes keep the whole set unique.
+    fn fork_chain_hash(fork: u64, block: u64) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xC0;
+        bytes[8..16].copy_from_slice(&fork.to_be_bytes());
+        bytes[24..32].copy_from_slice(&block.to_be_bytes());
+        BlockHash::from(bytes)
+    }
+
+    /// The never-observed parent a fork chain roots at, so the whole fork stays disconnected.
+    fn absent_fork_root(fork: u64) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xAB;
+        bytes[24..32].copy_from_slice(&fork.to_be_bytes());
+        BlockHash::from(bytes)
+    }
+
+    #[test]
+    fn per_chain_pending_cap_admits_beyond_the_legacy_flat_cap() {
+        // Base's cap is `PENDING_CAP_FORK_MARGIN × finality_depth = 8 × 200 = 1600`, above the legacy
+        // flat 1024. Feed a disconnected fork longer than 1024: every block must stay Pending (none
+        // refused), which the old flat cap would have truncated at 1024.
+        let chain = ChainKey::Base;
+        let anchor = BlockHash::with_last_byte(1);
+        // A parent that is never the anchor and never observed: the whole chain stays disconnected.
+        let absent_root = BlockHash::with_last_byte(2);
+        let mut state = empty_state_at(anchor);
+
+        let fork_len: u64 = 1_030;
+        let mut parent = absent_root;
+        for k in 0..fork_len {
+            let hash = fork_block_hash(k);
+            let (next, _effects) = transition(
+                chain,
+                state,
+                Event::HeadObserved {
+                    hash,
+                    parent_hash: parent,
+                    logs_bloom: bloom_matching_any(),
+                    number: 10_000 + k, // above the anchor; irrelevant to the cap
+                },
+            );
+            state = next;
+            parent = hash;
+        }
+
+        assert_eq!(state.pending_block_count(), fork_len as usize);
+        assert!(state.pending_block_count() > 1024);
+        assert!(state.pending_block_count() < crate::chain::max_pending_blocks(chain));
     }
 
     /// Observes `STREAM_SETTLE_DEPTH` bloom-clear padding heads above `parent_hash`, sinking the
@@ -5519,154 +5657,402 @@ mod tests {
         assert_state_invariants(&state);
     }
 
-    // A finalized block observed at the anchor's EXACT height but with a different hash is a provable
-    // finality reorg: exactly one block occupies a given height, so the anchor is orphaned. The kernel
-    // re-initializes at the new finalized block — dropping all recent-block and snapshot state that no
-    // longer descends from a valid anchor — while preserving the reorg-invariant verified registries.
+    // The orphaned-anchor finality probe ([`GetCanonicalHeaderAtHeight`]) answers with the canonical
+    // block at the anchor's height. A hash that differs from the anchor, at the anchor's *current*
+    // height, proves the anchor was orphaned: re-init at the true block, registries preserved.
     #[test]
-    fn finalized_block_observed_at_anchor_height_with_conflicting_hash_reanchors() {
-        let finalized_hash = BlockHash::with_last_byte(1);
-        let advanced_hash = BlockHash::with_last_byte(4);
-        let tip_hash = BlockHash::with_last_byte(5);
-        let fork_hash = BlockHash::with_last_byte(9);
+    fn finality_probe_with_conflicting_hash_at_anchor_height_reinitializes() {
+        let anchor = BlockHash::with_last_byte(1);
+        let true_block = BlockHash::with_last_byte(9);
         let candidate = pool_candidate_address(6);
-        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
-        let snapshot = pool_state(7);
-        let mut state = empty_state_at(finalized_hash);
+        let pool = PoolRef {
+            key: candidate,
+            chain: ChainKey::Ethereum,
+        };
 
+        let mut state = empty_state_at(anchor); // anchor number 0
         state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
             ChainKey::Ethereum,
             HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
         );
+        // A probe for the anchor's height (0) is in flight.
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetCanonicalHeaderAtHeight { number: 0 }, state.tick);
+        state.pending_requests = pending_requests;
 
-        // Advance the anchor to a genuine finalized block at height 4, folding a swap into the base.
-        let state = observe_complete_block(
-            state,
-            advanced_hash,
-            finalized_hash,
-            vec![swap_log(candidate, 0, &snapshot)],
-        );
-        let state = state_with_more_observed_heads(state, advanced_hash, &[tip_hash]);
         let (state, _effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::FinalizedBlockObserved {
-                block_hash: advanced_hash,
-                number: block_number_for(advanced_hash),
-            },
-        );
-        assert_eq!(state.blocks.graph.anchor_hash(), advanced_hash);
-        assert_eq!(state.blocks.graph.anchor_number(), 4);
-        assert!(!state.blocks.finalized_snapshot.is_empty());
-        assert!(state.blocks.graph.contains(tip_hash));
-
-        // A DIFFERENT block is now reported finalized at that same height 4: the anchor is orphaned.
-        let (state, _effects) = transition(
-            ChainKey::Ethereum,
-            state,
-            Event::FinalizedBlockObserved {
-                block_hash: fork_hash,
-                number: 4,
+            Event::CanonicalHeaderAtHeightReceived {
+                request_id,
+                hash: true_block,
+                number: 0,
             },
         );
 
         let graph = &state.blocks.graph;
-        // Re-anchored at the new finalized block, with the coupled height carried through.
-        assert_eq!(graph.anchor_hash(), fork_hash);
-        assert_eq!(graph.anchor_number(), 4);
-        assert_eq!(graph.observed_head_hash(), fork_hash);
-        // Recent-block and snapshot state tied to the orphaned fork is dropped.
+        assert_eq!(graph.anchor_hash(), true_block);
+        assert_eq!(graph.anchor_number(), 0);
         assert!(state.blocks.finalized_snapshot.is_empty());
-        assert!(!graph.contains(advanced_hash));
-        assert!(!graph.contains(tip_hash));
-        // Verified pool metadata is reorg-invariant and preserved (not re-fetched).
         assert!(
             state
                 .pool_registry
                 .verified_pools(ChainKey::Ethereum)
                 .contains(&pool)
         );
+        assert!(!state.pending_requests.has_pending_finality_probe());
         assert_state_invariants(&state);
     }
 
-    // Higher divergent fork: finality lands ABOVE the anchor, on a block we do not hold as
-    // connected, while our canonical chain carries a *different* block at that height. The
-    // generalized predicate (canonical witness at the finalized height, not just the anchor's exact
-    // height) proves the anchored chain is not final and re-anchors — the case the exact-height-only
-    // predicate missed.
+    // A probe confirming the anchor (same hash at the anchor's height) is a no-op: the anchor is
+    // genuinely final, so nothing changes and the in-flight probe simply clears.
     #[test]
-    fn finalized_block_observed_above_anchor_on_divergent_fork_reanchors() {
-        let finalized_hash = BlockHash::with_last_byte(1);
-        let a2 = BlockHash::with_last_byte(2);
-        let a3 = BlockHash::with_last_byte(3);
-        let fork_hash = BlockHash::with_last_byte(9);
-        let candidate = pool_candidate_address(6);
-        let pool = PoolRef { key: candidate, chain: ChainKey::Ethereum };
+    fn finality_probe_matching_anchor_hash_is_noop() {
+        let anchor = BlockHash::with_last_byte(1);
+        let child = BlockHash::with_last_byte(2);
+        let mut state = state_with_observed_chain(anchor, &[child]);
+        let anchor_before = state.blocks.graph.anchor_hash();
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetCanonicalHeaderAtHeight { number: 0 }, state.tick);
+        state.pending_requests = pending_requests;
 
-        // Anchor stays at genesis height 0; the canonical connected chain extends to height 3.
-        let mut state = state_with_observed_chain(finalized_hash, &[a2, a3]);
-        state.pool_registry = TrustedPoolRegistry::new().with_metadata_results(
-            ChainKey::Ethereum,
-            HashMap::from([(candidate, Ok(pool_metadata(1, 2, UniswapV3Fee::Fee3000)))]),
-        );
-        assert_eq!(state.blocks.graph.anchor_number(), 0);
-        assert!(state.blocks.graph.contains(a3));
-
-        // A DIFFERENT block is reported finalized at height 3 — above the anchor, on a fork we never
-        // held as connected. `3 > anchor_number` looks like a benign forward advance, but our
-        // canonical block at height 3 (`a3`) proves the conflict.
-        let (state, _effects) = transition(
+        let (state, effects) = transition(
             ChainKey::Ethereum,
             state,
-            Event::FinalizedBlockObserved {
-                block_hash: fork_hash,
+            Event::CanonicalHeaderAtHeightReceived {
+                request_id,
+                hash: anchor,
+                number: 0,
+            },
+        );
+
+        assert_eq!(state.blocks.graph.anchor_hash(), anchor_before);
+        assert!(state.blocks.graph.contains(child));
+        assert!(effects.is_empty());
+        assert!(!state.pending_requests.has_pending_finality_probe());
+        assert_state_invariants(&state);
+    }
+
+    // A probe whose height is no longer the anchor's — the anchor advanced via a legitimate forward
+    // finalization while the probe was in flight — is stale and no-ops via the height guard, even
+    // though the returned hash differs from the (now-advanced) anchor.
+    #[test]
+    fn finality_probe_for_stale_height_is_noop() {
+        let anchor = BlockHash::with_last_byte(1);
+        let mut state = empty_state_at(anchor); // anchor number 0
+        let (pending_requests, request_id) = state
+            .pending_requests
+            .with_new_request(GetCanonicalHeaderAtHeight { number: 5 }, state.tick);
+        state.pending_requests = pending_requests;
+
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::CanonicalHeaderAtHeightReceived {
+                request_id,
+                hash: BlockHash::with_last_byte(7),
+                number: 5,
+            },
+        );
+
+        assert_eq!(state.blocks.graph.anchor_hash(), anchor);
+        assert_eq!(state.blocks.graph.anchor_number(), 0);
+        assert!(effects.is_empty());
+        assert!(!state.pending_requests.has_pending_finality_probe());
+        assert_state_invariants(&state);
+    }
+
+    fn finality_probe_count(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    Effect::Request(AnyIssuedRequest::CanonicalHeader(_))
+                )
+            })
+            .count()
+    }
+
+    fn finality_probe_number(effects: &[Effect]) -> Option<u64> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Request(AnyIssuedRequest::CanonicalHeader(request)) => {
+                Some(request.request_payload.number)
+            }
+            _ => None,
+        })
+    }
+
+    // A disconnected block admitted at the anchor's height + 1 cannot descend from the anchor (a block
+    // whose parent is the anchor connects immediately), so its fork diverges at/below finality — the
+    // orphaned-anchor signature. Admission emits exactly one authoritative probe of the anchor height.
+    #[test]
+    fn pending_block_at_anchor_boundary_emits_one_finality_probe() {
+        let anchor = BlockHash::with_last_byte(1); // anchor number 0
+        let absent_parent = BlockHash::with_last_byte(2);
+        let fork = fork_block_hash(1);
+        let state = empty_state_at(anchor);
+
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: fork,
+                parent_hash: absent_parent,
+                logs_bloom: bloom_matching_any(),
+                number: 1, // anchor_number (0) + 1
+            },
+        );
+
+        assert!(state.blocks.graph.contains(fork));
+        assert_eq!(finality_probe_count(&effects), 1);
+        assert_eq!(finality_probe_number(&effects), Some(0));
+        assert!(state.pending_requests.has_pending_finality_probe());
+        assert_state_invariants(&state);
+    }
+
+    // A head that connects to the anchor is not pending, so no orphaning is suspected — no probe,
+    // even though its height is within the boundary.
+    #[test]
+    fn connected_forward_head_emits_no_finality_probe() {
+        let anchor = BlockHash::with_last_byte(1); // anchor number 0
+        let child = fork_block_hash(1);
+        let state = empty_state_at(anchor);
+
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: child,
+                parent_hash: anchor,
+                logs_bloom: bloom_matching_any(),
+                number: 1,
+            },
+        );
+
+        assert_eq!(finality_probe_count(&effects), 0);
+        assert!(!state.pending_requests.has_pending_finality_probe());
+        assert_state_invariants(&state);
+    }
+
+    // A pending block well above the anchor's height is a normal (shallow) reorg still backfilling —
+    // it will reconnect above the anchor — so no orphaning is suspected and no probe fires.
+    #[test]
+    fn pending_block_above_anchor_boundary_emits_no_finality_probe() {
+        let anchor = BlockHash::with_last_byte(1); // anchor number 0
+        let absent_parent = BlockHash::with_last_byte(2);
+        let high = fork_block_hash(5);
+        let state = empty_state_at(anchor);
+
+        let (state, effects) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: high,
+                parent_hash: absent_parent,
+                logs_bloom: bloom_matching_any(),
+                number: 5, // > anchor_number (0) + 1
+            },
+        );
+
+        assert!(state.blocks.graph.contains(high));
+        assert_eq!(finality_probe_count(&effects), 0);
+        assert!(!state.pending_requests.has_pending_finality_probe());
+        assert_state_invariants(&state);
+    }
+
+    // The probe is per-chain-singleton: a second boundary-pending block while one probe is in flight
+    // emits no new probe (dedup), so a fork descending toward the anchor issues one probe, not many.
+    #[test]
+    fn finality_probe_is_deduped_while_one_is_in_flight() {
+        let anchor = BlockHash::with_last_byte(1); // anchor number 0
+        let absent_parent = BlockHash::with_last_byte(2);
+        let state = empty_state_at(anchor);
+
+        let (state, first) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: fork_block_hash(1),
+                parent_hash: absent_parent,
+                logs_bloom: bloom_matching_any(),
+                number: 1,
+            },
+        );
+        assert_eq!(finality_probe_count(&first), 1);
+
+        let (state, second) = transition(
+            ChainKey::Ethereum,
+            state,
+            Event::HeadObserved {
+                hash: fork_block_hash(2),
+                parent_hash: fork_block_hash(1),
+                logs_bloom: bloom_matching_any(),
+                number: 1,
+            },
+        );
+        assert_eq!(finality_probe_count(&second), 0);
+        assert!(state.pending_requests.has_pending_finality_probe());
+        assert_state_invariants(&state);
+    }
+
+    // End-to-end wedge path: a fork diverging below finality, backfilled downward, reaches the
+    // anchor's height + 1 and trips the probe; feeding the authoritative conflicting answer re-inits
+    // and collapses the pending fork — so even the failure mode never approaches the cap.
+    #[test]
+    fn below_finality_fork_reaching_boundary_triggers_probe_then_reinit_collapses_pending() {
+        let chain = ChainKey::Ethereum;
+        let anchor = BlockHash::with_last_byte(1); // anchor number 0
+        let true_block = BlockHash::with_last_byte(9);
+        let below_anchor = BlockHash::with_last_byte(2); // f1's parent — diverges at/below finality
+        let f3 = fork_block_hash(3);
+        let f2 = fork_block_hash(2);
+        let f1 = fork_block_hash(1);
+        let state = empty_state_at(anchor);
+
+        // Descend the fork toward the anchor. Blocks above the boundary trip nothing.
+        let (state, e3) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: f3,
+                parent_hash: f2,
+                logs_bloom: bloom_matching_any(),
                 number: 3,
             },
         );
-
-        let graph = &state.blocks.graph;
-        assert_eq!(graph.anchor_hash(), fork_hash);
-        assert_eq!(graph.anchor_number(), 3);
-        assert_eq!(graph.observed_head_hash(), fork_hash);
-        assert!(state.blocks.finalized_snapshot.is_empty());
-        assert!(!graph.contains(a2));
-        assert!(!graph.contains(a3));
-        assert!(
-            state
-                .pool_registry
-                .verified_pools(ChainKey::Ethereum)
-                .contains(&pool)
+        assert_eq!(finality_probe_count(&e3), 0);
+        let (state, e2) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: f2,
+                parent_hash: f1,
+                logs_bloom: bloom_matching_any(),
+                number: 2,
+            },
         );
+        assert_eq!(finality_probe_count(&e2), 0);
+
+        // The block at anchor_number + 1 = 1 cannot descend from the anchor: the probe fires once.
+        let (state, e1) = transition(
+            chain,
+            state,
+            Event::HeadObserved {
+                hash: f1,
+                parent_hash: below_anchor,
+                logs_bloom: bloom_matching_any(),
+                number: 1,
+            },
+        );
+        assert_eq!(finality_probe_count(&e1), 1);
+        assert_eq!(finality_probe_number(&e1), Some(0));
+        let probe_request_id = e1
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Request(AnyIssuedRequest::CanonicalHeader(request)) => {
+                    Some(request.request_id)
+                }
+                _ => None,
+            })
+            .expect("the boundary admission emits a probe");
+
+        // The descent held a bounded pending set, never near the cap.
+        assert_eq!(state.pending_block_count(), 3);
+        assert!(state.pending_block_count() < crate::chain::max_pending_blocks(chain));
+
+        // The authoritative answer conflicts with the anchor → re-init collapses the fork.
+        let (state, _effects) = transition(
+            chain,
+            state,
+            Event::CanonicalHeaderAtHeightReceived {
+                request_id: probe_request_id,
+                hash: true_block,
+                number: 0,
+            },
+        );
+        assert_eq!(state.blocks.graph.anchor_hash(), true_block);
+        assert_eq!(state.blocks.graph.anchor_number(), 0);
+        assert_eq!(state.pending_block_count(), 0);
         assert_state_invariants(&state);
     }
 
-    // A finalized block above the anchor that we do NOT yet hold as connected (no canonical witness
-    // at its height) is the benign not-yet-backfilled case: no conflict, the normal finalized_to
-    // path no-ops and the kernel waits for backfill rather than re-anchoring.
-    #[test]
-    fn finalized_block_observed_above_anchor_without_canonical_witness_is_noop() {
-        let finalized_hash = BlockHash::with_last_byte(1);
-        let a2 = BlockHash::with_last_byte(2);
-        let future_hash = BlockHash::with_last_byte(7);
+    proptest! {
+        /// Bound proof: under normal conditions — up to `MAX_SIMULTANEOUS_FORKS` competing forks,
+        /// each no deeper than the chain's finality depth, all diverging ABOVE the anchor (numbered
+        /// past the boundary so none trip the orphan probe) — the pending staging area never reaches
+        /// the per-chain cap and no admission is refused. Encodes
+        /// `simultaneous_forks ≤ F ∧ cap > F × finality_depth ⇒ no cap hit`.
+        #[test]
+        fn pending_stays_below_cap_for_simultaneous_shallow_forks(
+            fork_depths in prop::collection::vec(
+                1usize..=crate::chain::approx_finalized_block_age(ChainKey::Ethereum),
+                1..=crate::chain::MAX_SIMULTANEOUS_FORKS,
+            ),
+        ) {
+            let chain = ChainKey::Ethereum;
+            let finality_depth = crate::chain::approx_finalized_block_age(chain);
+            let cap = crate::chain::max_pending_blocks(chain);
+            let anchor = BlockHash::with_last_byte(1); // anchor number 0
 
-        // Canonical chain reaches only height 2; nothing is held at height 7.
-        let state = state_with_observed_chain(finalized_hash, &[a2]);
-        let anchor_before = state.blocks.graph.anchor_hash();
+            // One descending chain per fork, each rooted at an absent parent so it stays
+            // disconnected; every block numbered well above `anchor_number + 1` so the orphan probe
+            // never fires (shallow reorgs still backfilling, not below-finality divergences).
+            let forks: Vec<Vec<(BlockHash, BlockHash)>> = fork_depths
+                .iter()
+                .enumerate()
+                .map(|(fork, &depth)| {
+                    let mut parent = absent_fork_root(fork as u64);
+                    (0..depth)
+                        .map(|block| {
+                            let hash = fork_chain_hash(fork as u64, block as u64);
+                            let edge = (hash, parent);
+                            parent = hash;
+                            edge
+                        })
+                        .collect()
+                })
+                .collect();
 
-        let (state, _effects) = transition(
-            ChainKey::Ethereum,
-            state,
-            Event::FinalizedBlockObserved {
-                block_hash: future_hash,
-                number: 7,
-            },
-        );
+            // Round-robin interleave (concurrent fork growth) — every block stays disconnected
+            // regardless of order, so this only varies the admission sequence.
+            let max_depth = fork_depths.iter().copied().max().unwrap_or(0);
+            let mut feed: Vec<(BlockHash, BlockHash)> = Vec::new();
+            for block in 0..max_depth {
+                for fork in &forks {
+                    if let Some(edge) = fork.get(block) {
+                        feed.push(*edge);
+                    }
+                }
+            }
 
-        let graph = &state.blocks.graph;
-        // No re-anchor: the anchor is unchanged and the connected chain is intact.
-        assert_eq!(graph.anchor_hash(), anchor_before);
-        assert!(graph.contains(a2));
-        assert_state_invariants(&state);
+            let total = feed.len();
+            prop_assert!(total <= crate::chain::MAX_SIMULTANEOUS_FORKS * finality_depth);
+
+            let mut state = empty_state_at(anchor);
+            for (hash, parent) in &feed {
+                let (next, _effects) = transition(
+                    chain,
+                    state,
+                    Event::HeadObserved {
+                        hash: *hash,
+                        parent_hash: *parent,
+                        logs_bloom: bloom_matching_any(),
+                        number: 1_000, // > anchor_number + 1
+                    },
+                );
+                state = next;
+                prop_assert!(state.pending_block_count() < cap);
+            }
+
+            // No admission was refused: every fork block is present, and all are still pending.
+            for (hash, _parent) in &feed {
+                prop_assert!(state.blocks.graph.contains(*hash));
+            }
+            prop_assert_eq!(state.pending_block_count(), total);
+        }
     }
 
     // Compacts to the newest complete prefix when the observed finalized target's path still has
@@ -7830,6 +8216,7 @@ mod tests {
                     Effect::Request(AnyIssuedRequest::TokenMetadata(_)) => {}
                     Effect::Request(AnyIssuedRequest::PoolData(_)) => {}
                     Effect::Request(AnyIssuedRequest::LogsRange(_)) => {}
+                    Effect::Request(AnyIssuedRequest::CanonicalHeader(_)) => {}
                 }
             }
 

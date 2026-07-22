@@ -104,6 +104,20 @@ pub(crate) fn build_finalized_block_header_request(request_id: u64) -> Value {
     })
 }
 
+/// Reads the canonical block header at an explicit height (`eth_getBlockByNumber` with a numeric
+/// tag) — the orphaned-anchor probe. Unlike the `"finalized"` tag form above, this asks "what block
+/// is canonical at exactly this height", the question the detector needs to compare against its
+/// anchor. The response is decoded by [`parse_block_header_response_by_id`] (no expected hash: the
+/// point is to learn whatever hash the height resolves to).
+pub(crate) fn build_block_header_by_number_request(request_id: u64, number: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "eth_getBlockByNumber",
+        "params": [format!("0x{number:x}"), false]
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_unsubscribe_request(request_id: u64, subscription_id: &str) -> Value {
     json!({

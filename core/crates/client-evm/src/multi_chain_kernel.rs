@@ -97,7 +97,6 @@ const fn nonzero_stride(value: usize) -> NonZeroUsize {
     }
 }
 
-const ETHEREUM_APPROX_FINALIZED_BLOCK_AGE: usize = 64;
 const ETHEREUM_FINALIZED_RETENTION_MARGIN: usize = 8;
 const ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(8);
 
@@ -110,7 +109,6 @@ const ETHEREUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // finality, so its block-denominated retention/look-back windows are larger than Ethereum's. These
 // values do not affect runtime while Arbitrum is absent from `ACTIVE_CHAINS`; they are starting points
 // for the activation chunk.
-const ARBITRUM_APPROX_FINALIZED_BLOCK_AGE: usize = 1_000;
 const ARBITRUM_FINALIZED_RETENTION_MARGIN: usize = 64;
 const ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(32);
 
@@ -123,13 +121,11 @@ const ARBITRUM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 // blocks): the unsafe sequencer head can reorg shallowly while true finality follows L1, so the
 // block-denominated window is moderate. Values anchored to block time × an Ethereum-comparable reorg
 // depth; revisit against observed reorg depth.
-const BASE_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
 const BASE_FINALIZED_RETENTION_MARGIN: usize = 32;
 const BASE_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const BASE_BOOTSTRAP_TIP_TRIM: usize = 8;
 const BASE_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
-const OPTIMISM_APPROX_FINALIZED_BLOCK_AGE: usize = 200;
 const OPTIMISM_FINALIZED_RETENTION_MARGIN: usize = 32;
 const OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const OPTIMISM_BOOTSTRAP_TIP_TRIM: usize = 8;
@@ -137,21 +133,18 @@ const OPTIMISM_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — Polygon PoS (~2s blocks) has historically the deepest probabilistic reorgs of this
 // set, so its retention/look-back windows are the largest.
-const POLYGON_APPROX_FINALIZED_BLOCK_AGE: usize = 400;
 const POLYGON_FINALIZED_RETENTION_MARGIN: usize = 64;
 const POLYGON_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(32);
 const POLYGON_BOOTSTRAP_TIP_TRIM: usize = 16;
 const POLYGON_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — BNB Chain (~3s blocks) has fast finality with occasional short reorgs.
-const BNB_APPROX_FINALIZED_BLOCK_AGE: usize = 150;
 const BNB_FINALIZED_RETENTION_MARGIN: usize = 32;
 const BNB_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(16);
 const BNB_BOOTSTRAP_TIP_TRIM: usize = 12;
 const BNB_BOOTSTRAP_DEADLINE_TICKS: u64 = 180;
 
 // PROVISIONAL — Avalanche C-Chain (~2s blocks) has near-instant finality, so the smallest window.
-const AVALANCHE_APPROX_FINALIZED_BLOCK_AGE: usize = 80;
 const AVALANCHE_FINALIZED_RETENTION_MARGIN: usize = 16;
 const AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE: NonZeroUsize = nonzero_stride(8);
 const AVALANCHE_BOOTSTRAP_TIP_TRIM: usize = 6;
@@ -1116,33 +1109,36 @@ fn tick(mut state: State) -> (State, Vec<Effect>) {
 }
 
 fn finalized_refresh_policy(chain: ChainKey) -> FinalizedRefreshPolicy {
+    // Look-back window = the chain's finality depth (single source of truth in `chain.rs`) plus a
+    // per-chain retention margin so a finalized block stays in the window long enough to prune on.
+    let finality_depth = crate::chain::approx_finalized_block_age(chain);
     match chain {
         ChainKey::Ethereum => FinalizedRefreshPolicy {
-            target_len: ETHEREUM_APPROX_FINALIZED_BLOCK_AGE + ETHEREUM_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + ETHEREUM_FINALIZED_RETENTION_MARGIN,
             retry_stride: ETHEREUM_FINALIZED_REFRESH_RETRY_STRIDE,
         },
         ChainKey::Arbitrum => FinalizedRefreshPolicy {
-            target_len: ARBITRUM_APPROX_FINALIZED_BLOCK_AGE + ARBITRUM_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + ARBITRUM_FINALIZED_RETENTION_MARGIN,
             retry_stride: ARBITRUM_FINALIZED_REFRESH_RETRY_STRIDE,
         },
         ChainKey::Base => FinalizedRefreshPolicy {
-            target_len: BASE_APPROX_FINALIZED_BLOCK_AGE + BASE_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + BASE_FINALIZED_RETENTION_MARGIN,
             retry_stride: BASE_FINALIZED_REFRESH_RETRY_STRIDE,
         },
         ChainKey::Optimism => FinalizedRefreshPolicy {
-            target_len: OPTIMISM_APPROX_FINALIZED_BLOCK_AGE + OPTIMISM_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + OPTIMISM_FINALIZED_RETENTION_MARGIN,
             retry_stride: OPTIMISM_FINALIZED_REFRESH_RETRY_STRIDE,
         },
         ChainKey::Polygon => FinalizedRefreshPolicy {
-            target_len: POLYGON_APPROX_FINALIZED_BLOCK_AGE + POLYGON_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + POLYGON_FINALIZED_RETENTION_MARGIN,
             retry_stride: POLYGON_FINALIZED_REFRESH_RETRY_STRIDE,
         },
         ChainKey::Bnb => FinalizedRefreshPolicy {
-            target_len: BNB_APPROX_FINALIZED_BLOCK_AGE + BNB_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + BNB_FINALIZED_RETENTION_MARGIN,
             retry_stride: BNB_FINALIZED_REFRESH_RETRY_STRIDE,
         },
         ChainKey::Avalanche => FinalizedRefreshPolicy {
-            target_len: AVALANCHE_APPROX_FINALIZED_BLOCK_AGE + AVALANCHE_FINALIZED_RETENTION_MARGIN,
+            target_len: finality_depth + AVALANCHE_FINALIZED_RETENTION_MARGIN,
             retry_stride: AVALANCHE_FINALIZED_REFRESH_RETRY_STRIDE,
         },
     }

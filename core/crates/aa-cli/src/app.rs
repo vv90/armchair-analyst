@@ -15,7 +15,8 @@ use client_evm::{
     POLYGON_USDT_TOKEN_ADDRESS, POLYGON_WBTC_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS,
     POOL_LOG_BATCH_WINDOW, PoolDataResult, PoolLog, PoolMetadata, PoolMetadataResult, PoolRef,
     ProtocolPoolKey, RangeLogBlock, RequestId, TokenAddress, TokenMetadataResult, TokenWhitelist,
-    WsSubscriptionEndpoint, bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
+    WsSubscriptionEndpoint, bootstrap, consolidate_pool_logs, fetch_block_header,
+    fetch_canonical_block_header_at, fetch_block_logs,
     fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
     fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
     kernel,
@@ -790,6 +791,14 @@ fn format_chain_event_log(chain: ChainKey, event: &kernel::Event) -> String {
             "input chain={chain:?} block_header_not_found request={}",
             format_typed_request_id_log(request_id),
         ),
+        kernel::Event::CanonicalHeaderAtHeightReceived {
+            request_id,
+            hash,
+            number,
+        } => format!(
+            "input chain={chain:?} canonical_header_at_height_received request={} hash={hash} number={number}",
+            format_typed_request_id_log(request_id),
+        ),
         kernel::Event::BlockLogsReceived { request_id, logs } => format!(
             "input chain={chain:?} block_logs_received request={} pools={}",
             format_typed_request_id_log(request_id),
@@ -1007,6 +1016,7 @@ impl ClientEvmRuntime {
             // it is read live with no cache wrapper.
             |at, pools| fetch_pool_data(&self.agent, self.endpoints(), chain, at, pools),
             |from, to| fetch_pool_logs_in_range(&self.agent, self.endpoints(), chain, from, to),
+            |number| fetch_canonical_block_header_at(&self.agent, self.endpoints(), chain, number),
         )
     }
 }
@@ -1286,6 +1296,7 @@ fn execute_chain_effect_with<
     FetchTokenMetadata,
     FetchPoolData,
     FetchLogsRange,
+    FetchCanonicalHeader,
 >(
     chain: ChainKey,
     effect: kernel::Effect,
@@ -1296,9 +1307,11 @@ fn execute_chain_effect_with<
     fetch_token_metadata: FetchTokenMetadata,
     fetch_pool_data: FetchPoolData,
     fetch_logs_range: FetchLogsRange,
+    fetch_canonical_header: FetchCanonicalHeader,
 ) -> Vec<Event>
 where
     FetchBlockHeader: FnOnce(BlockHash) -> Result<Option<ClientHead>, ClientEvmError>,
+    FetchCanonicalHeader: FnOnce(u64) -> Result<Option<ClientHead>, ClientEvmError>,
     FetchBlockLogs: FnOnce(BlockHash) -> Result<Vec<PoolLog>, ClientEvmError>,
     FetchPoolMetadata:
         FnOnce(
@@ -1481,6 +1494,33 @@ where
                     }
                 }
             }
+            AnyIssuedRequest::CanonicalHeader(request) => {
+                let request_id = request.request_id;
+                let number = request.request_payload.number;
+
+                match fetch_canonical_header(number) {
+                    Ok(Some(header)) => vec![Event::ChainEvent {
+                        chain,
+                        event: kernel::Event::CanonicalHeaderAtHeightReceived {
+                            request_id,
+                            hash: header.inner.hash,
+                            number: header.inner.inner.number,
+                        },
+                    }],
+                    // The height is not yet available on the answering endpoint: retry (the anchor's
+                    // height is below the tip, so this is transient provider lag, not a real absence).
+                    Ok(None) | Err(_) => {
+                        let request_id = AnyRequestId::CanonicalHeader(request_id);
+                        logger.log(&format!(
+                            "error chain={chain:?} request_failed request={request_id:?} finality_probe number={number}"
+                        ));
+                        vec![Event::ChainEvent {
+                            chain,
+                            event: kernel::Event::RequestFailed { request_id },
+                        }]
+                    }
+                }
+            }
         },
     }
 }
@@ -1488,8 +1528,8 @@ where
 #[cfg(test)]
 mod tests {
     use client_evm::{
-        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetLogsRange, GetPoolData,
-        GetPoolMetadata, GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
+        Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetCanonicalHeaderAtHeight, GetLogsRange,
+        GetPoolData, GetPoolMetadata, GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
         PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
         TokenMetadataResult, UniswapV3Fee,
     };
@@ -2549,6 +2589,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2590,6 +2631,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2623,6 +2665,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2656,6 +2699,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2695,6 +2739,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2731,6 +2776,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2772,6 +2818,7 @@ mod tests {
             unexpected_token_metadata_fetch,
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2808,6 +2855,7 @@ mod tests {
             },
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2849,6 +2897,7 @@ mod tests {
             },
             unexpected_pool_data_fetch,
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -2860,6 +2909,79 @@ mod tests {
                         request_id: client_evm::AnyRequestId::TokenMetadata(request_id),
                     },
             }] if *event_chain == chain && *request_id == expected_request_id
+        ));
+    }
+
+    #[test]
+    fn canonical_header_probe_success_maps_to_chain_event() -> Result<(), serde_json::Error> {
+        let chain = ChainKey::Ethereum;
+        let probed_hash = hash(2);
+        let request_id = RequestId::<GetCanonicalHeaderAtHeight>::from_raw_for_test(12);
+        let effect = kernel::Effect::Request(AnyIssuedRequest::CanonicalHeader(IssuedRequest {
+            request_id,
+            request_payload: GetCanonicalHeaderAtHeight { number: 9 },
+        }));
+        let header = block_header(probed_hash, hash(4))?; // header number is 0x9 = 9
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
+            |number| {
+                assert_eq!(number, 9);
+                Ok(Some(header))
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                chain: event_chain,
+                event:
+                    kernel::Event::CanonicalHeaderAtHeightReceived {
+                        hash: event_hash,
+                        number: event_number,
+                        ..
+                    },
+            }] if *event_chain == chain && *event_hash == probed_hash && *event_number == 9
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_header_probe_absent_maps_to_request_failed() {
+        let chain = ChainKey::Ethereum;
+        let request_id = RequestId::<GetCanonicalHeaderAtHeight>::from_raw_for_test(13);
+        let effect = kernel::Effect::Request(AnyIssuedRequest::CanonicalHeader(IssuedRequest {
+            request_id,
+            request_payload: GetCanonicalHeaderAtHeight { number: 42 },
+        }));
+
+        let events = execute_chain_effect_with(
+            chain,
+            effect,
+            &Logger::sink(),
+            unexpected_block_header_fetch,
+            unexpected_block_logs_fetch,
+            unexpected_pool_metadata_fetch,
+            unexpected_token_metadata_fetch,
+            unexpected_pool_data_fetch,
+            unexpected_logs_range_fetch,
+            |_number| Ok(None),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChainEvent {
+                event: kernel::Event::RequestFailed { .. },
+                ..
+            }]
         ));
     }
 
@@ -2989,6 +3111,7 @@ mod tests {
                     logs: Vec::new(),
                 }])
             },
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -3027,6 +3150,7 @@ mod tests {
                     reason: "bad config".to_owned(),
                 })
             },
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -3062,6 +3186,7 @@ mod tests {
                 Ok(HashMap::new())
             },
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -3103,6 +3228,7 @@ mod tests {
                 })
             },
             unexpected_logs_range_fetch,
+            unexpected_canonical_header_fetch,
         );
 
         assert!(matches!(
@@ -3153,6 +3279,12 @@ mod tests {
         _to: u64,
     ) -> Result<Vec<RangeLogBlock>, ClientEvmError> {
         panic!("ranged logs fetch must not be called")
+    }
+
+    fn unexpected_canonical_header_fetch(
+        _number: u64,
+    ) -> Result<Option<ClientHead>, ClientEvmError> {
+        panic!("canonical-header probe must not be called")
     }
 
     fn pool_candidate_address(last_byte: u8) -> ProtocolPoolKey {
