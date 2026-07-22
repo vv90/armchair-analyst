@@ -1,0 +1,18 @@
+[package]
+name = "aa-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+client-evm = { path = "../client-evm" }
+aa-framework = { path = "../aa-framework" }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
+
+[dev-dependencies]
+client-evm = { path = "../client-evm", features = ["test-support"] }
+
+[lints]
+workspace = true

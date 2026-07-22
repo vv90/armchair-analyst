@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/aa-cli",
     "crates/aa-framework",
+    "crates/aa-server",
     "crates/aa-kernel",
     "crates/aa-token-vetting",
     "crates/client-evm",

@@ -204,51 +204,75 @@ impl State {
 
     /// Looks up verified pool metadata without exposing registry internals.
     /// Added so projections can refuse incomplete data while keeping validation ownership inside the kernel registry.
-    pub(crate) fn verified_pool_metadata(&self, pool: PoolRef) -> Option<&PoolMetadata> {
+    pub fn verified_pool_metadata(&self, pool: PoolRef) -> Option<&PoolMetadata> {
         self.pool_registry.verified_metadata(pool)
     }
 
     /// Looks up verified token metadata without exposing registry internals.
     /// Added so projections can scale raw on-chain amounts only after token decimals have been validated.
-    pub(crate) fn verified_token_metadata(&self, token: TokenAddress) -> Option<&TokenMetadata> {
+    pub fn verified_token_metadata(&self, token: TokenAddress) -> Option<&TokenMetadata> {
         self.token_registry.verified_metadata(token)
     }
 
     /// Counts pools the registry has verified.
     /// Added so read models can surface tracked-pool progress without reaching into the registry.
-    pub(crate) fn verified_pool_count(&self) -> usize {
+    pub fn verified_pool_count(&self) -> usize {
         self.pool_registry.verified_size()
     }
 
     /// Counts RPC requests currently in flight: dispatched but not yet answered.
     /// Added so read models can surface per-chain fetch backlog without reaching into the request store.
-    pub(crate) fn in_flight_request_count(&self) -> usize {
+    pub fn in_flight_request_count(&self) -> usize {
         self.pending_requests.len()
     }
 
     /// Cumulative streamed-vs-authoritative log divergences (see the `ws_miss_count` field) for
     /// the per-chain gauge: `ws_miss=0` means the WS feeds have never been caught wrong.
-    pub(crate) fn ws_miss_count(&self) -> u64 {
+    pub fn ws_miss_count(&self) -> u64 {
         self.ws_miss_count
     }
 
-    /// The production optimization read: the blocks graph's best-effort fold over its finalized
-    /// base ([`blocks_graph::BlocksGraph::optimization_pool_states`]), reading `Streamed` as well
-    /// as `Complete` logs so the optimizer runs on the freshest state rather than stalling on the
-    /// last fully-verified block. Total: an unconnected or unfoldable head yields an empty overlay
-    /// at the anchor (the finalized state — never stale, at worst behind). The returned
-    /// `block_hash` is the fold frontier, the height the reserves are valid at; the dispatch gate
-    /// and progress reporting key on it as they did on the legacy complete-block hash.
-    pub(crate) fn optimization_update(&self, chain: ChainKey) -> OptimizationStateUpdate {
+    /// The finalized anchor — the immutable base of the graph (invariant A1) — as `(hash, number)`.
+    /// The finality boundary a slice/quote response labels itself with; also the height the
+    /// orphaned-anchor probe reads.
+    pub fn finalized_head(&self) -> (BlockHash, u64) {
+        (
+            self.blocks.graph.anchor_hash(),
+            self.blocks.graph.anchor_number(),
+        )
+    }
+
+    /// The observed canonical tip (the latest head admitted from the feed). The block a slice is
+    /// coherent at; it may run ahead of the fold frontier ([`Self::projected_pool_states`]).
+    pub fn canonical_head(&self) -> BlockHash {
+        self.blocks.graph.observed_head_hash()
+    }
+
+    /// The projected per-pool state overlay at the current fold frontier, folded over the finalized
+    /// base ([`blocks_graph::BlocksGraph::projected_pool_states`]), reading `Streamed` as well as
+    /// `Complete` logs so consumers see the freshest state rather than stalling on the last
+    /// fully-verified block. Returns the overlay and the fold-frontier `BlockHash` it is valid at.
+    /// Total: an unconnected or unfoldable head yields an empty overlay at the anchor (the finalized
+    /// state — never stale, at worst behind). The neutral read shared by the serving surface and the
+    /// optimizer dispatch ([`Self::optimization_update`]).
+    pub fn projected_pool_states(
+        &self,
+        chain: ChainKey,
+    ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
         let v4_manager = uniswap_v4::pool_manager_address(chain);
         // Hand the fold the verified tracked set so it watches — and can absolute-seed — pools
         // discovered after bootstrap (the graph is registry-free; identity comes from here).
         let verified = self.pool_registry.verified_pools(chain);
-        let (pool_states, block_hash) = self.blocks.graph.optimization_pool_states(
-            &self.blocks.finalized_snapshot,
-            &verified,
-            v4_manager,
-        );
+        self.blocks
+            .graph
+            .projected_pool_states(&self.blocks.finalized_snapshot, &verified, v4_manager)
+    }
+
+    /// The optimizer dispatch view over [`Self::projected_pool_states`]: the same overlay + frontier
+    /// wrapped in [`OptimizationStateUpdate`]. The dispatch gate and progress reporting key on the
+    /// frontier `block_hash` as they did on the legacy complete-block hash.
+    pub(crate) fn optimization_update(&self, chain: ChainKey) -> OptimizationStateUpdate {
+        let (pool_states, block_hash) = self.projected_pool_states(chain);
         OptimizationStateUpdate {
             block_hash,
             pool_states,
@@ -256,22 +280,22 @@ impl State {
     }
 
     /// [`Self::optimization_update`]'s `block_hash` without the fold: the current optimization
-    /// frontier ([`blocks_graph::BlocksGraph::optimization_frontier`]). The differential surface
+    /// frontier ([`blocks_graph::BlocksGraph::projected_frontier`]). The differential surface
     /// pinning the dispatch gate — the invariant tests hold it equal to the full read's frontier
     /// and to [`Self::optimization_update_if_changed`]'s verdict.
     #[cfg(test)]
-    pub(crate) fn optimization_frontier(&self, chain: ChainKey) -> BlockHash {
+    pub(crate) fn projected_frontier(&self, chain: ChainKey) -> BlockHash {
         let v4_manager = uniswap_v4::pool_manager_address(chain);
         let verified = self.pool_registry.verified_pools(chain);
         self.blocks
             .graph
-            .optimization_frontier(&verified, v4_manager)
+            .projected_frontier(&verified, v4_manager)
     }
 
     /// The production dispatch read: [`Self::optimization_update`] gated on its own frontier —
     /// `None` when the frontier still equals `last_dispatched` (the fold would be discarded),
     /// the full update otherwise, from a single frontier walk
-    /// ([`blocks_graph::BlocksGraph::optimization_pool_states_if_changed`]).
+    /// ([`blocks_graph::BlocksGraph::projected_pool_states_if_changed`]).
     pub(crate) fn optimization_update_if_changed(
         &self,
         chain: ChainKey,
@@ -279,7 +303,7 @@ impl State {
     ) -> Option<OptimizationStateUpdate> {
         let v4_manager = uniswap_v4::pool_manager_address(chain);
         let verified = self.pool_registry.verified_pools(chain);
-        let (pool_states, block_hash) = self.blocks.graph.optimization_pool_states_if_changed(
+        let (pool_states, block_hash) = self.blocks.graph.projected_pool_states_if_changed(
             &self.blocks.finalized_snapshot,
             &verified,
             v4_manager,
@@ -334,7 +358,7 @@ impl State {
     /// pool-state overlay; `None` mirrors a reference that is off the tip's connected path.
     /// The reference is the optimization frontier, so the
     /// walk and the frontier now live in the same graph.
-    pub(crate) fn blocks_behind(&self, reference_hash: BlockHash) -> Option<usize> {
+    pub fn blocks_behind(&self, reference_hash: BlockHash) -> Option<usize> {
         self.blocks.graph.distance_from_head(reference_hash)
     }
 
@@ -361,7 +385,7 @@ impl State {
     /// Measures the connected canonical path length from the finalized anchor to the current tip.
     /// Added so wrappers can trigger finalized-header refreshes from graph distance without inspecting graph internals.
     /// The graph anchor IS the finalized boundary (invariant A1).
-    pub(crate) fn canonical_path_len_from_finalized(&self) -> Option<usize> {
+    pub fn canonical_path_len_from_finalized(&self) -> Option<usize> {
         let graph = &self.blocks.graph;
         graph.distance_from_head(graph.anchor_hash())
     }
@@ -1638,9 +1662,9 @@ mod tests {
         // pinning that chain covers every state these tests can reach.
         let update = state.optimization_update(ChainKey::Ethereum);
         assert_eq!(
-            state.optimization_frontier(ChainKey::Ethereum),
+            state.projected_frontier(ChainKey::Ethereum),
             update.block_hash,
-            "optimization_frontier must equal the full fold's frontier"
+            "projected_frontier must equal the full fold's frontier"
         );
         // The one-walk gated read (the production dispatch path) must gate exactly on that
         // frontier: hold when it was the last dispatched block, open with the full fold's
@@ -1993,6 +2017,48 @@ mod tests {
         assert_empty_initial_state_at(&state, finalized_hash);
         assert!(state.blocks.finalized_snapshot.is_empty());
         assert_eq!(state.tick.raw_for_test(), Tick::initial().raw_for_test());
+    }
+
+    #[test]
+    fn finalized_head_and_canonical_head_reflect_the_init_anchor() {
+        let anchor = BlockHash::with_last_byte(1);
+        let state = State::init(anchor, 100);
+
+        assert_eq!(state.finalized_head(), (anchor, 100));
+        // On empty init the observed head starts at the anchor (no head seen yet).
+        assert_eq!(state.canonical_head(), anchor);
+    }
+
+    #[test]
+    fn projected_pool_states_on_empty_init_is_an_empty_overlay_at_the_anchor() {
+        let anchor = BlockHash::with_last_byte(1);
+        let state = State::init(anchor, 100);
+
+        let (overlay, frontier) = state.projected_pool_states(ChainKey::Ethereum);
+
+        assert!(overlay.is_empty());
+        assert_eq!(frontier, anchor);
+    }
+
+    #[test]
+    fn canonical_head_advances_with_observed_heads_while_finalized_head_holds() {
+        let anchor = BlockHash::with_last_byte(1);
+        let head = BlockHash::with_last_byte(2);
+
+        let (state, _) = transition(
+            ChainKey::Ethereum,
+            State::init(anchor, 100),
+            Event::HeadObserved {
+                number: 101,
+                logs_bloom: bloom_matching_any(),
+                hash: head,
+                parent_hash: anchor,
+            },
+        );
+
+        assert_eq!(state.canonical_head(), head);
+        // A head observation never moves the finalized anchor.
+        assert_eq!(state.finalized_head(), (anchor, 100));
     }
 
     /// Issues an expected request through PendingRequests.

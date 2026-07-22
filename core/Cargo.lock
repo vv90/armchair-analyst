@@ -33,6 +33,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aa-server"
+version = "0.1.0"
+dependencies = [
+ "aa-framework",
+ "client-evm",
+ "rustls",
+ "ureq 3.3.0",
+]
+
+[[package]]
 name = "aa-token-vetting"
 version = "0.1.0"
 dependencies = [

@@ -900,7 +900,7 @@ impl BlocksGraph {
     /// The per-pool **overlay** of the canonical path `anchor → target` folded over `base`: only pools
     /// whose state actually changes on the path appear; an untouched pool is absent and the caller
     /// reads `base` for it. The single fold engine — see [`folded_pool_states`] for the full-snapshot
-    /// wrapper and [`optimization_pool_states`] for the overlay consumer.
+    /// wrapper and [`projected_pool_states`] for the overlay consumer.
     ///
     /// Single pass: walk the path once ([`connected_path_data`], oldest→newest) and bucket each
     /// **readable** log's `&PoolLogEvent` by its [`ProtocolPoolKey`] — buckets borrow, nothing is
@@ -1027,7 +1027,7 @@ impl BlocksGraph {
     ///
     /// The production optimization read, called by `State::optimization_update`.
     /// `v4_manager` is the chain's v4 PoolManager address (`None` when the chain deploys none), used for v4 bloom-touch checks.
-    pub(crate) fn optimization_pool_states(
+    pub(crate) fn projected_pool_states(
         &self,
         base: &HashMap<PoolRef, PoolState>,
         verified: &HashSet<PoolRef>,
@@ -1035,7 +1035,7 @@ impl BlocksGraph {
     ) -> (HashMap<PoolRef, PoolState>, BlockHash) {
         // A pending/absent/anchor head has no foldable suffix: the overlay is empty and the
         // reserves are valid at the anchor (matching the empty-walk behavior downstream).
-        let Some(frontier) = self.optimization_fold_frontier(verified, v4_manager) else {
+        let Some(frontier) = self.projected_fold_frontier(verified, v4_manager) else {
             return (HashMap::new(), self.anchor.hash);
         };
         let frontier_hash = frontier.0;
@@ -1049,7 +1049,7 @@ impl BlocksGraph {
     /// frontier/overlay pair (connected head → watched set → `AllowStreamed` frontier walk), so
     /// the frontier-only gate and the full fold cannot diverge. `None` when `observed_head` is
     /// the anchor, `Pending`, or absent (no foldable suffix; both consumers read the anchor).
-    fn optimization_fold_frontier(
+    fn projected_fold_frontier(
         &self,
         verified: &HashSet<PoolRef>,
         v4_manager: Option<Address>,
@@ -1059,35 +1059,35 @@ impl BlocksGraph {
         Some(self.foldable_frontier(head, &watched, Authority::AllowStreamed))
     }
 
-    /// The optimization frontier hash alone — [`optimization_pool_states`]'s `BlockHash` without
+    /// The optimization frontier hash alone — [`projected_pool_states`]'s `BlockHash` without
     /// the fold. The differential surface pinning the dispatch gate: the kernel invariant tests
     /// hold it equal to the full read's frontier and to the one-walk gated read's verdict
-    /// ([`optimization_pool_states_if_changed`], the production dispatch path).
+    /// ([`projected_pool_states_if_changed`], the production dispatch path).
     #[cfg(test)]
-    pub(crate) fn optimization_frontier(
+    pub(crate) fn projected_frontier(
         &self,
         verified: &HashSet<PoolRef>,
         v4_manager: Option<Address>,
     ) -> BlockHash {
-        self.optimization_fold_frontier(verified, v4_manager)
+        self.projected_fold_frontier(verified, v4_manager)
             .map(|ConnectedHash(hash)| hash)
             .unwrap_or(self.anchor.hash)
     }
 
-    /// The one-walk dispatch read: [`optimization_pool_states`] gated on its own frontier —
+    /// The one-walk dispatch read: [`projected_pool_states`] gated on its own frontier —
     /// `None` when the frontier still equals `last_dispatched` (the fold's result would be
     /// discarded: most log deliveries and scheduler-progressing responses), the folded overlay
     /// and frontier otherwise. One frontier walk decides the gate *and* feeds the fold, so the
     /// dispatch path never walks the canonical chain twice; the differential pins hold it equal
-    /// to gating on [`optimization_frontier`] and folding separately.
-    pub(crate) fn optimization_pool_states_if_changed(
+    /// to gating on [`projected_frontier`] and folding separately.
+    pub(crate) fn projected_pool_states_if_changed(
         &self,
         base: &HashMap<PoolRef, PoolState>,
         verified: &HashSet<PoolRef>,
         v4_manager: Option<Address>,
         last_dispatched: Option<BlockHash>,
     ) -> Option<(HashMap<PoolRef, PoolState>, BlockHash)> {
-        let frontier = self.optimization_fold_frontier(verified, v4_manager);
+        let frontier = self.projected_fold_frontier(verified, v4_manager);
         let frontier_hash = frontier
             .as_ref()
             .map(|ConnectedHash(hash)| *hash)
@@ -3386,7 +3386,7 @@ mod tests {
             (Some(hit_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph_hash(3));
         assert_graph_invariants(&graph);
@@ -3403,7 +3403,7 @@ mod tests {
             (Some(clear_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph_hash(4));
         assert_graph_invariants(&graph);
@@ -3419,7 +3419,7 @@ mod tests {
             Some(hit_bloom()),
             streamed(vec![pool_log(pool, swap_to(150, 3, 15))]),
         )]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(150, 3, 15))]));
         assert_eq!(frontier, graph_hash(2));
         assert_graph_invariants(&graph);
@@ -3436,7 +3436,7 @@ mod tests {
             (None, BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(100, 1, 10))]));
         assert_eq!(frontier, graph_hash(2));
         assert_graph_invariants(&graph);
@@ -3451,7 +3451,7 @@ mod tests {
             (Some(hit_bloom()), complete_swap(100, 1, 10)),
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert_eq!(overlay, HashMap::from([(pool, ps(200, 2, 20))]));
         assert_eq!(frontier, graph.observed_head);
         assert_eq!(frontier, graph_hash(3));
@@ -3464,7 +3464,7 @@ mod tests {
         let pool = watched_pool();
         let base = HashMap::from([(pool, ps(10, 5, 1000))]);
         let graph = BlocksGraph::new(graph_hash(0), 0);
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert!(overlay.is_empty());
         assert_eq!(frontier, graph_hash(0));
     }
@@ -3479,7 +3479,7 @@ mod tests {
             .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_observed_head(graph_hash(3));
         assert!(matches!(graph.nodes.get(&graph_hash(3)), Some(Node::Pending(_))));
-        let (overlay, frontier) = graph.optimization_pool_states(&base, &verified_of(&base), None);
+        let (overlay, frontier) = graph.projected_pool_states(&base, &verified_of(&base), None);
         assert!(overlay.is_empty());
         assert_eq!(frontier, graph_hash(0));
         assert_graph_invariants(&graph);
@@ -3488,7 +3488,7 @@ mod tests {
     // --- optimization read: frontier-only gate ---------------------------------------------------
 
     #[test]
-    fn optimization_frontier_is_anchor_for_non_connected_head() {
+    fn projected_frontier_is_anchor_for_non_connected_head() {
         // A Pending observed head has no foldable suffix: the frontier-only read returns the
         // anchor, exactly like the full read's frontier.
         let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
@@ -3496,15 +3496,15 @@ mod tests {
         let graph = BlocksGraph::new(graph_hash(0), 0)
             .with_block(graph_hash(3), graph_hash(2), 3, hit_bloom()).0
             .with_observed_head(graph_hash(3));
-        assert_eq!(graph.optimization_frontier(&verified, None), graph_hash(0));
+        assert_eq!(graph.projected_frontier(&verified, None), graph_hash(0));
         assert_eq!(
-            graph.optimization_frontier(&verified, None),
-            graph.optimization_pool_states(&base, &verified, None).1
+            graph.projected_frontier(&verified, None),
+            graph.projected_pool_states(&base, &verified, None).1
         );
     }
 
     #[test]
-    fn optimization_frontier_is_anchor_when_first_block_blocks() {
+    fn projected_frontier_is_anchor_when_first_block_blocks() {
         // [Unknown+hit][good]: the first canonical block already blocks the fold, so the frontier
         // is the anchor — for both the frontier-only and the full read.
         let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
@@ -3513,15 +3513,15 @@ mod tests {
             (Some(hit_bloom()), BlockLogs::Unknown),
             (Some(hit_bloom()), complete_swap(999, 9, 99)),
         ]);
-        assert_eq!(graph.optimization_frontier(&verified, None), graph_hash(1));
+        assert_eq!(graph.projected_frontier(&verified, None), graph_hash(1));
         assert_eq!(
-            graph.optimization_frontier(&verified, None),
-            graph.optimization_pool_states(&base, &verified, None).1
+            graph.projected_frontier(&verified, None),
+            graph.projected_pool_states(&base, &verified, None).1
         );
     }
 
     #[test]
-    fn optimization_frontier_reaches_head_on_fully_readable_path() {
+    fn projected_frontier_reaches_head_on_fully_readable_path() {
         // Every block readable: the frontier is the observed head, matching the full read.
         let base = HashMap::from([(watched_pool(), ps(10, 5, 1000))]);
         let verified = verified_of(&base);
@@ -3530,12 +3530,12 @@ mod tests {
             (Some(hit_bloom()), complete_swap(200, 2, 20)),
         ]);
         assert_eq!(
-            graph.optimization_frontier(&verified, None),
+            graph.projected_frontier(&verified, None),
             graph.observed_head
         );
         assert_eq!(
-            graph.optimization_frontier(&verified, None),
-            graph.optimization_pool_states(&base, &verified, None).1
+            graph.projected_frontier(&verified, None),
+            graph.projected_pool_states(&base, &verified, None).1
         );
     }
 
@@ -3549,9 +3549,9 @@ mod tests {
             (Some(hit_bloom()), complete_swap(100, 1, 10)),
             (Some(hit_bloom()), BlockLogs::Unknown),
         ]);
-        let (_, frontier) = graph.optimization_pool_states(&base, &verified, None);
+        let (_, frontier) = graph.projected_pool_states(&base, &verified, None);
         assert_eq!(
-            graph.optimization_pool_states_if_changed(&base, &verified, None, Some(frontier)),
+            graph.projected_pool_states_if_changed(&base, &verified, None, Some(frontier)),
             None
         );
     }
@@ -3563,8 +3563,8 @@ mod tests {
         let verified = verified_of(&base);
         let graph = opt_chain(vec![(Some(hit_bloom()), complete_swap(100, 1, 10))]);
         assert_eq!(
-            graph.optimization_pool_states_if_changed(&base, &verified, None, None),
-            Some(graph.optimization_pool_states(&base, &verified, None))
+            graph.projected_pool_states_if_changed(&base, &verified, None, None),
+            Some(graph.projected_pool_states(&base, &verified, None))
         );
     }
 
@@ -3575,18 +3575,18 @@ mod tests {
         let verified = verified_of(&base);
         let graph = opt_chain(vec![(Some(hit_bloom()), complete_swap(100, 1, 10))]);
         assert_eq!(
-            graph.optimization_pool_states_if_changed(&base, &verified, None, Some(graph_hash(99))),
-            Some(graph.optimization_pool_states(&base, &verified, None))
+            graph.projected_pool_states_if_changed(&base, &verified, None, Some(graph_hash(99))),
+            Some(graph.projected_pool_states(&base, &verified, None))
         );
     }
 
     proptest! {
         /// The frontier-only read never diverges from the full fold's frontier: for any per-block
         /// mix of bloom (absent/clear/hit) and log authority (Unknown/Streamed/Complete) along a
-        /// canonical chain, `optimization_frontier` equals `optimization_pool_states`'s hash. The
+        /// canonical chain, `projected_frontier` equals `projected_pool_states`'s hash. The
         /// differential pin behind the multi-chain wrapper's cheap dispatch gate.
         #[test]
-        fn optimization_frontier_equals_pool_states_frontier(
+        fn projected_frontier_equals_pool_states_frontier(
             blocks in prop::collection::vec((0u8..3, 0u8..3), 0..12),
         ) {
             let pool = watched_pool();
@@ -3609,8 +3609,8 @@ mod tests {
                 })
                 .collect();
             let graph = opt_chain(blocks);
-            let (_, expected) = graph.optimization_pool_states(&base, &verified, None);
-            prop_assert_eq!(graph.optimization_frontier(&verified, None), expected);
+            let (_, expected) = graph.projected_pool_states(&base, &verified, None);
+            prop_assert_eq!(graph.projected_frontier(&verified, None), expected);
         }
 
         /// The one-walk gated read never diverges from gating and folding separately: for any
@@ -3642,7 +3642,7 @@ mod tests {
                 })
                 .collect();
             let graph = opt_chain(blocks);
-            let (overlay, frontier) = graph.optimization_pool_states(&base, &verified, None);
+            let (overlay, frontier) = graph.projected_pool_states(&base, &verified, None);
             let last_dispatched = match gate {
                 0 => None,
                 1 => Some(frontier),
@@ -3650,7 +3650,7 @@ mod tests {
             };
             let expected = (last_dispatched != Some(frontier)).then_some((overlay, frontier));
             prop_assert_eq!(
-                graph.optimization_pool_states_if_changed(&base, &verified, None, last_dispatched),
+                graph.projected_pool_states_if_changed(&base, &verified, None, last_dispatched),
                 expected
             );
         }
@@ -3991,7 +3991,7 @@ mod tests {
             .admitted(graph_hash(5), graph_hash(4), 5, clear_bloom())
             .with_observed_head(graph_hash(5));
         let (overlay, frontier) =
-            graph.optimization_pool_states(&base, &verified_of(&base), None);
+            graph.projected_pool_states(&base, &verified_of(&base), None);
         assert_eq!(frontier, graph_hash(5));
         assert_eq!(overlay.get(&pool), Some(&ps(500, 5, 5_100)));
         assert_graph_invariants(&graph);
@@ -4022,11 +4022,11 @@ mod tests {
         let base: HashMap<PoolRef, PoolState> = HashMap::new();
         let graph = seeded_graph().with_observed_head(graph_hash(4));
 
-        let (before, _) = graph.optimization_pool_states(&base, &HashSet::new(), None);
+        let (before, _) = graph.projected_pool_states(&base, &HashSet::new(), None);
         assert!(before.is_empty(), "unverified pool must stay invisible");
 
         let (after, frontier) =
-            graph.optimization_pool_states(&base, &HashSet::from([pool]), None);
+            graph.projected_pool_states(&base, &HashSet::from([pool]), None);
         assert_eq!(frontier, graph_hash(4));
         assert_eq!(after.get(&pool), Some(&ps(500, 5, 5_100)));
         assert_graph_invariants(&graph);
