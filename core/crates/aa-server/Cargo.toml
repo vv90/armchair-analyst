@@ -10,6 +10,8 @@ client-evm = { path = "../client-evm" }
 aa-framework = { path = "../aa-framework" }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
+tiny_http = "0.12.0"
+arc-swap = "1.9.2"
 
 [dev-dependencies]
 client-evm = { path = "../client-evm", features = ["test-support"] }

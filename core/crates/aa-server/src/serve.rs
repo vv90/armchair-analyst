@@ -88,6 +88,16 @@ fn to_json(snapshot: &HealthSnapshot) -> String {
     }
 }
 
+/// Returns the path portion of a request URL, dropping any `?query` suffix. A transport's request
+/// URL carries the query string (e.g. `/health?probe=1`), but [`http_response`] matches exact
+/// paths, so the query is stripped before routing. Pure — a thin string split, unit-tested here.
+pub fn strip_query(url: &str) -> &str {
+    match url.split_once('?') {
+        Some((path, _query)) => path,
+        None => url,
+    }
+}
+
 /// The pure request→response decision. `GET /health` returns the snapshot; a wrong method on
 /// `/health` is `405`; any other path is `404`. `method` is the HTTP method token (e.g. `"GET"`).
 pub fn http_response(method: &str, path: &str, snapshot: &HealthSnapshot) -> HttpResponse {
@@ -261,5 +271,21 @@ mod tests {
 
         assert_eq!(response.status, 405);
         assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn strip_query_drops_the_query_string() {
+        assert_eq!(strip_query("/health?a=1&b=2"), "/health");
+    }
+
+    #[test]
+    fn strip_query_leaves_a_bare_path_unchanged() {
+        assert_eq!(strip_query("/health"), "/health");
+        assert_eq!(strip_query("/"), "/");
+    }
+
+    #[test]
+    fn strip_query_handles_an_empty_query() {
+        assert_eq!(strip_query("/health?"), "/health");
     }
 }

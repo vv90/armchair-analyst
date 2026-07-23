@@ -11,9 +11,8 @@ use crate::{core::CHAIN, runtime::ServerRuntime};
 
 mod core;
 mod runtime;
-// Pure response-producing surface. Nothing calls it yet; the transport adapter (a later increment)
-// binds a blocking HTTP server and calls `serve::http_response`. Remove the allow when wired.
-#[allow(dead_code)]
+// Pure response-producing surface; the runtime's serve loop binds a blocking HTTP server and calls
+// `serve::http_response`.
 mod serve;
 
 fn main() -> ExitCode {
@@ -36,12 +35,17 @@ fn run() -> Result<(), String> {
         .map_err(|_| "AA_ETH_RPC_URL is not set (Ethereum HTTP RPC endpoint)".to_owned())?;
     let ws_url = env::var("AA_ETH_WS_URL")
         .map_err(|_| "AA_ETH_WS_URL is not set (Ethereum WebSocket endpoint)".to_owned())?;
+    // Loopback by default so the data plane is never exposed by accident; set an explicit address
+    // (e.g. `0.0.0.0:8080`) to serve clients over the network.
+    let bind_addr = env::var("AA_SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
 
     let endpoints = ChainEndpoints::single(CHAIN, "primary", rpc_url);
-    let runtime = ServerRuntime::new(endpoints, ws_url);
+    let runtime = ServerRuntime::new(endpoints, ws_url, bind_addr);
 
     let (_input_sender, handle) = runtime.run();
-    handle.join().map_err(|_| "runtime thread panicked".to_owned())
+    handle
+        .join()
+        .map_err(|_| "runtime thread panicked".to_owned())
 }
 
 fn install_rustls_provider() -> Result<(), ()> {

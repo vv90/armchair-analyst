@@ -188,8 +188,10 @@ mod tests {
 
     #[test]
     fn failed_probe_while_awaiting_reschedules_the_probe() {
-        let (state, effects) =
-            server_transition(ServerState::AwaitingAnchor, ServerInput::FinalizedHeader(None));
+        let (state, effects) = server_transition(
+            ServerState::AwaitingAnchor,
+            ServerInput::FinalizedHeader(None),
+        );
 
         assert!(matches!(state, ServerState::AwaitingAnchor));
         assert!(only_finalized_probe(&effects));

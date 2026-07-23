@@ -7,6 +7,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
         mpsc::Sender,
     },
@@ -15,25 +16,34 @@ use std::{
 };
 
 use aa_framework::{Application, Runtime, Transition};
+use arc_swap::ArcSwap;
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints, ClientEvent, ClientEvmError,
-    ClientHead, PoolDataResult, PoolLog, PoolMetadataResult, PoolRef, ProtocolPoolKey, RangeLogBlock,
-    TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
+    ClientHead, PoolDataResult, PoolLog, PoolMetadataResult, PoolRef, ProtocolPoolKey,
+    RangeLogBlock, TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
     fetch_canonical_block_header_at, fetch_finalized_block_header, fetch_pool_data,
-    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, kernel, subscribe_new_heads,
+    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, kernel,
+    subscribe_new_heads,
 };
 
-use crate::core::{
-    AnchorHeader, CHAIN, ServerEffect, ServerInput, ServerState, server_init, server_transition,
+use crate::{
+    core::{
+        AnchorHeader, CHAIN, ServerEffect, ServerInput, ServerState, server_init, server_transition,
+    },
+    serve::{HealthSnapshot, health_snapshot, http_response, strip_query},
 };
 
 /// The single-chain server application (pure core wired to the framework).
 pub struct ServerApp;
 
-/// The framework subscriptions the server seeds: the live head stream and the driver tick.
+/// The framework subscriptions the server seeds: the live head stream, the driver tick, and the
+/// HTTP serving loop.
 pub enum ServerSubscription {
     NewHeads,
     Tick(Duration),
+    /// The blocking HTTP server; reads the published snapshot and answers `/health`. Sends no
+    /// inputs back into the runtime (a read-only serving boundary).
+    Serve,
 }
 
 impl Application for ServerApp {
@@ -56,6 +66,7 @@ impl Application for ServerApp {
         vec![
             ServerSubscription::NewHeads,
             ServerSubscription::Tick(Duration::from_millis(1000)),
+            ServerSubscription::Serve,
         ]
     }
 }
@@ -65,22 +76,36 @@ pub struct ServerRuntime {
     agent: ureq::Agent,
     endpoints: ChainEndpoints,
     ws_url: String,
+    /// Address the HTTP serving loop binds (e.g. `127.0.0.1:8080`).
+    bind_addr: String,
     tick_interval: Duration,
     started: Instant,
     /// Wall-clock millis of the last emitted observation line, throttling the smoke log to ~1/s.
     last_log_millis: AtomicU64,
+    /// The latest freshness snapshot, republished from `observe_state` (inside the throttle) and
+    /// read by the serve loop per request — the serve thread never touches kernel state. `ArcSwap`
+    /// so publishes and per-request reads are lock-free (single writer, whole-value replace).
+    snapshot: Arc<ArcSwap<HealthSnapshot>>,
 }
 
 impl ServerRuntime {
-    pub fn new(endpoints: ChainEndpoints, ws_url: String) -> ServerRuntime {
+    pub fn new(endpoints: ChainEndpoints, ws_url: String, bind_addr: String) -> ServerRuntime {
         ServerRuntime {
             agent: ureq::Agent::new_with_defaults(),
             endpoints,
             ws_url,
+            bind_addr,
             tick_interval: Duration::from_millis(1000),
             started: Instant::now(),
             last_log_millis: AtomicU64::new(0),
+            snapshot: Arc::new(ArcSwap::from_pointee(HealthSnapshot::AwaitingAnchor)),
         }
+    }
+
+    /// Publishes the latest snapshot into the slot the serve loop reads. Lock-free: a single atomic
+    /// pointer swap, so it never blocks (or is blocked by) a concurrent request read.
+    fn publish(&self, snapshot: HealthSnapshot) {
+        self.snapshot.store(Arc::new(snapshot));
     }
 
     fn fetch_anchor(&self) -> Option<AnchorHeader> {
@@ -102,7 +127,9 @@ impl ServerRuntime {
             request,
             |hash| fetch_block_header(&self.agent, &self.endpoints, CHAIN, hash),
             |hash| fetch_block_logs(&self.agent, &self.endpoints, CHAIN, hash),
-            |at, candidates| fetch_pool_metadata(&self.agent, &self.endpoints, CHAIN, at, candidates),
+            |at, candidates| {
+                fetch_pool_metadata(&self.agent, &self.endpoints, CHAIN, at, candidates)
+            },
             |at, tokens| fetch_token_metadata(&self.agent, &self.endpoints, CHAIN, at, tokens),
             |at, pools| fetch_pool_data(&self.agent, &self.endpoints, CHAIN, at, pools),
             |from, to| fetch_pool_logs_in_range(&self.agent, &self.endpoints, CHAIN, from, to),
@@ -137,6 +164,20 @@ impl Runtime<ServerApp> for ServerRuntime {
                     break;
                 }
             },
+            ServerSubscription::Serve => match tiny_http::Server::http(&self.bind_addr) {
+                // A failed bind (bad/occupied address) is fatal only to serving: log loudly and let
+                // this thread end. The kernel and its subscriptions keep running; no panic.
+                Err(error) => {
+                    eprintln!(
+                        "aa-server serve bind_failed addr={} error={error}",
+                        self.bind_addr
+                    )
+                }
+                Ok(server) => {
+                    eprintln!("aa-server serve listening addr={}", self.bind_addr);
+                    serve_forever(server, self.snapshot.clone());
+                }
+            },
         }
     }
 
@@ -148,29 +189,56 @@ impl Runtime<ServerApp> for ServerRuntime {
     fn observe_state(&self, state: &ServerState) {
         // Throttle the smoke log to roughly once per second so warmup is visible without per-event spam.
         let now = self.started.elapsed().as_millis() as u64;
-        if now.saturating_sub(self.last_log_millis.load(Ordering::Relaxed)) < self.tick_interval.as_millis() as u64
+        if now.saturating_sub(self.last_log_millis.load(Ordering::Relaxed))
+            < self.tick_interval.as_millis() as u64
         {
             return;
         }
         self.last_log_millis.store(now, Ordering::Relaxed);
 
-        match state {
-            ServerState::AwaitingAnchor => {
+        // Project once (the `Running` arm folds the frontier — the per-event hotspot, so this runs
+        // at most ~1/s under the throttle), publish it for the serve loop, then log the same facts.
+        let snapshot = health_snapshot(state);
+        self.publish(snapshot.clone());
+
+        match snapshot {
+            HealthSnapshot::AwaitingAnchor => {
                 eprintln!("aa-server chain={CHAIN:?} status=awaiting_anchor")
             }
-            ServerState::Running(kernel_state) => {
-                let (finalized_hash, finalized_number) = kernel_state.finalized_head();
-                let (_, frontier) = kernel_state.projected_pool_states(CHAIN);
+            HealthSnapshot::Running {
+                finalized: (finalized_hash, finalized_number),
+                canonical,
+                verified_pool_count,
+                in_flight,
+                ws_miss,
+                behind,
+            } => {
                 eprintln!(
                     "aa-server chain={CHAIN:?} status=running finalized={finalized_hash}@{finalized_number} \
-                     canonical={} pools={} inflight={} behind={:?} ws_miss={} frontier={frontier}",
-                    kernel_state.canonical_head(),
-                    kernel_state.verified_pool_count(),
-                    kernel_state.in_flight_request_count(),
-                    kernel_state.blocks_behind(frontier),
-                    kernel_state.ws_miss_count(),
+                     canonical={canonical} pools={verified_pool_count} inflight={in_flight} \
+                     behind={behind:?} ws_miss={ws_miss}"
                 );
             }
+        }
+    }
+}
+
+/// The blocking HTTP serving loop: one request at a time on a single thread. Each request reads the
+/// method and path, loads the current published snapshot (a lock-free `ArcSwap` read), and answers
+/// via the pure [`http_response`]. A per-request `respond` I/O error (e.g. a client that hung up) is
+/// logged and skipped so one broken connection cannot kill the loop.
+fn serve_forever(server: tiny_http::Server, snapshot: Arc<ArcSwap<HealthSnapshot>>) {
+    for request in server.incoming_requests() {
+        let method = request.method().as_str().to_owned();
+        let path = strip_query(request.url()).to_owned();
+
+        let current = snapshot.load_full();
+        let response = http_response(&method, &path, &current);
+
+        let http =
+            tiny_http::Response::from_string(response.body).with_status_code(response.status);
+        if let Err(error) = request.respond(http) {
+            eprintln!("aa-server serve respond_failed error={error}");
         }
     }
 }
@@ -179,12 +247,14 @@ impl Runtime<ServerApp> for ServerRuntime {
 /// subscribed, and closed events carry no kernel input on this stream.
 fn map_new_head(event: ClientEvent) -> Option<ServerInput> {
     match event {
-        ClientEvent::NewHead { header, .. } => Some(ServerInput::Kernel(kernel::Event::HeadObserved {
-            hash: header.inner.hash,
-            parent_hash: header.inner.inner.parent_hash,
-            logs_bloom: header.inner.inner.logs_bloom,
-            number: header.inner.inner.number,
-        })),
+        ClientEvent::NewHead { header, .. } => {
+            Some(ServerInput::Kernel(kernel::Event::HeadObserved {
+                hash: header.inner.hash,
+                parent_hash: header.inner.inner.parent_hash,
+                logs_bloom: header.inner.inner.logs_bloom,
+                number: header.inner.inner.number,
+            }))
+        }
         ClientEvent::PoolLogObserved { .. }
         | ClientEvent::Subscribed { .. }
         | ClientEvent::Closed { .. } => None,
@@ -452,5 +522,62 @@ mod tests {
             event,
             kernel::Event::BlockLogsReceived { request_id: got, logs } if got == request_id && logs.is_empty()
         ));
+    }
+
+    fn test_runtime() -> ServerRuntime {
+        let endpoints =
+            ChainEndpoints::single(CHAIN, "primary", "http://localhost:8545".to_owned());
+        ServerRuntime::new(
+            endpoints,
+            "ws://localhost:8546".to_owned(),
+            "127.0.0.1:0".to_owned(),
+        )
+    }
+
+    fn running_snapshot() -> HealthSnapshot {
+        HealthSnapshot::Running {
+            finalized: (hash(100), 100),
+            canonical: hash(101),
+            verified_pool_count: 3,
+            in_flight: 1,
+            ws_miss: 2,
+            behind: Some(4),
+        }
+    }
+
+    #[test]
+    fn publish_updates_the_snapshot_slot() {
+        let runtime = test_runtime();
+        let snapshot = running_snapshot();
+
+        runtime.publish(snapshot.clone());
+
+        let stored = runtime.snapshot.load_full();
+        assert_eq!(*stored, snapshot);
+    }
+
+    #[test]
+    fn serve_answers_health_over_a_loopback_socket() {
+        let snapshot = running_snapshot();
+        let slot = Arc::new(ArcSwap::from_pointee(snapshot.clone()));
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral loopback port");
+        let port = server.server_addr().to_ip().expect("ip listen addr").port();
+        thread::spawn(move || serve_forever(server, slot));
+
+        let agent = ureq::Agent::new_with_defaults();
+
+        let mut response = agent
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect("GET /health");
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response.body_mut().read_to_string().expect("read body");
+        assert_eq!(body, http_response("GET", "/health", &snapshot).body);
+
+        match agent.get(&format!("http://127.0.0.1:{port}/nope")).call() {
+            Err(ureq::Error::StatusCode(code)) => assert_eq!(code, 404),
+            other => panic!("expected a 404 status error, got {other:?}"),
+        }
     }
 }
