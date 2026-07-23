@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, U256};
+use imbl::HashMap as ImHashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::ChainKey;
@@ -79,14 +80,17 @@ static NATIVE_TOKEN_METADATA: TokenMetadata = TokenMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRegistry {
-    verified: HashMap<TokenAddress, TokenMetadata>,
+    /// Verified token metadata, held in a persistent (structurally-shared) map so a whole-map clone is
+    /// O(1) and shares nodes with the source — the same property `TrustedPoolRegistry::verified` relies
+    /// on, letting a reader thread take a consistent snapshot of the tracked tokens without a copy.
+    verified: ImHashMap<TokenAddress, TokenMetadata>,
     unsupported: HashMap<TokenAddress, TokenMetadataFailure>,
 }
 
 impl TokenRegistry {
     pub fn new() -> TokenRegistry {
         TokenRegistry {
-            verified: HashMap::new(),
+            verified: ImHashMap::new(),
             unsupported: HashMap::new(),
         }
     }
@@ -359,5 +363,52 @@ mod tests {
         TokenMetadata {
             decimals: TokenDecimals::try_from_u256(U256::from(decimals)).unwrap(),
         }
+    }
+
+    // Distinct token addresses across a wide space so a "many tokens" registry holds enough entries
+    // for structural sharing to be meaningful rather than fitting in a single node.
+    fn token_n(n: u32) -> TokenAddress {
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        TokenAddress(Address::from(bytes), ChainKey::Ethereum)
+    }
+
+    const MANY: u32 = 5_000;
+
+    fn registry_with_many_tokens() -> TokenRegistry {
+        let results = (0..MANY)
+            .map(|n| (token_n(n), Ok(token_metadata(6))))
+            .collect::<HashMap<_, _>>();
+        TokenRegistry::new().with_metadata_results(results)
+    }
+
+    // Same relied-upon assumptions as the pool registry: cloning the verified token map shares its
+    // root (so publishing a snapshot to a reader thread is O(1)), and a write after a clone leaves the
+    // already-published snapshot untouched (copy-on-write isolation, no lock, no defensive copy).
+
+    #[test]
+    fn cloning_the_verified_token_map_shares_its_root_instead_of_copying_entries() {
+        let registry = registry_with_many_tokens();
+
+        let snapshot = registry.verified.clone();
+
+        assert!(registry.verified.ptr_eq(&snapshot));
+        assert_eq!(snapshot.len(), MANY as usize);
+    }
+
+    #[test]
+    fn a_token_write_after_a_clone_leaves_the_earlier_snapshot_untouched() {
+        let registry = registry_with_many_tokens();
+        let snapshot = registry.verified.clone();
+        assert!(registry.verified.ptr_eq(&snapshot)); // shared before any write
+
+        let new_token = token_n(MANY + 1);
+        let grown =
+            registry.with_metadata_results(HashMap::from([(new_token, Ok(token_metadata(18)))]));
+
+        assert_eq!(snapshot.len(), MANY as usize);
+        assert!(snapshot.get(&new_token).is_none());
+        assert_eq!(grown.verified.len(), MANY as usize + 1);
+        assert!(!grown.verified.ptr_eq(&snapshot));
     }
 }

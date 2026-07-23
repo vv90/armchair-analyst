@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::Address;
+use imbl::HashMap as ImHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ChainKey;
@@ -113,14 +114,19 @@ pub type PoolMetadataResult = Result<PoolMetadata, PoolMetadataFailure>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustedPoolRegistry {
-    verified: HashMap<PoolRef, PoolMetadata>,
+    /// Verified pool metadata, held in a persistent (structurally-shared) map so a whole-map clone is
+    /// O(1) and shares nodes with the source. This lets a reader thread be handed a consistent
+    /// snapshot of the tracked set without copying the entries — the kernel keeps mutating its own
+    /// version while a published snapshot shares the untouched subtrees (see the structural-sharing
+    /// tests below).
+    verified: ImHashMap<PoolRef, PoolMetadata>,
     rejected: HashSet<ProtocolPoolKey>,
 }
 
 impl TrustedPoolRegistry {
     pub fn new() -> TrustedPoolRegistry {
         TrustedPoolRegistry {
-            verified: HashMap::new(),
+            verified: ImHashMap::new(),
             rejected: HashSet::new(),
         }
     }
@@ -548,5 +554,74 @@ mod tests {
             token1: Address::with_last_byte(token1),
             fee: PoolFee::Tiered(fee),
         }
+    }
+
+    // Distinct pool candidates across a wide address space, so a "many pools" registry has enough
+    // entries for structural sharing (rather than a small map that might fit in one node) to be
+    // meaningful.
+    fn candidate_n(n: u32) -> ProtocolPoolKey {
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        ProtocolPoolKey::UniswapV3(Address::from(bytes))
+    }
+
+    const MANY: u32 = 5_000;
+
+    fn registry_with_many_pools() -> TrustedPoolRegistry {
+        let results = (0..MANY)
+            .map(|n| {
+                (
+                    candidate_n(n),
+                    Ok(pool_metadata(1, 2, UniswapV3Fee::Fee500)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        TrustedPoolRegistry::new().with_metadata_results(ChainKey::Ethereum, results)
+    }
+
+    // The reader-thread publish path (kernel writes; HTTP threads read a handed-out snapshot) is only
+    // cheap and lock-free because `verified` is a persistent map: cloning it shares the root instead
+    // of copying entries, and a later write on one version cannot mutate a snapshot already published.
+    // These two tests pin exactly those relied-upon assumptions about copied footprint and isolation.
+
+    #[test]
+    fn cloning_the_verified_map_shares_its_root_instead_of_copying_entries() {
+        let registry = registry_with_many_pools();
+
+        let snapshot = registry.verified.clone();
+
+        // `ptr_eq` holds only when both handles point at the same root node — i.e. the clone copied a
+        // pointer, not the MANY entries. This is what keeps an every-tick publish O(1) regardless of
+        // how large the tracked set has grown.
+        assert!(registry.verified.ptr_eq(&snapshot));
+        assert_eq!(snapshot.len(), MANY as usize);
+    }
+
+    #[test]
+    fn a_write_after_a_clone_leaves_the_earlier_snapshot_untouched() {
+        let registry = registry_with_many_pools();
+        let snapshot = registry.verified.clone();
+        assert!(registry.verified.ptr_eq(&snapshot)); // shared before any write
+
+        let new_pool = candidate_n(MANY + 1);
+        let grown = registry.with_metadata_results(
+            ChainKey::Ethereum,
+            HashMap::from([(new_pool, Ok(pool_metadata(3, 4, UniswapV3Fee::Fee3000)))]),
+        );
+
+        // The snapshot handed out before the write never sees the new pool (copy-on-write on the write
+        // path), and its root has diverged from the grown map — a reader on the old snapshot is fully
+        // isolated from the writer with no lock and no defensive copy.
+        assert_eq!(snapshot.len(), MANY as usize);
+        assert!(
+            snapshot
+                .get(&PoolRef {
+                    key: new_pool,
+                    chain: ChainKey::Ethereum,
+                })
+                .is_none()
+        );
+        assert_eq!(grown.verified.len(), MANY as usize + 1);
+        assert!(!grown.verified.ptr_eq(&snapshot));
     }
 }

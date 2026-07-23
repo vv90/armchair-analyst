@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 alloy = { version = "2.0.5", default-features = false, features = ["std", "sol-types", "serde", "rpc-types-eth"] }
+imbl = "7.0.1"
 optimization = { path = "../optimization" }
 redb = "2"
 serde = { version = "1.0.228", features = ["derive"] }
