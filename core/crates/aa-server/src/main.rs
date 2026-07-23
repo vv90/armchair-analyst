@@ -11,6 +11,10 @@ use crate::{core::CHAIN, runtime::ServerRuntime};
 
 mod core;
 mod runtime;
+// Pure response-producing surface. Nothing calls it yet; the transport adapter (a later increment)
+// binds a blocking HTTP server and calls `serve::http_response`. Remove the allow when wired.
+#[allow(dead_code)]
+mod serve;
 
 fn main() -> ExitCode {
     warn_if_rustls_provider_already_installed(install_rustls_provider(), &mut io::stderr());
