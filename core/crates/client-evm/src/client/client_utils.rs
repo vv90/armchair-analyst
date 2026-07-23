@@ -296,9 +296,12 @@ pub(crate) fn parse_block_number_response(
         detail,
     };
 
-    let hex = result
-        .as_str()
-        .ok_or_else(|| malformed(format!("expected hex string, got {}", describe_field(Some(result)))))?;
+    let hex = result.as_str().ok_or_else(|| {
+        malformed(format!(
+            "expected hex string, got {}",
+            describe_field(Some(result))
+        ))
+    })?;
     let digits = hex
         .strip_prefix("0x")
         .ok_or_else(|| malformed(format!("expected 0x-prefixed quantity, got {hex}")))?;
@@ -384,7 +387,10 @@ fn group_range_logs_by_block(logs: Vec<Log>) -> Vec<RangeLogBlock> {
             continue;
         };
 
-        logs_by_block.entry((number, hash)).or_default().push(pool_log);
+        logs_by_block
+            .entry((number, hash))
+            .or_default()
+            .push(pool_log);
     }
 
     let mut blocks = logs_by_block
@@ -674,7 +680,10 @@ mod tests {
         );
 
         let response = json!({ "jsonrpc": "2.0", "id": 9, "result": "0x2d9b3da" });
-        assert_eq!(parse_block_number_response(&response, 9).unwrap(), 0x2d9b3da);
+        assert_eq!(
+            parse_block_number_response(&response, 9).unwrap(),
+            0x2d9b3da
+        );
     }
 
     #[test]

@@ -29,9 +29,7 @@ use super::pool_registry::{
 use super::token_registry::{
     TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataResult, TokenRegistry,
 };
-use super::{
-    Effect, Event, MAX_STREAMED_LOG_BLOCKS, State, TransitionOutcome, transition_outcome,
-};
+use super::{Effect, Event, MAX_STREAMED_LOG_BLOCKS, State, TransitionOutcome, transition_outcome};
 use crate::pool_state::{PoolState, ProtocolPoolKey};
 use crate::tick::REQUEST_TTL_FOR_TEST as REQUEST_TTL;
 use crate::{BlockHash, Bloom, ChainKey, PoolLog, PoolLogEvent};
@@ -275,12 +273,9 @@ impl Provider {
             }
             Decision::Fail(at) => {
                 stat.failed += 1;
-                self.due
-                    .entry(at)
-                    .or_default()
-                    .push(Event::RequestFailed {
-                        request_id: failure_id,
-                    });
+                self.due.entry(at).or_default().push(Event::RequestFailed {
+                    request_id: failure_id,
+                });
             }
             Decision::Drop => {
                 stat.dropped += 1;
@@ -801,7 +796,11 @@ fn regime_baseline_healthy_provider_keeps_pace() {
         report.behind()
     );
     assert!(
-        report.state.canonical_path_len_from_finalized().unwrap_or(usize::MAX) <= 100,
+        report
+            .state
+            .canonical_path_len_from_finalized()
+            .unwrap_or(usize::MAX)
+            <= 100,
         "finalization must bound the window, window={:?}",
         report.state.canonical_path_len_from_finalized()
     );
@@ -810,8 +809,16 @@ fn regime_baseline_healthy_provider_keeps_pace() {
         "no request leak on a healthy chain, inflight={}",
         report.state.in_flight_request_count()
     );
-    assert_eq!(report.state.ws_miss_count(), 0, "full WS delivery is never caught wrong");
-    assert_eq!(report.stat("block_logs").issued, 0, "no tip holes when WS delivers everything");
+    assert_eq!(
+        report.state.ws_miss_count(),
+        0,
+        "full WS delivery is never caught wrong"
+    );
+    assert_eq!(
+        report.stat("block_logs").issued,
+        0,
+        "no tip holes when WS delivers everything"
+    );
     assert!(
         report.dispatches >= 350,
         "nearly every block should dispatch an optimization, dispatches={}",
@@ -849,7 +856,10 @@ fn regime_ws_stall_recovers_via_backstop_at_per_block_fetch_cost() {
         "per-block fetch rate returns when WS dies, block_logs issued={}",
         backstop.issued
     );
-    assert_eq!(backstop.issued, backstop.answered, "healthy backstop answers everything");
+    assert_eq!(
+        backstop.issued, backstop.answered,
+        "healthy backstop answers everything"
+    );
 }
 
 /// The Polygon 2026-07-15 freeze: WS stalls AND the repair requests (backstop + ranged
@@ -877,7 +887,9 @@ fn regime_silent_request_death_freezes_frontier_despite_ttl_retries() {
         sample_every: 50,
     });
 
-    let frontier = report.frontier_number().expect("dispatched before the stall");
+    let frontier = report
+        .frontier_number()
+        .expect("dispatched before the stall");
     assert!(
         frontier <= 1202,
         "frontier must freeze at the first unrepaired hole, frontier={frontier}"
@@ -1019,7 +1031,9 @@ fn regime_archive_refused_ranges_ping_pong_and_freeze_finalization() {
     });
 
     // The first WS outage wave starts at block 1040; the frontier can never pass its first hole.
-    let frontier = report.frontier_number().expect("dispatched before the first wave");
+    let frontier = report
+        .frontier_number()
+        .expect("dispatched before the first wave");
     assert!(
         frontier <= 1042,
         "frontier frozen at the first unrepaired outage wave, frontier={frontier}"
@@ -1042,7 +1056,10 @@ fn regime_archive_refused_ranges_ping_pong_and_freeze_finalization() {
         ranges.issued,
         ranges.answered
     );
-    let window = report.state.canonical_path_len_from_finalized().unwrap_or(0);
+    let window = report
+        .state
+        .canonical_path_len_from_finalized()
+        .unwrap_or(0);
     assert!(
         window >= 500,
         "finalization cannot advance over the frozen holes: window grows unbounded, window={window}"
@@ -1106,8 +1123,14 @@ fn regime_finalization_stall_grows_window_and_event_cost() {
         sample_every: 250,
     });
 
-    let window = report.state.canonical_path_len_from_finalized().unwrap_or(0);
-    assert!(window >= 2_400, "window grows with every block, window={window}");
+    let window = report
+        .state
+        .canonical_path_len_from_finalized()
+        .unwrap_or(0);
+    assert!(
+        window >= 2_400,
+        "window grows with every block, window={window}"
+    );
     assert!(
         report.behind().unwrap_or(usize::MAX) <= 2,
         "the chain still tracks the tip; the cost is CPU, not lag, behind={:?}",
@@ -1209,7 +1232,10 @@ fn regime_orphaned_streamed_log_flood_stays_bounded() {
 
     // A staged block whose head finally arrives still drains into the graph.
     let staged_hash = block_hash(9_000_000);
-    assert!(state.streamed_logs.contains_key(&staged_hash), "first flood entry is staged");
+    assert!(
+        state.streamed_logs.contains_key(&staged_hash),
+        "first flood entry is staged"
+    );
     let (state, _) = super::transition(
         CHAIN,
         state,

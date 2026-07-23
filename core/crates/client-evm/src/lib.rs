@@ -1,6 +1,6 @@
 //! Integration logic for EVM-based chains.
 
-pub use alloy::primitives::{Address, BlockHash, Bloom, U160, aliases::I24};
+pub use alloy::primitives::{Address, BlockHash, Bloom, U160, U256, aliases::I24};
 
 pub mod bootstrap;
 pub mod chain;
@@ -26,11 +26,10 @@ mod utils;
 pub use chain::{ACTIVE_CHAINS, ChainKey, chain_key_for_network_path, drpc_network_path};
 pub use client::{
     ClientEvent, ClientHead, MetadataCache, MetadataCacheError, POOL_LOG_BATCH_WINDOW,
-    RangeLogBlock, consolidate_pool_logs, fetch_block_header, fetch_canonical_block_header_at,
-    fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
-    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, plan_ws_subscriptions,
-    subscribe_new_heads, subscribe_pool_events, WsSubscriptionEndpoint,
+    RangeLogBlock, WsSubscriptionEndpoint, consolidate_pool_logs, fetch_block_header,
+    fetch_block_logs, fetch_canonical_block_header_at, fetch_finalized_block_header,
+    fetch_pool_candidates_window, fetch_pool_data, fetch_pool_logs_in_range, fetch_pool_metadata,
+    fetch_token_metadata, plan_ws_subscriptions, subscribe_new_heads, subscribe_pool_events,
 };
 pub use endpoints::{
     ChainEndpoints, ChainSubscriptions, EndpointPool, EndpointSpec, GraphEndpoints,
@@ -61,7 +60,6 @@ pub use tick_math::TickMathError;
 pub use token_whitelist::{
     ChainTokens, TokenEntry, TokenWhitelist, TokenWhitelistError, TokenWhitelistFile,
 };
-pub use uniswap_v4_subgraph::{fetch_v4_pool_metadata, send_graphql_request};
 pub use tokens::{
     ARBITRUM_NATIVE_TOKEN_ADDRESS, ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_USDT_TOKEN_ADDRESS,
     ARBITRUM_WBTC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS, AVALANCHE_NATIVE_TOKEN_ADDRESS,
@@ -76,4 +74,5 @@ pub use tokens::{
     OPTIMISM_WETH_TOKEN_ADDRESS, POLYGON_NATIVE_TOKEN_ADDRESS, POLYGON_USDC_TOKEN_ADDRESS,
     POLYGON_USDT_TOKEN_ADDRESS, POLYGON_WBTC_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS,
 };
+pub use uniswap_v4_subgraph::{fetch_v4_pool_metadata, send_graphql_request};
 pub use utils::{TokenAmountConversionError, u256_token_amount_to_f32};

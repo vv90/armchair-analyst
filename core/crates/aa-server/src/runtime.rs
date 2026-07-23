@@ -19,11 +19,11 @@ use aa_framework::{Application, Runtime, Transition};
 use arc_swap::ArcSwap;
 use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints, ClientEvent, ClientEvmError,
-    ClientHead, PoolDataResult, PoolLog, PoolMetadataResult, PoolRef, ProtocolPoolKey,
-    RangeLogBlock, TokenAddress, TokenMetadataResult, fetch_block_header, fetch_block_logs,
-    fetch_canonical_block_header_at, fetch_finalized_block_header, fetch_pool_data,
-    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, kernel,
-    subscribe_new_heads,
+    ClientHead, MetadataCache, PoolDataResult, PoolLog, PoolMetadata, PoolMetadataResult, PoolRef,
+    ProtocolPoolKey, RangeLogBlock, TokenAddress, TokenMetadata, TokenMetadataResult,
+    fetch_block_header, fetch_block_logs, fetch_canonical_block_header_at,
+    fetch_finalized_block_header, fetch_pool_data, fetch_pool_logs_in_range, fetch_pool_metadata,
+    fetch_token_metadata, kernel, subscribe_new_heads,
 };
 
 use crate::{
@@ -86,10 +86,20 @@ pub struct ServerRuntime {
     /// read by the serve loop per request — the serve thread never touches kernel state. `ArcSwap`
     /// so publishes and per-request reads are lock-free (single writer, whole-value replace).
     snapshot: Arc<ArcSwap<ServerSnapshot>>,
+    /// The persistent metadata cache backing the pool/token metadata effects: validated
+    /// `PoolMetadata`/`TokenMetadata` is immutable, so it is stored once and reused across runs
+    /// (warm restarts skip RPC re-validation). Behind an `Arc` because the serve loop shares it in a
+    /// later increment; `MetadataCache` (redb) is `Send + Sync` with concurrent readers.
+    metadata_cache: Arc<MetadataCache>,
 }
 
 impl ServerRuntime {
-    pub fn new(endpoints: ChainEndpoints, ws_url: String, bind_addr: String) -> ServerRuntime {
+    pub fn new(
+        endpoints: ChainEndpoints,
+        ws_url: String,
+        bind_addr: String,
+        metadata_cache: Arc<MetadataCache>,
+    ) -> ServerRuntime {
         ServerRuntime {
             agent: ureq::Agent::new_with_defaults(),
             endpoints,
@@ -99,6 +109,7 @@ impl ServerRuntime {
             started: Instant::now(),
             last_log_millis: AtomicU64::new(0),
             snapshot: Arc::new(ArcSwap::from_pointee(ServerSnapshot::AwaitingAnchor)),
+            metadata_cache,
         }
     }
 
@@ -127,15 +138,139 @@ impl ServerRuntime {
             request,
             |hash| fetch_block_header(&self.agent, &self.endpoints, CHAIN, hash),
             |hash| fetch_block_logs(&self.agent, &self.endpoints, CHAIN, hash),
-            |at, candidates| {
-                fetch_pool_metadata(&self.agent, &self.endpoints, CHAIN, at, candidates)
-            },
-            |at, tokens| fetch_token_metadata(&self.agent, &self.endpoints, CHAIN, at, tokens),
+            |at, candidates| self.cached_pool_metadata(at, candidates),
+            |at, tokens| self.cached_token_metadata(at, tokens),
             |at, pools| fetch_pool_data(&self.agent, &self.endpoints, CHAIN, at, pools),
             |from, to| fetch_pool_logs_in_range(&self.agent, &self.endpoints, CHAIN, from, to),
             |number| fetch_canonical_block_header_at(&self.agent, &self.endpoints, CHAIN, number),
         )
     }
+
+    /// Cache-backed pool-metadata resolution: cached hits are served from the persistent cache, only
+    /// the misses hit RPC, and the freshly validated results are persisted before returning. Pool
+    /// *state* is never cached (per-block); only immutable metadata is.
+    fn cached_pool_metadata(
+        &self,
+        at: BlockHash,
+        candidates: HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError> {
+        cached_pool_metadata_with(
+            candidates,
+            |candidates| self.metadata_cache.load_pool_metadata(CHAIN, candidates),
+            |metadata| self.metadata_cache.store_pool_metadata(CHAIN, metadata),
+            |misses| fetch_pool_metadata(&self.agent, &self.endpoints, CHAIN, at, misses),
+        )
+    }
+
+    /// Token-decimals counterpart of [`ServerRuntime::cached_pool_metadata`].
+    fn cached_token_metadata(
+        &self,
+        at: BlockHash,
+        tokens: HashSet<TokenAddress>,
+    ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError> {
+        cached_token_metadata_with(
+            tokens,
+            |tokens| self.metadata_cache.load_token_metadata(tokens),
+            |metadata| self.metadata_cache.store_token_metadata(metadata),
+            |misses| fetch_token_metadata(&self.agent, &self.endpoints, CHAIN, at, misses),
+        )
+    }
+}
+
+/// Cache-backed pool-metadata resolution over injected cache and fetch closures: return the cached
+/// hits, fetch only the misses, persist the freshly fetched results, then merge. A cache load/store
+/// fault degrades to a plain fetch (logged), so the cache can never make a request fail that would
+/// otherwise succeed. Single fetch path — aa-server wires no v4 subgraph, so unlike aa-cli's
+/// `resolve_pool_metadata_with` there is no v3/v4 partition. Generic so it is unit-testable with an
+/// in-memory cache and fake fetchers.
+fn cached_pool_metadata_with<Load, Store, Fetch, LoadErr, StoreErr>(
+    candidates: HashSet<ProtocolPoolKey>,
+    load_cache: Load,
+    store_cache: Store,
+    fetch: Fetch,
+) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>
+where
+    Load: FnOnce(
+        &HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadata>, LoadErr>,
+    Store: FnOnce(&HashMap<ProtocolPoolKey, PoolMetadataResult>) -> Result<(), StoreErr>,
+    Fetch: FnOnce(
+        HashSet<ProtocolPoolKey>,
+    ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>,
+    LoadErr: std::fmt::Display,
+    StoreErr: std::fmt::Display,
+{
+    let cached = match load_cache(&candidates) {
+        Ok(cached) => cached,
+        Err(error) => {
+            eprintln!(
+                "aa-server chain={CHAIN:?} metadata_cache_load_failed kind=pool error={error}"
+            );
+            HashMap::new()
+        }
+    };
+
+    let misses = candidates
+        .into_iter()
+        .filter(|candidate| !cached.contains_key(candidate))
+        .collect::<HashSet<_>>();
+
+    let mut metadata = fetch(misses)?;
+
+    if let Err(error) = store_cache(&metadata) {
+        eprintln!("aa-server chain={CHAIN:?} metadata_cache_store_failed kind=pool error={error}");
+    }
+
+    metadata.extend(
+        cached
+            .into_iter()
+            .map(|(candidate, value)| (candidate, Ok(value))),
+    );
+
+    Ok(metadata)
+}
+
+/// Token-decimals counterpart of [`cached_pool_metadata_with`]: same load/miss/fetch/store/merge
+/// shape over `TokenAddress`/`TokenMetadata`.
+fn cached_token_metadata_with<Load, Store, Fetch, LoadErr, StoreErr>(
+    tokens: HashSet<TokenAddress>,
+    load_cache: Load,
+    store_cache: Store,
+    fetch: Fetch,
+) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError>
+where
+    Load: FnOnce(&HashSet<TokenAddress>) -> Result<HashMap<TokenAddress, TokenMetadata>, LoadErr>,
+    Store: FnOnce(&HashMap<TokenAddress, TokenMetadataResult>) -> Result<(), StoreErr>,
+    Fetch: FnOnce(
+        HashSet<TokenAddress>,
+    ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError>,
+    LoadErr: std::fmt::Display,
+    StoreErr: std::fmt::Display,
+{
+    let cached = match load_cache(&tokens) {
+        Ok(cached) => cached,
+        Err(error) => {
+            eprintln!(
+                "aa-server chain={CHAIN:?} metadata_cache_load_failed kind=token error={error}"
+            );
+            HashMap::new()
+        }
+    };
+
+    let misses = tokens
+        .into_iter()
+        .filter(|token| !cached.contains_key(token))
+        .collect::<HashSet<_>>();
+
+    let mut metadata = fetch(misses)?;
+
+    if let Err(error) = store_cache(&metadata) {
+        eprintln!("aa-server chain={CHAIN:?} metadata_cache_store_failed kind=token error={error}");
+    }
+
+    metadata.extend(cached.into_iter().map(|(token, value)| (token, Ok(value))));
+
+    Ok(metadata)
 }
 
 impl Runtime<ServerApp> for ServerRuntime {
@@ -538,6 +673,7 @@ mod tests {
             endpoints,
             "ws://localhost:8546".to_owned(),
             "127.0.0.1:0".to_owned(),
+            Arc::new(MetadataCache::in_memory().expect("in-memory metadata cache")),
         )
     }
 
@@ -606,5 +742,136 @@ mod tests {
             Err(ureq::Error::StatusCode(code)) => assert_eq!(code, 404),
             other => panic!("expected a 404 status error, got {other:?}"),
         }
+    }
+
+    // ---- metadata cache-back helpers ----
+
+    use client_evm::{Address, PoolFee, TokenDecimals, U256, UniswapV3Fee};
+
+    fn v3_key(byte: u8) -> ProtocolPoolKey {
+        ProtocolPoolKey::UniswapV3(Address::from([byte; 20]))
+    }
+    fn pool_meta(byte: u8) -> PoolMetadata {
+        PoolMetadata {
+            token0: Address::from([byte; 20]),
+            token1: Address::from([byte.wrapping_add(1); 20]),
+            fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
+        }
+    }
+    fn token_addr(byte: u8) -> TokenAddress {
+        TokenAddress(Address::from([byte; 20]), CHAIN)
+    }
+    fn token_meta(decimals: u8) -> TokenMetadata {
+        TokenMetadata {
+            decimals: TokenDecimals::try_from_u256(U256::from(decimals))
+                .expect("decimals in range"),
+        }
+    }
+
+    #[test]
+    fn cached_pool_metadata_serves_hits_and_fetches_only_misses() {
+        let cache = MetadataCache::in_memory().expect("cache");
+        let hit = v3_key(1);
+        let miss = v3_key(2);
+        cache
+            .store_pool_metadata(CHAIN, &HashMap::from([(hit, Ok(pool_meta(1)))]))
+            .expect("preseed hit");
+
+        let mut fetched_misses: Option<HashSet<ProtocolPoolKey>> = None;
+        let result = cached_pool_metadata_with(
+            HashSet::from([hit, miss]),
+            |candidates| cache.load_pool_metadata(CHAIN, candidates),
+            |metadata| cache.store_pool_metadata(CHAIN, metadata),
+            |misses| {
+                fetched_misses = Some(misses.clone());
+                Ok(HashMap::from([(miss, Ok(pool_meta(2)))]))
+            },
+        )
+        .expect("resolve");
+
+        // The fetch closure was handed only the miss — the hit was served from the cache.
+        assert_eq!(fetched_misses, Some(HashSet::from([miss])));
+        assert_eq!(result.get(&hit), Some(&Ok(pool_meta(1))));
+        assert_eq!(result.get(&miss), Some(&Ok(pool_meta(2))));
+        // The freshly fetched miss was persisted, so a later load includes it.
+        let reloaded = cache
+            .load_pool_metadata(CHAIN, &HashSet::from([miss]))
+            .expect("reload");
+        assert_eq!(reloaded.get(&miss), Some(&pool_meta(2)));
+    }
+
+    #[test]
+    fn cached_pool_metadata_degrades_to_fetch_on_load_fault() {
+        let miss = v3_key(3);
+        let result = cached_pool_metadata_with(
+            HashSet::from([miss]),
+            |_| Err::<HashMap<ProtocolPoolKey, PoolMetadata>, &str>("load boom"),
+            |_| Ok::<(), &str>(()),
+            |misses| {
+                assert_eq!(misses, HashSet::from([miss]));
+                Ok(HashMap::from([(miss, Ok(pool_meta(3)))]))
+            },
+        )
+        .expect("resolve despite load fault");
+
+        assert_eq!(result.get(&miss), Some(&Ok(pool_meta(3))));
+    }
+
+    #[test]
+    fn cached_pool_metadata_returns_fetched_despite_store_fault() {
+        let miss = v3_key(4);
+        let result = cached_pool_metadata_with(
+            HashSet::from([miss]),
+            |_| Ok::<_, &str>(HashMap::new()),
+            |_| Err::<(), &str>("store boom"),
+            |_| Ok(HashMap::from([(miss, Ok(pool_meta(4)))])),
+        )
+        .expect("resolve despite store fault");
+
+        assert_eq!(result.get(&miss), Some(&Ok(pool_meta(4))));
+    }
+
+    #[test]
+    fn cached_token_metadata_serves_hits_and_fetches_only_misses() {
+        let cache = MetadataCache::in_memory().expect("cache");
+        let hit = token_addr(1);
+        let miss = token_addr(2);
+        cache
+            .store_token_metadata(&HashMap::from([(hit, Ok(token_meta(6)))]))
+            .expect("preseed hit");
+
+        let mut fetched_misses: Option<HashSet<TokenAddress>> = None;
+        let result = cached_token_metadata_with(
+            HashSet::from([hit, miss]),
+            |tokens| cache.load_token_metadata(tokens),
+            |metadata| cache.store_token_metadata(metadata),
+            |misses| {
+                fetched_misses = Some(misses.clone());
+                Ok(HashMap::from([(miss, Ok(token_meta(18)))]))
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(fetched_misses, Some(HashSet::from([miss])));
+        assert_eq!(result.get(&hit), Some(&Ok(token_meta(6))));
+        assert_eq!(result.get(&miss), Some(&Ok(token_meta(18))));
+        let reloaded = cache
+            .load_token_metadata(&HashSet::from([miss]))
+            .expect("reload");
+        assert_eq!(reloaded.get(&miss), Some(&token_meta(18)));
+    }
+
+    #[test]
+    fn cached_token_metadata_returns_fetched_despite_store_fault() {
+        let miss = token_addr(3);
+        let result = cached_token_metadata_with(
+            HashSet::from([miss]),
+            |_| Ok::<_, &str>(HashMap::new()),
+            |_| Err::<(), &str>("store boom"),
+            |_| Ok(HashMap::from([(miss, Ok(token_meta(9)))])),
+        )
+        .expect("resolve despite store fault");
+
+        assert_eq!(result.get(&miss), Some(&Ok(token_meta(9))));
     }
 }

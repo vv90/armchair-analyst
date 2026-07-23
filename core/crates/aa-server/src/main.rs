@@ -1,11 +1,13 @@
 use std::{
     env,
     io::{self, Write},
+    path::PathBuf,
     process::ExitCode,
+    sync::Arc,
 };
 
 use aa_framework::Runtime;
-use client_evm::ChainEndpoints;
+use client_evm::{ChainEndpoints, MetadataCache};
 
 use crate::{core::CHAIN, runtime::ServerRuntime};
 
@@ -40,12 +42,43 @@ fn run() -> Result<(), String> {
     let bind_addr = env::var("AA_SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
 
     let endpoints = ChainEndpoints::single(CHAIN, "primary", rpc_url);
-    let runtime = ServerRuntime::new(endpoints, ws_url, bind_addr);
+    let metadata_cache = Arc::new(open_metadata_cache()?);
+    let runtime = ServerRuntime::new(endpoints, ws_url, bind_addr, metadata_cache);
 
     let (_input_sender, handle) = runtime.run();
     handle
         .join()
         .map_err(|_| "runtime thread panicked".to_owned())
+}
+
+/// Opens the persistent metadata cache, falling back to an in-memory cache (with a loud warning) if
+/// the on-disk path cannot be opened. A cache-path problem must not stop the server serving and
+/// warming — it only costs persistence — consistent with the crate's non-fatal robustness (a serve
+/// bind failure likewise only ends that thread). Only failing to build even the in-memory cache is
+/// fatal.
+fn open_metadata_cache() -> Result<MetadataCache, String> {
+    let path = metadata_cache_path();
+    match MetadataCache::open(&path) {
+        Ok(cache) => Ok(cache),
+        Err(error) => {
+            eprintln!(
+                "aa-server metadata_cache open_failed path={} error={error} falling_back=in_memory",
+                path.display()
+            );
+            MetadataCache::in_memory()
+                .map_err(|error| format!("failed to open in-memory metadata cache: {error}"))
+        }
+    }
+}
+
+/// The metadata-cache file path from `AA_SERVER_METADATA_CACHE_PATH`, defaulting to a file in the
+/// working directory. Server-scoped (distinct from aa-cli's `AA_METADATA_CACHE_PATH`) so the two
+/// processes never contend on the same single-writer redb file.
+fn metadata_cache_path() -> PathBuf {
+    match env::var("AA_SERVER_METADATA_CACHE_PATH") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+        _ => PathBuf::from("aa-server-metadata.redb"),
+    }
 }
 
 fn install_rustls_provider() -> Result<(), ()> {

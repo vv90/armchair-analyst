@@ -32,8 +32,8 @@ use alloy::primitives::{Address, BloomInput, U160, U256, aliases::I24};
 use client_evm::kernel::{Event, State, transition};
 use client_evm::{
     BlockHash, Bloom, ChainKey, PoolFee, PoolLog, PoolLogEvent, PoolMetadata, PoolMetadataResult,
-    ProtocolPoolKey, TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataResult, TokenRegistry,
-    TrustedPoolRegistry, UniswapV3Fee,
+    ProtocolPoolKey, TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataResult,
+    TokenRegistry, TrustedPoolRegistry, UniswapV3Fee,
 };
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 

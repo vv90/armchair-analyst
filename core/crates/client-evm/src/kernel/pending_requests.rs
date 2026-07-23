@@ -482,11 +482,7 @@ impl PendingRequests {
                     .values()
                     .map(|request| request.dispatched_at),
             )
-            .chain(
-                self.pool_data
-                    .values()
-                    .map(|request| request.dispatched_at),
-            )
+            .chain(self.pool_data.values().map(|request| request.dispatched_at))
             .chain(
                 self.logs_range
                     .values()
@@ -600,8 +596,10 @@ mod tests {
     fn retaining_block_targets_drops_a_pool_data_seed_for_a_superseded_anchor() {
         let old_anchor = BlockHash::with_last_byte(1);
         let retained_block = BlockHash::with_last_byte(2);
-        let pool =
-            PoolRef::uniswap_v3(alloy::primitives::Address::with_last_byte(4), crate::ChainKey::Ethereum);
+        let pool = PoolRef::uniswap_v3(
+            alloy::primitives::Address::with_last_byte(4),
+            crate::ChainKey::Ethereum,
+        );
 
         let (pending, seed_id) = PendingRequests::new().with_new_request(
             GetPoolData {
@@ -610,15 +608,25 @@ mod tests {
             },
             Tick::initial(),
         );
-        let (pending, log_id) =
-            pending.with_new_request(GetBlockLogs { block_hash: retained_block }, Tick::initial());
+        let (pending, log_id) = pending.with_new_request(
+            GetBlockLogs {
+                block_hash: retained_block,
+            },
+            Tick::initial(),
+        );
 
         // The re-root keeps `retained_block` as a node but never the old anchor (finalized anchors
         // are not graph nodes), so the seed targeting it is superseded and dropped.
         let pending = pending.retaining_block_targets(&HashSet::from([retained_block]));
 
-        assert!(!pending.contains(&seed_id), "stale-anchor seed must be dropped");
-        assert!(pending.contains(&log_id), "a request for a retained block survives");
+        assert!(
+            !pending.contains(&seed_id),
+            "stale-anchor seed must be dropped"
+        );
+        assert!(
+            pending.contains(&log_id),
+            "a request for a retained block survives"
+        );
     }
 
     #[test]
@@ -807,7 +815,10 @@ mod tests {
         // An in-flight range is latency-critical backfill (the seed scheduler must stay idle) and
         // covers every number in its window for the range scheduler's dedup.
         assert!(pending.has_pending_block_backfill());
-        assert_eq!(pending.pending_log_range_numbers(), HashSet::from([5, 6, 7]));
+        assert_eq!(
+            pending.pending_log_range_numbers(),
+            HashSet::from([5, 6, 7])
+        );
 
         let (pending, _) = pending.take(&request_id);
         assert!(!pending.has_pending_block_backfill());

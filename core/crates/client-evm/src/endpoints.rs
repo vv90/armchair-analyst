@@ -658,10 +658,22 @@ mod tests {
             panic!("all-retryable failures must surface as FailoverExhausted, got {result:?}");
         };
         // Both endpoints were tried (not short-circuited), and each appears with its error.
-        assert!(detail.contains("tried 2 of 2 endpoint(s):"), "detail: {detail}");
-        assert!(!detail.contains("stopped on non-retryable"), "detail: {detail}");
-        assert!(detail.contains("ep0=[http status 503: down]"), "detail: {detail}");
-        assert!(detail.contains("ep1=[http status 503: down]"), "detail: {detail}");
+        assert!(
+            detail.contains("tried 2 of 2 endpoint(s):"),
+            "detail: {detail}"
+        );
+        assert!(
+            !detail.contains("stopped on non-retryable"),
+            "detail: {detail}"
+        );
+        assert!(
+            detail.contains("ep0=[http status 503: down]"),
+            "detail: {detail}"
+        );
+        assert!(
+            detail.contains("ep1=[http status 503: down]"),
+            "detail: {detail}"
+        );
     }
 
     #[test]
@@ -689,7 +701,10 @@ mod tests {
             "detail: {detail}"
         );
         // Whichever endpoint the cursor picked first carries the recorded 404.
-        assert!(detail.contains("=[http status 404: not found]"), "detail: {detail}");
+        assert!(
+            detail.contains("=[http status 404: not found]"),
+            "detail: {detail}"
+        );
     }
 
     #[test]
@@ -899,17 +914,30 @@ mod tests {
     #[test]
     fn assemble_chain_builds_a_pool_per_active_chain_from_specs() {
         let mut specs = rpc_specs();
-        specs.entry(ChainKey::Ethereum).or_default().push(
-            EndpointSpec::new("publicnode", "https://ethereum-rpc.publicnode.com", 1),
-        );
+        specs
+            .entry(ChainKey::Ethereum)
+            .or_default()
+            .push(EndpointSpec::new(
+                "publicnode",
+                "https://ethereum-rpc.publicnode.com",
+                1,
+            ));
 
         let endpoints = assemble_chain_endpoints(&specs).expect("assembly succeeds");
         assert_eq!(
-            endpoints.pool(ChainKey::Ethereum).expect("ethereum pool").endpoints.len(),
+            endpoints
+                .pool(ChainKey::Ethereum)
+                .expect("ethereum pool")
+                .endpoints
+                .len(),
             2
         );
         assert_eq!(
-            endpoints.pool(ChainKey::Base).expect("base pool").endpoints.len(),
+            endpoints
+                .pool(ChainKey::Base)
+                .expect("base pool")
+                .endpoints
+                .len(),
             1
         );
     }
@@ -1032,11 +1060,19 @@ mod tests {
 
         let endpoints = assemble_graph_endpoints(&specs).expect("assembly succeeds");
         assert_eq!(
-            endpoints.pool(ChainKey::Ethereum).expect("ethereum pool").endpoints.len(),
+            endpoints
+                .pool(ChainKey::Ethereum)
+                .expect("ethereum pool")
+                .endpoints
+                .len(),
             1
         );
         assert_eq!(
-            endpoints.pool(ChainKey::Base).expect("base pool").endpoints.len(),
+            endpoints
+                .pool(ChainKey::Base)
+                .expect("base pool")
+                .endpoints
+                .len(),
             1
         );
     }
@@ -1053,9 +1089,14 @@ mod tests {
     #[test]
     fn assemble_graph_includes_all_specs_for_a_chain() {
         let mut specs = graph_specs();
-        specs.entry(ChainKey::Ethereum).or_default().push(
-            EndpointSpec::new("goldsky", "https://api.goldsky.com/subgraphs/v4", 1),
-        );
+        specs
+            .entry(ChainKey::Ethereum)
+            .or_default()
+            .push(EndpointSpec::new(
+                "goldsky",
+                "https://api.goldsky.com/subgraphs/v4",
+                1,
+            ));
 
         let endpoints = assemble_graph_endpoints(&specs).expect("assembly succeeds");
         let eth = endpoints.pool(ChainKey::Ethereum).expect("ethereum pool");
@@ -1064,8 +1105,7 @@ mod tests {
 
     #[test]
     fn assemble_graph_with_no_specs_yields_no_pools() {
-        let endpoints =
-            assemble_graph_endpoints(&BTreeMap::new()).expect("assembly succeeds");
+        let endpoints = assemble_graph_endpoints(&BTreeMap::new()).expect("assembly succeeds");
 
         assert!(endpoints.pool(ChainKey::Ethereum).is_none());
         assert!(endpoints.pool(ChainKey::Arbitrum).is_none());

@@ -33,10 +33,9 @@ pub const AVALANCHE_UNISWAP_V3_FACTORY_ADDRESS: Address =
 /// added here, not by reusing a per-chain constant elsewhere.
 pub fn v3_factory_address(chain: ChainKey) -> Address {
     match chain {
-        ChainKey::Ethereum
-        | ChainKey::Arbitrum
-        | ChainKey::Optimism
-        | ChainKey::Polygon => ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS,
+        ChainKey::Ethereum | ChainKey::Arbitrum | ChainKey::Optimism | ChainKey::Polygon => {
+            ETHEREUM_UNISWAP_V3_FACTORY_ADDRESS
+        }
         ChainKey::Base => BASE_UNISWAP_V3_FACTORY_ADDRESS,
         ChainKey::Bnb => BNB_UNISWAP_V3_FACTORY_ADDRESS,
         ChainKey::Avalanche => AVALANCHE_UNISWAP_V3_FACTORY_ADDRESS,

@@ -200,7 +200,6 @@ impl TrustedPoolRegistry {
     pub fn is_known(&self, chain: ChainKey, candidate: ProtocolPoolKey) -> bool {
         self.verified_pool(chain, candidate).is_some() || self.is_rejected(candidate)
     }
-
 }
 
 #[cfg(test)]
@@ -276,12 +275,18 @@ mod tests {
         );
 
         assert_eq!(
-            registry.verified_metadata(PoolRef { key: candidate, chain: ChainKey::Ethereum }),
+            registry.verified_metadata(PoolRef {
+                key: candidate,
+                chain: ChainKey::Ethereum
+            }),
             Some(&metadata)
         );
         assert_eq!(
             registry.verified_pool(ChainKey::Ethereum, candidate),
-            Some(PoolRef { key: candidate, chain: ChainKey::Ethereum })
+            Some(PoolRef {
+                key: candidate,
+                chain: ChainKey::Ethereum
+            })
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -295,10 +300,7 @@ mod tests {
 
         let registry = TrustedPoolRegistry::new().with_metadata_results(
             ChainKey::Ethereum,
-            HashMap::from([
-                (v3, Ok(v3_metadata.clone())),
-                (v4, Ok(v4_metadata.clone())),
-            ]),
+            HashMap::from([(v3, Ok(v3_metadata.clone())), (v4, Ok(v4_metadata.clone()))]),
         );
 
         assert_eq!(
@@ -356,7 +358,10 @@ mod tests {
 
         assert_eq!(
             registry.verified_pool(ChainKey::Ethereum, candidate),
-            Some(PoolRef { key: candidate, chain: ChainKey::Ethereum })
+            Some(PoolRef {
+                key: candidate,
+                chain: ChainKey::Ethereum
+            })
         );
         assert!(!registry.is_rejected(candidate));
     }
@@ -397,7 +402,10 @@ mod tests {
 
         assert_eq!(
             registry.verified_pool(ChainKey::Ethereum, candidate),
-            Some(PoolRef { key: candidate, chain: ChainKey::Ethereum })
+            Some(PoolRef {
+                key: candidate,
+                chain: ChainKey::Ethereum
+            })
         );
         assert!(!registry.is_rejected(candidate));
     }

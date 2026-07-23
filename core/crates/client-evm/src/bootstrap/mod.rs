@@ -11,7 +11,7 @@ use alloy::primitives::{BlockHash, keccak256};
 // Pool/token/data request payloads are shared with the kernel — reused here to keep a single
 // definition rather than duplicating the request models.
 use crate::{
-    ChainKey, PoolLog, PoolRef, ProtocolPoolKey, PoolMetadataResult, PoolState, RangeLogBlock,
+    ChainKey, PoolLog, PoolMetadataResult, PoolRef, PoolState, ProtocolPoolKey, RangeLogBlock,
     TokenAddress, TokenMetadataResult, TokenRegistry, TrustedPoolRegistry, tick::Tick,
 };
 pub use crate::{GetPoolMetadata, GetTokenMetadata};

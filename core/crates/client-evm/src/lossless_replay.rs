@@ -113,7 +113,11 @@ impl LosslessPool {
     /// `y·u/(x+u)`, pre-fee input added to the input-side reserve. All intermediates are U512-widened,
     /// every narrowing is bounded by construction (`after_fee ≤ amount_in`, `out ≤ y`), and reserve
     /// mutation saturates, so the path cannot panic or overflow.
-    fn swap(&mut self, token_in: TokenAddress, amount_in: U256) -> Result<Hop, LosslessReplayError> {
+    fn swap(
+        &mut self,
+        token_in: TokenAddress,
+        amount_in: U256,
+    ) -> Result<Hop, LosslessReplayError> {
         let forward = token_in == self.token0;
         let (x, y, limit) = if forward {
             (self.reserve0, self.reserve1, self.swap_limit_0)
@@ -125,9 +129,8 @@ impl LosslessPool {
 
         // A malformed fee of 100% or more keeps nothing: after_fee = 0, out = 0, never a panic.
         let keep = PIPS_DENOMINATOR.saturating_sub(self.fee_pips);
-        let after_fee = U256::from(
-            U512::from(amount_in) * U512::from(keep) / U512::from(PIPS_DENOMINATOR),
-        );
+        let after_fee =
+            U256::from(U512::from(amount_in) * U512::from(keep) / U512::from(PIPS_DENOMINATOR));
 
         let hit_limit = after_fee > limit;
         let capped = if hit_limit { limit } else { after_fee };
@@ -201,10 +204,7 @@ pub fn replay_plan_lossless(
     for stage in 0..=max_stage {
         let mut next: HashMap<TokenAddress, U256> = HashMap::new();
         for step in plan.steps.iter().filter(|step| step.stage == stage) {
-            let available = balances
-                .get(&step.token_in)
-                .copied()
-                .unwrap_or(U256::ZERO);
+            let available = balances.get(&step.token_in).copied().unwrap_or(U256::ZERO);
             let amount_in = weighted_amount(available, step.weight);
             if amount_in.is_zero() {
                 continue;
@@ -276,7 +276,12 @@ mod tests {
         PoolRef::uniswap_v3(Address::with_last_byte(byte), ChainKey::Ethereum)
     }
 
-    fn pool(token0: TokenAddress, token1: TokenAddress, reserve0: u128, reserve1: u128) -> LosslessPool {
+    fn pool(
+        token0: TokenAddress,
+        token1: TokenAddress,
+        reserve0: u128,
+        reserve1: u128,
+    ) -> LosslessPool {
         LosslessPool {
             token0,
             token1,
@@ -322,9 +327,7 @@ mod tests {
         }
     }
 
-    fn resolver(
-        book: Vec<(PoolRef, LosslessPool)>,
-    ) -> impl Fn(PoolRef) -> Option<LosslessPool> {
+    fn resolver(book: Vec<(PoolRef, LosslessPool)>) -> impl Fn(PoolRef) -> Option<LosslessPool> {
         move |pool| {
             book.iter()
                 .find(|(id, _)| *id == pool)
@@ -381,10 +384,7 @@ mod tests {
         let plan = ExecutionPlan {
             init_asset: a,
             entry_amount: 100_000.0,
-            steps: vec![
-                swap_step(0, a, b, p1, 1.0),
-                swap_step(1, b, a, p2, 1.0),
-            ],
+            steps: vec![swap_step(0, a, b, p1, 1.0), swap_step(1, b, a, p2, 1.0)],
         };
         (plan, book)
     }
@@ -421,11 +421,16 @@ mod tests {
             fee: PoolFee::Tiered(UniswapV3Fee::Fee3000),
         };
 
-        let entry =
-            LosslessPool::from_pool_state(&state, &metadata, ChainKey::Ethereum).unwrap();
+        let entry = LosslessPool::from_pool_state(&state, &metadata, ChainKey::Ethereum).unwrap();
 
-        assert_eq!(entry.token0, TokenAddress(metadata.token0, ChainKey::Ethereum));
-        assert_eq!(entry.token1, TokenAddress(metadata.token1, ChainKey::Ethereum));
+        assert_eq!(
+            entry.token0,
+            TokenAddress(metadata.token0, ChainKey::Ethereum)
+        );
+        assert_eq!(
+            entry.token1,
+            TokenAddress(metadata.token1, ChainKey::Ethereum)
+        );
         assert_eq!(entry.reserve0, state.virtual_reserve_x());
         assert_eq!(entry.reserve1, state.virtual_reserve_y());
         assert_eq!(entry.fee_pips, 3000);
@@ -441,12 +446,14 @@ mod tests {
             .map(|(id, entry)| f32_reserves_from(*id, entry))
             .collect();
 
-        let outcome =
-            replay_plan_lossless(&plan, resolver(book), U256::from(100_000u64)).unwrap();
+        let outcome = replay_plan_lossless(&plan, resolver(book), U256::from(100_000u64)).unwrap();
         let oracle = replay_plan(&plan, &reserves).unwrap();
 
         assert!(!outcome.hit_tick_limit);
-        assert!(outcome.output > U256::from(100_000u64), "loop is profitable");
+        assert!(
+            outcome.output > U256::from(100_000u64),
+            "loop is profitable"
+        );
         assert_relative_eq(outcome.output, oracle, 1e-3);
     }
 
@@ -489,8 +496,7 @@ mod tests {
             steps: vec![swap_step(0, c, b, p, 1.0)],
         };
 
-        let error =
-            replay_plan_lossless(&plan, resolver(book), U256::from(1_000u64)).unwrap_err();
+        let error = replay_plan_lossless(&plan, resolver(book), U256::from(1_000u64)).unwrap_err();
 
         assert_eq!(error, LosslessReplayError::TokenNotInPool);
     }
@@ -545,8 +551,7 @@ mod tests {
             .map(|(id, entry)| f32_reserves_from(*id, entry))
             .collect();
 
-        let outcome =
-            replay_plan_lossless(&plan, resolver(book), U256::from(100_000u64)).unwrap();
+        let outcome = replay_plan_lossless(&plan, resolver(book), U256::from(100_000u64)).unwrap();
         let oracle = replay_plan(&plan, &reserves).unwrap();
 
         assert_relative_eq(outcome.output, oracle, 1e-3);

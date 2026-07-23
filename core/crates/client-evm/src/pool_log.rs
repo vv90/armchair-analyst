@@ -263,11 +263,7 @@ fn apply_liquidity_delta(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{
-        Address, B256, I256, U256,
-        aliases::U24,
-        b256,
-    };
+    use alloy::primitives::{Address, B256, I256, U256, aliases::U24, b256};
     use proptest::prelude::*;
 
     use super::*;

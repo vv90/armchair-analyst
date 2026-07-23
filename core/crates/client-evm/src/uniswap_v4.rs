@@ -176,8 +176,10 @@ pub fn pool_metadata_from_pool_key(id: PoolId, key: &PoolKey) -> PoolMetadataRes
         return Err(PoolMetadataFailure::PoolIdMismatch);
     }
 
-    let tick_spacing_i32 = i32::try_from(key.tickSpacing)
-        .map_err(|_| PoolMetadataFailure::InvalidTickSpacing { tick_spacing: i32::MIN })?;
+    let tick_spacing_i32 =
+        i32::try_from(key.tickSpacing).map_err(|_| PoolMetadataFailure::InvalidTickSpacing {
+            tick_spacing: i32::MIN,
+        })?;
     let tick_spacing = u16::try_from(tick_spacing_i32)
         .ok()
         .filter(|spacing| *spacing > 0)
@@ -389,7 +391,9 @@ mod tests {
         assert!(is_v4_pool_manager(BASE_UNISWAP_V4_POOL_MANAGER_ADDRESS));
         // Arbitrum is temporarily deactivated (see `ACTIVE_CHAINS`), so its manager is not
         // recognized: no Arbitrum logs arrive, and recognition is scoped to the active set.
-        assert!(!is_v4_pool_manager(ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS));
+        assert!(!is_v4_pool_manager(
+            ARBITRUM_UNISWAP_V4_POOL_MANAGER_ADDRESS
+        ));
         assert!(!is_v4_pool_manager(Address::ZERO));
         assert!(!is_v4_pool_manager(address!(
             "00000000000000000000000000000000deadbeef"

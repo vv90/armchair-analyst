@@ -27,7 +27,8 @@ pub const ETHEREUM_DAI_TOKEN_ADDRESS: TokenAddress = TokenAddress(
 
 /// Native ETH on Ethereum, denoted by the zero address. v4 native-currency pools store this as their
 /// `token0`; the token registry resolves it intrinsically to 18 decimals (it is not an ERC20).
-pub const ETHEREUM_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Ethereum);
+pub const ETHEREUM_NATIVE_TOKEN_ADDRESS: TokenAddress =
+    TokenAddress(Address::ZERO, ChainKey::Ethereum);
 
 /// Canonical Wrapped Ether (WETH) on Ethereum. Wrapping is 1:1 with native ETH, so the optimizer
 /// bridges this to [`ETHEREUM_NATIVE_TOKEN_ADDRESS`] to unify v4 native-ETH liquidity with v3 WETH.
@@ -56,7 +57,8 @@ pub const ARBITRUM_WBTC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
 
 /// Native ETH on Arbitrum One (the chain's gas token), denoted by the zero address. v4 native-currency
 /// pools store this as their `token0`; the token registry resolves it intrinsically to 18 decimals.
-pub const ARBITRUM_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Arbitrum);
+pub const ARBITRUM_NATIVE_TOKEN_ADDRESS: TokenAddress =
+    TokenAddress(Address::ZERO, ChainKey::Arbitrum);
 
 /// Canonical Wrapped Ether (WETH) on Arbitrum One. Wrapping is 1:1 with native ETH, so the optimizer
 /// bridges this to [`ARBITRUM_NATIVE_TOKEN_ADDRESS`] to unify v4 native-ETH liquidity with v3 WETH.
@@ -108,7 +110,8 @@ pub const OPTIMISM_DAI_TOKEN_ADDRESS: TokenAddress = TokenAddress(
     ChainKey::Optimism,
 );
 /// Native ETH on Optimism, denoted by the zero address; 18 decimals intrinsically.
-pub const OPTIMISM_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Optimism);
+pub const OPTIMISM_NATIVE_TOKEN_ADDRESS: TokenAddress =
+    TokenAddress(Address::ZERO, ChainKey::Optimism);
 /// Canonical Wrapped Ether (WETH) on Optimism, bridged 1:1 to [`OPTIMISM_NATIVE_TOKEN_ADDRESS`].
 pub const OPTIMISM_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
     address!("4200000000000000000000000000000000000006"),
@@ -134,7 +137,8 @@ pub const POLYGON_WBTC_TOKEN_ADDRESS: TokenAddress = TokenAddress(
 );
 /// Polygon's native gas token is POL (zero address, 18 decimals) — *not* ETH. WETH below is a bridged
 /// ERC20, so unlike the rollups it is not 1:1 with the native token; it is the wrapped-ETH anchor only.
-pub const POLYGON_NATIVE_TOKEN_ADDRESS: TokenAddress = TokenAddress(Address::ZERO, ChainKey::Polygon);
+pub const POLYGON_NATIVE_TOKEN_ADDRESS: TokenAddress =
+    TokenAddress(Address::ZERO, ChainKey::Polygon);
 /// Bridged Wrapped Ether (WETH) on Polygon.
 pub const POLYGON_WETH_TOKEN_ADDRESS: TokenAddress = TokenAddress(
     address!("7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"),

@@ -236,14 +236,22 @@ mod tests {
     #[test]
     fn issued_request_is_retrievable_then_consumed() {
         let pending = PendingRequests::new();
-        let (pending, request_id) =
-            pending.with_new_request(GetPoolCandidatesInRange { from_block: 7, scan_tip: None }, tick(1));
+        let (pending, request_id) = pending.with_new_request(
+            GetPoolCandidatesInRange {
+                from_block: 7,
+                scan_tip: None,
+            },
+            tick(1),
+        );
 
         let (pending, taken) = pending.take(&request_id);
         assert!(matches!(
             taken,
             Some(PendingPayload {
-                payload: GetPoolCandidatesInRange { from_block: 7, scan_tip: None },
+                payload: GetPoolCandidatesInRange {
+                    from_block: 7,
+                    scan_tip: None
+                },
                 ..
             })
         ));
@@ -256,8 +264,13 @@ mod tests {
     fn distinct_requests_get_distinct_ids() {
         let pending = PendingRequests::new();
         let (pending, finalized_id) = pending.with_new_request(GetFinalizedHeader, tick(1));
-        let (_pending, candidates_id) =
-            pending.with_new_request(GetPoolCandidatesInRange { from_block: 1, scan_tip: None }, tick(1));
+        let (_pending, candidates_id) = pending.with_new_request(
+            GetPoolCandidatesInRange {
+                from_block: 1,
+                scan_tip: None,
+            },
+            tick(1),
+        );
 
         assert_ne!(finalized_id.raw_for_test(), candidates_id.raw_for_test());
     }
@@ -265,8 +278,13 @@ mod tests {
     #[test]
     fn retry_expired_before_ttl_keeps_request_pending() {
         let pending = PendingRequests::new();
-        let (pending, request_id) =
-            pending.with_new_request(GetPoolCandidatesInRange { from_block: 5, scan_tip: None }, tick(0));
+        let (pending, request_id) = pending.with_new_request(
+            GetPoolCandidatesInRange {
+                from_block: 5,
+                scan_tip: None,
+            },
+            tick(0),
+        );
 
         let (pending, reissued) = pending.retry_expired(tick(REQUEST_TTL_FOR_TEST - 1));
         assert!(reissued.is_empty());
@@ -275,7 +293,10 @@ mod tests {
         assert!(matches!(
             taken,
             Some(PendingPayload {
-                payload: GetPoolCandidatesInRange { from_block: 5, scan_tip: None },
+                payload: GetPoolCandidatesInRange {
+                    from_block: 5,
+                    scan_tip: None
+                },
                 ..
             })
         ));
@@ -284,8 +305,13 @@ mod tests {
     #[test]
     fn retry_expired_after_ttl_reissues_same_payload_with_new_id() {
         let pending = PendingRequests::new();
-        let (pending, request_id) =
-            pending.with_new_request(GetPoolCandidatesInRange { from_block: 42, scan_tip: None }, tick(0));
+        let (pending, request_id) = pending.with_new_request(
+            GetPoolCandidatesInRange {
+                from_block: 42,
+                scan_tip: None,
+            },
+            tick(0),
+        );
 
         let (pending, reissued) = pending.retry_expired(tick(REQUEST_TTL_FOR_TEST));
         assert!(matches!(

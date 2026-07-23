@@ -52,7 +52,9 @@ pub struct ChainProgress {
 pub enum ChainObservation {
     /// Still bootstrapping. `buffered_events` counts the live subscription deliveries queued for
     /// replay at activation, so the size of the activation burst is visible while it accumulates.
-    Initializing { buffered_events: usize },
+    Initializing {
+        buffered_events: usize,
+    },
     Active(ChainProgress),
 }
 
@@ -175,7 +177,10 @@ pub enum PlanVerification {
     /// The lossless replay ran: `profit` = output − entry in decimal-normalized init-asset units
     /// (the same scale as the claimed `profit_amount`); `hit_tick_limit` marks a hop clamped at its
     /// tick boundary, making `profit` a conservative lower-fidelity bound rather than exact.
-    Verified { profit: f32, hit_tick_limit: bool },
+    Verified {
+        profit: f32,
+        hit_tick_limit: bool,
+    },
     Unverifiable(PlanVerificationFailure),
 }
 
@@ -1001,7 +1006,9 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
             let (chain_state, effects) = match kernel::transition_outcome(chain, chain_state, event)
             {
                 kernel::TransitionOutcome::Inert(chain_state) => {
-                    state.chains.insert(chain, ChainLifecycle::Active(chain_state));
+                    state
+                        .chains
+                        .insert(chain, ChainLifecycle::Active(chain_state));
                     return (state, Vec::new());
                 }
                 kernel::TransitionOutcome::Progressed(chain_state, effects) => {
@@ -1039,7 +1046,9 @@ fn chain_event(mut state: State, chain: ChainKey, event: kernel::Event) -> (Stat
                 state.last_optimized_block.get(&chain).copied(),
             );
 
-            state.chains.insert(chain, ChainLifecycle::Active(chain_state));
+            state
+                .chains
+                .insert(chain, ChainLifecycle::Active(chain_state));
             // Dispatch only when *this* chain's fold frontier advanced and its own projection is
             // ready. Record the hash only on that success so an unready (`Ok(None)`) or failed
             // (`Err`) chain retries this block next event. The dispatched input is then re-derived
@@ -1190,7 +1199,7 @@ mod tests {
     use super::*;
     use crate::kernel;
     use crate::{
-        PoolFee, PoolRef, PoolMetadata, PoolState, TokenAddress, TokenAmountConversionError,
+        PoolFee, PoolMetadata, PoolRef, PoolState, TokenAddress, TokenAmountConversionError,
         TokenDecimals, TokenMetadata, TrustedPoolRegistry, UniswapV3Fee, u256_token_amount_to_f32,
     };
 
@@ -1638,10 +1647,7 @@ mod tests {
 
         assert_eq!(
             state.observe(),
-            vec![(
-                chain,
-                ChainObservation::Initializing { buffered_events: 0 }
-            )]
+            vec![(chain, ChainObservation::Initializing { buffered_events: 0 })]
         );
     }
 
@@ -1665,10 +1671,7 @@ mod tests {
 
         assert_eq!(
             state.observe(),
-            vec![(
-                chain,
-                ChainObservation::Initializing { buffered_events: 1 }
-            )]
+            vec![(chain, ChainObservation::Initializing { buffered_events: 1 })]
         );
     }
 
@@ -2562,7 +2565,8 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18)), (token1, token_metadata(6))]),
         );
-        let update = projection_update(hash(2), HashMap::from([(pool, updated_pool_state.clone())]));
+        let update =
+            projection_update(hash(2), HashMap::from([(pool, updated_pool_state.clone())]));
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update)
             .unwrap()
@@ -2587,7 +2591,10 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let update = projection_update(hash(2), HashMap::from([(pool, balanced_pool_state(1_000_000))]));
+        let update = projection_update(
+            hash(2),
+            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
+        );
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 
@@ -2606,7 +2613,10 @@ mod tests {
             HashMap::from([(pool, pool_metadata(token0, token1, UniswapV3Fee::Fee3000))]),
             HashMap::from([(token0, token_metadata(18))]),
         );
-        let update = projection_update(hash(2), HashMap::from([(pool, balanced_pool_state(1_000_000))]));
+        let update = projection_update(
+            hash(2),
+            HashMap::from([(pool, balanced_pool_state(1_000_000))]),
+        );
 
         let reserves = pool_reserves_for_optimization(&state, ChainKey::Ethereum, &update).unwrap();
 

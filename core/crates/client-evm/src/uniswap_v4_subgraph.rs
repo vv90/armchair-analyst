@@ -347,7 +347,8 @@ mod tests {
             "tickSpacing": "10",
             "hooks": format!("{:#x}", Address::ZERO),
         });
-        let (url, _requests, server) = spawn_graph_server(vec![json!({ "data": { "pools": [pool] } })]);
+        let (url, _requests, server) =
+            spawn_graph_server(vec![json!({ "data": { "pools": [pool] } })]);
         let graph = GraphEndpoints::single(ChainKey::Ethereum, "thegraph", url);
         let agent = ureq::Agent::new_with_defaults();
 
@@ -442,9 +443,7 @@ mod tests {
 
     /// Spawns a one-shot-per-response HTTP server returning canned JSON, reporting each request's parsed
     /// JSON body over the channel.
-    fn spawn_graph_server(
-        responses: Vec<Value>,
-    ) -> (String, Receiver<Value>, JoinHandle<()>) {
+    fn spawn_graph_server(responses: Vec<Value>) -> (String, Receiver<Value>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test server binds");
         let address = listener.local_addr().expect("test server has an address");
         let (sender, receiver) = channel();

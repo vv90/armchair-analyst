@@ -17,29 +17,28 @@ use serde_json::Value;
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 use crate::{
-    ChainKey, ClientEvmError, PoolFee, PoolRef, ProtocolPoolKey, PoolDataCall, PoolDataFailure,
-    PoolDataResult, PoolLog, PoolMetadata, PoolMetadataCall, PoolMetadataFailure,
-    PoolMetadataResult, PoolState, RangeLogBlock, TokenAddress, TokenDecimals,
-    TokenMetadata, TokenMetadataCall, TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee,
-    decode_pool_log,
+    ChainKey, ClientEvmError, PoolDataCall, PoolDataFailure, PoolDataResult, PoolFee, PoolLog,
+    PoolMetadata, PoolMetadataCall, PoolMetadataFailure, PoolMetadataResult, PoolRef, PoolState,
+    ProtocolPoolKey, RangeLogBlock, TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall,
+    TokenMetadataFailure, TokenMetadataResult, UniswapV3Fee, decode_pool_log,
     endpoints::{ChainEndpoints, EndpointPool},
 };
 
 use super::{
     ClientEvent, ClientHead,
-    subscription::LogBatchBuffer,
     client_utils::{
         build_block_header_by_number_request, build_block_header_request, build_block_logs_request,
-        build_block_number_request,
-        build_finalized_block_header_request, build_new_heads_subscribe_request,
-        build_pool_events_subscribe_request, build_pool_logs_range_request,
-        parse_block_header_response, parse_block_header_response_by_id, parse_block_logs_response,
-        parse_block_number_response, parse_pool_logs_range_response, parse_subscription_response,
+        build_block_number_request, build_finalized_block_header_request,
+        build_new_heads_subscribe_request, build_pool_events_subscribe_request,
+        build_pool_logs_range_request, parse_block_header_response,
+        parse_block_header_response_by_id, parse_block_logs_response, parse_block_number_response,
+        parse_pool_logs_range_response, parse_subscription_response,
     },
     multicall3::{
         MulticallBlock, MulticallCall, MulticallCallResult, build_multicall3_batch_request,
         parse_multicall3_batch_response,
     },
+    subscription::LogBatchBuffer,
 };
 
 const HTTP_REQUEST_ID: u64 = 1;
@@ -423,9 +422,7 @@ pub fn fetch_token_metadata(
     Ok(decode_token_metadata_results(&tokens, &results))
 }
 
-fn sorted_pool_candidate_addresses(
-    candidates: HashSet<ProtocolPoolKey>,
-) -> Vec<ProtocolPoolKey> {
+fn sorted_pool_candidate_addresses(candidates: HashSet<ProtocolPoolKey>) -> Vec<ProtocolPoolKey> {
     // This RPC path validates pools via the v3 factory and per-pool `token0`/`token1`/`fee` reads,
     // so it applies only to v3 candidates; v4 metadata is event-sourced. Drop any non-v3 candidate
     // defensively (none reach here today).
@@ -499,9 +496,7 @@ fn decode_token_metadata_multicall_result<T>(
     }
 }
 
-fn pool_metadata_candidate_multicall_calls(
-    candidates: &[ProtocolPoolKey],
-) -> Vec<MulticallCall> {
+fn pool_metadata_candidate_multicall_calls(candidates: &[ProtocolPoolKey]) -> Vec<MulticallCall> {
     candidates
         .iter()
         .flat_map(|candidate| {
@@ -721,10 +716,7 @@ fn pool_data_call_plan(pool: PoolRef, state_view: Option<Address>) -> Option<[Mu
 }
 
 fn pool_data_multicall_calls(plans: &[(PoolRef, [MulticallCall; 2])]) -> Vec<MulticallCall> {
-    plans
-        .iter()
-        .flat_map(|(_, calls)| calls.clone())
-        .collect()
+    plans.iter().flat_map(|(_, calls)| calls.clone()).collect()
 }
 
 fn decode_pool_data_results(
@@ -1136,9 +1128,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        PoolRef, ProtocolPoolKey, PoolDataCall, PoolDataFailure, PoolMetadataCall,
-        PoolMetadataFailure, PoolState, TokenAddress, TokenDecimals, TokenMetadata,
-        TokenMetadataCall, TokenMetadataFailure, UniswapV3Fee,
+        PoolDataCall, PoolDataFailure, PoolMetadataCall, PoolMetadataFailure, PoolRef, PoolState,
+        ProtocolPoolKey, TokenAddress, TokenDecimals, TokenMetadata, TokenMetadataCall,
+        TokenMetadataFailure, UniswapV3Fee,
         client::multicall3::{
             MULTICALL3_ADDRESS, MulticallCall, MulticallCallResult,
             aggregate3_return_data_for_test, decode_aggregate3_call_data_for_test,
@@ -1450,7 +1442,10 @@ mod tests {
             &endpoints,
             ChainKey::Ethereum,
             B256::with_last_byte(1),
-            HashSet::from([PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum)]),
+            HashSet::from([PoolRef::uniswap_v3(
+                Address::with_last_byte(2),
+                ChainKey::Ethereum,
+            )]),
         );
 
         assert!(matches!(result, Err(ClientEvmError::HttpTransport(_))));
@@ -1558,8 +1553,10 @@ mod tests {
     #[test]
     fn fetch_pool_data_returns_per_pool_failure_for_failed_v4_inner_call() {
         let at = B256::with_last_byte(1);
-        let pool =
-            PoolRef::uniswap_v4(crate::uniswap_v4::PoolId(B256::with_last_byte(7)), ChainKey::Ethereum);
+        let pool = PoolRef::uniswap_v4(
+            crate::uniswap_v4::PoolId(B256::with_last_byte(7)),
+            ChainKey::Ethereum,
+        );
         let state = pool_state(31, -32, 33);
         let response = multicall3_response([
             successful_multicall_result(v4_get_slot0_return_data(&state)),
@@ -1588,8 +1585,10 @@ mod tests {
     #[test]
     fn pool_data_call_plans_skip_v4_pools_when_the_chain_has_no_state_view() {
         let v3_pool = PoolRef::uniswap_v3(Address::with_last_byte(2), ChainKey::Ethereum);
-        let v4_pool =
-            PoolRef::uniswap_v4(crate::uniswap_v4::PoolId(B256::with_last_byte(7)), ChainKey::Arbitrum);
+        let v4_pool = PoolRef::uniswap_v4(
+            crate::uniswap_v4::PoolId(B256::with_last_byte(7)),
+            ChainKey::Arbitrum,
+        );
 
         // With no StateView for the chain the v4 pool has no contract to target and is dropped, while
         // the v3 pool still produces its (address-targeted) plan.
@@ -2932,7 +2931,10 @@ mod tests {
 
         // The tip is resolved once (first call only); each call pages exactly one getLogs window.
         let tip_request = received.recv().expect("tip request");
-        assert_eq!(tip_request.body.get("method"), Some(&json!("eth_blockNumber")));
+        assert_eq!(
+            tip_request.body.get("method"),
+            Some(&json!("eth_blockNumber"))
+        );
 
         let first = received.recv().expect("first window request");
         assert_eq!(first.body.get("method"), Some(&json!("eth_getLogs")));

@@ -75,7 +75,7 @@ pub fn chain_key_for_network_path(path: &str) -> Option<ChainKey> {
 /// only trades call count for headroom and cannot break their bootstrap.
 pub fn pool_candidate_block_range_chunk(chain: ChainKey) -> u64 {
     match chain {
-        ChainKey::Base => 100,    // ~76 logs/blk → ~7.6k logs/window
+        ChainKey::Base => 100,     // ~76 logs/blk → ~7.6k logs/window
         ChainKey::Optimism => 250, // ~29 logs/blk → ~7.3k logs/window
         ChainKey::Ethereum
         | ChainKey::Arbitrum
@@ -191,7 +191,8 @@ mod tests {
     fn pending_cap_safely_exceeds_finality_depth_times_max_forks_for_every_chain() {
         for &chain in ALL_CHAINS {
             assert!(
-                max_pending_blocks(chain) > MAX_SIMULTANEOUS_FORKS * approx_finalized_block_age(chain),
+                max_pending_blocks(chain)
+                    > MAX_SIMULTANEOUS_FORKS * approx_finalized_block_age(chain),
                 "chain {chain:?}: pending cap {} must exceed {MAX_SIMULTANEOUS_FORKS} × finality depth {}",
                 max_pending_blocks(chain),
                 approx_finalized_block_age(chain),

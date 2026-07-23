@@ -314,7 +314,10 @@ mod tests {
         // not an RPC-fetched value (the zero address is not an ERC20).
         let registry = TokenRegistry::new();
 
-        assert_eq!(registry.verified_metadata(native).unwrap().decimals.value(), 18);
+        assert_eq!(
+            registry.verified_metadata(native).unwrap().decimals.value(),
+            18
+        );
         assert!(registry.is_known(native));
         assert!(!registry.is_unsupported(native));
     }

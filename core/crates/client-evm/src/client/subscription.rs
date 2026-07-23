@@ -160,7 +160,10 @@ mod tests {
     ) -> BTreeMap<(BlockHash, u64), PoolLog> {
         batches
             .into_iter()
-            .flat_map(|(hash, logs)| logs.into_iter().map(move |log| ((hash, log.log_index), log)))
+            .flat_map(|(hash, logs)| {
+                logs.into_iter()
+                    .map(move |log| ((hash, log.log_index), log))
+            })
             .collect()
     }
 
