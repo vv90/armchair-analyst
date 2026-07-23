@@ -117,7 +117,11 @@ pub struct SliceResponse {
 /// so the published snapshot feeds `/health` (scalars) and `/slice` (the overlay) from one fold.
 pub fn server_snapshot(state: &ServerState) -> ServerSnapshot {
     match state {
-        ServerState::AwaitingAnchor => ServerSnapshot::AwaitingAnchor,
+        // Both pre-anchor states are "no reading yet" from a client's view: the disk seed is loading,
+        // or it has loaded and the anchor probe is still outstanding.
+        ServerState::AwaitingSeed | ServerState::AwaitingAnchor { .. } => {
+            ServerSnapshot::AwaitingAnchor
+        }
         ServerState::Running(kernel_state) => {
             let (pools, frontier) = kernel_state.projected_pool_states(CHAIN);
             ServerSnapshot::Running {
@@ -284,17 +288,22 @@ pub fn http_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{AnchorHeader, ServerInput, server_transition};
-    use client_evm::{Bloom, I24, U160};
+    use crate::core::{AnchorHeader, RegistrySeed, ServerInput, server_transition};
+    use client_evm::{Bloom, I24, TokenRegistry, TrustedPoolRegistry, U160};
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::with_last_byte(byte)
     }
 
-    /// Empty-inits a `Running` state anchored at `number` (hash derived from `number`).
+    /// Empty-inits a `Running` state anchored at `number` (hash derived from `number`) with an empty
+    /// warm-start seed — the projection is state-driven, so the seed content is irrelevant here.
     fn running_at_anchor(number: u64) -> ServerState {
+        let seed = Box::new(RegistrySeed {
+            pool_registry: TrustedPoolRegistry::new(),
+            token_registry: TokenRegistry::new(),
+        });
         let (state, _) = server_transition(
-            ServerState::AwaitingAnchor,
+            ServerState::AwaitingAnchor { seed },
             ServerInput::FinalizedHeader(Some(AnchorHeader {
                 hash: hash(number as u8),
                 number,
@@ -328,9 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn server_snapshot_of_awaiting_is_awaiting() {
+    fn server_snapshot_of_either_pre_anchor_state_is_awaiting() {
         assert_eq!(
-            server_snapshot(&ServerState::AwaitingAnchor),
+            server_snapshot(&ServerState::AwaitingSeed),
+            ServerSnapshot::AwaitingAnchor
+        );
+        let seed = Box::new(RegistrySeed {
+            pool_registry: TrustedPoolRegistry::new(),
+            token_registry: TokenRegistry::new(),
+        });
+        assert_eq!(
+            server_snapshot(&ServerState::AwaitingAnchor { seed }),
             ServerSnapshot::AwaitingAnchor
         );
     }

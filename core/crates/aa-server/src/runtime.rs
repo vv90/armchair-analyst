@@ -21,14 +21,16 @@ use client_evm::{
     AnyIssuedRequest, AnyRequestId, BlockHash, ChainEndpoints, ClientEvent, ClientEvmError,
     ClientHead, MetadataCache, PoolDataResult, PoolLog, PoolMetadata, PoolMetadataResult, PoolRef,
     ProtocolPoolKey, RangeLogBlock, TokenAddress, TokenMetadata, TokenMetadataResult,
-    fetch_block_header, fetch_block_logs, fetch_canonical_block_header_at,
-    fetch_finalized_block_header, fetch_pool_data, fetch_pool_logs_in_range, fetch_pool_metadata,
-    fetch_token_metadata, kernel, subscribe_new_heads,
+    TokenRegistry, TrustedPoolRegistry, fetch_block_header, fetch_block_logs,
+    fetch_canonical_block_header_at, fetch_finalized_block_header, fetch_pool_data,
+    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, kernel,
+    subscribe_new_heads,
 };
 
 use crate::{
     core::{
-        AnchorHeader, CHAIN, ServerEffect, ServerInput, ServerState, server_init, server_transition,
+        AnchorHeader, CHAIN, RegistrySeed, ServerEffect, ServerInput, ServerState, server_init,
+        server_transition,
     },
     serve::{ServerSnapshot, http_response, server_snapshot, strip_query},
 };
@@ -41,8 +43,10 @@ pub struct ServerApp;
 pub enum ServerSubscription {
     NewHeads,
     Tick(Duration),
-    /// The blocking HTTP server; reads the published snapshot and answers `/health`. Sends no
-    /// inputs back into the runtime (a read-only serving boundary).
+    /// The blocking HTTP server; reads the published snapshot and answers `/health` + `/slice`. Sends
+    /// no inputs back into the runtime, so **no user request can ever trigger an RPC** — all fetching
+    /// is owned by the kernel loop (`execute_kernel_request`). A pool a request asks about that is not
+    /// yet tracked is reported absent/`Incomplete`, never lazily fetched. A read-only serving boundary.
     Serve,
 }
 
@@ -273,9 +277,72 @@ where
     Ok(metadata)
 }
 
+/// Re-hydrates the pool + token registries from the persistent metadata cache for the warm-start
+/// seed. Reads only — pool candidates, their metadata, and the referenced tokens' decimals — so a
+/// restart re-activates every previously-validated pool without RPC (only genuinely new pools reach
+/// the kernel's discovery path). Every stored entry is a prior successful validation, so it re-enters
+/// as an `Ok`. Any cache fault degrades that portion to empty (logged), like the crate's other
+/// non-fatal cache faults: a bad cache costs a cold start, never a failed boot. No RPC here — the
+/// kernel loop owns all fetching.
+fn load_registry_seed(cache: &MetadataCache) -> RegistrySeed {
+    let candidates = cache.load_pool_candidates(CHAIN).unwrap_or_else(|error| {
+        eprintln!(
+            "aa-server chain={CHAIN:?} registry_seed_load_failed kind=pool_candidates error={error}"
+        );
+        HashSet::new()
+    });
+    let pool_metadata = cache
+        .load_pool_metadata(CHAIN, &candidates)
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "aa-server chain={CHAIN:?} registry_seed_load_failed kind=pool_metadata error={error}"
+            );
+            HashMap::new()
+        });
+
+    let tokens = pool_metadata
+        .values()
+        .flat_map(|metadata| {
+            [
+                TokenAddress(metadata.token0, CHAIN),
+                TokenAddress(metadata.token1, CHAIN),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    let token_metadata = cache.load_token_metadata(&tokens).unwrap_or_else(|error| {
+        eprintln!(
+            "aa-server chain={CHAIN:?} registry_seed_load_failed kind=token_metadata error={error}"
+        );
+        HashMap::new()
+    });
+
+    RegistrySeed {
+        pool_registry: TrustedPoolRegistry::new().with_metadata_results(
+            CHAIN,
+            pool_metadata
+                .into_iter()
+                .map(|(key, value)| (key, Ok(value)))
+                .collect(),
+        ),
+        token_registry: TokenRegistry::new().with_metadata_results(
+            token_metadata
+                .into_iter()
+                .map(|(token, value)| (token, Ok(value)))
+                .collect(),
+        ),
+    }
+}
+
 impl Runtime<ServerApp> for ServerRuntime {
     fn execute_effect(&self, effect: ServerEffect) -> Vec<ServerInput> {
         match effect {
+            ServerEffect::LoadRegistrySeed => {
+                // One-shot warm-start disk read: re-hydrate the metadata registry from the cache. Disk
+                // only — no RPC — so it never violates the kernel-loop-owns-RPC invariant.
+                vec![ServerInput::RegistrySeed(Box::new(load_registry_seed(
+                    &self.metadata_cache,
+                )))]
+            }
             ServerEffect::FetchFinalizedHeader => {
                 vec![ServerInput::FinalizedHeader(self.fetch_anchor())]
             }
@@ -873,5 +940,101 @@ mod tests {
         .expect("resolve despite store fault");
 
         assert_eq!(result.get(&miss), Some(&Ok(token_meta(9))));
+    }
+
+    // ---- warm-start registry re-hydration ----
+
+    #[test]
+    fn load_registry_seed_rehydrates_pools_and_their_tokens() {
+        let cache = MetadataCache::in_memory().expect("cache");
+        let pool = v3_key(1);
+        let meta = pool_meta(1); // token0 = [1; 20], token1 = [2; 20]
+        cache
+            .store_pool_metadata(CHAIN, &HashMap::from([(pool, Ok(meta.clone()))]))
+            .expect("store pool");
+        cache
+            .store_token_metadata(&HashMap::from([
+                (token_addr(1), Ok(token_meta(18))),
+                (token_addr(2), Ok(token_meta(6))),
+            ]))
+            .expect("store tokens");
+
+        let seed = load_registry_seed(&cache);
+
+        assert_eq!(
+            seed.pool_registry.verified_metadata(PoolRef {
+                key: pool,
+                chain: CHAIN,
+            }),
+            Some(&meta)
+        );
+        assert_eq!(
+            seed.token_registry.verified_metadata(token_addr(1)),
+            Some(&token_meta(18))
+        );
+        assert_eq!(
+            seed.token_registry.verified_metadata(token_addr(2)),
+            Some(&token_meta(6))
+        );
+    }
+
+    #[test]
+    fn load_registry_seed_seeds_a_pool_even_when_its_tokens_are_uncached() {
+        let cache = MetadataCache::in_memory().expect("cache");
+        let pool = v3_key(5);
+        let meta = pool_meta(5);
+        cache
+            .store_pool_metadata(CHAIN, &HashMap::from([(pool, Ok(meta.clone()))]))
+            .expect("store pool");
+        // No token metadata stored: the pool still seeds; its decimals get fetched by the kernel loop.
+
+        let seed = load_registry_seed(&cache);
+
+        assert_eq!(
+            seed.pool_registry.verified_metadata(PoolRef {
+                key: pool,
+                chain: CHAIN,
+            }),
+            Some(&meta)
+        );
+        assert!(
+            seed.token_registry
+                .verified_metadata(token_addr(5))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_registry_seed_on_a_cold_cache_is_empty() {
+        let cache = MetadataCache::in_memory().expect("cache");
+
+        let seed = load_registry_seed(&cache);
+
+        assert_eq!(seed.pool_registry, TrustedPoolRegistry::new());
+        assert_eq!(seed.token_registry, TokenRegistry::new());
+    }
+
+    #[test]
+    fn execute_effect_load_registry_seed_returns_the_rehydrated_seed() {
+        let runtime = test_runtime();
+        let pool = v3_key(1);
+        let meta = pool_meta(1);
+        runtime
+            .metadata_cache
+            .store_pool_metadata(CHAIN, &HashMap::from([(pool, Ok(meta.clone()))]))
+            .expect("store pool");
+
+        let inputs = runtime.execute_effect(ServerEffect::LoadRegistrySeed);
+
+        match inputs.as_slice() {
+            [ServerInput::RegistrySeed(seed)] => assert_eq!(
+                seed.pool_registry.verified_metadata(PoolRef {
+                    key: pool,
+                    chain: CHAIN,
+                }),
+                Some(&meta)
+            ),
+            _ => panic!("expected a single RegistrySeed input"),
+        }
     }
 }
