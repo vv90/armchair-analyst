@@ -30,7 +30,7 @@ use crate::{
     core::{
         AnchorHeader, CHAIN, ServerEffect, ServerInput, ServerState, server_init, server_transition,
     },
-    serve::{HealthSnapshot, health_snapshot, http_response, strip_query},
+    serve::{ServerSnapshot, http_response, server_snapshot, strip_query},
 };
 
 /// The single-chain server application (pure core wired to the framework).
@@ -82,10 +82,10 @@ pub struct ServerRuntime {
     started: Instant,
     /// Wall-clock millis of the last emitted observation line, throttling the smoke log to ~1/s.
     last_log_millis: AtomicU64,
-    /// The latest freshness snapshot, republished from `observe_state` (inside the throttle) and
+    /// The latest servable snapshot, republished from `observe_state` (inside the throttle) and
     /// read by the serve loop per request — the serve thread never touches kernel state. `ArcSwap`
     /// so publishes and per-request reads are lock-free (single writer, whole-value replace).
-    snapshot: Arc<ArcSwap<HealthSnapshot>>,
+    snapshot: Arc<ArcSwap<ServerSnapshot>>,
 }
 
 impl ServerRuntime {
@@ -98,13 +98,13 @@ impl ServerRuntime {
             tick_interval: Duration::from_millis(1000),
             started: Instant::now(),
             last_log_millis: AtomicU64::new(0),
-            snapshot: Arc::new(ArcSwap::from_pointee(HealthSnapshot::AwaitingAnchor)),
+            snapshot: Arc::new(ArcSwap::from_pointee(ServerSnapshot::AwaitingAnchor)),
         }
     }
 
     /// Publishes the latest snapshot into the slot the serve loop reads. Lock-free: a single atomic
     /// pointer swap, so it never blocks (or is blocked by) a concurrent request read.
-    fn publish(&self, snapshot: HealthSnapshot) {
+    fn publish(&self, snapshot: ServerSnapshot) {
         self.snapshot.store(Arc::new(snapshot));
     }
 
@@ -198,20 +198,21 @@ impl Runtime<ServerApp> for ServerRuntime {
 
         // Project once (the `Running` arm folds the frontier — the per-event hotspot, so this runs
         // at most ~1/s under the throttle), publish it for the serve loop, then log the same facts.
-        let snapshot = health_snapshot(state);
+        let snapshot = server_snapshot(state);
         self.publish(snapshot.clone());
 
         match snapshot {
-            HealthSnapshot::AwaitingAnchor => {
+            ServerSnapshot::AwaitingAnchor => {
                 eprintln!("aa-server chain={CHAIN:?} status=awaiting_anchor")
             }
-            HealthSnapshot::Running {
+            ServerSnapshot::Running {
                 finalized: (finalized_hash, finalized_number),
                 canonical,
                 verified_pool_count,
                 in_flight,
                 ws_miss,
                 behind,
+                ..
             } => {
                 eprintln!(
                     "aa-server chain={CHAIN:?} status=running finalized={finalized_hash}@{finalized_number} \
@@ -224,16 +225,22 @@ impl Runtime<ServerApp> for ServerRuntime {
 }
 
 /// The blocking HTTP serving loop: one request at a time on a single thread. Each request reads the
-/// method and path, loads the current published snapshot (a lock-free `ArcSwap` read), and answers
-/// via the pure [`http_response`]. A per-request `respond` I/O error (e.g. a client that hung up) is
-/// logged and skipped so one broken connection cannot kill the loop.
-fn serve_forever(server: tiny_http::Server, snapshot: Arc<ArcSwap<HealthSnapshot>>) {
-    for request in server.incoming_requests() {
+/// method, path, and body, loads the current published snapshot (a lock-free `ArcSwap` read), and
+/// answers via the pure [`http_response`]. A per-request `respond` I/O error (e.g. a client that
+/// hung up) is logged and skipped so one broken connection cannot kill the loop.
+fn serve_forever(server: tiny_http::Server, snapshot: Arc<ArcSwap<ServerSnapshot>>) {
+    for mut request in server.incoming_requests() {
         let method = request.method().as_str().to_owned();
         let path = strip_query(request.url()).to_owned();
+        // Read the body for `POST /slice`; a read failure leaves it empty, which the pure handler
+        // rejects as a `400`. GET requests carry no body, so this is a no-op for `/health`.
+        let mut body = String::new();
+        if let Err(error) = request.as_reader().read_to_string(&mut body) {
+            eprintln!("aa-server serve body_read_failed error={error}");
+        }
 
         let current = snapshot.load_full();
-        let response = http_response(&method, &path, &current);
+        let response = http_response(&method, &path, &body, &current);
 
         let http =
             tiny_http::Response::from_string(response.body).with_status_code(response.status);
@@ -534,14 +541,16 @@ mod tests {
         )
     }
 
-    fn running_snapshot() -> HealthSnapshot {
-        HealthSnapshot::Running {
+    fn running_snapshot() -> ServerSnapshot {
+        ServerSnapshot::Running {
             finalized: (hash(100), 100),
             canonical: hash(101),
+            frontier: hash(101),
             verified_pool_count: 3,
             in_flight: 1,
             ws_miss: 2,
             behind: Some(4),
+            pools: HashMap::new(),
         }
     }
 
@@ -557,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_answers_health_over_a_loopback_socket() {
+    fn serve_answers_health_and_slice_over_a_loopback_socket() {
         let snapshot = running_snapshot();
         let slot = Arc::new(ArcSwap::from_pointee(snapshot.clone()));
 
@@ -573,7 +582,25 @@ mod tests {
             .expect("GET /health");
         assert_eq!(response.status().as_u16(), 200);
         let body = response.body_mut().read_to_string().expect("read body");
-        assert_eq!(body, http_response("GET", "/health", &snapshot).body);
+        assert_eq!(body, http_response("GET", "/health", "", &snapshot).body);
+
+        // POST /slice reads the request body and answers via the same pure oracle.
+        let slice_body = r#"{"pools":[]}"#;
+        let mut slice = agent
+            .post(&format!("http://127.0.0.1:{port}/slice"))
+            .send(slice_body)
+            .expect("POST /slice");
+        assert_eq!(slice.status().as_u16(), 200);
+        let slice_body_out = slice.body_mut().read_to_string().expect("read slice body");
+        assert_eq!(
+            slice_body_out,
+            http_response("POST", "/slice", slice_body, &snapshot).body
+        );
+
+        match agent.get(&format!("http://127.0.0.1:{port}/slice")).call() {
+            Err(ureq::Error::StatusCode(code)) => assert_eq!(code, 405),
+            other => panic!("expected a 405 status error, got {other:?}"),
+        }
 
         match agent.get(&format!("http://127.0.0.1:{port}/nope")).call() {
             Err(ureq::Error::StatusCode(code)) => assert_eq!(code, 404),

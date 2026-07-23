@@ -40,6 +40,8 @@ dependencies = [
  "arc-swap",
  "client-evm",
  "rustls",
+ "serde",
+ "serde_json",
  "tiny_http",
  "ureq 3.3.0",
 ]

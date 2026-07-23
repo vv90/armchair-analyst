@@ -1,6 +1,6 @@
 //! Integration logic for EVM-based chains.
 
-pub use alloy::primitives::{Address, BlockHash, Bloom};
+pub use alloy::primitives::{Address, BlockHash, Bloom, U160, aliases::I24};
 
 pub mod bootstrap;
 pub mod chain;
