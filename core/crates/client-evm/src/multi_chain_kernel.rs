@@ -464,7 +464,11 @@ fn projection_metadata(
 
 /// Converts one pool state into scaled virtual reserves, fee multiplier, and swap caps.
 /// Added to keep Uniswap math, token scaling, and projection error context in one isolated pure step.
-fn pool_reserve_values(
+///
+/// Public so the greenfield GUI client (`aa-client-core`) can reuse this exact assembly — the
+/// `fee_multiplier = 1 - pips/1e6` formula plus the reserve/swap-cap composition — when projecting
+/// wire pool state, rather than re-implementing it and risking drift from the domain path.
+pub fn pool_reserve_values(
     pool: PoolRef,
     pool_state: &PoolState,
     fee: PoolFee,

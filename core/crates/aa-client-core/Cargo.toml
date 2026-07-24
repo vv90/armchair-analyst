@@ -10,6 +10,7 @@ aa-wire = { path = "../aa-wire" }
 aa-client-api = { path = "../aa-client-api" }
 client-evm = { path = "../client-evm" }
 optimization = { path = "../optimization" }
+thiserror = "2.0.18"
 
 [lints]
 workspace = true

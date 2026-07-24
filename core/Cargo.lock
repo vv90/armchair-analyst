@@ -33,6 +33,7 @@ dependencies = [
  "aa-wire",
  "client-evm",
  "optimization",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
