@@ -1,0 +1,15 @@
+[package]
+name = "aa-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aa-wire = { path = "../aa-wire" }
+aa-client-api = { path = "../aa-client-api" }
+client-evm = { path = "../client-evm" }
+optimization = { path = "../optimization" }
+
+[lints]
+workspace = true

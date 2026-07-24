@@ -8,6 +8,10 @@ members = [
     "crates/aa-token-vetting",
     "crates/client-evm",
     "crates/optimization",
+    "crates/aa-wire",
+    "crates/aa-client-api",
+    "crates/aa-client-core",
+    "crates/aa-client-ffi",
 ]
 
 [workspace.package]

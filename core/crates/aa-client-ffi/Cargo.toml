@@ -1,0 +1,30 @@
+[package]
+name = "aa-client-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# `cdylib` produces the loadable dynamic library (`.dll`/`.dylib`/`.so`) a native UI links via
+# P/Invoke (C#) or the equivalent; `lib` keeps it usable as a normal Rust dep for in-process tests.
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+aa-client-core = { path = "../aa-client-core" }
+aa-client-api = { path = "../aa-client-api" }
+
+# NOT `[lints] workspace = true`: the workspace sets `unsafe_code = "forbid"`, which cannot be
+# relaxed by an inner `#[allow]`. This crate is the FFI boundary and will expose `extern "C"`
+# functions over raw pointers, so it needs `deny` (locally overridable with a scoped, documented
+# `#[allow(unsafe_code)]`) instead. The clippy denies from the workspace are replicated verbatim.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

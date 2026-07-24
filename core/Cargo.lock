@@ -18,6 +18,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aa-client-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aa-client-core"
+version = "0.1.0"
+dependencies = [
+ "aa-client-api",
+ "aa-wire",
+ "client-evm",
+ "optimization",
+]
+
+[[package]]
+name = "aa-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "aa-client-api",
+ "aa-client-core",
+]
+
+[[package]]
 name = "aa-framework"
 version = "0.1.0"
 dependencies = [
@@ -55,6 +81,14 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "ureq 3.3.0",
+]
+
+[[package]]
+name = "aa-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
