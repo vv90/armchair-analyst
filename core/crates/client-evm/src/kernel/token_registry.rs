@@ -124,6 +124,13 @@ impl TokenRegistry {
         self.verified.get(&token)
     }
 
+    /// The verified token map as an O(1) structurally-shared clone — the persistent map's root is
+    /// shared, not its entries. Counterpart of [`crate::kernel::pool_registry::TrustedPoolRegistry::verified_view`];
+    /// the native currency is intrinsic (never stored), so it is absent from this view.
+    pub(crate) fn verified_view(&self) -> ImHashMap<TokenAddress, TokenMetadata> {
+        self.verified.clone()
+    }
+
     pub fn unsupported_failure(&self, token: TokenAddress) -> Option<&TokenMetadataFailure> {
         self.unsupported.get(&token)
     }

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use alloy::primitives::{BlockHash, Bloom};
 
 pub(crate) mod blocks_graph;
+pub mod metadata_catalog;
 pub(crate) mod pending_requests;
 pub(crate) mod pool_registry;
 /// Heavy regime-exploration suite (provider failures, WS stalls, resource constraints); every test
@@ -11,7 +12,9 @@ pub(crate) mod pool_registry;
 mod regimes;
 pub(crate) mod token_registry;
 
-use self::{pending_requests::*, pool_registry::*, token_registry::*};
+use self::{
+    metadata_catalog::MetadataCatalog, pending_requests::*, pool_registry::*, token_registry::*,
+};
 use crate::{ChainKey, PoolLog, pool_state::*, tick::Tick, uniswap_v4};
 
 /// The optimization read's result: for each pool the canonical unfinalized path touched, its
@@ -217,6 +220,18 @@ impl State {
     /// Added so read models can surface tracked-pool progress without reaching into the registry.
     pub fn verified_pool_count(&self) -> usize {
         self.pool_registry.verified_size()
+    }
+
+    /// An O(1) snapshot of the verified pool + token metadata for reader threads (e.g. the aa-server
+    /// `/pools/meta` endpoint), built from the registries' persistent-map views — cloning shares the
+    /// maps' roots rather than copying entries, so a large tracked set is published without
+    /// duplication. Chain-unfiltered: this per-chain kernel's registry holds only its own chain's
+    /// entries, so the catalog equals the chain set.
+    pub fn metadata_catalog(&self) -> MetadataCatalog {
+        MetadataCatalog::from_views(
+            self.pool_registry.verified_view(),
+            self.token_registry.verified_view(),
+        )
     }
 
     /// Counts RPC requests currently in flight: dispatched but not yet answered.

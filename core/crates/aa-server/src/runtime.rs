@@ -609,7 +609,7 @@ fn request_failed(request_id: AnyRequestId, error: &ClientEvmError) -> kernel::E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use client_evm::{GetBlockHeader, GetBlockLogs, IssuedRequest, RequestId};
+    use client_evm::{GetBlockHeader, GetBlockLogs, IssuedRequest, MetadataCatalog, RequestId};
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::with_last_byte(byte)
@@ -754,6 +754,7 @@ mod tests {
             ws_miss: 2,
             behind: Some(4),
             pools: HashMap::new(),
+            catalog: MetadataCatalog::default(),
         }
     }
 

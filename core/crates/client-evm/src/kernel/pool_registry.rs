@@ -163,6 +163,14 @@ impl TrustedPoolRegistry {
         self.verified.get(&pool)
     }
 
+    /// The verified pool map as an O(1) structurally-shared clone — the persistent map's root is
+    /// shared, not its entries. `pub(crate)` because it hands out the internal `imbl` type; the
+    /// public seam is [`crate::kernel::State::metadata_catalog`], which wraps this in a
+    /// [`crate::MetadataCatalog`] so a reader thread gets the whole tracked set without a copy.
+    pub(crate) fn verified_view(&self) -> ImHashMap<PoolRef, PoolMetadata> {
+        self.verified.clone()
+    }
+
     /// Counts the pools the registry has verified.
     /// Added so read models can surface tracked-pool progress without exposing the backing map.
     pub fn verified_size(&self) -> usize {

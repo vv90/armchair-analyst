@@ -36,6 +36,7 @@ pub use endpoints::{
     assemble_chain_endpoints, assemble_graph_endpoints,
 };
 pub use error::{ClientEvmError, ConfigScope};
+pub use kernel::metadata_catalog::MetadataCatalog;
 pub use kernel::pending_requests::{
     AnyIssuedRequest, AnyRequestId, GetBlockHeader, GetBlockLogs, GetCanonicalHeaderAtHeight,
     GetLogsRange, GetPoolData, GetPoolMetadata, GetTokenMetadata, IssuedRequest, RequestId,
