@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 client-evm = { path = "../client-evm" }
 aa-framework = { path = "../aa-framework" }
+aa-wire = { path = "../aa-wire" }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 tiny_http = "0.12.0"

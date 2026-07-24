@@ -63,6 +63,7 @@ name = "aa-server"
 version = "0.1.0"
 dependencies = [
  "aa-framework",
+ "aa-wire",
  "arc-swap",
  "client-evm",
  "rustls",

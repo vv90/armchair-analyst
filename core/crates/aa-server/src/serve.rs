@@ -12,6 +12,10 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use aa_wire::{
+    FinalizedHead, HealthResponse, PoolCompleteness, PoolMetaEntry, PoolQuery, PoolSlice,
+    PoolsMetaResponse, SliceRequest, SliceResponse, TokenMetaEntry, WirePoolState,
+};
 use client_evm::{
     Address, BlockHash, MetadataCatalog, PoolRef, PoolState, ProtocolPoolKey, TokenAddress,
     uniswap_v4::PoolId,
@@ -67,94 +71,6 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// A `POST /slice` request body: the pool set the client wants current-tick state for.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-pub struct SliceRequest {
-    pub pools: Vec<PoolQuery>,
-}
-
-/// One pool's on-chain identity on the wire. The chain is implicit (the server is single-chain), so
-/// only the protocol-specific key travels. Deserialized from a request and serialized back into each
-/// [`PoolSlice`] so a client can match responses to what it asked for.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "protocol", rename_all = "snake_case")]
-pub enum PoolQuery {
-    /// A Uniswap v3 pool, identified by its own contract address (`0x`-hex).
-    UniswapV3 { address: String },
-    /// A Uniswap v4 pool, identified by its `PoolId` (`0x`-hex, 32 bytes).
-    UniswapV4 { pool_id: String },
-}
-
-/// Raw current-tick pool state on the wire. `sqrt_price_x96` (U160) and `liquidity` (u128) exceed a
-/// JSON number's safe integer range, so they ride as `0x`-hex strings; `tick` (I24) fits an `i32`.
-/// These are the only per-block fields the client's optimizer needs — it derives reserves, swap
-/// caps, and fees itself from these plus static metadata.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct WirePoolState {
-    pub sqrt_price_x96: String,
-    pub tick: i32,
-    pub liquidity: String,
-}
-
-/// One pool's slice result: its echoed identity flattened with its completeness/state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct PoolSlice {
-    #[serde(flatten)]
-    pub key: PoolQuery,
-    #[serde(flatten)]
-    pub state: PoolCompleteness,
-}
-
-/// Whether a requested pool had resolved state at the frontier. `Incomplete` is a raw fact, not a
-/// verdict — the server never says *why* (untracked vs unresolved); the client interprets it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "completeness", rename_all = "snake_case")]
-pub enum PoolCompleteness {
-    Complete { state: WirePoolState },
-    Incomplete,
-}
-
-/// The `POST /slice` response: the frontier the state is valid at, its depth below the observed tip,
-/// and one entry per requested pool.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct SliceResponse {
-    /// The frontier block hash (`0x`-hex) the pool states are valid at.
-    pub block_hash: String,
-    /// Canonical blocks the observed tip is ahead of the frontier (the freshness/reorg-depth fact).
-    pub confirmations: u64,
-    pub pools: Vec<PoolSlice>,
-}
-
-/// One verified pool's static metadata on the wire: its echoed identity flattened with its token
-/// pair (`0x`-hex addresses) and fee. `fee_pips`/`tick_spacing` are the protocol-agnostic fee facts
-/// (a v3 tier and a v4 static fee both reduce to these), so the client reconstructs swap math
-/// without needing to know which protocol produced them (the protocol still travels in `key`).
-#[derive(Debug, serde::Serialize)]
-struct PoolMetaEntry {
-    #[serde(flatten)]
-    key: PoolQuery,
-    token0: String,
-    token1: String,
-    fee_pips: u32,
-    tick_spacing: u16,
-}
-
-/// One token's static metadata on the wire: its `0x`-hex address and validated decimals.
-#[derive(Debug, serde::Serialize)]
-struct TokenMetaEntry {
-    address: String,
-    decimals: u8,
-}
-
-/// The `GET /pools/meta` response: every verified pool's static metadata plus the decimals of every
-/// token those pools reference — a self-contained catalog from which a client derives reserves and
-/// swap caps (paired with `/slice` state) without any metadata RPC of its own.
-#[derive(Debug, serde::Serialize)]
-struct PoolsMetaResponse {
-    pools: Vec<PoolMetaEntry>,
-    tokens: Vec<TokenMetaEntry>,
-}
-
 /// Projects the server state into a [`ServerSnapshot`]. Pure. The `Running` arm runs the single
 /// `projected_pool_states` fold (the per-event hotspot) once and keeps both its overlay and frontier
 /// so the published snapshot feeds `/health` (scalars) and `/slice` (the overlay) from one fold.
@@ -183,12 +99,13 @@ pub fn server_snapshot(state: &ServerState) -> ServerSnapshot {
     }
 }
 
-/// Serializes the health snapshot to JSON. Hand-rolled over a fixed, flat shape — every field is a
-/// number, a `0x`-hex block hash, or a fixed status literal, so there is nothing to escape. The
-/// `frontier`/`pools` fields carry `/slice`'s payload and are not part of the health view.
-fn to_json(snapshot: &ServerSnapshot) -> String {
-    match snapshot {
-        ServerSnapshot::AwaitingAnchor => r#"{"status":"awaiting_anchor"}"#.to_owned(),
+/// The pure `GET /health` handler: renders the freshness snapshot. Projects the snapshot onto the
+/// shared [`HealthResponse`] DTO and serializes it — `200`, or `500` on the (practically impossible)
+/// serialize error, symmetric with [`slice_response`]/[`pools_meta_response`]. The `frontier`/`pools`
+/// overlay fields carry `/slice`'s payload and are not part of the health view.
+fn health_response(snapshot: &ServerSnapshot) -> HttpResponse {
+    let health = match snapshot {
+        ServerSnapshot::AwaitingAnchor => HealthResponse::AwaitingAnchor,
         ServerSnapshot::Running {
             finalized: (finalized_hash, finalized_number),
             canonical,
@@ -197,15 +114,24 @@ fn to_json(snapshot: &ServerSnapshot) -> String {
             ws_miss,
             behind,
             ..
-        } => {
-            let behind = match behind {
-                Some(blocks) => blocks.to_string(),
-                None => "null".to_owned(),
-            };
-            format!(
-                r#"{{"status":"running","finalized":{{"number":{finalized_number},"hash":"{finalized_hash}"}},"canonical":"{canonical}","pools":{verified_pool_count},"in_flight":{in_flight},"ws_miss":{ws_miss},"behind":{behind}}}"#
-            )
-        }
+        } => HealthResponse::Running {
+            finalized: FinalizedHead {
+                number: *finalized_number,
+                hash: format!("{finalized_hash}"),
+            },
+            canonical: format!("{canonical}"),
+            pools: *verified_pool_count,
+            in_flight: *in_flight,
+            ws_miss: *ws_miss,
+            behind: *behind,
+        },
+    };
+    match serde_json::to_string(&health) {
+        Ok(body) => HttpResponse { status: 200, body },
+        Err(_) => HttpResponse {
+            status: 500,
+            body: String::new(),
+        },
     }
 }
 
@@ -383,10 +309,7 @@ pub fn http_response(
     snapshot: &ServerSnapshot,
 ) -> HttpResponse {
     match (method, path) {
-        ("GET", "/health") => HttpResponse {
-            status: 200,
-            body: to_json(snapshot),
-        },
+        ("GET", "/health") => health_response(snapshot),
         ("GET", "/pools/meta") => pools_meta_response(snapshot),
         ("POST", "/slice") => slice_response(body, snapshot),
         (_, "/health") | (_, "/slice") | (_, "/pools/meta") => HttpResponse {
@@ -528,15 +451,15 @@ mod tests {
     }
 
     #[test]
-    fn to_json_of_awaiting_is_the_fixed_literal() {
-        assert_eq!(
-            to_json(&ServerSnapshot::AwaitingAnchor),
-            r#"{"status":"awaiting_anchor"}"#
-        );
+    fn health_of_awaiting_is_the_fixed_literal() {
+        let response = health_response(&ServerSnapshot::AwaitingAnchor);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"status":"awaiting_anchor"}"#);
     }
 
     #[test]
-    fn to_json_of_running_emits_every_health_field() {
+    fn health_of_running_emits_every_health_field() {
         let snapshot = ServerSnapshot::Running {
             finalized: (hash(100), 100),
             canonical: hash(101),
@@ -555,11 +478,13 @@ mod tests {
             hash(101),
         );
 
-        assert_eq!(to_json(&snapshot), expected);
+        let response = health_response(&snapshot);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected);
     }
 
     #[test]
-    fn to_json_renders_absent_lag_as_null() {
+    fn health_renders_absent_lag_as_null() {
         let snapshot = ServerSnapshot::Running {
             finalized: (hash(1), 1),
             canonical: hash(1),
@@ -572,7 +497,11 @@ mod tests {
             catalog: MetadataCatalog::default(),
         };
 
-        assert!(to_json(&snapshot).ends_with(r#""behind":null}"#));
+        assert!(
+            health_response(&snapshot)
+                .body
+                .ends_with(r#""behind":null}"#)
+        );
     }
 
     #[test]
@@ -582,7 +511,7 @@ mod tests {
         let response = http_response("GET", "/health", "", &snapshot);
 
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, to_json(&snapshot));
+        assert_eq!(response.body, health_response(&snapshot).body);
     }
 
     #[test]
