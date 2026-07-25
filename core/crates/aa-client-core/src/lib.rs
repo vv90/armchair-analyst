@@ -5,14 +5,17 @@
 //!
 //! Transport-agnostic: it consumes `AppCommand`s and produces `ViewModel`s and knows nothing about
 //! the binding (FFI/`cdylib`) or the UI framework. So far this crate holds the wire→reserves adapter
-//! (below) and the pure `state` reducer that drives the poll/optimize loop; the effect driver,
-//! optimizer worker, and UI contract land in later increments.
+//! (below), the pure `state` reducer that drives the poll/optimize loop, and the `optimizer` worker
+//! that executes its `Optimize` effect; the effect driver, HTTP data plane, and UI contract land in
+//! later increments.
 
+mod optimizer;
 mod state;
 
+pub use optimizer::{OptimizerWorker, run as run_optimizer};
 pub use state::{
-    AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeCommand, Phase,
-    SessionConfig, SliceProvenance, slice_request_for, transition,
+    AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeCommand, OptimizeStage,
+    Phase, SessionConfig, SliceProvenance, slice_request_for, transition,
 };
 
 use std::collections::HashMap;

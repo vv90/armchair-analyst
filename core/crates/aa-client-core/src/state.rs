@@ -150,6 +150,23 @@ pub enum EffectError {
         /// Its raw value.
         value: String,
     },
+    /// The optimizer worker failed to initialize or advance the runner. `stage` names which; `message`
+    /// is the optimizer error's text (the typed `optimization` errors don't cross the module boundary).
+    Optimize {
+        /// Whether the failure was at `init` or at `run`.
+        stage: OptimizeStage,
+        /// The optimizer error's diagnostic text.
+        message: String,
+    },
+}
+
+/// Which optimizer call a [`EffectError::Optimize`] refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimizeStage {
+    /// `OptimizationRunner::init` (first productive slice).
+    Init,
+    /// `OptimizationRunner::run` (a `NewReserves`/`Continue` step, or a `Run` before any `Init`).
+    Run,
 }
 
 /// Which data-plane request a [`EffectError::Fetch`] refers to.
