@@ -4,8 +4,16 @@
 //! candidate tracking, and the `AppState` it projects into an `aa-client-api::ViewModel`.
 //!
 //! Transport-agnostic: it consumes `AppCommand`s and produces `ViewModel`s and knows nothing about
-//! the binding (FFI/`cdylib`) or the UI framework. Only the wire→reserves adapter exists so far; the
-//! rest of the engine lands in later increments.
+//! the binding (FFI/`cdylib`) or the UI framework. So far this crate holds the wire→reserves adapter
+//! (below) and the pure `state` reducer that drives the poll/optimize loop; the effect driver,
+//! optimizer worker, and UI contract land in later increments.
+
+mod state;
+
+pub use state::{
+    AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeCommand, Phase,
+    SessionConfig, SliceProvenance, slice_request_for, transition,
+};
 
 use std::collections::HashMap;
 use std::str::FromStr;
