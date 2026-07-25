@@ -5,13 +5,15 @@
 //!
 //! Transport-agnostic: it consumes `AppCommand`s and produces `ViewModel`s and knows nothing about
 //! the binding (FFI/`cdylib`) or the UI framework. So far this crate holds the wire→reserves adapter
-//! (below), the pure `state` reducer that drives the poll/optimize loop, and the `optimizer` worker
-//! that executes its `Optimize` effect; the effect driver, HTTP data plane, and UI contract land in
-//! later increments.
+//! (below), the pure `state` reducer that drives the poll/optimize loop, the `optimizer` worker that
+//! executes its `Optimize` effect, and the `http` data-plane adapter that executes its fetch effects;
+//! the effect driver and UI contract land in later increments.
 
+mod http;
 mod optimizer;
 mod state;
 
+pub use http::{DataPlaneClient, FetchRequest, run as run_data_plane};
 pub use optimizer::{OptimizerWorker, run as run_optimizer};
 pub use state::{
     AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeCommand, OptimizeStage,

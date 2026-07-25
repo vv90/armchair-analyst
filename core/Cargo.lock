@@ -33,7 +33,11 @@ dependencies = [
  "aa-wire",
  "client-evm",
  "optimization",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
+ "tiny_http",
+ "ureq 3.3.0",
 ]
 
 [[package]]

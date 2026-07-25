@@ -11,6 +11,16 @@ aa-client-api = { path = "../aa-client-api" }
 client-evm = { path = "../client-evm" }
 optimization = { path = "../optimization" }
 thiserror = "2.0.18"
+# Outbound HTTP against the `aa-server` data plane. Mirrors aa-server's feature set (rustls, no
+# default features); the crate stays a library and installs no crypto provider — that is the binary's
+# job, so loopback `http://` tests need no TLS handshake.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+serde = "1.0.228"
+serde_json = "1.0.150"
+
+[dev-dependencies]
+# The loopback data-plane server the HTTP-adapter tests answer against (same as aa-server's runtime test).
+tiny_http = "0.12.0"
 
 [lints]
 workspace = true
