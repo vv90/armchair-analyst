@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 aa-wire = { path = "../aa-wire" }
 aa-client-api = { path = "../aa-client-api" }
+aa-framework = { path = "../aa-framework" }
 client-evm = { path = "../client-evm" }
 optimization = { path = "../optimization" }
 thiserror = "2.0.18"

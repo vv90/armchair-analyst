@@ -30,6 +30,7 @@ name = "aa-client-core"
 version = "0.1.0"
 dependencies = [
  "aa-client-api",
+ "aa-framework",
  "aa-wire",
  "client-evm",
  "optimization",

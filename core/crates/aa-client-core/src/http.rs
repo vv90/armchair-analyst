@@ -20,7 +20,7 @@ use crate::state::{EffectError, Event, FetchKind};
 
 /// The three data-plane fetches the reducer can ask for — a narrow mirror of [`crate::Effect`]'s fetch
 /// variants so the adapter is total over exactly its domain (the driver maps `Effect::FetchMeta ->
-/// FetchRequest::Meta`, and so on). `Optimize`/`Schedule` cannot reach here.
+/// FetchRequest::Meta`, and so on). `Optimize` cannot reach here.
 #[derive(Clone, Debug)]
 pub enum FetchRequest {
     /// `GET /pools/meta`.

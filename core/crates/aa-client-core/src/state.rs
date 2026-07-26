@@ -14,7 +14,6 @@
 
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::time::Duration;
 
 use aa_wire::{HealthResponse, PoolsMetaResponse, SliceRequest, SliceResponse};
 use client_evm::{BlockHash, ChainKey, PoolRef, TokenAddress};
@@ -42,8 +41,6 @@ pub struct SessionConfig {
     pub step: OptimizationStepConfig,
     /// Which optimizer backend to initialize (wgpu/cpu).
     pub backend: OptimizationBackendSelection,
-    /// How often the poll clock fires: the interval re-armed by every `Tick`.
-    pub poll_interval: Duration,
 }
 
 /// The freshness envelope of the reserves currently driving the optimizer: which block the state was
@@ -214,8 +211,6 @@ pub enum Effect {
     FetchSlice(SliceRequest),
     /// Drive the optimizer worker.
     Optimize(OptimizeCommand),
-    /// Re-arm the poll clock to fire after the given delay.
-    Schedule(Duration),
 }
 
 /// A command for the optimizer worker that owns the `OptimizationRunner`. `Init` bundles the config
@@ -265,10 +260,11 @@ fn reduce(config: &SessionConfig, phase: Phase, event: Event) -> (Phase, Vec<Eff
     }
 }
 
-/// The poll clock: re-arm the timer, always refresh `/health`, and either bootstrap the catalog (if
-/// not yet known) or request a fresh slice for it.
-fn on_tick(config: &SessionConfig, phase: Phase) -> (Phase, Vec<Effect>) {
-    let mut effects = vec![Effect::Schedule(config.poll_interval), Effect::FetchHealth];
+/// The poll clock fired: always refresh `/health`, and either bootstrap the catalog (if not yet
+/// known) or request a fresh slice for it. The clock itself is re-armed by the runtime's periodic
+/// `Tick` subscription, so the reducer no longer schedules it.
+fn on_tick(_config: &SessionConfig, phase: Phase) -> (Phase, Vec<Effect>) {
+    let mut effects = vec![Effect::FetchHealth];
     match meta_of(&phase) {
         Some(meta) => effects.push(Effect::FetchSlice(slice_request_for(meta))),
         None => effects.push(Effect::FetchMeta),
@@ -639,7 +635,6 @@ mod tests {
                 iterations: 8,
             },
             backend: OptimizationBackendSelection::Cpu,
-            poll_interval: Duration::from_millis(500),
         }
     }
 
@@ -737,7 +732,6 @@ mod tests {
         let (_state, effects) = transition(AppState::started(config()), Event::Tick);
         assert!(effects.iter().any(|e| matches!(e, Effect::FetchMeta)));
         assert!(effects.iter().any(|e| matches!(e, Effect::FetchHealth)));
-        assert!(effects.iter().any(|e| matches!(e, Effect::Schedule(_))));
         // Without a catalog yet, we must not request a slice.
         assert!(!effects.iter().any(|e| matches!(e, Effect::FetchSlice(_))));
     }

@@ -1,0 +1,410 @@
+//! The composition root: the client engine as an [`aa_framework`] application. The pure `state`
+//! reducer, the `optimizer` worker, and the `http` adapter are the leaf pieces; this module wires them
+//! into the framework's event loop ([`aa_framework::Runtime::run`]) — the same Elm-style runtime the
+//! kernel runs on. `run` owns the input channel, folds [`crate::transition`] over incoming events,
+//! executes each emitted [`Effect`] on a thread-pool, feeds the results back as [`Event`]s, and drives
+//! the periodic poll clock and the optimizer as subscriptions.
+//!
+//! Two roles map onto the framework's two traits:
+//! - [`ClientEngineApp`] is the pure [`Application`]: `init`/`transition`/`subscriptions`, delegating
+//!   the reducer verbatim.
+//! - [`ClientEngineRuntime`] is the effectful [`Runtime`]. The fetch effects run inline in
+//!   [`ClientEngineRuntime::execute_effect`] via the [`DataPlaneClient`] (synchronous HTTP). The
+//!   optimizer cannot: its [`crate::OptimizerWorker`] owns an `OptimizationRunner` whose GPU-capable
+//!   type is not `Send + Sync`, so it can never live in the shared runtime. Instead it runs on its own
+//!   [`Subscription::Optimizer`] thread ([`crate::run_optimizer`]) that owns the runner internally;
+//!   `execute_effect` just enqueues each [`OptimizeCommand`] onto that thread's FIFO channel (ordering
+//!   preserved, so `Init` always precedes its `Run`s) and the results come back as [`Event`]s. This is
+//!   the same subscription-owned-worker shape aa-cli uses for its optimizer.
+//!
+//! [`ClientEngineRuntime::observe_state`] is the seam a later increment projects into a
+//! `aa_client_api::ViewModel`.
+
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use aa_framework::{Application, Runtime, Transition};
+use client_evm::{ChainKey, ETHEREUM_USDC_TOKEN_ADDRESS};
+use optimization::{
+    OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
+};
+
+use crate::http::{DataPlaneClient, FetchRequest};
+use crate::optimizer;
+use crate::state::{self, AppState, Effect, Event, OptimizeCommand, SessionConfig};
+
+/// How often the poll clock fires. The framework's `subscriptions()` is a nullary static, so — like
+/// aa-cli's hardcoded tick — the interval is a const rather than a per-session field for now
+/// (configurable cadence is deferred with the rest of runtime config).
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One optimizer step's per-call input amount, matching aa-cli's `default_optimization_step_config`
+/// scale; `iterations` is the bounded grind budget of a single `run` between reserve refreshes.
+const STEP_INPUT_AMOUNT: f32 = 1000.0;
+const STEP_ITERATIONS: usize = 10;
+
+/// The long-lived, background work the runtime spawns. A narrow enum (not the effect type) so a
+/// subscription can only be something the runtime actually knows how to spawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subscription {
+    /// Emit an [`Event::Tick`] every interval, forever (until the loop shuts down).
+    Tick(Duration),
+    /// Own the optimizer worker: drain its command channel and emit each step result as an event.
+    Optimizer,
+}
+
+/// The session config the engine starts with. Built from consts for now (single Ethereum server,
+/// USDC init asset, no bridges/whitelist, Cpu backend) because the framework's `init`/`subscriptions`
+/// are nullary statics; threading a caller-supplied config in is a later increment.
+fn default_session_config() -> SessionConfig {
+    SessionConfig {
+        chain: ChainKey::Ethereum,
+        optimization: OptimizationSessionConfig {
+            init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+            bridges: std::collections::HashSet::new(),
+            whitelist: None,
+        },
+        step: OptimizationStepConfig {
+            input_amount: STEP_INPUT_AMOUNT,
+            iterations: STEP_ITERATIONS,
+        },
+        backend: OptimizationBackendSelection::Cpu,
+    }
+}
+
+/// The pure application: `State = AppState`, `Input = Event`, `Effect = Effect`. All decision logic
+/// lives in the `state` reducer; this impl only adapts it to the framework's shape.
+pub struct ClientEngineApp;
+
+impl Application for ClientEngineApp {
+    type State = AppState;
+    type Input = Event;
+    type Effect = Effect;
+    type Subscription = Subscription;
+
+    /// Start awaiting the first slice, and kick off the cold-start fetches immediately so the engine
+    /// doesn't idle a full poll interval before its first `/pools/meta` + `/health`.
+    fn init() -> Transition<AppState, Effect> {
+        Transition {
+            state: AppState::started(default_session_config()),
+            effects: vec![Effect::FetchMeta, Effect::FetchHealth],
+        }
+    }
+
+    fn transition(state: AppState, input: Event) -> Transition<AppState, Effect> {
+        let (state, effects) = state::transition(state, input);
+        Transition { state, effects }
+    }
+
+    fn subscriptions() -> Vec<Subscription> {
+        vec![Subscription::Tick(POLL_INTERVAL), Subscription::Optimizer]
+    }
+}
+
+/// The effectful runtime: owns the outbound HTTP client and the send end of the optimizer worker's
+/// command channel. `Send + Sync` (the framework runs effects on a pool): the client is `Send + Sync`,
+/// and the channel ends are held behind `Mutex`es. The optimizer worker itself — whose runner is not
+/// `Send + Sync` — is deliberately *not* here; it lives on the [`Subscription::Optimizer`] thread.
+pub struct ClientEngineRuntime {
+    client: DataPlaneClient,
+    /// Enqueues commands for the optimizer thread. FIFO, so `Init` always precedes its `Run`s.
+    optimizer_commands: Mutex<Sender<OptimizeCommand>>,
+    /// The matching receiver, taken once by the optimizer subscription when it starts.
+    optimizer_inbox: Mutex<Option<Receiver<OptimizeCommand>>>,
+}
+
+impl ClientEngineRuntime {
+    /// A runtime targeting one `aa-server` base URL, with the optimizer channel created but its worker
+    /// not yet spawned (the [`Subscription::Optimizer`] claims the receiver and owns the worker).
+    pub fn new(base_url: String) -> ClientEngineRuntime {
+        let (commands, inbox) = channel();
+        ClientEngineRuntime {
+            client: DataPlaneClient::new(base_url),
+            optimizer_commands: Mutex::new(commands),
+            optimizer_inbox: Mutex::new(Some(inbox)),
+        }
+    }
+
+    /// Hand a command to the optimizer thread. A poisoned lock or a dropped worker (the engine is
+    /// shutting down) is swallowed — the reducer records no result and simply re-issues on the next
+    /// productive slice. Never panics.
+    fn enqueue_optimize(&self, command: OptimizeCommand) {
+        if let Ok(commands) = self.optimizer_commands.lock() {
+            let _ = commands.send(command);
+        }
+    }
+}
+
+impl Runtime<ClientEngineApp> for ClientEngineRuntime {
+    /// Execute one effect and return the events it produced. Fetch effects run inline against the data
+    /// plane and yield exactly one event (the executor is total — faults come back as
+    /// `Event::EffectFailed`, never a panic). `Optimize` is asynchronous: it is enqueued onto the
+    /// optimizer thread and produces no event here; the result arrives later via the optimizer
+    /// subscription.
+    fn execute_effect(&self, effect: Effect) -> Vec<Event> {
+        match effect {
+            Effect::FetchMeta => vec![self.client.handle(FetchRequest::Meta)],
+            Effect::FetchHealth => vec![self.client.handle(FetchRequest::Health)],
+            Effect::FetchSlice(request) => vec![self.client.handle(FetchRequest::Slice(request))],
+            Effect::Optimize(command) => {
+                self.enqueue_optimize(command);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Run one background subscription. The poll clock sleeps then emits an [`Event::Tick`]; the
+    /// optimizer subscription claims the command receiver and runs the worker, which owns its runner
+    /// and forwards each step result as an event. Both return only when the event receiver is gone
+    /// (the engine is shutting down). Panic-free.
+    fn spawn_subscription(&self, sender: &Sender<Event>, subscription: Subscription) {
+        match subscription {
+            Subscription::Tick(interval) => loop {
+                thread::sleep(interval);
+                if sender.send(Event::Tick).is_err() {
+                    break;
+                }
+            },
+            Subscription::Optimizer => {
+                // Take the receiver exactly once; a second Optimizer subscription (there is only one)
+                // would find it gone and simply return.
+                let inbox = self
+                    .optimizer_inbox
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take());
+                if let Some(inbox) = inbox {
+                    optimizer::run(inbox, sender.clone());
+                }
+            }
+        }
+    }
+
+    /// The observation seam. A later increment projects `state` into a `aa_client_api::ViewModel` and
+    /// publishes it to the UI; for now the engine just runs.
+    fn observe_state(&self, _state: &AppState) {}
+}
+
+/// Build the engine for one `aa-server` base URL and start the framework loop on its own thread.
+/// Returns the input sender (the future `AppCommand` seam) and the loop's join handle.
+pub fn run(base_url: String) -> (Sender<Event>, JoinHandle<()>) {
+    ClientEngineRuntime::new(base_url).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    use aa_wire::{
+        PoolCompleteness, PoolMetaEntry, PoolQuery, PoolSlice, PoolsMetaResponse, SliceResponse,
+        TokenMetaEntry, WirePoolState,
+    };
+    use client_evm::Address;
+
+    use super::*;
+    use crate::state::Phase;
+
+    // Tick-0 price (`2^96`): keeps swap caps non-underflowing for any tick spacing.
+    const SQRT_PRICE_TICK_0: u128 = 79_228_162_514_264_337_593_543_950_336;
+
+    /// A loopback `aa-server` on an ephemeral port that answers each request from `handler`
+    /// (`(method, path) -> (status, body)`); returns the port and the server thread's handle.
+    fn loopback(
+        handler: impl Fn(&str, &str) -> (u16, String) + Send + 'static,
+    ) -> (u16, JoinHandle<()>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral loopback port");
+        let port = server.server_addr().to_ip().expect("ip listen addr").port();
+        let handle = std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let method = request.method().as_str().to_owned();
+                let path = request.url().to_owned();
+                let (status, body) = handler(&method, &path);
+                let response = tiny_http::Response::from_string(body).with_status_code(status);
+                let _ = request.respond(response);
+            }
+        });
+        (port, handle)
+    }
+
+    fn addr(byte: u8) -> Address {
+        Address::from([byte; 20])
+    }
+
+    /// The USDC address the default session config uses as its init asset.
+    fn usdc() -> Address {
+        ETHEREUM_USDC_TOKEN_ADDRESS.0
+    }
+
+    fn v3_key(address: Address) -> PoolQuery {
+        PoolQuery::UniswapV3 {
+            address: format!("{address:#x}"),
+        }
+    }
+
+    /// A catalog with one v3 pool over `(USDC, addr(2))` — a pair reaching the default init asset, so a
+    /// complete slice for it is productive and initializes the optimizer.
+    fn productive_meta() -> PoolsMetaResponse {
+        PoolsMetaResponse {
+            pools: vec![PoolMetaEntry {
+                key: v3_key(addr(9)),
+                token0: format!("{:#x}", usdc()),
+                token1: format!("{:#x}", addr(2)),
+                fee_pips: 3000,
+                tick_spacing: 60,
+            }],
+            tokens: vec![
+                TokenMetaEntry {
+                    address: format!("{:#x}", usdc()),
+                    decimals: 6,
+                },
+                TokenMetaEntry {
+                    address: format!("{:#x}", addr(2)),
+                    decimals: 18,
+                },
+            ],
+        }
+    }
+
+    /// A complete slice for `productive_meta`'s pool at tick 0.
+    fn productive_slice() -> SliceResponse {
+        SliceResponse {
+            block_hash: format!("{:#x}", client_evm::BlockHash::from([0xbb; 32])),
+            confirmations: 2,
+            pools: vec![PoolSlice {
+                key: v3_key(addr(9)),
+                state: PoolCompleteness::Complete {
+                    state: WirePoolState {
+                        sqrt_price_x96: format!("{SQRT_PRICE_TICK_0:#x}"),
+                        tick: 0,
+                        liquidity: format!("{:#x}", 1_000_000_000_000_000_000u128),
+                    },
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn execute_effect_fetch_meta_hits_the_data_plane() {
+        let body = serde_json::to_string(&productive_meta()).expect("serialize meta");
+        let (port, _server) = loopback(move |method, path| {
+            assert_eq!((method, path), ("GET", "/pools/meta"));
+            (200, body.clone())
+        });
+        let runtime = ClientEngineRuntime::new(format!("http://127.0.0.1:{port}"));
+        let events = runtime.execute_effect(Effect::FetchMeta);
+        assert_eq!(events, vec![Event::MetaFetched(productive_meta())]);
+    }
+
+    #[test]
+    fn optimize_effect_is_enqueued_not_run_inline() {
+        let runtime = ClientEngineRuntime::new("http://127.0.0.1:1".to_owned());
+        // The optimizer runs on its subscription thread, so `execute_effect` returns no event...
+        let events = runtime.execute_effect(Effect::Optimize(OptimizeCommand::Run(
+            optimization::OptimizationStepUpdate::Continue,
+        )));
+        assert!(events.is_empty());
+
+        // ...but the command was placed on the FIFO channel the optimizer subscription drains.
+        let inbox = runtime
+            .optimizer_inbox
+            .lock()
+            .expect("inbox lock")
+            .take()
+            .expect("inbox present");
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(OptimizeCommand::Run(
+                optimization::OptimizationStepUpdate::Continue
+            ))
+        ));
+    }
+
+    #[test]
+    fn tick_subscription_emits_ticks_then_stops_when_the_receiver_is_gone() {
+        let runtime = ClientEngineRuntime::new("http://127.0.0.1:1".to_owned());
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            runtime.spawn_subscription(&event_tx, Subscription::Tick(Duration::from_millis(1)));
+        });
+        assert_eq!(event_rx.recv().expect("first tick"), Event::Tick);
+        // Dropping the receiver makes the next `send` fail, so the subscription loop returns.
+        drop(event_rx);
+        worker.join().expect("subscription thread joins");
+    }
+
+    /// A recording runtime: delegates every effect/subscription to a real [`ClientEngineRuntime`] and
+    /// only overrides `observe_state` to capture each post-transition phase. Lets the end-to-end test
+    /// watch the engine reach `Optimizing` without changing the production runtime.
+    struct RecordingRuntime {
+        inner: ClientEngineRuntime,
+        observed: Arc<StdMutex<Vec<Phase>>>,
+    }
+
+    impl Runtime<ClientEngineApp> for RecordingRuntime {
+        fn execute_effect(&self, effect: Effect) -> Vec<Event> {
+            self.inner.execute_effect(effect)
+        }
+
+        fn spawn_subscription(&self, sender: &Sender<Event>, subscription: Subscription) {
+            self.inner.spawn_subscription(sender, subscription);
+        }
+
+        fn observe_state(&self, state: &AppState) {
+            if let Ok(mut observed) = self.observed.lock() {
+                observed.push(state.phase.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn engine_runs_from_cold_start_to_optimizing_over_a_loopback_data_plane() {
+        let meta = serde_json::to_string(&productive_meta()).expect("serialize meta");
+        let slice = serde_json::to_string(&productive_slice()).expect("serialize slice");
+        let health = serde_json::to_string(&aa_wire::HealthResponse::AwaitingAnchor)
+            .expect("serialize health");
+        let (port, _server) = loopback(move |_method, path| match path {
+            "/pools/meta" => (200, meta.clone()),
+            "/slice" => (200, slice.clone()),
+            "/health" => (200, health.clone()),
+            _ => (404, String::new()),
+        });
+
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = RecordingRuntime {
+            inner: ClientEngineRuntime::new(format!("http://127.0.0.1:{port}")),
+            observed: observed.clone(),
+        };
+        // `run` loops forever (it self-clocks and grinds), so we never join it — we watch the recorded
+        // phases until the productive slice has driven the engine into `Optimizing`.
+        let (_sender, _handle) = <RecordingRuntime as Runtime<ClientEngineApp>>::run(runtime);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reached = observed
+                .lock()
+                .map(|phases| {
+                    phases
+                        .iter()
+                        .any(|phase| matches!(phase, Phase::Optimizing { .. }))
+                })
+                .unwrap_or(false);
+            if reached {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not reach Optimizing in time; observed: {:?}",
+                observed
+                    .lock()
+                    .map(|phases| phases.clone())
+                    .unwrap_or_default(),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
