@@ -22,6 +22,7 @@ use optimization::{
     OptimizationStepResult, OptimizationStepUpdate, PoolReserves, reserves_reach_init_asset,
 };
 
+use crate::pending::{FetchId, PendingFetches};
 use crate::{WireAdapterError, slice_to_reserves};
 
 /// Client-owned strategy and cadence for one server session. The optimizer's own config types are
@@ -57,18 +58,22 @@ pub struct SliceProvenance {
     pub chain: ChainKey,
 }
 
-/// The whole application state: immutable session config plus the current lifecycle [`Phase`].
+/// The whole application state: immutable session config, the current lifecycle [`Phase`], and the
+/// in-flight fetch ledger that gates and correlates data-plane requests.
 #[derive(Clone, Debug)]
 pub struct AppState {
     /// The session's fixed strategy/cadence for its whole lifetime.
     pub config: SessionConfig,
     /// Where in the bootstrap→optimize lifecycle the engine currently is.
     pub phase: Phase,
+    /// Which `/pools/meta`, `/slice`, and `/health` requests are outstanding — one per kind — so the
+    /// poll loop never double-issues, retries a lost fetch on TTL, and rejects superseded responses.
+    pub pending: PendingFetches,
 }
 
 impl AppState {
-    /// A freshly armed engine: it has a config but has seen nothing from the server yet. The first
-    /// `Tick` kicks off the initial `/pools/meta` + `/health` fetches and arms the poll clock.
+    /// A freshly armed engine: it has a config but has seen nothing from the server yet and has no
+    /// request in flight. The first `Tick` issues the initial `/pools/meta` + `/health` fetches.
     pub fn started(config: SessionConfig) -> AppState {
         AppState {
             config,
@@ -77,6 +82,7 @@ impl AppState {
                 health: None,
                 status: AwaitStatus::Bootstrapping,
             },
+            pending: PendingFetches::new(),
         }
     }
 }
@@ -177,15 +183,42 @@ pub enum FetchKind {
     Slice,
 }
 
-/// Everything a driver can feed the reducer: the outcomes of the effects it was asked to perform.
+/// Everything a driver can feed the reducer: the outcomes of the effects it was asked to perform. Each
+/// fetch outcome carries the [`FetchId`] of the request it answers so the reducer can reject a
+/// superseded (re-issued-past) response instead of applying it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// The `/pools/meta` catalog was fetched.
-    MetaFetched(PoolsMetaResponse),
-    /// A `/slice` response was fetched.
-    SliceFetched(SliceResponse),
-    /// A `/health` snapshot was fetched.
-    HealthFetched(HealthResponse),
+    /// The `/pools/meta` catalog was fetched for request `id`.
+    MetaFetched {
+        /// The id of the fetch this answers.
+        id: FetchId,
+        /// The fetched catalog.
+        response: PoolsMetaResponse,
+    },
+    /// A `/slice` response was fetched for request `id`.
+    SliceFetched {
+        /// The id of the fetch this answers.
+        id: FetchId,
+        /// The fetched slice.
+        response: SliceResponse,
+    },
+    /// A `/health` snapshot was fetched for request `id`.
+    HealthFetched {
+        /// The id of the fetch this answers.
+        id: FetchId,
+        /// The fetched health snapshot.
+        response: HealthResponse,
+    },
+    /// A data-plane fetch for request `id` (of `kind`) failed; `error` is its recorded fault. Distinct
+    /// from [`Event::EffectFailed`] (optimizer faults) so the reducer can free the right ledger slot.
+    FetchFailed {
+        /// The id of the fetch that failed.
+        id: FetchId,
+        /// Which data-plane request it was, so the reducer clears the matching slot.
+        kind: FetchKind,
+        /// The recorded fault.
+        error: EffectError,
+    },
     /// The optimizer completed a step (init or run), returning its scalar result and recovered plan.
     OptimizerStepped {
         /// The scalar step summary.
@@ -193,22 +226,34 @@ pub enum Event {
         /// The executable plan recovered from the trained weights, if extraction succeeded.
         plan: Option<ExecutionPlan<PoolRef, TokenAddress>>,
     },
-    /// A previously requested effect failed.
+    /// A non-fetch effect (the optimizer) failed.
     EffectFailed(EffectError),
     /// The poll clock fired.
     Tick,
 }
 
 /// A side effect the reducer asks the driver to perform. Executing an effect eventually produces one
-/// or more [`Event`]s fed back into `transition`.
+/// or more [`Event`]s fed back into `transition`. Each fetch carries the [`FetchId`] the ledger issued,
+/// which the driver echoes back on the outcome event.
 #[derive(Clone, Debug)]
 pub enum Effect {
     /// Fetch `GET /pools/meta`.
-    FetchMeta,
+    FetchMeta {
+        /// The ledger-issued id to echo on the outcome.
+        id: FetchId,
+    },
     /// Fetch `GET /health`.
-    FetchHealth,
+    FetchHealth {
+        /// The ledger-issued id to echo on the outcome.
+        id: FetchId,
+    },
     /// Fetch `POST /slice` for the given pool set.
-    FetchSlice(SliceRequest),
+    FetchSlice {
+        /// The ledger-issued id to echo on the outcome.
+        id: FetchId,
+        /// The pools to request state for.
+        request: SliceRequest,
+    },
     /// Drive the optimizer worker.
     Optimize(OptimizeCommand),
 }
@@ -244,39 +289,107 @@ pub fn slice_request_for(meta: &PoolsMetaResponse) -> SliceRequest {
 /// Pure and total — every event maps to a valid next phase, and any data fault becomes a recorded
 /// [`EffectError`] rather than a panic.
 pub fn transition(state: AppState, event: Event) -> (AppState, Vec<Effect>) {
-    let AppState { config, phase } = state;
-    let (phase, effects) = reduce(&config, phase, event);
-    (AppState { config, phase }, effects)
+    let AppState {
+        config,
+        phase,
+        pending,
+    } = state;
+    let (phase, pending, effects) = reduce(&config, phase, pending, event);
+    (
+        AppState {
+            config,
+            phase,
+            pending,
+        },
+        effects,
+    )
 }
 
-fn reduce(config: &SessionConfig, phase: Phase, event: Event) -> (Phase, Vec<Effect>) {
+fn reduce(
+    config: &SessionConfig,
+    phase: Phase,
+    mut pending: PendingFetches,
+    event: Event,
+) -> (Phase, PendingFetches, Vec<Effect>) {
     match event {
-        Event::Tick => on_tick(config, phase),
-        Event::MetaFetched(meta) => on_meta(meta, phase),
-        Event::SliceFetched(slice) => on_slice(config, phase, slice),
-        Event::HealthFetched(health) => (with_health(phase, health), vec![]),
-        Event::OptimizerStepped { result, plan } => on_step(phase, result, plan),
-        Event::EffectFailed(error) => (with_error(phase, error), vec![]),
+        Event::Tick => on_tick(phase, pending),
+        Event::MetaFetched { id, response } => {
+            if pending.accept(FetchKind::Meta, id) {
+                on_meta(response, phase, pending)
+            } else {
+                (phase, pending, vec![])
+            }
+        }
+        Event::SliceFetched { id, response } => {
+            if pending.accept(FetchKind::Slice, id) {
+                let (phase, effects) = on_slice(config, phase, response);
+                (phase, pending, effects)
+            } else {
+                (phase, pending, vec![])
+            }
+        }
+        Event::HealthFetched { id, response } => {
+            if pending.accept(FetchKind::Health, id) {
+                (with_health(phase, response), pending, vec![])
+            } else {
+                (phase, pending, vec![])
+            }
+        }
+        Event::FetchFailed { id, kind, error } => {
+            if pending.accept(kind, id) {
+                (with_error(phase, error), pending, vec![])
+            } else {
+                (phase, pending, vec![])
+            }
+        }
+        Event::OptimizerStepped { result, plan } => {
+            let (phase, effects) = on_step(phase, result, plan);
+            (phase, pending, effects)
+        }
+        Event::EffectFailed(error) => (with_error(phase, error), pending, vec![]),
     }
 }
 
-/// The poll clock fired: always refresh `/health`, and either bootstrap the catalog (if not yet
-/// known) or request a fresh slice for it. The clock itself is re-armed by the runtime's periodic
-/// `Tick` subscription, so the reducer no longer schedules it.
-fn on_tick(_config: &SessionConfig, phase: Phase) -> (Phase, Vec<Effect>) {
-    let mut effects = vec![Effect::FetchHealth];
-    match meta_of(&phase) {
-        Some(meta) => effects.push(Effect::FetchSlice(slice_request_for(meta))),
-        None => effects.push(Effect::FetchMeta),
+/// The poll clock fired: advance the ledger clock, then ensure the desired fetches are in flight —
+/// `/health` always, plus a fresh slice for the known catalog (else the catalog itself). `ensure`
+/// gates on the ledger, so a fetch is issued only when that kind is free or its request has expired;
+/// the periodic `Tick` subscription re-arms the clock, so the reducer no longer schedules it.
+fn on_tick(phase: Phase, mut pending: PendingFetches) -> (Phase, PendingFetches, Vec<Effect>) {
+    pending.advance();
+    let mut effects = Vec::new();
+    if let Some(id) = pending.ensure(FetchKind::Health) {
+        effects.push(Effect::FetchHealth { id });
     }
-    (phase, effects)
+    match meta_of(&phase) {
+        Some(meta) => {
+            let request = slice_request_for(meta);
+            if let Some(id) = pending.ensure(FetchKind::Slice) {
+                effects.push(Effect::FetchSlice { id, request });
+            }
+        }
+        None => {
+            if let Some(id) = pending.ensure(FetchKind::Meta) {
+                effects.push(Effect::FetchMeta { id });
+            }
+        }
+    }
+    (phase, pending, effects)
 }
 
 /// The catalog arrived: store it and immediately request the first slice for it (don't wait a full
-/// poll interval).
-fn on_meta(meta: PoolsMetaResponse, phase: Phase) -> (Phase, Vec<Effect>) {
-    let request = Effect::FetchSlice(slice_request_for(&meta));
-    (set_meta(phase, meta), vec![request])
+/// poll interval). The slice slot is free at this point, so `ensure` issues.
+fn on_meta(
+    meta: PoolsMetaResponse,
+    phase: Phase,
+    mut pending: PendingFetches,
+) -> (Phase, PendingFetches, Vec<Effect>) {
+    let request = slice_request_for(&meta);
+    let phase = set_meta(phase, meta);
+    let effects = match pending.ensure(FetchKind::Slice) {
+        Some(id) => vec![Effect::FetchSlice { id, request }],
+        None => vec![],
+    };
+    (phase, pending, effects)
 }
 
 /// A slice arrived: project it against the catalog and, if it yields a productive reserve set,
@@ -715,13 +828,48 @@ mod tests {
         effects.iter().any(|e| matches!(e, Effect::Optimize(_)))
     }
 
-    /// Drives `started → MetaFetched → productive SliceFetched` and asserts we land in `Optimizing`.
+    /// The id of the `FetchMeta` effect in a batch (the ledger issued it on the cold-start tick).
+    fn meta_id(effects: &[Effect]) -> FetchId {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FetchMeta { id } => Some(*id),
+                _ => None,
+            })
+            .expect("FetchMeta issued")
+    }
+
+    /// The id of the `FetchSlice` effect in a batch.
+    fn slice_id(effects: &[Effect]) -> FetchId {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FetchSlice { id, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("FetchSlice issued")
+    }
+
+    /// Cold-start tick → deliver the catalog. Returns the state (with a slice now in flight) and the
+    /// `FetchSlice` id `on_meta` issued, so a caller can deliver a matching slice.
+    fn after_catalog(config: SessionConfig, meta: PoolsMetaResponse) -> (AppState, FetchId) {
+        let (state, effects) = transition(AppState::started(config), Event::Tick);
+        let id = meta_id(&effects);
+        let (state, effects) = transition(state, Event::MetaFetched { id, response: meta });
+        let slice = slice_id(&effects);
+        (state, slice)
+    }
+
+    /// Drives cold start → catalog → productive slice and asserts we land in `Optimizing`.
     fn optimizing_state() -> AppState {
-        let (state, _) = transition(
-            AppState::started(config()),
-            Event::MetaFetched(meta_over(1, 2)),
+        let (state, slice) = after_catalog(config(), meta_over(1, 2));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
         );
-        let (state, effects) = transition(state, Event::SliceFetched(slice_complete()));
         assert!(effects.iter().any(is_optimize_init));
         assert!(matches!(state.phase, Phase::Optimizing { .. }));
         state
@@ -730,33 +878,76 @@ mod tests {
     #[test]
     fn cold_start_tick_bootstraps_catalog() {
         let (_state, effects) = transition(AppState::started(config()), Event::Tick);
-        assert!(effects.iter().any(|e| matches!(e, Effect::FetchMeta)));
-        assert!(effects.iter().any(|e| matches!(e, Effect::FetchHealth)));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchMeta { .. }))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchHealth { .. }))
+        );
         // Without a catalog yet, we must not request a slice.
-        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchSlice(_))));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchSlice { .. }))
+        );
     }
 
     #[test]
     fn tick_with_catalog_requests_slice() {
+        // Catalog known and its slice already delivered (slot free), over tokens with no init-asset
+        // route so we stay in `AwaitingFirstSlice`.
+        let (state, slice) = after_catalog(config(), meta_over(3, 4));
         let (state, _) = transition(
-            AppState::started(config()),
-            Event::MetaFetched(meta_over(1, 2)),
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
         );
         let (_state, effects) = transition(state, Event::Tick);
-        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchMeta)));
-        assert!(effects.iter().any(|e| matches!(e, Effect::FetchSlice(_))));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchMeta { .. }))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchSlice { .. }))
+        );
+    }
+
+    #[test]
+    fn fresh_in_flight_slice_is_not_reissued_on_the_next_tick() {
+        // `after_catalog` leaves a slice in flight; a tick right after must NOT issue another (gating).
+        let (state, _slice) = after_catalog(config(), meta_over(1, 2));
+        let (_state, effects) = transition(state, Event::Tick);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchSlice { .. }))
+        );
     }
 
     #[test]
     fn meta_fetched_requests_slice_for_its_pools() {
+        let (state, effects) = transition(AppState::started(config()), Event::Tick);
+        let id = meta_id(&effects);
         let (state, effects) = transition(
-            AppState::started(config()),
-            Event::MetaFetched(meta_over(1, 2)),
+            state,
+            Event::MetaFetched {
+                id,
+                response: meta_over(1, 2),
+            },
         );
         let request = effects
             .iter()
             .find_map(|e| match e {
-                Effect::FetchSlice(request) => Some(request),
+                Effect::FetchSlice { request, .. } => Some(request),
                 _ => None,
             })
             .expect("slice request");
@@ -769,11 +960,14 @@ mod tests {
 
     #[test]
     fn first_productive_slice_initializes_optimizer() {
-        let (state, _) = transition(
-            AppState::started(config()),
-            Event::MetaFetched(meta_over(1, 2)),
+        let (state, slice) = after_catalog(config(), meta_over(1, 2));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
         );
-        let (state, effects) = transition(state, Event::SliceFetched(slice_complete()));
 
         let reserves = effects
             .iter()
@@ -803,7 +997,16 @@ mod tests {
     #[test]
     fn subsequent_slice_runs_new_reserves_not_init() {
         let state = optimizing_state();
-        let (state, effects) = transition(state, Event::SliceFetched(slice_complete()));
+        // Issue a fresh slice (the first was consumed reaching `Optimizing`), then deliver it.
+        let (state, effects) = transition(state, Event::Tick);
+        let slice = slice_id(&effects);
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
+        );
         assert!(effects.iter().any(is_optimize_new_reserves));
         assert!(!effects.iter().any(is_optimize_init));
         assert!(matches!(state.phase, Phase::Optimizing { .. }));
@@ -835,11 +1038,14 @@ mod tests {
     #[test]
     fn unproductive_slice_stays_awaiting_without_optimizing() {
         // Catalog over tokens that do NOT include the init asset (`addr(1)`).
-        let (state, _) = transition(
-            AppState::started(config()),
-            Event::MetaFetched(meta_over(3, 4)),
+        let (state, slice) = after_catalog(config(), meta_over(3, 4));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
         );
-        let (state, effects) = transition(state, Event::SliceFetched(slice_complete()));
         assert!(!any_optimize(&effects));
         assert!(matches!(
             state.phase,
@@ -852,10 +1058,7 @@ mod tests {
 
     #[test]
     fn bad_slice_hex_records_adapter_error_without_optimizing() {
-        let (state, _) = transition(
-            AppState::started(config()),
-            Event::MetaFetched(meta_over(1, 2)),
-        );
+        let (state, slice) = after_catalog(config(), meta_over(1, 2));
         // Same pool, but a malformed price string.
         let bad = SliceResponse {
             block_hash: format!("{:#x}", hash(0xbb)),
@@ -871,7 +1074,13 @@ mod tests {
                 },
             }],
         };
-        let (state, effects) = transition(state, Event::SliceFetched(bad));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: bad,
+            },
+        );
         assert!(!any_optimize(&effects));
         assert!(matches!(
             state.phase,
@@ -883,13 +1092,67 @@ mod tests {
     }
 
     #[test]
-    fn effect_failed_records_error_in_place() {
+    fn mismatched_slice_id_is_rejected_then_the_real_id_is_accepted() {
+        let (state, slice) = after_catalog(config(), meta_over(1, 2));
+        let phase_before = state.phase.clone();
+
+        // A slice carrying a stale id the ledger never issued is dropped: no effects, no state change.
+        let stale = FetchId::from_raw_for_test(9999);
         let (state, effects) = transition(
-            AppState::started(config()),
-            Event::EffectFailed(EffectError::Fetch {
-                what: FetchKind::Slice,
-                message: "boom".to_owned(),
-            }),
+            state,
+            Event::SliceFetched {
+                id: stale,
+                response: slice_complete(),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(state.phase, phase_before);
+
+        // The real in-flight id is still accepted and initializes the optimizer.
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
+        );
+        assert!(effects.iter().any(is_optimize_init));
+        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+    }
+
+    #[test]
+    fn expired_slice_is_reissued_with_a_new_id() {
+        let (mut state, first) = after_catalog(config(), meta_over(1, 2));
+        // Idle ticks (no slice delivered) until the TTL elapses; the slot is then re-issued.
+        let mut reissued = None;
+        for _ in 0..crate::pending::FETCH_TTL_TICKS {
+            let (next, effects) = transition(state, Event::Tick);
+            state = next;
+            if let Some(effect_id) = effects.iter().find_map(|e| match e {
+                Effect::FetchSlice { id, .. } => Some(*id),
+                _ => None,
+            }) {
+                reissued = Some(effect_id);
+            }
+        }
+        assert_ne!(reissued.expect("slice re-issued after TTL"), first);
+    }
+
+    #[test]
+    fn failed_fetch_frees_the_slot_for_reissue() {
+        let (state, effects) = transition(AppState::started(config()), Event::Tick);
+        let id = meta_id(&effects);
+        // A failure for the in-flight meta is recorded and frees the slot.
+        let (state, effects) = transition(
+            state,
+            Event::FetchFailed {
+                id,
+                kind: FetchKind::Meta,
+                error: EffectError::Fetch {
+                    what: FetchKind::Meta,
+                    message: "boom".to_owned(),
+                },
+            },
         );
         assert!(effects.is_empty());
         assert!(matches!(
@@ -899,5 +1162,31 @@ mod tests {
                 ..
             }
         ));
+        // The next tick re-issues meta with a fresh id (still no catalog).
+        let (_state, effects) = transition(state, Event::Tick);
+        assert_ne!(meta_id(&effects), id);
+    }
+
+    #[test]
+    fn stale_failure_is_rejected() {
+        let (state, effects) = transition(AppState::started(config()), Event::Tick);
+        let real = meta_id(&effects);
+        let phase_before = state.phase.clone();
+        // A failure carrying an id the ledger no longer holds is ignored — state is unchanged.
+        let stale = FetchId::from_raw_for_test(9999);
+        assert_ne!(real, stale);
+        let (state, effects) = transition(
+            state,
+            Event::FetchFailed {
+                id: stale,
+                kind: FetchKind::Meta,
+                error: EffectError::Fetch {
+                    what: FetchKind::Meta,
+                    message: "boom".to_owned(),
+                },
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(state.phase, phase_before);
     }
 }

@@ -12,11 +12,13 @@
 
 mod http;
 mod optimizer;
+mod pending;
 mod runtime;
 mod state;
 
 pub use http::{DataPlaneClient, FetchRequest, run as run_data_plane};
 pub use optimizer::{OptimizerWorker, run as run_optimizer};
+pub use pending::{FetchId, PendingFetches};
 pub use runtime::{ClientEngineApp, ClientEngineRuntime, Subscription, run as run_engine};
 pub use state::{
     AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeCommand, OptimizeStage,

@@ -87,10 +87,12 @@ impl Application for ClientEngineApp {
     /// Start awaiting the first slice, and kick off the cold-start fetches immediately so the engine
     /// doesn't idle a full poll interval before its first `/pools/meta` + `/health`.
     fn init() -> Transition<AppState, Effect> {
-        Transition {
-            state: AppState::started(default_session_config()),
-            effects: vec![Effect::FetchMeta, Effect::FetchHealth],
-        }
+        // The cold start *is* a first tick: folding `Tick` over a fresh state issues the initial
+        // `/pools/meta` + `/health` fetches (no catalog yet ⇒ meta, not slice) *and* records them in
+        // the ledger, so there is a single issuance path and the first fetches occupy their slots.
+        let (state, effects) =
+            state::transition(AppState::started(default_session_config()), Event::Tick);
+        Transition { state, effects }
     }
 
     fn transition(state: AppState, input: Event) -> Transition<AppState, Effect> {
@@ -145,9 +147,11 @@ impl Runtime<ClientEngineApp> for ClientEngineRuntime {
     /// subscription.
     fn execute_effect(&self, effect: Effect) -> Vec<Event> {
         match effect {
-            Effect::FetchMeta => vec![self.client.handle(FetchRequest::Meta)],
-            Effect::FetchHealth => vec![self.client.handle(FetchRequest::Health)],
-            Effect::FetchSlice(request) => vec![self.client.handle(FetchRequest::Slice(request))],
+            Effect::FetchMeta { id } => vec![self.client.handle(FetchRequest::Meta { id })],
+            Effect::FetchHealth { id } => vec![self.client.handle(FetchRequest::Health { id })],
+            Effect::FetchSlice { id, request } => {
+                vec![self.client.handle(FetchRequest::Slice { id, request })]
+            }
             Effect::Optimize(command) => {
                 self.enqueue_optimize(command);
                 Vec::new()
@@ -296,8 +300,15 @@ mod tests {
             (200, body.clone())
         });
         let runtime = ClientEngineRuntime::new(format!("http://127.0.0.1:{port}"));
-        let events = runtime.execute_effect(Effect::FetchMeta);
-        assert_eq!(events, vec![Event::MetaFetched(productive_meta())]);
+        let id = crate::FetchId::from_raw_for_test(1);
+        let events = runtime.execute_effect(Effect::FetchMeta { id });
+        assert_eq!(
+            events,
+            vec![Event::MetaFetched {
+                id,
+                response: productive_meta()
+            }]
+        );
     }
 
     #[test]

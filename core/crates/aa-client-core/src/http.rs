@@ -16,19 +16,32 @@ use std::sync::mpsc::{Receiver, Sender};
 use aa_wire::{HealthResponse, PoolsMetaResponse, SliceRequest, SliceResponse};
 use serde::de::DeserializeOwned;
 
+use crate::pending::FetchId;
 use crate::state::{EffectError, Event, FetchKind};
 
 /// The three data-plane fetches the reducer can ask for — a narrow mirror of [`crate::Effect`]'s fetch
-/// variants so the adapter is total over exactly its domain (the driver maps `Effect::FetchMeta ->
-/// FetchRequest::Meta`, and so on). `Optimize` cannot reach here.
+/// variants so the adapter is total over exactly its domain (the driver maps `Effect::FetchMeta { id }
+/// -> FetchRequest::Meta { id }`, and so on). Each carries the [`FetchId`] to echo back on the outcome
+/// event so a superseded response can be rejected. `Optimize` cannot reach here.
 #[derive(Clone, Debug)]
 pub enum FetchRequest {
     /// `GET /pools/meta`.
-    Meta,
+    Meta {
+        /// The id to echo on the outcome event.
+        id: FetchId,
+    },
     /// `GET /health`.
-    Health,
+    Health {
+        /// The id to echo on the outcome event.
+        id: FetchId,
+    },
     /// `POST /slice` for the given pool set.
-    Slice(SliceRequest),
+    Slice {
+        /// The id to echo on the outcome event.
+        id: FetchId,
+        /// The pools to request state for.
+        request: SliceRequest,
+    },
 }
 
 /// Outbound HTTP client bound to one `aa-server` base URL (e.g. `http://127.0.0.1:8080`). Owns a
@@ -54,15 +67,34 @@ impl DataPlaneClient {
     /// [`Event::EffectFailed`]`(`[`EffectError::Fetch`]`)`, so the adapter can never take down the loop.
     pub fn handle(&self, request: FetchRequest) -> Event {
         match request {
-            FetchRequest::Meta => self
-                .get::<PoolsMetaResponse>("/pools/meta", FetchKind::Meta)
-                .map_or_else(Event::EffectFailed, Event::MetaFetched),
-            FetchRequest::Health => self
-                .get::<HealthResponse>("/health", FetchKind::Health)
-                .map_or_else(Event::EffectFailed, Event::HealthFetched),
-            FetchRequest::Slice(request) => self
-                .post_slice(&request)
-                .map_or_else(Event::EffectFailed, Event::SliceFetched),
+            FetchRequest::Meta { id } => {
+                match self.get::<PoolsMetaResponse>("/pools/meta", FetchKind::Meta) {
+                    Ok(response) => Event::MetaFetched { id, response },
+                    Err(error) => Event::FetchFailed {
+                        id,
+                        kind: FetchKind::Meta,
+                        error,
+                    },
+                }
+            }
+            FetchRequest::Health { id } => {
+                match self.get::<HealthResponse>("/health", FetchKind::Health) {
+                    Ok(response) => Event::HealthFetched { id, response },
+                    Err(error) => Event::FetchFailed {
+                        id,
+                        kind: FetchKind::Health,
+                        error,
+                    },
+                }
+            }
+            FetchRequest::Slice { id, request } => match self.post_slice(&request) {
+                Ok(response) => Event::SliceFetched { id, response },
+                Err(error) => Event::FetchFailed {
+                    id,
+                    kind: FetchKind::Slice,
+                    error,
+                },
+            },
         }
     }
 
@@ -164,6 +196,11 @@ mod tests {
         DataPlaneClient::new(format!("http://127.0.0.1:{port}"))
     }
 
+    /// A fixed fetch id; the adapter only echoes it back, so any value serves the round-trip.
+    fn id() -> FetchId {
+        FetchId::from_raw_for_test(1)
+    }
+
     fn sample_meta() -> PoolsMetaResponse {
         PoolsMetaResponse {
             pools: vec![PoolMetaEntry {
@@ -241,9 +278,15 @@ mod tests {
             (200, body.clone())
         });
 
-        let event = client_for(port).handle(FetchRequest::Meta);
+        let event = client_for(port).handle(FetchRequest::Meta { id: id() });
 
-        assert_eq!(event, Event::MetaFetched(expected));
+        assert_eq!(
+            event,
+            Event::MetaFetched {
+                id: id(),
+                response: expected
+            }
+        );
     }
 
     #[test]
@@ -255,9 +298,15 @@ mod tests {
             (200, body.clone())
         });
 
-        let event = client_for(port).handle(FetchRequest::Health);
+        let event = client_for(port).handle(FetchRequest::Health { id: id() });
 
-        assert_eq!(event, Event::HealthFetched(expected));
+        assert_eq!(
+            event,
+            Event::HealthFetched {
+                id: id(),
+                response: expected
+            }
+        );
     }
 
     #[test]
@@ -275,23 +324,33 @@ mod tests {
             (200, body.clone())
         });
 
-        let event = client_for(port).handle(FetchRequest::Slice(request));
+        let event = client_for(port).handle(FetchRequest::Slice { id: id(), request });
 
-        assert_eq!(event, Event::SliceFetched(expected));
+        assert_eq!(
+            event,
+            Event::SliceFetched {
+                id: id(),
+                response: expected
+            }
+        );
     }
 
     #[test]
     fn non_2xx_status_is_a_recorded_fetch_error() {
         let (port, _server) = loopback(|_, _, _| (500, "boom".to_owned()));
 
-        let event = client_for(port).handle(FetchRequest::Meta);
+        let event = client_for(port).handle(FetchRequest::Meta { id: id() });
 
         assert!(matches!(
             event,
-            Event::EffectFailed(EffectError::Fetch {
-                what: FetchKind::Meta,
+            Event::FetchFailed {
+                kind: FetchKind::Meta,
+                error: EffectError::Fetch {
+                    what: FetchKind::Meta,
+                    ..
+                },
                 ..
-            })
+            }
         ));
     }
 
@@ -299,29 +358,37 @@ mod tests {
     fn malformed_body_is_a_recorded_fetch_error() {
         let (port, _server) = loopback(|_, _, _| (200, "not json".to_owned()));
 
-        let event = client_for(port).handle(FetchRequest::Health);
+        let event = client_for(port).handle(FetchRequest::Health { id: id() });
 
         assert!(matches!(
             event,
-            Event::EffectFailed(EffectError::Fetch {
-                what: FetchKind::Health,
+            Event::FetchFailed {
+                kind: FetchKind::Health,
+                error: EffectError::Fetch {
+                    what: FetchKind::Health,
+                    ..
+                },
                 ..
-            })
+            }
         ));
     }
 
     #[test]
     fn connection_failure_is_a_recorded_fetch_error() {
         // Port 1 on loopback has nothing listening: the connection is refused, not a status error.
-        let event =
-            DataPlaneClient::new("http://127.0.0.1:1".to_owned()).handle(FetchRequest::Meta);
+        let event = DataPlaneClient::new("http://127.0.0.1:1".to_owned())
+            .handle(FetchRequest::Meta { id: id() });
 
         assert!(matches!(
             event,
-            Event::EffectFailed(EffectError::Fetch {
-                what: FetchKind::Meta,
+            Event::FetchFailed {
+                kind: FetchKind::Meta,
+                error: EffectError::Fetch {
+                    what: FetchKind::Meta,
+                    ..
+                },
                 ..
-            })
+            }
         ));
     }
 
@@ -339,16 +406,26 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let worker = thread::spawn(move || run(client_for(port), request_rx, event_tx));
 
-        request_tx.send(FetchRequest::Meta).expect("send meta");
-        request_tx.send(FetchRequest::Health).expect("send health");
+        request_tx
+            .send(FetchRequest::Meta { id: id() })
+            .expect("send meta");
+        request_tx
+            .send(FetchRequest::Health { id: id() })
+            .expect("send health");
 
         assert_eq!(
             event_rx.recv().expect("meta event"),
-            Event::MetaFetched(sample_meta())
+            Event::MetaFetched {
+                id: id(),
+                response: sample_meta()
+            }
         );
         assert_eq!(
             event_rx.recv().expect("health event"),
-            Event::HealthFetched(sample_health())
+            Event::HealthFetched {
+                id: id(),
+                response: sample_health()
+            }
         );
 
         // Dropping the request sender closes the channel, so the worker loop returns and the thread joins.
