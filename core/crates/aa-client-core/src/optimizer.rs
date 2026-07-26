@@ -1,96 +1,126 @@
-//! The executor for [`crate::Effect::Optimize`]: the optimizer worker. It owns the heavy mutable
-//! state the pure reducer deliberately does not — `optimization::OptimizationRunner`, the move-based
-//! state machine holding the `Model`/optimizer/session tensors — and turns the reducer's
-//! [`OptimizeCommand`]s into [`Event::OptimizerStepped`] outcomes, closing the `Optimize → stepped`
-//! ping-pong.
+//! The optimizer worker: a **self-clocked** grind loop that owns the heavy mutable state the pure
+//! reducer deliberately does not — `optimization::OptimizationRunner`, the move-based state machine
+//! holding the `Model`/optimizer/session tensors — and turns a stream of fresh reserve snapshots into
+//! [`Event::OptimizerStepped`] outcomes.
 //!
-//! The decision logic (init vs. run vs. continue, whether a slice is productive) lives entirely in the
-//! reducer, so this worker is a pure *command executor*: it runs exactly what it is told and reports
-//! the result. [`OptimizerWorker::handle`] is synchronous and does no I/O, so a command sequence is
-//! testable by asserting the returned events (deterministic on the Cpu backend). [`run`] is the only
-//! threaded part — a thin channel loop around `handle`.
+//! This mirrors aa-cli's `run_optimization`: reserves arrive through a **coalescing** [`LatestReceiver`]
+//! ([`crate::latest_slot`]), and the worker drives its own cadence. After each step it *pulls* — a
+//! fresh snapshot ([`LatestReceiver::try_take`]) becomes a `NewReserves` step, an empty slot becomes a
+//! `Continue`. `Continue` therefore never crosses a channel: the loop self-continues at full compute
+//! speed with no round-trip through the reducer, and reserve snapshots coalesce (latest-wins) so the
+//! optimizer always grinds the freshest reserves instead of a backlog. Contrast the old design, where
+//! the reducer re-emitted every `Continue` and each slice queued a `NewReserves`, so the worker fell
+//! linearly behind on ever-staler reserves.
+//!
+//! The reducer keeps the productivity gate (it only pushes reserves that reach the init asset), so init
+//! succeeds on the first snapshot and the grind only ever `Continue`s on an empty slot. The worker still
+//! carries aa-cli's internal skip guards (a transiently unreachable snapshot is skipped, not fatal) for
+//! robustness. Every optimizer error degrades to an [`Event::EffectFailed`]; the loop never panics.
 
-use std::sync::mpsc::{Receiver, Sender};
+use std::collections::HashSet;
+use std::sync::mpsc::Sender;
 
 use client_evm::{PoolRef, TokenAddress};
-use optimization::OptimizationRunner;
+use optimization::{
+    OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
+    OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
+    OptimizationStepUpdate, PoolReserves, reserves_reach_init_asset,
+};
 
-use crate::state::{EffectError, Event, OptimizeCommand, OptimizeStage};
+use crate::latest_slot::LatestReceiver;
+use crate::state::{EffectError, Event, OptimizeStage};
 
 /// One optimizer session's worth of layers. Matches aa-cli's `OPTIMIZATION_LAYERS`.
 const LAYERS: usize = 1;
 
-/// Owns the move-based runner at the effect edge. `None` until the first successful `Init`. Pure:
-/// [`OptimizerWorker::handle`] performs no I/O and spawns nothing.
-#[derive(Default)]
-pub struct OptimizerWorker {
-    runner: Option<OptimizationRunner<PoolRef, TokenAddress, LAYERS>>,
-}
+/// The reserve snapshot that crosses the slot: just the projected reserves. Freshness/provenance is the
+/// reducer's concern and is tracked in `AppState`, so the worker needs only the reserves themselves.
+type ReserveSnapshot = Vec<PoolReserves<PoolRef, TokenAddress>>;
 
-impl OptimizerWorker {
-    /// A worker with no runner yet: the first `Init` command creates one.
-    pub fn new() -> OptimizerWorker {
-        OptimizerWorker { runner: None }
-    }
-
-    /// Execute one command, returning the [`Event`] the reducer must be fed. Total: every optimizer
-    /// error — and a `Run` received before any `Init` — degrades to
-    /// [`Event::EffectFailed`]`(`[`EffectError::Optimize`]`)` rather than a panic, so the worker can
-    /// never take down the loop.
-    pub fn handle(&mut self, command: OptimizeCommand) -> Event {
-        match command {
-            OptimizeCommand::Init {
-                reserves,
-                session_config,
-                step_config,
-                backend,
-            } => match OptimizationRunner::<PoolRef, TokenAddress, LAYERS>::init(
-                backend,
-                reserves,
-                session_config,
-                step_config,
-            ) {
-                Ok((runner, result, plan)) => {
-                    self.runner = Some(runner);
-                    Event::OptimizerStepped { result, plan }
-                }
-                Err(error) => Event::EffectFailed(EffectError::Optimize {
+/// Own an `OptimizationRunner` and grind it, self-clocked, until the slot or the event sink closes.
+///
+/// Blocks for the first snapshot that initializes (skipping any that transiently cannot reach the init
+/// asset), then loops forever: pull the freshest reserves if any (`NewReserves`) else `Continue`, step,
+/// and forward the result as an [`Event`]. Returns — ending the subscription thread cleanly — when the
+/// reserve slot closes (the runtime dropped its sender) or the event receiver is gone (the engine is
+/// shutting down). A fatal init/step error is reported as [`Event::EffectFailed`] before returning.
+pub(crate) fn run(
+    receiver: LatestReceiver<ReserveSnapshot>,
+    backend: OptimizationBackendSelection,
+    session_config: OptimizationSessionConfig<TokenAddress>,
+    step_config: OptimizationStepConfig,
+    events: Sender<Event>,
+) {
+    // Init loop: wait for the first snapshot that actually initializes. A snapshot that momentarily
+    // cannot reach the init asset (`InitAssetOutputNotFound`) is a transient "not ready yet", not a
+    // fatal error — skip it and wait for the next. Every other init error is fatal.
+    let (mut runner, result, plan) = loop {
+        let reserves = match receiver.wait_take() {
+            Ok(reserves) => reserves,
+            // Slot closed before we ever initialized: nothing to do.
+            Err(_) => return,
+        };
+        match OptimizationRunner::<PoolRef, TokenAddress, LAYERS>::init(
+            backend,
+            reserves,
+            session_config.clone(),
+            step_config,
+        ) {
+            Ok(initialized) => break initialized,
+            Err(OptimizationInitError::Step(OptimizationStepError::InitAssetOutputNotFound)) => {
+                continue;
+            }
+            Err(error) => {
+                let _ = events.send(Event::EffectFailed(EffectError::Optimize {
                     stage: OptimizeStage::Init,
                     message: error.to_string(),
-                }),
-            },
-            OptimizeCommand::Run(update) => match self.runner.take() {
-                Some(runner) => match runner.run(update) {
-                    Ok((runner, result, plan)) => {
-                        self.runner = Some(runner);
-                        Event::OptimizerStepped { result, plan }
-                    }
-                    Err(error) => Event::EffectFailed(EffectError::Optimize {
-                        stage: OptimizeStage::Run,
-                        message: error.to_string(),
-                    }),
-                },
-                // A `Run` before `Init`: the reducer only emits this after it has emitted an `Init`,
-                // and the command channel is FIFO, so it should not happen — but stay total.
-                None => Event::EffectFailed(EffectError::Optimize {
-                    stage: OptimizeStage::Run,
-                    message: "run before init".to_owned(),
-                }),
-            },
+                }));
+                return;
+            }
         }
-    }
-}
+    };
 
-/// The threaded shell: own a fresh [`OptimizerWorker`], execute each incoming command, and forward the
-/// resulting event. Returns (ending the thread) when either channel closes — the command sender
-/// dropped (`recv` errs) or the event receiver dropped (`send` errs) — so a torn-down driver stops
-/// the worker cleanly. Panic-free: both channel ends are handled as `Result`.
-pub fn run(commands: Receiver<OptimizeCommand>, events: Sender<Event>) {
-    let mut worker = OptimizerWorker::new();
-    while let Ok(command) = commands.recv() {
-        if events.send(worker.handle(command)).is_err() {
-            break;
+    if events
+        .send(Event::OptimizerStepped { result, plan })
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        let update = match receiver.try_take() {
+            // Fresh reserves that reach the init asset: step them.
+            Ok(Some(reserves)) if reserves_reach_init_asset(&reserves, &session_config) => {
+                OptimizationStepUpdate::NewReserves {
+                    reserves,
+                    disabled: HashSet::new(),
+                }
+            }
+            // A transiently unreachable snapshot would abort the session; skip it and keep grinding the
+            // reserves already loaded.
+            Ok(Some(_)) => OptimizationStepUpdate::Continue,
+            // Nothing new: self-continue on the current session (the self-clock).
+            Ok(None) => OptimizationStepUpdate::Continue,
+            // Slot closed: the runtime is shutting down.
+            Err(_) => return,
+        };
+        let (next_runner, result, plan) = match runner.run(update) {
+            Ok(stepped) => stepped,
+            Err(error) => {
+                let _ = events.send(Event::EffectFailed(EffectError::Optimize {
+                    stage: OptimizeStage::Run,
+                    message: error.to_string(),
+                }));
+                return;
+            }
+        };
+        if events
+            .send(Event::OptimizerStepped { result, plan })
+            .is_err()
+        {
+            return;
         }
+        runner = next_runner;
     }
 }
 
@@ -99,14 +129,16 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use client_evm::{ChainKey, PoolRef, TokenAddress};
     use optimization::{
         OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
-        OptimizationStepStatus, OptimizationStepUpdate, PoolReserves, VirtualReserveValues,
+        OptimizationStepStatus, PoolReserves, VirtualReserveValues,
     };
 
     use super::*;
+    use crate::latest_slot::latest_slot;
 
     const CHAIN: ChainKey = ChainKey::Ethereum;
 
@@ -135,7 +167,7 @@ mod tests {
 
     /// A single self-token pool whose output is the init asset — the minimal snapshot that initializes
     /// (mirrors aa-cli's optimizer-test fixture).
-    fn base_reserves() -> Vec<PoolReserves<PoolRef, TokenAddress>> {
+    fn base_reserves() -> ReserveSnapshot {
         vec![PoolReserves {
             pool_id: pool(),
             token0: token(),
@@ -150,116 +182,208 @@ mod tests {
         }]
     }
 
-    fn init_command(reserves: Vec<PoolReserves<PoolRef, TokenAddress>>) -> OptimizeCommand {
-        OptimizeCommand::Init {
-            reserves,
-            session_config: session_config(),
-            step_config: step_config(),
-            backend: OptimizationBackendSelection::Cpu,
-        }
+    /// Reserves that never output the session's init asset (a distinct, Arbitrum-stamped token), so
+    /// `reserves_reach_init_asset` is false and init would fail with `InitAssetOutputNotFound`.
+    fn unreachable_reserves() -> ReserveSnapshot {
+        let other = TokenAddress(Default::default(), ChainKey::Arbitrum);
+        vec![PoolReserves {
+            pool_id: PoolRef::uniswap_v3(Default::default(), ChainKey::Arbitrum),
+            token0: other,
+            token1: other,
+            value: VirtualReserveValues {
+                token_0: 2.0,
+                token_1: 3.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 1.0,
+                max_swap_1: 1.0,
+            },
+        }]
     }
 
-    /// Asserts an event is an `OptimizerStepped` of the given status and returns whether it carried a
-    /// plan.
-    fn expect_step(event: Event, status: OptimizationStepStatus) -> bool {
+    fn step_status(event: Event) -> OptimizationStepStatus {
         match event {
-            Event::OptimizerStepped { result, plan } => {
-                assert_eq!(result.status, status);
-                plan.is_some()
-            }
+            Event::OptimizerStepped { result, .. } => result.status,
             other => panic!("expected OptimizerStepped, got {other:?}"),
         }
     }
 
-    #[test]
-    fn init_produces_an_initialized_step_and_retains_the_runner() {
-        let mut worker = OptimizerWorker::new();
-        let has_plan = expect_step(
-            worker.handle(init_command(base_reserves())),
-            OptimizationStepStatus::Initialized,
-        );
-        assert!(has_plan, "a completed step must emit a plan");
-        assert!(worker.runner.is_some(), "the runner must be retained");
+    fn run_worker(
+        receiver: LatestReceiver<ReserveSnapshot>,
+        events: Sender<Event>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            run(
+                receiver,
+                OptimizationBackendSelection::Cpu,
+                session_config(),
+                step_config(),
+                events,
+            )
+        })
     }
 
     #[test]
-    fn continue_after_init_advances_the_session() {
-        let mut worker = OptimizerWorker::new();
-        worker.handle(init_command(base_reserves()));
-        expect_step(
-            worker.handle(OptimizeCommand::Run(OptimizationStepUpdate::Continue)),
-            OptimizationStepStatus::Continued,
+    fn slot_closed_before_first_snapshot_exits_without_stepping() {
+        let (sender, receiver) = latest_slot();
+        drop(sender);
+        let (events_tx, events_rx) = mpsc::channel();
+        // No thread needed: `wait_take` returns Closed immediately, so `run` returns at once.
+        run(
+            receiver,
+            OptimizationBackendSelection::Cpu,
+            session_config(),
+            step_config(),
+            events_tx,
         );
+        // No step was ever produced (and the sender end is now dropped).
+        assert!(events_rx.recv().is_err());
     }
 
     #[test]
-    fn new_reserves_with_same_keys_updates_in_place() {
-        let mut worker = OptimizerWorker::new();
-        worker.handle(init_command(base_reserves()));
-        expect_step(
-            worker.handle(OptimizeCommand::Run(OptimizationStepUpdate::NewReserves {
-                reserves: base_reserves(),
-                disabled: HashSet::new(),
-            })),
-            OptimizationStepStatus::Updated,
+    fn one_snapshot_self_clocks_a_stream_of_continues() {
+        // THE core parity behaviour: a single snapshot yields Initialized then a run of Continued steps
+        // with no further sends — proving `Continue` needs no channel round-trip.
+        let (sender, receiver) = latest_slot();
+        let (events_tx, events_rx) = mpsc::channel();
+        let handle = run_worker(receiver, events_tx);
+
+        sender.send(base_reserves()).expect("send initial snapshot");
+
+        assert_eq!(
+            step_status(events_rx.recv().expect("init event")),
+            OptimizationStepStatus::Initialized
         );
+        // With no additional sends, the next several steps are all self-driven Continues.
+        for _ in 0..3 {
+            assert_eq!(
+                step_status(events_rx.recv().expect("continue event")),
+                OptimizationStepStatus::Continued
+            );
+        }
+
+        // Dropping the sender closes the slot; the worker's next `try_take` returns Closed and it exits.
+        drop(sender);
+        handle.join().expect("worker joins");
     }
 
     #[test]
-    fn run_before_init_is_a_recorded_error() {
-        let mut worker = OptimizerWorker::new();
-        let event = worker.handle(OptimizeCommand::Run(OptimizationStepUpdate::Continue));
+    fn fresh_reserves_produce_an_updated_step() {
+        let (sender, receiver) = latest_slot();
+        let (events_tx, events_rx) = mpsc::channel();
+        let handle = run_worker(receiver, events_tx);
+
+        sender.send(base_reserves()).expect("send initial snapshot");
+        assert_eq!(
+            step_status(events_rx.recv().expect("init event")),
+            OptimizationStepStatus::Initialized
+        );
+
+        // A fresh snapshot must be applied as a NewReserves step; the worker may emit a Continue or two
+        // before its `try_take` observes the send, so we look for the Updated within a bounded window.
+        sender.send(base_reserves()).expect("send fresh snapshot");
+        let mut saw_updated = false;
+        for _ in 0..16 {
+            if step_status(
+                events_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("step event"),
+            ) == OptimizationStepStatus::Updated
+            {
+                saw_updated = true;
+                break;
+            }
+        }
+        assert!(saw_updated, "a fresh snapshot must produce an Updated step");
+
+        drop(sender);
+        handle.join().expect("worker joins");
+    }
+
+    #[test]
+    fn first_unreachable_snapshot_is_skipped_not_fatal() {
+        // An unready snapshot at init must be skipped (no fatal error, no step), and the worker keeps
+        // waiting. Closing the slot then ends it cleanly.
+        let (sender, receiver) = latest_slot();
+        let (events_tx, events_rx) = mpsc::channel();
+        let handle = run_worker(receiver, events_tx);
+
+        sender
+            .send(unreachable_reserves())
+            .expect("send unready snapshot");
+        // Give the worker a moment to consume-and-skip it, then close.
+        thread::sleep(Duration::from_millis(20));
+        drop(sender);
+
+        // No step and no fatal error was ever emitted; the channel just closes.
+        assert!(events_rx.recv().is_err());
+        handle.join().expect("worker joins");
+    }
+
+    #[test]
+    fn unreachable_snapshot_after_init_keeps_grinding() {
+        let (sender, receiver) = latest_slot();
+        let (events_tx, events_rx) = mpsc::channel();
+        let handle = run_worker(receiver, events_tx);
+
+        sender.send(base_reserves()).expect("send initial snapshot");
+        assert_eq!(
+            step_status(events_rx.recv().expect("init event")),
+            OptimizationStepStatus::Initialized
+        );
+
+        // A transiently unreachable snapshot must not abort the live session; the worker skips it and
+        // keeps producing Continued steps (never an EffectFailed).
+        sender
+            .send(unreachable_reserves())
+            .expect("send unready snapshot");
+        for _ in 0..4 {
+            assert_eq!(
+                step_status(events_rx.recv().expect("continue event")),
+                OptimizationStepStatus::Continued
+            );
+        }
+
+        drop(sender);
+        handle.join().expect("worker joins");
+    }
+
+    #[test]
+    fn fatal_init_error_is_reported_then_the_worker_exits() {
+        // Empty reserves abort init with a fatal (non-transient) error; the reducer's productivity gate
+        // keeps this from happening in practice, but the worker must report it and stay total.
+        let (sender, receiver) = latest_slot();
+        sender.send(Vec::new()).expect("send empty snapshot");
+        let (events_tx, events_rx) = mpsc::channel();
+        // Pre-sent snapshot, so `run` returns after the init failure without needing another thread.
+        run(
+            receiver,
+            OptimizationBackendSelection::Cpu,
+            session_config(),
+            step_config(),
+            events_tx,
+        );
         assert!(matches!(
-            event,
-            Event::EffectFailed(EffectError::Optimize {
-                stage: OptimizeStage::Run,
-                ..
-            })
-        ));
-        assert!(worker.runner.is_none());
-    }
-
-    #[test]
-    fn init_failure_is_a_recorded_error() {
-        // Empty reserves abort init with `EmptyReserves`; the reducer's `is_productive` gate keeps
-        // this from happening in practice, but the worker must stay total.
-        let mut worker = OptimizerWorker::new();
-        let event = worker.handle(init_command(Vec::new()));
-        assert!(matches!(
-            event,
+            events_rx.recv().expect("failure event"),
             Event::EffectFailed(EffectError::Optimize {
                 stage: OptimizeStage::Init,
                 ..
             })
         ));
-        assert!(worker.runner.is_none());
     }
 
     #[test]
-    fn run_loop_processes_commands_in_order_then_exits_on_close() {
-        let (command_tx, command_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
-        let handle = thread::spawn(move || run(command_rx, event_tx));
-
-        command_tx
-            .send(init_command(base_reserves()))
-            .expect("send init");
-        command_tx
-            .send(OptimizeCommand::Run(OptimizationStepUpdate::Continue))
-            .expect("send continue");
-
-        expect_step(
-            event_rx.recv().expect("init event"),
-            OptimizationStepStatus::Initialized,
+    fn exits_cleanly_when_event_receiver_is_dropped() {
+        let (sender, receiver) = latest_slot();
+        sender.send(base_reserves()).expect("send snapshot");
+        let (events_tx, events_rx) = mpsc::channel::<Event>();
+        drop(events_rx);
+        // The worker inits, fails to send the first result (receiver gone), and returns.
+        run(
+            receiver,
+            OptimizationBackendSelection::Cpu,
+            session_config(),
+            step_config(),
+            events_tx,
         );
-        expect_step(
-            event_rx.recv().expect("continue event"),
-            OptimizationStepStatus::Continued,
-        );
-
-        // Dropping the command sender closes the channel, so the worker loop returns and the thread
-        // joins.
-        drop(command_tx);
-        handle.join().expect("worker thread joins");
     }
 }

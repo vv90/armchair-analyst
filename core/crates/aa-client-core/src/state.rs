@@ -1,25 +1,25 @@
 //! The headless engine's pure core: an `AppState` and a `transition` reducer with the same
 //! `event → state → (state, effects)` shape as the kernel. It owns *all* of the client's decision
-//! logic — when to poll the data plane, when to (re)initialize the optimizer, when to keep grinding —
-//! while holding **none** of the heavy machinery. In particular the optimizer's mutable tensor state
-//! never lives here: `optimization::OptimizationRunner` is a move-based state machine that owns the
-//! `Model`; the reducer only emits [`OptimizeCommand`]s to it (via [`Effect::Optimize`]) and folds its
-//! results back in as [`Event::OptimizerStepped`]. Keeping the derived heavy thing out of the
-//! reducible state is the same discipline the kernel uses for reserves and pool folds.
+//! logic — when to poll the data plane, when to start optimizing — while holding **none** of the heavy
+//! machinery. In particular the optimizer's mutable tensor state never lives here:
+//! `optimization::OptimizationRunner` is a move-based state machine that owns the `Model`; the reducer
+//! only hands the worker fresh reserves (via [`Effect::PushReserves`]) and folds its results back in as
+//! [`Event::OptimizerStepped`]. The grind cadence (`Continue` vs `NewReserves`) is the worker's, not the
+//! reducer's. Keeping the derived heavy thing out of the reducible state is the same discipline the
+//! kernel uses for reserves and pool folds.
 //!
 //! Everything in this module is pure and synchronous: the reducer performs no I/O and spawns nothing.
 //! A driver (a later increment) executes the returned [`Effect`]s on real threads/HTTP and feeds the
 //! outcomes back as [`Event`]s. That split makes the entire engine testable by feeding event
 //! sequences and asserting `(state, effects)`, with no transport in the loop.
 
-use std::collections::HashSet;
 use std::str::FromStr;
 
 use aa_wire::{HealthResponse, PoolsMetaResponse, SliceRequest, SliceResponse};
 use client_evm::{BlockHash, ChainKey, PoolRef, TokenAddress};
 use optimization::{
     ExecutionPlan, OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
-    OptimizationStepResult, OptimizationStepUpdate, PoolReserves, reserves_reach_init_asset,
+    OptimizationStepResult, PoolReserves, reserves_reach_init_asset,
 };
 
 use crate::pending::{FetchId, PendingFetches};
@@ -114,8 +114,6 @@ pub enum Phase {
         plan: Option<ExecutionPlan<PoolRef, TokenAddress>>,
         /// The latest server freshness snapshot, if polled.
         health: Option<HealthResponse>,
-        /// Whether an optimizer command is in flight; backpressure so at most one is outstanding.
-        awaiting_step: bool,
         /// The most recent recorded fault (adapter/fetch), cleared when a good slice is applied.
         last_error: Option<EffectError>,
     },
@@ -254,28 +252,13 @@ pub enum Effect {
         /// The pools to request state for.
         request: SliceRequest,
     },
-    /// Drive the optimizer worker.
-    Optimize(OptimizeCommand),
-}
-
-/// A command for the optimizer worker that owns the `OptimizationRunner`. `Init` bundles the config
-/// the runner's `init` needs; `Run` reuses the optimizer's own `OptimizationStepUpdate` (a fresh
-/// reserve snapshot, or `Continue` to grind more iterations on the current one).
-#[derive(Clone, Debug)]
-pub enum OptimizeCommand {
-    /// Initialize the runner from the first productive reserve snapshot.
-    Init {
-        /// The projected reserves to seed the model with.
+    /// Push the latest projected reserves to the optimizer worker's coalescing slot. The worker owns
+    /// the grind cadence: it inits on the first snapshot, applies later ones as `NewReserves`, and
+    /// self-continues when no fresh snapshot is waiting — so the reducer only ever hands it reserves.
+    PushReserves {
+        /// The freshest productive reserves to grind (latest-wins; older un-taken pushes are dropped).
         reserves: Vec<PoolReserves<PoolRef, TokenAddress>>,
-        /// The routing strategy (init asset / bridges / whitelist).
-        session_config: OptimizationSessionConfig<TokenAddress>,
-        /// The per-step input amount and iteration budget.
-        step_config: OptimizationStepConfig,
-        /// Which backend to initialize.
-        backend: OptimizationBackendSelection,
     },
-    /// Advance the already-initialized runner one step.
-    Run(OptimizationStepUpdate<PoolRef, TokenAddress>),
 }
 
 /// Builds the `POST /slice` request that asks for every catalog pool's current-tick state.
@@ -438,12 +421,7 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                     vec![],
                 );
             }
-            let command = OptimizeCommand::Init {
-                reserves,
-                session_config: config.optimization.clone(),
-                step_config: config.step,
-                backend: config.backend,
-            };
+            // The worker inits on this first productive snapshot; later slices arrive as `NewReserves`.
             (
                 Phase::Optimizing {
                     meta,
@@ -451,10 +429,9 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                     last_step: None,
                     plan: None,
                     health,
-                    awaiting_step: true,
                     last_error: None,
                 },
-                vec![Effect::Optimize(command)],
+                vec![Effect::PushReserves { reserves }],
             )
         }
         Phase::AwaitingFirstSlice {
@@ -478,7 +455,6 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
             last_step,
             plan,
             health,
-            awaiting_step,
             last_error,
         } => {
             let reserves = match slice_to_reserves(&slice, &meta, config.chain) {
@@ -491,7 +467,6 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                             last_step,
                             plan,
                             health,
-                            awaiting_step,
                             last_error: Some(EffectError::Adapter(error)),
                         },
                         vec![],
@@ -508,7 +483,6 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                             last_step,
                             plan,
                             health,
-                            awaiting_step,
                             last_error: Some(error),
                         },
                         vec![],
@@ -525,16 +499,12 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                         last_step,
                         plan,
                         health,
-                        awaiting_step,
                         last_error,
                     },
                     vec![],
                 );
             }
-            let command = OptimizeCommand::Run(OptimizationStepUpdate::NewReserves {
-                reserves,
-                disabled: HashSet::new(),
-            });
+            // Push the freshest reserves; the worker coalesces and applies them as `NewReserves`.
             (
                 Phase::Optimizing {
                     meta,
@@ -542,17 +512,16 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                     last_step,
                     plan,
                     health,
-                    awaiting_step: true,
                     last_error: None,
                 },
-                vec![Effect::Optimize(command)],
+                vec![Effect::PushReserves { reserves }],
             )
         }
     }
 }
 
-/// A step came back: record it and grind another bounded iteration chunk. A concurrently arriving
-/// slice supersedes the `Continue` with a `NewReserves` on its own event.
+/// A step came back: record its result and plan. No effect follows — the worker self-clocks, pulling
+/// fresh reserves or self-continuing on its own thread, so the reducer never re-issues a `Continue`.
 fn on_step(
     phase: Phase,
     result: OptimizationStepResult,
@@ -572,12 +541,9 @@ fn on_step(
                 last_step: Some(result),
                 plan,
                 health,
-                awaiting_step: true,
                 last_error,
             },
-            vec![Effect::Optimize(OptimizeCommand::Run(
-                OptimizationStepUpdate::Continue,
-            ))],
+            vec![],
         ),
         // A step result while not optimizing is stale (e.g. after a reset); ignore it.
         other => (other, vec![]),
@@ -628,7 +594,6 @@ fn set_meta(phase: Phase, meta: PoolsMetaResponse) -> Phase {
             last_step,
             plan,
             health,
-            awaiting_step,
             last_error,
             ..
         } => Phase::Optimizing {
@@ -637,7 +602,6 @@ fn set_meta(phase: Phase, meta: PoolsMetaResponse) -> Phase {
             last_step,
             plan,
             health,
-            awaiting_step,
             last_error,
         },
     }
@@ -656,7 +620,6 @@ fn with_health(phase: Phase, health: HealthResponse) -> Phase {
             latest,
             last_step,
             plan,
-            awaiting_step,
             last_error,
             ..
         } => Phase::Optimizing {
@@ -665,7 +628,6 @@ fn with_health(phase: Phase, health: HealthResponse) -> Phase {
             last_step,
             plan,
             health: Some(health),
-            awaiting_step,
             last_error,
         },
     }
@@ -685,7 +647,6 @@ fn with_error(phase: Phase, error: EffectError) -> Phase {
             last_step,
             plan,
             health,
-            awaiting_step,
             ..
         } => Phase::Optimizing {
             meta,
@@ -693,7 +654,6 @@ fn with_error(phase: Phase, error: EffectError) -> Phase {
             last_step,
             plan,
             health,
-            awaiting_step,
             last_error: Some(error),
         },
     }
@@ -701,6 +661,8 @@ fn with_error(phase: Phase, error: EffectError) -> Phase {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use aa_wire::{
         PoolCompleteness, PoolMetaEntry, PoolQuery, PoolSlice, TokenMetaEntry, WirePoolState,
     };
@@ -804,28 +766,16 @@ mod tests {
         }
     }
 
-    fn is_optimize_init(effect: &Effect) -> bool {
-        matches!(effect, Effect::Optimize(OptimizeCommand::Init { .. }))
+    /// The reserves of the `PushReserves` effect in a batch, if one was emitted.
+    fn pushed_reserves(effects: &[Effect]) -> Option<&Vec<PoolReserves<PoolRef, TokenAddress>>> {
+        effects.iter().find_map(|e| match e {
+            Effect::PushReserves { reserves } => Some(reserves),
+            _ => None,
+        })
     }
 
-    fn is_optimize_new_reserves(effect: &Effect) -> bool {
-        matches!(
-            effect,
-            Effect::Optimize(OptimizeCommand::Run(
-                OptimizationStepUpdate::NewReserves { .. }
-            ))
-        )
-    }
-
-    fn is_optimize_continue(effect: &Effect) -> bool {
-        matches!(
-            effect,
-            Effect::Optimize(OptimizeCommand::Run(OptimizationStepUpdate::Continue))
-        )
-    }
-
-    fn any_optimize(effects: &[Effect]) -> bool {
-        effects.iter().any(|e| matches!(e, Effect::Optimize(_)))
+    fn any_push_reserves(effects: &[Effect]) -> bool {
+        pushed_reserves(effects).is_some()
     }
 
     /// The id of the `FetchMeta` effect in a batch (the ledger issued it on the cold-start tick).
@@ -870,7 +820,7 @@ mod tests {
                 response: slice_complete(),
             },
         );
-        assert!(effects.iter().any(is_optimize_init));
+        assert!(any_push_reserves(&effects));
         assert!(matches!(state.phase, Phase::Optimizing { .. }));
         state
     }
@@ -959,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn first_productive_slice_initializes_optimizer() {
+    fn first_productive_slice_pushes_reserves() {
         let (state, slice) = after_catalog(config(), meta_over(1, 2));
         let (state, effects) = transition(
             state,
@@ -969,33 +919,24 @@ mod tests {
             },
         );
 
-        let reserves = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Optimize(OptimizeCommand::Init { reserves, .. }) => Some(reserves),
-                _ => None,
-            })
-            .expect("init command");
+        // The reducer no longer inits directly: it hands the worker the projected reserves.
+        let reserves = pushed_reserves(&effects).expect("push reserves effect");
         // The one v3 pool projects to forward + inverse.
         assert_eq!(reserves.len(), 2);
 
         let Phase::Optimizing {
-            latest,
-            awaiting_step,
-            last_step,
-            ..
+            latest, last_step, ..
         } = &state.phase
         else {
             panic!("expected Optimizing, got {:?}", state.phase);
         };
         assert_eq!(latest.confirmations, 2);
         assert_eq!(latest.block_hash, hash(0xbb));
-        assert!(*awaiting_step);
         assert!(last_step.is_none());
     }
 
     #[test]
-    fn subsequent_slice_runs_new_reserves_not_init() {
+    fn subsequent_slice_also_pushes_reserves() {
         let state = optimizing_state();
         // Issue a fresh slice (the first was consumed reaching `Optimizing`), then deliver it.
         let (state, effects) = transition(state, Event::Tick);
@@ -1007,13 +948,13 @@ mod tests {
                 response: slice_complete(),
             },
         );
-        assert!(effects.iter().any(is_optimize_new_reserves));
-        assert!(!effects.iter().any(is_optimize_init));
+        // Init vs update is the worker's concern now; the reducer just pushes the freshest reserves.
+        assert!(any_push_reserves(&effects));
         assert!(matches!(state.phase, Phase::Optimizing { .. }));
     }
 
     #[test]
-    fn step_records_result_and_grinds_continue() {
+    fn step_records_result_without_re_issuing_continue() {
         let state = optimizing_state();
         let (state, effects) = transition(
             state,
@@ -1022,17 +963,12 @@ mod tests {
                 plan: None,
             },
         );
-        assert!(effects.iter().any(is_optimize_continue));
-        let Phase::Optimizing {
-            last_step,
-            awaiting_step,
-            ..
-        } = &state.phase
-        else {
+        // The worker self-clocks its own `Continue`; the reducer emits no follow-up effect.
+        assert!(effects.is_empty());
+        let Phase::Optimizing { last_step, .. } = &state.phase else {
             panic!("expected Optimizing");
         };
         assert!(last_step.is_some());
-        assert!(*awaiting_step);
     }
 
     #[test]
@@ -1046,7 +982,7 @@ mod tests {
                 response: slice_complete(),
             },
         );
-        assert!(!any_optimize(&effects));
+        assert!(!any_push_reserves(&effects));
         assert!(matches!(
             state.phase,
             Phase::AwaitingFirstSlice {
@@ -1081,7 +1017,7 @@ mod tests {
                 response: bad,
             },
         );
-        assert!(!any_optimize(&effects));
+        assert!(!any_push_reserves(&effects));
         assert!(matches!(
             state.phase,
             Phase::AwaitingFirstSlice {
@@ -1108,7 +1044,7 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(state.phase, phase_before);
 
-        // The real in-flight id is still accepted and initializes the optimizer.
+        // The real in-flight id is still accepted and drives the optimizer.
         let (state, effects) = transition(
             state,
             Event::SliceFetched {
@@ -1116,7 +1052,7 @@ mod tests {
                 response: slice_complete(),
             },
         );
-        assert!(effects.iter().any(is_optimize_init));
+        assert!(any_push_reserves(&effects));
         assert!(matches!(state.phase, Phase::Optimizing { .. }));
     }
 

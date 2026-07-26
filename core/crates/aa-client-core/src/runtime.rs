@@ -10,30 +10,34 @@
 //!   the reducer verbatim.
 //! - [`ClientEngineRuntime`] is the effectful [`Runtime`]. The fetch effects run inline in
 //!   [`ClientEngineRuntime::execute_effect`] via the [`DataPlaneClient`] (synchronous HTTP). The
-//!   optimizer cannot: its [`crate::OptimizerWorker`] owns an `OptimizationRunner` whose GPU-capable
-//!   type is not `Send + Sync`, so it can never live in the shared runtime. Instead it runs on its own
-//!   [`Subscription::Optimizer`] thread ([`crate::run_optimizer`]) that owns the runner internally;
-//!   `execute_effect` just enqueues each [`OptimizeCommand`] onto that thread's FIFO channel (ordering
-//!   preserved, so `Init` always precedes its `Run`s) and the results come back as [`Event`]s. This is
-//!   the same subscription-owned-worker shape aa-cli uses for its optimizer.
+//!   optimizer cannot: its `OptimizationRunner` is GPU-capable and not `Send + Sync`, so it can never
+//!   live in the shared runtime. Instead it runs on its own [`Subscription::Optimizer`] thread
+//!   ([`crate::optimizer::run`]) that owns the runner internally; `execute_effect` just pushes the
+//!   freshest reserves onto that thread's **coalescing** slot ([`crate::latest_slot`], latest-wins so a
+//!   slow worker never accumulates a backlog) and the step results come back as [`Event`]s. The worker
+//!   self-clocks its own `Continue`s. This is the same subscription-owned-worker shape aa-cli uses.
 //!
 //! [`ClientEngineRuntime::observe_state`] is the seam a later increment projects into a
 //! `aa_client_api::ViewModel`.
 
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use aa_framework::{Application, Runtime, Transition};
-use client_evm::{ChainKey, ETHEREUM_USDC_TOKEN_ADDRESS};
+use client_evm::{ChainKey, ETHEREUM_USDC_TOKEN_ADDRESS, PoolRef, TokenAddress};
 use optimization::{
-    OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
+    OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig, PoolReserves,
 };
 
 use crate::http::{DataPlaneClient, FetchRequest};
+use crate::latest_slot::{LatestReceiver, LatestSender, latest_slot};
 use crate::optimizer;
-use crate::state::{self, AppState, Effect, Event, OptimizeCommand, SessionConfig};
+use crate::state::{self, AppState, Effect, Event, SessionConfig};
+
+/// The reserve snapshot the reducer pushes to the optimizer worker's coalescing slot.
+type ReserveSnapshot = Vec<PoolReserves<PoolRef, TokenAddress>>;
 
 /// How often the poll clock fires. The framework's `subscriptions()` is a nullary static, so — like
 /// aa-cli's hardcoded tick — the interval is a const rather than a per-session field for now
@@ -51,7 +55,8 @@ const STEP_ITERATIONS: usize = 10;
 pub enum Subscription {
     /// Emit an [`Event::Tick`] every interval, forever (until the loop shuts down).
     Tick(Duration),
-    /// Own the optimizer worker: drain its command channel and emit each step result as an event.
+    /// Own the optimizer worker: pull the freshest reserves from its coalescing slot, self-clock the
+    /// grind, and emit each step result as an event.
     Optimizer,
 }
 
@@ -106,35 +111,30 @@ impl Application for ClientEngineApp {
 }
 
 /// The effectful runtime: owns the outbound HTTP client and the send end of the optimizer worker's
-/// command channel. `Send + Sync` (the framework runs effects on a pool): the client is `Send + Sync`,
-/// and the channel ends are held behind `Mutex`es. The optimizer worker itself — whose runner is not
-/// `Send + Sync` — is deliberately *not* here; it lives on the [`Subscription::Optimizer`] thread.
+/// coalescing reserve slot. `Send + Sync` (the framework runs effects on a pool): the client and
+/// [`LatestSender`] are `Send + Sync`, and the receiver is held behind a `Mutex` until claimed. The
+/// optimizer worker itself — whose runner is not `Send + Sync` — is deliberately *not* here; it lives on
+/// the [`Subscription::Optimizer`] thread, which also gets the session config to init the runner.
 pub struct ClientEngineRuntime {
     client: DataPlaneClient,
-    /// Enqueues commands for the optimizer thread. FIFO, so `Init` always precedes its `Run`s.
-    optimizer_commands: Mutex<Sender<OptimizeCommand>>,
+    /// The session's fixed strategy/cadence; handed to the optimizer worker when it spawns.
+    config: SessionConfig,
+    /// Coalescing sink for the freshest reserves (latest-wins, so a slow worker never backs up).
+    reserve_sender: LatestSender<ReserveSnapshot>,
     /// The matching receiver, taken once by the optimizer subscription when it starts.
-    optimizer_inbox: Mutex<Option<Receiver<OptimizeCommand>>>,
+    reserve_inbox: Mutex<Option<LatestReceiver<ReserveSnapshot>>>,
 }
 
 impl ClientEngineRuntime {
-    /// A runtime targeting one `aa-server` base URL, with the optimizer channel created but its worker
-    /// not yet spawned (the [`Subscription::Optimizer`] claims the receiver and owns the worker).
+    /// A runtime targeting one `aa-server` base URL, with the reserve slot created but its worker not
+    /// yet spawned (the [`Subscription::Optimizer`] claims the receiver and owns the worker).
     pub fn new(base_url: String) -> ClientEngineRuntime {
-        let (commands, inbox) = channel();
+        let (reserve_sender, reserve_inbox) = latest_slot();
         ClientEngineRuntime {
             client: DataPlaneClient::new(base_url),
-            optimizer_commands: Mutex::new(commands),
-            optimizer_inbox: Mutex::new(Some(inbox)),
-        }
-    }
-
-    /// Hand a command to the optimizer thread. A poisoned lock or a dropped worker (the engine is
-    /// shutting down) is swallowed — the reducer records no result and simply re-issues on the next
-    /// productive slice. Never panics.
-    fn enqueue_optimize(&self, command: OptimizeCommand) {
-        if let Ok(commands) = self.optimizer_commands.lock() {
-            let _ = commands.send(command);
+            config: default_session_config(),
+            reserve_sender,
+            reserve_inbox: Mutex::new(Some(reserve_inbox)),
         }
     }
 }
@@ -142,9 +142,9 @@ impl ClientEngineRuntime {
 impl Runtime<ClientEngineApp> for ClientEngineRuntime {
     /// Execute one effect and return the events it produced. Fetch effects run inline against the data
     /// plane and yield exactly one event (the executor is total — faults come back as
-    /// `Event::EffectFailed`, never a panic). `Optimize` is asynchronous: it is enqueued onto the
-    /// optimizer thread and produces no event here; the result arrives later via the optimizer
-    /// subscription.
+    /// `Event::EffectFailed`, never a panic). `PushReserves` is asynchronous: the reserves are placed on
+    /// the optimizer thread's coalescing slot and produce no event here; step results arrive later via
+    /// the optimizer subscription.
     fn execute_effect(&self, effect: Effect) -> Vec<Event> {
         match effect {
             Effect::FetchMeta { id } => vec![self.client.handle(FetchRequest::Meta { id })],
@@ -152,17 +152,20 @@ impl Runtime<ClientEngineApp> for ClientEngineRuntime {
             Effect::FetchSlice { id, request } => {
                 vec![self.client.handle(FetchRequest::Slice { id, request })]
             }
-            Effect::Optimize(command) => {
-                self.enqueue_optimize(command);
+            Effect::PushReserves { reserves } => {
+                // Coalescing send: overwrites any un-taken snapshot so the worker grinds the freshest
+                // reserves. A closed slot (worker gone / shutting down) or poisoned lock is swallowed —
+                // never a panic; the next productive slice simply pushes again.
+                let _ = self.reserve_sender.send(reserves);
                 Vec::new()
             }
         }
     }
 
     /// Run one background subscription. The poll clock sleeps then emits an [`Event::Tick`]; the
-    /// optimizer subscription claims the command receiver and runs the worker, which owns its runner
-    /// and forwards each step result as an event. Both return only when the event receiver is gone
-    /// (the engine is shutting down). Panic-free.
+    /// optimizer subscription claims the reserve receiver and runs the worker, which owns its runner,
+    /// self-clocks the grind, and forwards each step result as an event. Both return only when their
+    /// channel closes (the engine is shutting down). Panic-free.
     fn spawn_subscription(&self, sender: &Sender<Event>, subscription: Subscription) {
         match subscription {
             Subscription::Tick(interval) => loop {
@@ -175,12 +178,18 @@ impl Runtime<ClientEngineApp> for ClientEngineRuntime {
                 // Take the receiver exactly once; a second Optimizer subscription (there is only one)
                 // would find it gone and simply return.
                 let inbox = self
-                    .optimizer_inbox
+                    .reserve_inbox
                     .lock()
                     .ok()
                     .and_then(|mut slot| slot.take());
                 if let Some(inbox) = inbox {
-                    optimizer::run(inbox, sender.clone());
+                    optimizer::run(
+                        inbox,
+                        self.config.backend,
+                        self.config.optimization.clone(),
+                        self.config.step,
+                        sender.clone(),
+                    );
                 }
             }
         }
@@ -311,28 +320,56 @@ mod tests {
         );
     }
 
+    /// Minimal reserves of a given length, to tell one pushed snapshot from another.
+    fn sample_reserves(count: usize) -> ReserveSnapshot {
+        (0..count)
+            .map(|i| PoolReserves {
+                pool_id: PoolRef::uniswap_v3(addr(i as u8), ChainKey::Ethereum),
+                token0: TokenAddress(addr(1), ChainKey::Ethereum),
+                token1: TokenAddress(addr(2), ChainKey::Ethereum),
+                value: optimization::VirtualReserveValues {
+                    token_0: 1.0,
+                    token_1: 1.0,
+                    fee_multiplier: 0.997,
+                    max_swap_0: 1.0,
+                    max_swap_1: 1.0,
+                },
+            })
+            .collect()
+    }
+
     #[test]
-    fn optimize_effect_is_enqueued_not_run_inline() {
+    fn push_reserves_effect_coalesces_latest_into_the_slot() {
         let runtime = ClientEngineRuntime::new("http://127.0.0.1:1".to_owned());
         // The optimizer runs on its subscription thread, so `execute_effect` returns no event...
-        let events = runtime.execute_effect(Effect::Optimize(OptimizeCommand::Run(
-            optimization::OptimizationStepUpdate::Continue,
-        )));
-        assert!(events.is_empty());
+        assert!(
+            runtime
+                .execute_effect(Effect::PushReserves {
+                    reserves: sample_reserves(1),
+                })
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .execute_effect(Effect::PushReserves {
+                    reserves: sample_reserves(2),
+                })
+                .is_empty()
+        );
 
-        // ...but the command was placed on the FIFO channel the optimizer subscription drains.
+        // ...and the coalescing slot holds only the newest push (latest-wins, no backlog).
         let inbox = runtime
-            .optimizer_inbox
+            .reserve_inbox
             .lock()
             .expect("inbox lock")
             .take()
             .expect("inbox present");
-        assert!(matches!(
-            inbox.try_recv(),
-            Ok(OptimizeCommand::Run(
-                optimization::OptimizationStepUpdate::Continue
-            ))
-        ));
+        let taken = inbox
+            .try_take()
+            .expect("slot readable")
+            .expect("a snapshot is present");
+        assert_eq!(taken.len(), 2);
+        assert!(inbox.try_take().expect("slot readable").is_none());
     }
 
     #[test]

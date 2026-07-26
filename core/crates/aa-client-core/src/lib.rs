@@ -5,24 +5,24 @@
 //!
 //! Transport-agnostic: it consumes `AppCommand`s and produces `ViewModel`s and knows nothing about
 //! the binding (FFI/`cdylib`) or the UI framework. So far this crate holds the wire→reserves adapter
-//! (below), the pure `state` reducer that drives the poll/optimize loop, the `optimizer` worker that
-//! executes its `Optimize` effect, the `http` data-plane adapter that executes its fetch effects, and
+//! (below), the pure `state` reducer that drives the poll/optimize loop, the self-clocked `optimizer`
+//! worker fed fresh reserves through a coalescing `latest_slot`, the `http` data-plane adapter, and
 //! the `runtime` composition root that runs the whole engine on `aa-framework`; the UI `ViewModel`
 //! contract lands in a later increment.
 
 mod http;
+mod latest_slot;
 mod optimizer;
 mod pending;
 mod runtime;
 mod state;
 
 pub use http::{DataPlaneClient, FetchRequest, run as run_data_plane};
-pub use optimizer::{OptimizerWorker, run as run_optimizer};
 pub use pending::{FetchId, PendingFetches};
 pub use runtime::{ClientEngineApp, ClientEngineRuntime, Subscription, run as run_engine};
 pub use state::{
-    AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeCommand, OptimizeStage,
-    Phase, SessionConfig, SliceProvenance, slice_request_for, transition,
+    AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeStage, Phase,
+    SessionConfig, SliceProvenance, slice_request_for, transition,
 };
 
 use std::collections::HashMap;
