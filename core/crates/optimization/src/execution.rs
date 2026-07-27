@@ -562,6 +562,7 @@ where
                 let plan = build_plan(
                     &flows,
                     session_config.source_asset,
+                    session_config.output_asset,
                     step_config.input_amount,
                     PLAN_MIN_WEIGHT,
                     &session_config.bridges,
@@ -859,7 +860,8 @@ mod tests {
             .unwrap();
 
         let plan = plan.expect("a completed step must emit a plan");
-        assert_eq!(plan.init_asset, session_config().source_asset);
+        assert_eq!(plan.source_asset, session_config().source_asset);
+        assert_eq!(plan.output_asset, session_config().output_asset);
         assert_eq!(plan.entry_amount, step_config(0).input_amount);
     }
 

@@ -215,7 +215,7 @@ mod tests {
         let (result, plan) = result_receiver.recv().unwrap();
         assert_eq!(result.status, OptimizationStepStatus::Initialized);
         let plan = plan.expect("a completed step must emit a plan");
-        assert_eq!(plan.init_asset, session_config().source_asset);
+        assert_eq!(plan.source_asset, session_config().source_asset);
     }
 
     fn snapshot(last_byte: u8) -> OptimizationPoolReserves {

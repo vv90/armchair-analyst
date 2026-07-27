@@ -57,7 +57,11 @@ pub struct ExecutableStep<U, I> {
 /// stage are parallel and independent).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionPlan<U, I> {
-    pub init_asset: I,
+    /// The asset the whole `entry_amount` is deposited in (the route's start).
+    pub source_asset: I,
+    /// The asset the route terminates in and whose balance is the returned output. Equal to
+    /// `source_asset` for a closed arbitrage cycle; a distinct token for an open best-execution path.
+    pub output_asset: I,
     pub entry_amount: f32,
     pub steps: Vec<ExecutableStep<U, I>>,
 }
@@ -79,7 +83,8 @@ pub struct ExecutionPlan<U, I> {
 /// 5. **Order** by ascending `stage`.
 pub fn build_plan<U, I>(
     flows: &[FlowRecord<U, I>],
-    init_asset: I,
+    source_asset: I,
+    output_asset: I,
     entry_amount: f32,
     min_weight: f32,
     bridges: &HashSet<(I, I)>,
@@ -164,7 +169,8 @@ where
     steps.sort_by_key(|step| step.stage);
 
     ExecutionPlan {
-        init_asset,
+        source_asset,
+        output_asset,
         entry_amount,
         steps,
     }
@@ -265,7 +271,14 @@ mod tests {
         let input = 1_000.0;
 
         let flows = model.extract_flows(input).expect("extract_flows failed");
-        let plan = build_plan(&flows, tokens::USDC.address, input, 1e-4, &HashSet::new());
+        let plan = build_plan(
+            &flows,
+            tokens::USDC.address,
+            tokens::USDC.address,
+            input,
+            1e-4,
+            &HashSet::new(),
+        );
         let replayed = replay_plan(&plan, &reserves).expect("replay_plan failed");
         let predicted = model.evaluate(input);
 
@@ -286,11 +299,19 @@ mod tests {
         let input = 1_000.0;
 
         let flows = model.extract_flows(input).expect("extract_flows failed");
-        let plan = build_plan(&flows, tokens::USDC.address, input, 1e-4, &HashSet::new());
+        let plan = build_plan(
+            &flows,
+            tokens::USDC.address,
+            tokens::USDC.address,
+            input,
+            1e-4,
+            &HashSet::new(),
+        );
 
         assert!(!plan.steps.is_empty(), "plan has no steps");
         assert_eq!(plan.entry_amount, input);
-        assert_eq!(plan.init_asset, tokens::USDC.address);
+        assert_eq!(plan.source_asset, tokens::USDC.address);
+        assert_eq!(plan.output_asset, tokens::USDC.address);
 
         for ((stage, token_in), sum) in group_weight_sums(&plan) {
             assert!(
@@ -322,7 +343,7 @@ mod tests {
             step(weth, 3, 0.01), // dust — below min_weight
         ];
 
-        let plan = build_plan(&flows, usdc, 1_000.0, 0.05, &HashSet::new());
+        let plan = build_plan(&flows, usdc, usdc, 1_000.0, 0.05, &HashSet::new());
 
         assert_eq!(plan.steps.len(), 2, "dust flow should have been pruned");
         assert!(
@@ -360,7 +381,7 @@ mod tests {
         };
         let flows = vec![dup(0.3, 30.0, 29.0), dup(0.7, 70.0, 68.0)];
 
-        let plan = build_plan(&flows, usdc, 100.0, 1e-4, &HashSet::new());
+        let plan = build_plan(&flows, usdc, usdc, 100.0, 1e-4, &HashSet::new());
 
         assert_eq!(plan.steps.len(), 1, "duplicates should merge into one step");
         let step = plan.steps.first().expect("no step");
@@ -398,7 +419,7 @@ mod tests {
         let flows = vec![carry(weth, wbtc), carry(wbtc, usdc)];
         let bridges: HashSet<_> = [(weth, wbtc)].into_iter().collect();
 
-        let plan = build_plan(&flows, usdc, 100.0, 1e-4, &bridges);
+        let plan = build_plan(&flows, usdc, usdc, 100.0, 1e-4, &bridges);
 
         assert_eq!(plan.steps.len(), 1, "only the configured pair survives");
         let step = plan.steps.first().expect("no step");
@@ -423,7 +444,7 @@ mod tests {
         }];
         let bridges: HashSet<_> = [(weth, wbtc)].into_iter().collect();
 
-        let plan = build_plan(&flows, weth, 100.0, 1e-4, &bridges);
+        let plan = build_plan(&flows, weth, weth, 100.0, 1e-4, &bridges);
 
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(
@@ -458,7 +479,7 @@ mod tests {
         ];
         let bridges: HashSet<_> = [(usdc, weth)].into_iter().collect();
 
-        let plan = build_plan(&flows, usdc, 100.0, 0.05, &bridges);
+        let plan = build_plan(&flows, usdc, usdc, 100.0, 0.05, &bridges);
 
         assert_eq!(
             plan.steps.len(),
@@ -505,7 +526,7 @@ mod tests {
         .expect("model init failed");
 
         let flows = model.extract_flows(1_000.0).expect("extract_flows failed");
-        let plan = build_plan(&flows, usdc, 1_000.0, 1e-4, &bridges);
+        let plan = build_plan(&flows, usdc, usdc, 1_000.0, 1e-4, &bridges);
 
         let bridge_steps: Vec<_> = plan
             .steps
@@ -546,7 +567,7 @@ mod tests {
             let model = init_model(reserves.clone());
 
             let flows = model.extract_flows(input).expect("extract_flows failed");
-            let plan = build_plan(&flows, usdc, input, 1e-4, &HashSet::new());
+            let plan = build_plan(&flows, usdc, usdc, input, 1e-4, &HashSet::new());
             let replayed = replay_plan(&plan, &reserves).expect("replay_plan failed");
 
             prop_assert!(replayed.is_finite(), "replay produced non-finite {replayed}");
@@ -588,7 +609,7 @@ mod tests {
             .expect("model init failed");
 
             let flows = model.extract_flows(input).expect("extract_flows failed");
-            let plan = build_plan(&flows, usdc, input, 1e-4, &bridges);
+            let plan = build_plan(&flows, usdc, usdc, input, 1e-4, &bridges);
             let replayed = replay_plan(&plan, &reserves).expect("replay_plan failed");
 
             prop_assert!(replayed.is_finite(), "replay produced non-finite {replayed}");

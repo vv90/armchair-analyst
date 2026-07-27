@@ -60,7 +60,7 @@ pub struct LosslessPool {
     pub swap_limit_1: U256,
 }
 
-/// The terminal result of a lossless replay: the exact `init_asset` amount the route returns, and
+/// The terminal result of a lossless replay: the exact `output_asset` amount the route returns, and
 /// whether any hop was clamped at its tick boundary (beyond which constant product is no longer the
 /// exact in-tick math, so `output` is a conservative lower fidelity bound rather than exact).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +164,8 @@ fn weighted_amount(balance: U256, weight: f32) -> U256 {
 }
 
 /// Replays `plan` sequentially against lossless pool states, starting with the whole `entry_amount`
-/// (raw integer units of the plan's `init_asset`), and returns the exact terminal `init_asset` amount.
+/// (raw integer units of the plan's `source_asset`), and returns the exact terminal `output_asset`
+/// amount (the two coincide for a closed cycle).
 ///
 /// The book is built from the **resolver**, one call per distinct pool the plan swaps through —
 /// O(pools in the plan), never the whole market. `resolve` returns `None` when a pool cannot be turned
@@ -190,13 +191,18 @@ pub fn replay_plan_lossless(
     }
 
     let mut balances: HashMap<TokenAddress, U256> = HashMap::new();
-    balances.insert(plan.init_asset, entry_amount);
+    balances.insert(plan.source_asset, entry_amount);
     let mut hit_tick_limit = false;
 
     let Some(max_stage) = plan.steps.iter().map(|step| step.stage).max() else {
-        // No steps to route: the entry never leaves the init asset.
+        // No steps to route: the deposit never leaves `source_asset`. Read the output balance so the
+        // result is the entry when output and source coincide (a cycle "holds") and zero otherwise
+        // (an open path yields nothing without a route) — the value the fold below would produce.
         return Ok(LosslessOutcome {
-            output: entry_amount,
+            output: balances
+                .get(&plan.output_asset)
+                .copied()
+                .unwrap_or(U256::ZERO),
             hit_tick_limit: false,
         });
     };
@@ -240,7 +246,7 @@ pub fn replay_plan_lossless(
 
     Ok(LosslessOutcome {
         output: balances
-            .get(&plan.init_asset)
+            .get(&plan.output_asset)
             .copied()
             .unwrap_or(U256::ZERO),
         hit_tick_limit,
@@ -382,7 +388,8 @@ mod tests {
             (p2, pool(a, b, 1_000_000_000, 1_000_000_000)),
         ];
         let plan = ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 100_000.0,
             steps: vec![swap_step(0, a, b, p1, 1.0), swap_step(1, b, a, p2, 1.0)],
         };
@@ -463,7 +470,8 @@ mod tests {
         let p = pool_ref(11);
         let book = vec![(p, pool(a, b, 1_000_000_000, 1_000_000_000))];
         let plan = ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 100_000.0,
             steps: vec![swap_step(0, a, b, p, 1.0), swap_step(1, b, a, p, 1.0)],
         };
@@ -491,7 +499,8 @@ mod tests {
         let p = pool_ref(11);
         let book = vec![(p, pool(a, b, 1_000_000, 1_000_000))];
         let plan = ExecutionPlan {
-            init_asset: c,
+            source_asset: c,
+            output_asset: c,
             entry_amount: 1_000.0,
             steps: vec![swap_step(0, c, b, p, 1.0)],
         };
@@ -536,7 +545,8 @@ mod tests {
             (q, pool(a, b, 1_000_000_000, 1_000_000_000)),
         ];
         let plan = ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 100_000.0,
             steps: vec![
                 swap_step(0, a, b, p, 0.5),
@@ -565,7 +575,8 @@ mod tests {
         entry.swap_limit_0 = U256::from(500u64);
         let book = vec![(p, entry)];
         let plan = ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 10_000.0,
             steps: vec![swap_step(0, a, b, p, 1.0)],
         };
@@ -613,7 +624,8 @@ mod tests {
             (q, pool(c, a, 3_000_000_000, 1_500_000_000)),
         ];
         let plan = ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 100_000.0,
             steps: vec![
                 swap_step(0, a, b, p, 1.0),
@@ -648,7 +660,8 @@ mod tests {
             amount_out: 0.0,
         };
         let round_trip = |kind: StepKind<PoolRef>| ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 1_000.0,
             steps: vec![cross(kind, 0, a, b), cross(kind, 1, b, a)],
         };
@@ -673,7 +686,8 @@ mod tests {
         let (a, b) = (token(1), token(2));
         let (p, q) = (pool_ref(11), pool_ref(12));
         ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 0.0,
             steps: vec![
                 swap_step(0, a, b, p, split),
@@ -693,7 +707,8 @@ mod tests {
         let (a, b, c) = (token(1), token(2), token(3));
         let (p, q) = (pool_ref(11), pool_ref(12));
         ExecutionPlan {
-            init_asset: a,
+            source_asset: a,
+            output_asset: a,
             entry_amount: 0.0,
             steps: vec![
                 swap_step(0, a, b, p, split),
@@ -854,5 +869,78 @@ mod tests {
 
             prop_assert!(bridged_outcome.is_ok());
         }
+
+        /// An open best-execution route a -> b -> c terminating in a *distinct* output asset: the
+        /// terminal read is the routed `c` balance (a positive amount, never the spent source), and
+        /// the U256 twin still tracks the f32 oracle. Guards the source/output split end to end — two
+        /// distinct pools, so integer floor slack is ≤1 unit per hop amplified ≤2× by the last hop.
+        #[test]
+        fn differential_open_path_tracks_oracle(
+            reserve_p0 in 1_000_000_000u64..1_000_000_000_000,
+            ratio_p in 0.5f64..2.0,
+            reserve_q0 in 1_000_000_000u64..1_000_000_000_000,
+            ratio_q in 0.5f64..2.0,
+            entry in 100_000u64..1_000_000,
+        ) {
+            let reserve_p1 = (reserve_p0 as f64 * ratio_p) as u128;
+            let reserve_q1 = (reserve_q0 as f64 * ratio_q) as u128;
+            let (a, b, c) = (token(1), token(2), token(3));
+            let (p, q) = (pool_ref(11), pool_ref(12));
+            let book = vec![
+                (p, pool(a, b, reserve_p0.into(), reserve_p1)),
+                (q, pool(b, c, reserve_q0.into(), reserve_q1)),
+            ];
+            let plan = ExecutionPlan {
+                source_asset: a,
+                output_asset: c,
+                entry_amount: entry as f32,
+                steps: vec![swap_step(0, a, b, p, 1.0), swap_step(1, b, c, q, 1.0)],
+            };
+            let reserves: Vec<_> = book
+                .iter()
+                .map(|(id, entry)| f32_reserves_from(*id, entry))
+                .collect();
+
+            let outcome = replay_plan_lossless(&plan, resolver(book), U256::from(entry)).unwrap();
+            let oracle = replay_plan(&plan, &reserves).unwrap();
+
+            let lossless = to_f32(outcome.output);
+            prop_assert!(lossless > 0.0, "open path must yield a positive output, got {lossless}");
+            let scale = lossless.abs().max(oracle.abs()).max(1.0);
+            prop_assert!(
+                (lossless - oracle).abs() <= 1e-2 * scale + 16.0,
+                "open-path lossless {lossless} vs oracle {oracle}",
+            );
+        }
+    }
+
+    #[test]
+    fn no_steps_open_path_yields_zero_cycle_yields_entry() {
+        // With no routed steps the deposit sits in the source asset. A cycle "holds" (output == entry);
+        // an open path yields nothing in the output asset — the U256 twin of the f32 no-steps rule.
+        let (a, b) = (token(1), token(2));
+        let entry = U256::from(1_000u64);
+
+        let open = ExecutionPlan {
+            source_asset: a,
+            output_asset: b,
+            entry_amount: 1_000.0,
+            steps: vec![],
+        };
+        let outcome = replay_plan_lossless(&open, resolver(vec![]), entry).unwrap();
+        assert_eq!(
+            outcome.output,
+            U256::ZERO,
+            "open path with no route yields zero"
+        );
+
+        let cycle = ExecutionPlan {
+            source_asset: a,
+            output_asset: a,
+            entry_amount: 1_000.0,
+            steps: vec![],
+        };
+        let outcome = replay_plan_lossless(&cycle, resolver(vec![]), entry).unwrap();
+        assert_eq!(outcome.output, entry, "cycle with no route holds the entry");
     }
 }

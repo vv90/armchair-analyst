@@ -86,7 +86,8 @@ impl<I: Copy + PartialEq> PoolBookEntry<I> {
 }
 
 /// Replays `flows` sequentially against a mutable book built from `reserves`, starting with the whole
-/// `input` in `init_asset`, and returns the exact terminal `init_asset` amount.
+/// `input` in `source_asset`, and returns the exact terminal `output_asset` amount (the two coincide
+/// for a closed cycle).
 ///
 /// Stages run in ascending order (`FlowRecord::stage`: `0` = `layer_in` … `LAYERS + 1` = `layer_out`).
 /// Mirroring the forward, each stage reads the start-of-stage balances and writes a fresh next-stage
@@ -101,7 +102,8 @@ impl<I: Copy + PartialEq> PoolBookEntry<I> {
 pub fn replay_flows<U, I>(
     flows: &[FlowRecord<U, I>],
     reserves: &[PoolReserves<U, I>],
-    init_asset: I,
+    source_asset: I,
+    output_asset: I,
     input: f32,
 ) -> Result<f32, ReplayError>
 where
@@ -119,7 +121,7 @@ where
         },
         weight: flow.weight,
     });
-    replay_steps(steps, reserves, init_asset, input)
+    replay_steps(steps, reserves, source_asset, output_asset, input)
 }
 
 /// Replays a discrete [`ExecutionPlan`] (the candidate-extraction output) against an f32 reserve book,
@@ -127,7 +129,7 @@ where
 /// as [`replay_flows`]: [`StepKind::Swap`] swaps through and mutates its pool, [`StepKind::Carry`]
 /// carries the token through unchanged, and [`StepKind::Bridge`] converts its weighted input 1:1 into
 /// `token_out` — zero cost in token units, matching the forward's bypass-masked bridge cells. The plan
-/// supplies its own `init_asset` and absolute `entry_amount`.
+/// supplies its own `source_asset`/`output_asset` and absolute `entry_amount`.
 pub fn replay_plan<U, I>(
     plan: &ExecutionPlan<U, I>,
     reserves: &[PoolReserves<U, I>],
@@ -150,7 +152,13 @@ where
         },
         weight: step.weight,
     });
-    replay_steps(steps, reserves, plan.init_asset, plan.entry_amount)
+    replay_steps(
+        steps,
+        reserves,
+        plan.source_asset,
+        plan.output_asset,
+        plan.entry_amount,
+    )
 }
 
 /// What a [`ReplayStep`] does with its weighted input. Classification happens at the entry-point
@@ -175,13 +183,15 @@ struct ReplayStep<U, I> {
 }
 
 /// Shared sequential replay: build a mutable pool book from `reserves`, seed the whole `input` into
-/// `init_asset`, then fold the steps stage by stage (ascending), reading each stage's start balances
-/// and writing a fresh next-stage map so unrouted balances vanish. Returns the terminal `init_asset`
-/// amount.
+/// `source_asset`, then fold the steps stage by stage (ascending), reading each stage's start balances
+/// and writing a fresh next-stage map so unrouted balances vanish. Returns the terminal `output_asset`
+/// balance — the deposited `input` when `output_asset == source_asset` (a closed cycle) and the routed
+/// amount otherwise.
 fn replay_steps<U, I>(
     steps: impl Iterator<Item = ReplayStep<U, I>> + Clone,
     reserves: &[PoolReserves<U, I>],
-    init_asset: I,
+    source_asset: I,
+    output_asset: I,
     input: f32,
 ) -> Result<f32, ReplayError>
 where
@@ -205,11 +215,14 @@ where
     }
 
     let mut balances: HashMap<I, f32> = HashMap::new();
-    balances.insert(init_asset, input);
+    balances.insert(source_asset, input);
 
     let Some(max_stage) = steps.clone().map(|step| step.stage).max() else {
-        // No steps to route: the input never leaves the init asset.
-        return Ok(input);
+        // No steps to route: the deposit never leaves `source_asset`. Read the output balance so the
+        // result is the input when output and source coincide (a cycle "holds") and zero otherwise
+        // (an open path yields nothing in the output asset without a route) — the same value the fold
+        // below would produce with no stages.
+        return Ok(balances.get(&output_asset).copied().unwrap_or(0.0));
     };
 
     for stage in 0..=max_stage {
@@ -235,7 +248,7 @@ where
         balances = next;
     }
 
-    Ok(balances.get(&init_asset).copied().unwrap_or(0.0))
+    Ok(balances.get(&output_asset).copied().unwrap_or(0.0))
 }
 
 #[cfg(test)]
@@ -325,8 +338,14 @@ mod tests {
         let input = 1_000.0;
 
         let flows = model.extract_flows(input).expect("extract_flows failed");
-        let exact =
-            replay_flows(&flows, &reserves, tokens::USDC.address, input).expect("replay failed");
+        let exact = replay_flows(
+            &flows,
+            &reserves,
+            tokens::USDC.address,
+            tokens::USDC.address,
+            input,
+        )
+        .expect("replay failed");
         let predicted = model.evaluate(input);
 
         let tolerance = predicted.abs().max(exact.abs()) * 1e-3 + 1e-3;
@@ -347,8 +366,14 @@ mod tests {
         let input = 1_000.0;
 
         let flows = model.extract_flows(input).expect("extract_flows failed");
-        let exact =
-            replay_flows(&flows, &reserves, tokens::USDC.address, input).expect("replay failed");
+        let exact = replay_flows(
+            &flows,
+            &reserves,
+            tokens::USDC.address,
+            tokens::USDC.address,
+            input,
+        )
+        .expect("replay failed");
 
         assert!(exact > 0.0, "replay recovered nothing: {exact}");
         assert!(
@@ -409,7 +434,8 @@ mod tests {
         // Naive: the return leg quoted against the ORIGINAL reserves.
         let naive = ra * cap2 / (rb + cap2 + eps);
 
-        let exact = replay_flows(&flows, &reserves, token_a, input).expect("replay failed");
+        let exact =
+            replay_flows(&flows, &reserves, token_a, token_a, input).expect("replay failed");
 
         assert!(
             (exact - exact_expected).abs() <= exact_expected.abs() * 1e-5 + 1e-6,
@@ -453,7 +479,8 @@ mod tests {
         let reserves = vec![pool(usdc, weth, 1, ra, rb), pool(wbtc, usdc, 2, rc, rd)];
         let input = 1_000.0;
         let plan = ExecutionPlan {
-            init_asset: usdc,
+            source_asset: usdc,
+            output_asset: usdc,
             entry_amount: input,
             steps: vec![
                 plan_step(0, usdc, weth, StepKind::Swap(1)),
@@ -487,7 +514,8 @@ mod tests {
         let usdc = tokens::USDC.address;
         let weth = tokens::WETH.address;
         let round_trip = |kind_out: StepKind<i32>, kind_back: StepKind<i32>| ExecutionPlan {
-            init_asset: usdc,
+            source_asset: usdc,
+            output_asset: usdc,
             entry_amount: 1_000.0,
             steps: vec![
                 plan_step(0, usdc, weth, kind_out),
@@ -524,7 +552,7 @@ mod tests {
             weight: 1.0,
         }];
 
-        let exact = replay_flows(&flows, &[], usdc, 1_000.0).expect("replay failed");
+        let exact = replay_flows(&flows, &[], usdc, usdc, 1_000.0).expect("replay failed");
 
         assert_eq!(
             exact, 0.0,
@@ -556,10 +584,167 @@ mod tests {
             let model = init_model(reserves.clone());
 
             let flows = model.extract_flows(input).expect("extract_flows failed");
-            let exact = replay_flows(&flows, &reserves, usdc, input).expect("replay failed");
+            let exact =
+                replay_flows(&flows, &reserves, usdc, usdc, input).expect("replay failed");
 
             prop_assert!(exact.is_finite(), "replay produced non-finite {exact}");
             prop_assert!(exact >= 0.0, "replay produced negative {exact}");
         }
+    }
+
+    /// Frozen verbatim copy of the pre-Increment-4 single-asset replay: seed *and* read the same
+    /// `init_asset`. The split `replay_flows` must reduce to this bit-for-bit whenever
+    /// `source_asset == output_asset` — the permanent reduction oracle for the f32 evaluator, pinned
+    /// independently of the live code path.
+    fn replay_flows_reference(
+        flows: &[FlowRecord<i32, TokenAddress>],
+        reserves: &[PoolReserves<i32, TokenAddress>],
+        init_asset: TokenAddress,
+        input: f32,
+    ) -> Result<f32, ReplayError> {
+        let mut book: HashMap<i32, PoolBookEntry<TokenAddress>> = HashMap::new();
+        for reserve in reserves {
+            book.entry(reserve.pool_id)
+                .or_insert_with(|| PoolBookEntry {
+                    token0: reserve.token0,
+                    token1: reserve.token1,
+                    reserve0: reserve.value.token_0,
+                    reserve1: reserve.value.token_1,
+                    fee: reserve.value.fee_multiplier,
+                    max_swap_0: reserve.value.max_swap_0,
+                    max_swap_1: reserve.value.max_swap_1,
+                });
+        }
+
+        let mut balances: HashMap<TokenAddress, f32> = HashMap::new();
+        balances.insert(init_asset, input);
+
+        let Some(max_stage) = flows.iter().map(|flow| flow.stage).max() else {
+            return Ok(input);
+        };
+
+        for stage in 0..=max_stage {
+            let mut next: HashMap<TokenAddress, f32> = HashMap::new();
+            for flow in flows.iter().filter(|flow| flow.stage == stage) {
+                let available = balances.get(&flow.token_in).copied().unwrap_or(0.0);
+                let amount_in = available * flow.weight;
+                if amount_in <= 0.0 {
+                    continue;
+                }
+                match flow.pool_id {
+                    Some(pool) => {
+                        let entry = book.get_mut(&pool).ok_or(ReplayError::PoolNotFound)?;
+                        let out = entry.swap(flow.token_in, amount_in)?;
+                        *next.entry(flow.token_out).or_default() += out;
+                    }
+                    None if flow.token_in == flow.token_out => {
+                        *next.entry(flow.token_out).or_default() += amount_in;
+                    }
+                    None => {}
+                }
+            }
+            balances = next;
+        }
+
+        Ok(balances.get(&init_asset).copied().unwrap_or(0.0))
+    }
+
+    proptest! {
+        #[test]
+        fn source_equals_output_matches_frozen_single_asset_reference(
+            r0 in 1_000.0f32..DEEP,
+            r1 in 1_000.0f32..DEEP,
+            r2 in 1_000.0f32..DEEP,
+            r3 in 1_000.0f32..DEEP,
+            r4 in 1_000.0f32..DEEP,
+            r5 in 1_000.0f32..DEEP,
+            input in 1.0f32..1_000_000.0,
+        ) {
+            // The degenerate `output == source` case is arbitrage: the split replay must be
+            // bit-identical to the frozen single-asset fold over any (arbitraged, shallow) universe.
+            let usdc = tokens::USDC.address;
+            let weth = tokens::WETH.address;
+            let wbtc = tokens::WBTC.address;
+            let reserves = both_directions(vec![
+                pool(usdc, weth, 1, r0, r1),
+                pool(weth, wbtc, 2, r2, r3),
+                pool(wbtc, usdc, 3, r4, r5),
+            ]);
+            let model = init_model(reserves.clone());
+            let flows = model.extract_flows(input).expect("extract_flows failed");
+
+            let split = replay_flows(&flows, &reserves, usdc, usdc, input).expect("replay failed");
+            let reference =
+                replay_flows_reference(&flows, &reserves, usdc, input).expect("reference failed");
+
+            prop_assert_eq!(split, reference);
+        }
+    }
+
+    #[test]
+    fn open_path_reads_the_output_asset_not_the_source() {
+        // An open s->a->o route (USDC -> WETH -> WBTC, no returning hop): the terminal read must be
+        // the routed WBTC balance, whereas reading the source (the old single-asset behavior) sees the
+        // fully-spent USDC — zero. Pinned against an independent two-hop constant-product computation.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let wbtc = tokens::WBTC.address;
+        let (ra, rb) = (1_000_000.0, 2_000_000.0);
+        let (rc, rd) = (3_000_000.0, 1_500_000.0);
+        let reserves = vec![pool(usdc, weth, 1, ra, rb), pool(weth, wbtc, 2, rc, rd)];
+        let input = 1_000.0;
+        let flows = vec![
+            FlowRecord {
+                stage: 0,
+                token_in: usdc,
+                token_out: weth,
+                pool_id: Some(1),
+                amount_in: 0.0,
+                amount_out: 0.0,
+                weight: 1.0,
+            },
+            FlowRecord {
+                stage: 1,
+                token_in: weth,
+                token_out: wbtc,
+                pool_id: Some(2),
+                amount_in: 0.0,
+                amount_out: 0.0,
+                weight: 1.0,
+            },
+        ];
+
+        let eps = f32::EPSILON;
+        let cap0 = input * FEE;
+        let out_weth = rb * cap0 / (ra + cap0 + eps);
+        let cap1 = out_weth * FEE;
+        let expected = rd * cap1 / (rc + cap1 + eps);
+
+        let output = replay_flows(&flows, &reserves, usdc, wbtc, input).expect("replay failed");
+        assert!(
+            (output - expected).abs() <= expected.abs() * 1e-5 + 1e-6,
+            "open-path output {output} did not match hand-computed {expected}"
+        );
+
+        // Reading the source asset instead sees the spent input — the whole point of the split.
+        let source_read =
+            replay_flows(&flows, &reserves, usdc, usdc, input).expect("replay failed");
+        assert_eq!(source_read, 0.0, "no flow returns to the source asset");
+    }
+
+    #[test]
+    fn no_steps_open_path_yields_zero_cycle_yields_input() {
+        // With no routed steps the deposit sits in the source asset. A cycle "holds" (output == input);
+        // an open path yields nothing in the output asset — the fix that stops "do nothing" from
+        // masquerading as break-even for best execution.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let input = 1_000.0;
+
+        let open = replay_flows::<i32, _>(&[], &[], usdc, weth, input).expect("replay failed");
+        assert_eq!(open, 0.0, "an open path with no route yields zero output");
+
+        let cycle = replay_flows::<i32, _>(&[], &[], usdc, usdc, input).expect("replay failed");
+        assert_eq!(cycle, input, "a cycle with no route holds the input");
     }
 }

@@ -687,14 +687,19 @@ fn optimization_step_completed(
 /// units, swapped through [`LosslessPool`]s resolved from the freshest per-chain fold, and the
 /// terminal output projected back to the claimed profit's decimal-normalized scale.
 fn verify_plan(state: &State, plan: &ExecutionPlan<PoolRef, TokenAddress>) -> PlanVerification {
-    let Some(decimals) = verified_decimals(state, plan.init_asset) else {
+    // The entry is denominated in the source asset, the output in the (possibly distinct) output
+    // asset; both decimals must be verified. Equal assets collapse to one lookup — today's cycle case.
+    let Some(source_decimals) = verified_decimals(state, plan.source_asset) else {
+        return PlanVerification::Unverifiable(PlanVerificationFailure::InitAssetUnknown);
+    };
+    let Some(output_decimals) = verified_decimals(state, plan.output_asset) else {
         return PlanVerification::Unverifiable(PlanVerificationFailure::InitAssetUnknown);
     };
     if let Err(failure) = check_bridge_steps(state, plan) {
         return PlanVerification::Unverifiable(failure);
     }
 
-    let Ok(entry) = f32_token_amount_to_u256(plan.entry_amount, decimals) else {
+    let Ok(entry) = f32_token_amount_to_u256(plan.entry_amount, source_decimals) else {
         return PlanVerification::Unverifiable(PlanVerificationFailure::AmountConversion);
     };
 
@@ -706,10 +711,12 @@ fn verify_plan(state: &State, plan: &ExecutionPlan<PoolRef, TokenAddress>) -> Pl
         }
     };
 
-    // Back-project the exact output onto the claimed profit's scale. Subtracting the advisory
-    // entry rather than re-projecting the converted one skews by at most the ≤1-raw-unit
-    // conversion floor — immaterial at gate precision.
-    let Ok(output) = u256_token_amount_to_f32(outcome.output, decimals) else {
+    // Back-project the exact output onto the claimed profit's scale using the *output* asset's
+    // decimals. Subtracting the advisory entry rather than re-projecting the converted one skews by at
+    // most the ≤1-raw-unit conversion floor — immaterial at gate precision. `profit` is a cross-asset
+    // quantity for an open path (meaningful only when source == output); the display refinement is a
+    // later increment.
+    let Ok(output) = u256_token_amount_to_f32(outcome.output, output_decimals) else {
         return PlanVerification::Unverifiable(PlanVerificationFailure::AmountConversion);
     };
     PlanVerification::Verified {
@@ -1374,7 +1381,8 @@ mod tests {
 
     fn round_trip_plan(through: PoolRef) -> ExecutionPlan<PoolRef, TokenAddress> {
         ExecutionPlan {
-            init_asset: token(1),
+            source_asset: token(1),
+            output_asset: token(1),
             entry_amount: 100.0,
             steps: vec![
                 plan_swap_step(0, token(1), token(2), through),
@@ -1428,6 +1436,47 @@ mod tests {
     }
 
     #[test]
+    fn open_path_plan_verifies_reading_output_asset() {
+        // An open best-execution plan t1 -> t2 (distinct output): both decimals resolve, and the
+        // terminal is replayed and back-projected in the *output* asset — so the plan verifies rather
+        // than tripping the old single-asset assumption. (`profit` is cross-asset here; a single
+        // balanced hop returns nearly the entry in t2, less fees.)
+        let state = verification_state();
+        let plan = ExecutionPlan {
+            source_asset: token(1),
+            output_asset: token(2),
+            entry_amount: 100.0,
+            steps: vec![plan_swap_step(0, token(1), token(2), pool(10))],
+        };
+
+        let (state, effects) = transition(state, completed_step_event(Some(plan)));
+
+        assert!(effects.is_empty());
+        let Some(PlanVerification::Verified {
+            profit,
+            hit_tick_limit,
+        }) = state.latest_plan_verification()
+        else {
+            panic!(
+                "expected a verified open plan, got {:?}",
+                state.latest_plan_verification()
+            );
+        };
+        // The single hop produces a real, positive balance in the *output* asset (reading the source
+        // would have seen the spent input — zero). `profit = output − entry` is cross-asset, so its
+        // magnitude reflects the pool's price, not fees; the point is a finite, produced output.
+        assert!(
+            profit.is_finite(),
+            "open-path output must be finite, got {profit}"
+        );
+        assert!(
+            profit > -100.0,
+            "the hop must produce a non-negative output, got {profit}"
+        );
+        assert!(!hit_tick_limit);
+    }
+
+    #[test]
     fn plan_through_unresolvable_pool_is_unverifiable_pool_not_found() {
         let state = verification_state();
 
@@ -1446,7 +1495,7 @@ mod tests {
     fn plan_with_unverified_init_asset_is_unverifiable_init_asset_unknown() {
         let state = verification_state();
         let mut plan = round_trip_plan(pool(10));
-        plan.init_asset = token(9); // no verified token metadata
+        plan.source_asset = token(9); // no verified token metadata
 
         let (state, _effects) = transition(state, completed_step_event(Some(plan)));
 
@@ -1509,7 +1558,8 @@ mod tests {
         bridge_target: TokenAddress,
     ) -> ExecutionPlan<PoolRef, TokenAddress> {
         ExecutionPlan {
-            init_asset: token(1),
+            source_asset: token(1),
+            output_asset: token(1),
             entry_amount: 100.0,
             steps: vec![
                 plan_swap_step(0, token(1), token(2), pool(10)),
