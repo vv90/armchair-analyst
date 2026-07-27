@@ -215,7 +215,7 @@ mod tests {
         let (result, plan) = result_receiver.recv().unwrap();
         assert_eq!(result.status, OptimizationStepStatus::Initialized);
         let plan = plan.expect("a completed step must emit a plan");
-        assert_eq!(plan.init_asset, session_config().init_asset);
+        assert_eq!(plan.init_asset, session_config().source_asset);
     }
 
     fn snapshot(last_byte: u8) -> OptimizationPoolReserves {
@@ -254,7 +254,7 @@ mod tests {
 
     fn session_config() -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
-            init_asset: token(),
+            source_asset: token(),
             bridges: HashSet::new(),
             whitelist: None,
         }

@@ -701,7 +701,7 @@ mod tests {
         SessionConfig {
             chain: CHAIN,
             optimization: OptimizationSessionConfig {
-                init_asset: TokenAddress(addr(1), CHAIN),
+                source_asset: TokenAddress(addr(1), CHAIN),
                 bridges: HashSet::new(),
                 whitelist: None,
             },

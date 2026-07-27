@@ -544,7 +544,7 @@ impl<
     /// masked out of the softmax routing (see [`Model::update`]); pass an empty set for the
     /// all-pools-active case. Ids in `disabled` that no reserve carries are simply ignored.
     pub fn init(
-        init_asset: I,
+        source_asset: I,
         pool_reserves: Vec<PoolReserves<U, I>>,
         bridges: &HashSet<(I, I)>,
         disabled: &HashSet<U>,
@@ -562,7 +562,7 @@ impl<
 
         let init_asset_pool_indexes = model_layout
             .output_indexes
-            .get(&init_asset)
+            .get(&source_asset)
             .map(|idxs| idxs.iter().map(|RowIndex(idx)| *idx).collect::<Vec<_>>())
             .ok_or(OptimizationError::InitAssetOutputNotFound)?;
         let init_asset_pools_count = init_asset_pool_indexes.len();
@@ -571,7 +571,7 @@ impl<
 
         let init_asset_index = model_layout
             .input_indexes
-            .get(&init_asset)
+            .get(&source_asset)
             .map(|ColumnIndex(col_index)| *col_index)
             .ok_or(OptimizationError::InitAssetNotFound)?;
 

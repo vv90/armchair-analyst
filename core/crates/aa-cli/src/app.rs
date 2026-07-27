@@ -1107,7 +1107,7 @@ pub(crate) fn optimization_session_config(
     let Some(whitelist) = whitelist else {
         return Ok((
             OptimizationSessionConfig {
-                init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+                source_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
                 bridges,
                 whitelist: None,
             },
@@ -1127,7 +1127,7 @@ pub(crate) fn optimization_session_config(
 
     Ok((
         OptimizationSessionConfig {
-            init_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+            source_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
             bridges,
             whitelist: Some(whitelist.token_set().clone()),
         },
@@ -2255,7 +2255,7 @@ mod tests {
 
         // Ethereum USDC is the single global quote/init asset; the bidirectional 1:1 bridge to
         // Arbitrum USDC lets the solver close cross-chain cycles back to it.
-        assert_eq!(config.init_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
+        assert_eq!(config.source_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
         assert!(
             config
                 .bridges
@@ -2363,7 +2363,7 @@ mod tests {
         let (config, dropped) =
             optimization_session_config(None).expect("whitelist-free config");
 
-        assert_eq!(config.init_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
+        assert_eq!(config.source_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
         assert_eq!(config.bridges, default_optimization_bridges());
         assert_eq!(config.whitelist, None);
         assert!(dropped.is_empty());

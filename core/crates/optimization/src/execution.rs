@@ -98,7 +98,7 @@ struct OptimizationSession<
 
 #[derive(Clone, Debug)]
 pub struct OptimizationSessionConfig<TToken> {
-    pub init_asset: TToken,
+    pub source_asset: TToken,
     pub bridges: HashSet<(TToken, TToken)>,
     /// Tokens the optimizer may route through; a pool is admitted only if both of its tokens are
     /// in the set. `None` disables whitelisting (every token allowed).
@@ -502,7 +502,7 @@ where
     let reserve_keys = validate_reserve_snapshot(&reserves, &session_config, step_config)?;
     let disabled_count = effective_disabled_count(&reserves, disabled);
     let model = Model::<B, TPool, TToken, LAYERS>::init(
-        session_config.init_asset,
+        session_config.source_asset,
         reserves,
         &session_config.bridges,
         disabled,
@@ -557,7 +557,7 @@ where
                 let summary = FlowSummary::from_flows(&flows);
                 let plan = build_plan(
                     &flows,
-                    session_config.init_asset,
+                    session_config.source_asset,
                     step_config.input_amount,
                     PLAN_MIN_WEIGHT,
                     &session_config.bridges,
@@ -617,7 +617,7 @@ where
 {
     crate::routing_filter::admissible_reserves(reserves.to_vec(), session_config)
         .iter()
-        .any(|reserve| reserve.token1 == session_config.init_asset)
+        .any(|reserve| reserve.token1 == session_config.source_asset)
 }
 
 fn validate_reserve_snapshot<TPool, TToken>(
@@ -639,7 +639,7 @@ where
 
     if reserves
         .iter()
-        .all(|reserve| reserve.token1 != session_config.init_asset)
+        .all(|reserve| reserve.token1 != session_config.source_asset)
     {
         return Err(OptimizationStepError::InitAssetOutputNotFound);
     }
@@ -854,7 +854,7 @@ mod tests {
             .unwrap();
 
         let plan = plan.expect("a completed step must emit a plan");
-        assert_eq!(plan.init_asset, session_config().init_asset);
+        assert_eq!(plan.init_asset, session_config().source_asset);
         assert_eq!(plan.entry_amount, step_config(0).input_amount);
     }
 
@@ -1270,7 +1270,7 @@ mod tests {
 
     fn session_config() -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
-            init_asset: tokens::USDC.address,
+            source_asset: tokens::USDC.address,
             bridges: HashSet::new(),
             whitelist: None,
         }

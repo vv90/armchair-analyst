@@ -32,7 +32,7 @@ where
     let reserves = whitelisted_reserves(reserves, session_config.whitelist.as_ref());
     routable_reserves(
         reserves,
-        session_config.init_asset,
+        session_config.source_asset,
         &session_config.bridges,
     )
 }
@@ -400,11 +400,11 @@ mod tests {
     }
 
     fn config_with_whitelist(
-        init_asset: TokenAddress,
+        source_asset: TokenAddress,
         whitelist: Option<HashSet<TokenAddress>>,
     ) -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
-            init_asset,
+            source_asset,
             bridges: no_bridges(),
             whitelist,
         }
