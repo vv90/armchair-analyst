@@ -750,6 +750,40 @@ mod tests {
         }
     }
 
+    /// A slice for the `addr(9)` pool at a chosen block/confirmations, so a test can distinguish two
+    /// snapshots by provenance (freshness), not just by fetch id.
+    fn slice_at(block: u8, confirmations: u64) -> SliceResponse {
+        SliceResponse {
+            block_hash: format!("{:#x}", hash(block)),
+            confirmations,
+            pools: vec![PoolSlice {
+                key: v3_key(9),
+                state: PoolCompleteness::Complete {
+                    state: wire_state(),
+                },
+            }],
+        }
+    }
+
+    /// Idle-tick a state until its in-flight slice request expires and the ledger re-issues it,
+    /// returning the state and the *new* (current) slice id. After this, the previously-issued id is
+    /// superseded — the ledger will reject its response — which is exactly the "two concurrent slice
+    /// fetches on the wire" situation findings (a)/(e) are about.
+    fn reissue_slice_after_ttl(mut state: AppState) -> (AppState, FetchId) {
+        let mut reissued = None;
+        for _ in 0..crate::pending::FETCH_TTL_TICKS {
+            let (next, effects) = transition(state, Event::Tick);
+            state = next;
+            if let Some(id) = effects.iter().find_map(|e| match e {
+                Effect::FetchSlice { id, .. } => Some(*id),
+                _ => None,
+            }) {
+                reissued = Some(id);
+            }
+        }
+        (state, reissued.expect("slice re-issued after TTL"))
+    }
+
     fn step_result() -> OptimizationStepResult {
         OptimizationStepResult {
             status: OptimizationStepStatus::Updated,
@@ -1124,5 +1158,105 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert_eq!(state.phase, phase_before);
+    }
+
+    // --- Review-2 findings (a) & (e): fetch in-flight gating and out-of-order slice application. ---
+    // These pin the scenarios the grind-semantics review flagged before the `PendingFetches` ledger
+    // existed. With the ledger they are regression guards: (a) one-per-kind gating with TTL retry, and
+    // (e) `accept(id)` making `on_slice` apply only the latest-issued slice, rejecting a superseded one.
+
+    #[test]
+    fn slow_server_does_not_pile_up_concurrent_slice_fetches() {
+        // Finding (a): `after_catalog` leaves a slice in flight. While it is outstanding (and within
+        // its TTL), no tick may issue a second slice fetch — the gate is what prevents a slow server
+        // from accumulating concurrent requests.
+        let (mut state, _in_flight) = after_catalog(config(), meta_over(1, 2));
+        for _ in 0..(crate::pending::FETCH_TTL_TICKS - 1) {
+            let (next, effects) = transition(state, Event::Tick);
+            state = next;
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::FetchSlice { .. })),
+                "an in-flight slice must not be re-issued before its TTL elapses"
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_slice_from_a_prior_issuance_is_rejected() {
+        // Finding (e): after a TTL re-issue, two slice ids exist on the wire — the stale first one and
+        // the current second. The stale one's response must be dropped (its id is no longer held),
+        // leaving the engine untouched; the current one is still accepted and drives the optimizer.
+        let (state, stale) = after_catalog(config(), meta_over(1, 2));
+        let (state, current) = reissue_slice_after_ttl(state);
+        assert_ne!(stale, current);
+
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: stale,
+                response: slice_complete(),
+            },
+        );
+        assert!(!any_push_reserves(&effects));
+        assert!(matches!(state.phase, Phase::AwaitingFirstSlice { .. }));
+
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: current,
+                response: slice_complete(),
+            },
+        );
+        assert!(any_push_reserves(&effects));
+        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+    }
+
+    #[test]
+    fn out_of_order_slice_resolution_keeps_the_latest_issued_provenance() {
+        // Finding (e), the sharper edge: two concurrent slice fetches resolve out of order. The newer
+        // (current) request lands first and sets provenance; the older (superseded) request lands
+        // second carrying a *different* block — and must NOT overwrite `latest` backwards. The `accept`
+        // id-gate is what makes the otherwise-blind `on_slice` overwrite safe.
+        let state = optimizing_state();
+        let (state, effects) = transition(state, Event::Tick);
+        let stale = slice_id(&effects);
+        let (state, current) = reissue_slice_after_ttl(state);
+        assert_ne!(stale, current);
+
+        // Current resolves first, at block 0xcc / 1 confirmation.
+        let (state, _effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: current,
+                response: slice_at(0xcc, 1),
+            },
+        );
+        let Phase::Optimizing { latest, .. } = &state.phase else {
+            panic!("expected Optimizing");
+        };
+        assert_eq!(latest.block_hash, hash(0xcc));
+        assert_eq!(latest.confirmations, 1);
+
+        // The superseded older response arrives late at a different block and is rejected: no reserves
+        // pushed, and provenance does not regress.
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: stale,
+                response: slice_at(0xaa, 9),
+            },
+        );
+        assert!(!any_push_reserves(&effects));
+        let Phase::Optimizing { latest, .. } = &state.phase else {
+            panic!("expected Optimizing");
+        };
+        assert_eq!(
+            latest.block_hash,
+            hash(0xcc),
+            "a superseded slice must not move `latest` provenance backwards"
+        );
+        assert_eq!(latest.confirmations, 1);
     }
 }
