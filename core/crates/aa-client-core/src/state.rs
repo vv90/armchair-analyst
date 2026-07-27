@@ -702,6 +702,7 @@ mod tests {
             chain: CHAIN,
             optimization: OptimizationSessionConfig {
                 source_asset: TokenAddress(addr(1), CHAIN),
+                output_asset: TokenAddress(addr(1), CHAIN),
                 bridges: HashSet::new(),
                 whitelist: None,
             },

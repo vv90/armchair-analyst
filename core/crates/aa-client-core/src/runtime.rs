@@ -68,6 +68,7 @@ fn default_session_config() -> SessionConfig {
         chain: ChainKey::Ethereum,
         optimization: OptimizationSessionConfig {
             source_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+            output_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
             bridges: std::collections::HashSet::new(),
             whitelist: None,
         },

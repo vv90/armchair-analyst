@@ -405,6 +405,7 @@ mod tests {
     ) -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
             source_asset,
+            output_asset: source_asset,
             bridges: no_bridges(),
             whitelist,
         }

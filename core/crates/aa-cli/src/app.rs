@@ -1108,6 +1108,7 @@ pub(crate) fn optimization_session_config(
         return Ok((
             OptimizationSessionConfig {
                 source_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+                output_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
                 bridges,
                 whitelist: None,
             },
@@ -1128,6 +1129,7 @@ pub(crate) fn optimization_session_config(
     Ok((
         OptimizationSessionConfig {
             source_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+            output_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
             bridges,
             whitelist: Some(whitelist.token_set().clone()),
         },

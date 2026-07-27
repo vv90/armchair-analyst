@@ -404,6 +404,11 @@ pub struct Model<
     fee_multiplier_data: Vec<B::FloatElem>,
     max_swap_data: Vec<B::FloatElem>,
     block: LayerBlock<B, LAYERS>,
+    /// The route's terminal asset — the sink the final layer collapses flow into. Equal to the source
+    /// asset for a closed arbitrage cycle; distinct for an open best-execution path. Needed only at
+    /// build/reconcile/extract time (never sliced in the forward), so it lives here rather than on the
+    /// `LayerBlock` tensor module.
+    output_asset: I,
 }
 
 pub struct ModelOptimizer<B: AutodiffBackend, const LAYERS: usize> {
@@ -540,11 +545,28 @@ impl<
     const LAYERS: usize,
 > Model<B, U, I, LAYERS>
 {
-    /// Builds the model tensors from a reserve snapshot. `disabled` holds pool ids that should be
-    /// masked out of the softmax routing (see [`Model::update`]); pass an empty set for the
-    /// all-pools-active case. Ids in `disabled` that no reserve carries are simply ignored.
+    /// Closed-cycle (sink == source) convenience constructor for the arbitrage tests — a thin wrapper
+    /// over [`Model::init_route`] with `output_asset == source_asset`. Production always goes through
+    /// `init_route` with the config's explicit output asset, so this is `#[cfg(test)]`: it lets the
+    /// existing cycle tests exercise the exact `output == source` reduction without threading a
+    /// duplicate argument.
+    #[cfg(test)]
     pub fn init(
         source_asset: I,
+        pool_reserves: Vec<PoolReserves<U, I>>,
+        bridges: &HashSet<(I, I)>,
+        disabled: &HashSet<U>,
+    ) -> Result<Self, OptimizationError> {
+        Self::init_route(source_asset, source_asset, pool_reserves, bridges, disabled)
+    }
+
+    /// Builds the model tensors for a route from `source_asset` to `output_asset` (they may differ —
+    /// an open best-execution path — or coincide — a closed arbitrage cycle). `disabled` holds pool
+    /// ids masked out of the softmax routing (see [`Model::update`]); pass an empty set for the
+    /// all-pools-active case. Ids in `disabled` that no reserve carries are simply ignored.
+    pub fn init_route(
+        source_asset: I,
+        output_asset: I,
         pool_reserves: Vec<PoolReserves<U, I>>,
         bridges: &HashSet<(I, I)>,
         disabled: &HashSet<U>,
@@ -560,12 +582,14 @@ impl<
                 )
             });
 
-        let init_asset_pool_indexes = model_layout
+        // Sink selection: the pools that output the route's terminal (output) asset. For a closed
+        // arbitrage cycle `output_asset == source_asset`; for an open path they differ.
+        let output_asset_pool_indexes = model_layout
             .output_indexes
-            .get(&source_asset)
+            .get(&output_asset)
             .map(|idxs| idxs.iter().map(|RowIndex(idx)| *idx).collect::<Vec<_>>())
             .ok_or(OptimizationError::InitAssetOutputNotFound)?;
-        let init_asset_pools_count = init_asset_pool_indexes.len();
+        let output_asset_pools_count = output_asset_pool_indexes.len();
 
         let bypass_indexes = model_layout.bypass_indexes(bridges);
 
@@ -674,7 +698,7 @@ impl<
             Tensor::<B, 1, Bool>::from_data(disabled_mask_data.as_slice(), device).reshape(dims);
 
         let layer_out_pool_indexes =
-            Tensor::<B, 1, Int>::from_data(init_asset_pool_indexes.as_slice(), device);
+            Tensor::<B, 1, Int>::from_data(output_asset_pool_indexes.as_slice(), device);
 
         let layer_out_bypass_mask = bypass_mask
             .clone()
@@ -704,7 +728,7 @@ impl<
                 ),
                 // layer_out output is of shape [1] (only single token) which means all ouput_asset_indexes should be 0
                 layer_out_output_asset_indexes: Tensor::<B, 1, Int>::full(
-                    [init_asset_pools_count],
+                    [output_asset_pools_count],
                     0,
                     device,
                 ),
@@ -716,12 +740,13 @@ impl<
                 layer_in: Layer::init([size_pools, 1], size_tokens, device),
                 layers: [(); LAYERS]
                     .map(|_| Layer::init([size_pools, size_tokens], size_tokens, device)),
-                layer_out: Layer::init([init_asset_pools_count, size_tokens], 1, device),
+                layer_out: Layer::init([output_asset_pools_count, size_tokens], 1, device),
             },
             reserves_in_data,
             reserves_out_data,
             fee_multiplier_data,
             max_swap_data,
+            output_asset,
             layout: ModelLayout {
                 input_indexes: model_layout.input_indexes,
                 output_indexes: model_layout.output_indexes,
@@ -884,7 +909,7 @@ impl<
                 records.push(FlowRecord {
                     stage: LAYERS + 1,
                     token_in: *token_in,
-                    token_out: init_asset,
+                    token_out: self.output_asset,
                     pool_id: pool_id_at(*layout_row, col),
                     amount_in: *amount_in
                         .get(cell)
@@ -1186,20 +1211,17 @@ impl<
         let disabled_mask =
             Tensor::<B, 1, Bool>::from_data(disabled_mask_data.as_slice(), device).reshape(dims);
 
-        // layer_out rows: preserved trained order, then new init-asset-output rows appended, so the
-        // grown layer_out weight rows stay aligned with their pools.
-        let init_asset = *layout
-            .inputs()?
-            .get(init_asset_index as usize)
-            .ok_or(OptimizationError::InvalidInitAssetIndex)?;
+        // layer_out rows: preserved trained order, then new output-asset-output rows appended, so the
+        // grown layer_out weight rows stay aligned with their pools. The sink is the route's output
+        // asset (== source for a closed cycle), carried on the model across reconciles.
         let old_index_set: HashSet<usize> = old_layer_out_pool_indexes.iter().copied().collect();
         let mut layer_out_pool_indexes_vec = old_layer_out_pool_indexes;
         for (row_index, output_token) in outputs.iter().enumerate() {
-            if *output_token == init_asset && !old_index_set.contains(&row_index) {
+            if *output_token == self.output_asset && !old_index_set.contains(&row_index) {
                 layer_out_pool_indexes_vec.push(row_index);
             }
         }
-        let init_asset_pools_count = layer_out_pool_indexes_vec.len();
+        let output_asset_pools_count = layer_out_pool_indexes_vec.len();
         let layer_out_pool_indexes = Tensor::<B, 1, Int>::from_data(
             layer_out_pool_indexes_vec
                 .iter()
@@ -1240,7 +1262,7 @@ impl<
             }
         });
         let layer_out_w =
-            cold_grow_2d(old_layer_out_w, init_asset_pools_count, cols, device).detach();
+            cold_grow_2d(old_layer_out_w, output_asset_pools_count, cols, device).detach();
 
         Ok(Model {
             block: LayerBlock {
@@ -1251,7 +1273,7 @@ impl<
                 init_asset_index,
                 output_asset_indexes,
                 layer_out_output_asset_indexes: Tensor::<B, 1, Int>::full(
-                    [init_asset_pools_count],
+                    [output_asset_pools_count],
                     0,
                     device,
                 ),
@@ -1274,6 +1296,7 @@ impl<
             reserves_out_data,
             fee_multiplier_data,
             max_swap_data,
+            output_asset: self.output_asset,
             layout,
         })
     }
@@ -1353,6 +1376,140 @@ mod tests {
         }
         model.block.layer_out.weights =
             Param::from_tensor(Tensor::ones_like(&model.block.layer_out.weights));
+    }
+
+    #[test]
+    fn model_init_open_path_routes_sink_to_output_asset() {
+        // A bidirectional USDC/WETH pool: both USDC and WETH are pool outputs, so the sink for an
+        // open USDC -> WETH path (the pools that output WETH) is distinguishable from the closed
+        // USDC -> USDC cycle sink (the pools that output USDC).
+        let reserve = PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id: 1,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: 1_000.0,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        let reserves = vec![reserve, reserve.inverse()];
+
+        let model = Model::<CpuBackend, i32, TokenAddress, 1>::init_route(
+            tokens::USDC.address,
+            tokens::WETH.address,
+            reserves,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("open-path model init failed");
+
+        // The sink pool rows are exactly the pools that output the requested output asset (WETH).
+        let sink_rows: HashSet<usize> = model
+            .block
+            .layer_out_pool_indexes
+            .clone()
+            .into_data()
+            .iter::<i64>()
+            .map(|index| index as usize)
+            .collect();
+        let weth_rows: HashSet<usize> = model
+            .layout
+            .output_indexes
+            .get(&tokens::WETH.address)
+            .expect("WETH has output rows")
+            .iter()
+            .map(|RowIndex(index)| *index)
+            .collect();
+        assert_eq!(sink_rows, weth_rows, "sink must be the WETH-output pools");
+
+        // The terminal stage relabels every routed flow into the output asset (WETH), not the source.
+        for record in model
+            .extract_flows(100.0)
+            .expect("extract_flows failed")
+            .iter()
+            .filter(|record| record.stage == 2)
+        {
+            assert_eq!(record.token_out, tokens::WETH.address);
+        }
+
+        // Sanity: the fixture genuinely moves the sink — the closed-cycle sink (USDC outputs) differs.
+        let usdc_rows: HashSet<usize> = model
+            .layout
+            .output_indexes
+            .get(&tokens::USDC.address)
+            .expect("USDC has output rows")
+            .iter()
+            .map(|RowIndex(index)| *index)
+            .collect();
+        assert_ne!(
+            weth_rows, usdc_rows,
+            "fixture must make the two sinks distinguishable"
+        );
+    }
+
+    #[test]
+    fn open_path_model_trains_to_a_finite_positive_output() {
+        // End-to-end open-path (source != output) *optimization*, not just the init structure: two
+        // parallel bidirectional USDC/WETH pools give the optimizer a real USDC -> WETH routing
+        // choice. Training must stay finite, keep the output positive, and never destroy value.
+        let pool = |pool_id: i32, weth_reserve: f32| PoolReserves {
+            token0: tokens::USDC.address,
+            token1: tokens::WETH.address,
+            pool_id,
+            value: VirtualReserveValues {
+                token_0: 1_000.0,
+                token_1: weth_reserve,
+                fee_multiplier: 0.997,
+                max_swap_0: 500.0,
+                max_swap_1: 500.0,
+            },
+        };
+        // Pool 2 quotes more WETH per USDC, so an optimizer routing USDC -> WETH should prefer it.
+        let pool_a = pool(1, 1_000.0);
+        let pool_b = pool(2, 1_100.0);
+        let reserves = vec![pool_a, pool_a.inverse(), pool_b, pool_b.inverse()];
+
+        let model = Model::<CpuBackend, i32, TokenAddress, 1>::init_route(
+            tokens::USDC.address,
+            tokens::WETH.address,
+            reserves,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("open-path model init failed");
+
+        let before = model.evaluate(100.0);
+        assert!(
+            before.is_finite() && before > 0.0,
+            "untrained open-path output must be finite and positive, got {before}"
+        );
+
+        let optimizer = Model::<CpuBackend, i32, TokenAddress, 1>::init_optimizer();
+        let (model, _optimizer) = model.optimize_with(optimizer, 100.0, 50);
+
+        let after = model.evaluate(100.0);
+        assert!(
+            after.is_finite() && after > 0.0,
+            "trained open-path output must be finite and positive, got {after}"
+        );
+        // Maximizing WETH out must not reduce it (small slack for float noise across Adam steps).
+        assert!(
+            after >= before - 1e-3,
+            "optimization reduced the output: {before} -> {after}"
+        );
+
+        // Every routed terminal flow lands in the output asset (WETH), not the source.
+        for record in model
+            .extract_flows(100.0)
+            .expect("extract_flows failed")
+            .iter()
+            .filter(|record| record.stage == 2)
+        {
+            assert_eq!(record.token_out, tokens::WETH.address);
+        }
     }
 
     #[test]
@@ -2663,6 +2820,64 @@ mod tests {
                 );
                 previous_slots = next.pool_slots();
                 model = next;
+            }
+        }
+
+        /// The sink pool set is exactly the pools that output the chosen `output_asset` (any output
+        /// token, including one distinct from the source), and the terminal stage relabels every
+        /// routed flow into that output asset. Pins the output-asset seam over random graphs; with
+        /// `output == source` it reduces to the closed-cycle sink.
+        #[test]
+        fn model_init_sink_matches_output_asset(
+            reserves in arbitrary_pool_reserves(),
+            pick in 0usize..64,
+        ) {
+            let source = init_asset_for(&reserves);
+            let mut outputs: Vec<TokenAddress> = reserves
+                .iter()
+                .map(|reserve| reserve.token1)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            outputs.sort();
+            let output = *outputs
+                .get(pick % outputs.len())
+                .expect("modulo index is always in range");
+
+            let model = Model::<CpuBackend, i64, TokenAddress, 1>::init_route(
+                source,
+                output,
+                reserves,
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .expect("model init failed");
+
+            let expected: HashSet<usize> = model
+                .layout
+                .output_indexes
+                .get(&output)
+                .expect("output token has rows")
+                .iter()
+                .map(|RowIndex(index)| *index)
+                .collect();
+            let actual: HashSet<usize> = model
+                .block
+                .layer_out_pool_indexes
+                .clone()
+                .into_data()
+                .iter::<i64>()
+                .map(|index| index as usize)
+                .collect();
+            prop_assert_eq!(actual, expected);
+
+            for record in model
+                .extract_flows(100.0)
+                .expect("extract_flows failed")
+                .iter()
+                .filter(|record| record.stage == 2)
+            {
+                prop_assert_eq!(record.token_out, output);
             }
         }
 

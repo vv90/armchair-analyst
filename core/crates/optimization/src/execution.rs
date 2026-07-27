@@ -99,6 +99,9 @@ struct OptimizationSession<
 #[derive(Clone, Debug)]
 pub struct OptimizationSessionConfig<TToken> {
     pub source_asset: TToken,
+    /// The route's terminal asset. Equal to `source_asset` for a closed arbitrage cycle (the default
+    /// today); a distinct token requests an open best-execution path from source to output.
+    pub output_asset: TToken,
     pub bridges: HashSet<(TToken, TToken)>,
     /// Tokens the optimizer may route through; a pool is admitted only if both of its tokens are
     /// in the set. `None` disables whitelisting (every token allowed).
@@ -501,8 +504,9 @@ where
 {
     let reserve_keys = validate_reserve_snapshot(&reserves, &session_config, step_config)?;
     let disabled_count = effective_disabled_count(&reserves, disabled);
-    let model = Model::<B, TPool, TToken, LAYERS>::init(
+    let model = Model::<B, TPool, TToken, LAYERS>::init_route(
         session_config.source_asset,
+        session_config.output_asset,
         reserves,
         &session_config.bridges,
         disabled,
@@ -1271,6 +1275,7 @@ mod tests {
     fn session_config() -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
             source_asset: tokens::USDC.address,
+            output_asset: tokens::USDC.address,
             bridges: HashSet::new(),
             whitelist: None,
         }

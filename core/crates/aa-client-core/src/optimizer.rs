@@ -153,6 +153,7 @@ mod tests {
     fn session_config() -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
             source_asset: token(),
+            output_asset: token(),
             bridges: HashSet::new(),
             whitelist: None,
         }
