@@ -5,7 +5,7 @@ use client_evm::{PoolRef, TokenAddress, multi_chain_kernel::OptimizationPoolRese
 use optimization::{
     ExecutionPlan, OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
     OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
-    OptimizationStepResult, OptimizationStepUpdate, reserves_reach_init_asset,
+    OptimizationStepResult, OptimizationStepUpdate, reserves_reach_output_asset,
 };
 
 use crate::latest_slot::{LatestReceiveError, LatestReceiver};
@@ -28,8 +28,8 @@ pub fn run_optimization<T>(
     map_result: impl Fn(OptimizationStepResult, Option<ExecutionPlan<PoolRef, TokenAddress>>) -> T,
 ) -> Result<(), RunOptimizationError> {
     // Wait for the first snapshot that can actually initialize. With cross-chain merging, the first
-    // snapshot may arrive from a faster chain before the chain that owns the `init_asset` (quote
-    // token) has reported, so the init asset is absent and init fails with `InitAssetOutputNotFound`.
+    // snapshot may arrive from a faster chain before the chain that owns the `output_asset` (sink
+    // token) has reported, so the output asset is absent and init fails with `OutputAssetNotFound`.
     // That is a transient "not ready yet" condition, not a fatal error: drop the snapshot and wait
     // for the next one. Every other init error stays fatal.
     let (mut runner, result, plan) = loop {
@@ -43,7 +43,7 @@ pub fn run_optimization<T>(
             step_config,
         ) {
             Ok(initialized) => break initialized,
-            Err(OptimizationInitError::Step(OptimizationStepError::InitAssetOutputNotFound)) => {
+            Err(OptimizationInitError::Step(OptimizationStepError::OutputAssetNotFound)) => {
                 continue;
             }
             Err(error) => return Err(RunOptimizationError::Init(error)),
@@ -57,10 +57,10 @@ pub fn run_optimization<T>(
     loop {
         let update = match receiver.try_take().map_err(RunOptimizationError::Receive)? {
             // Same transient guard as init: a merged cross-chain snapshot can momentarily fail to
-            // reach the init asset (a chain bootstrapping, a refresh gap). Feeding it to the session
-            // would abort the worker with `InitAssetOutputNotFound`, permanently closing the
+            // reach the output asset (a chain bootstrapping, a refresh gap). Feeding it to the session
+            // would abort the worker with `OutputAssetNotFound`, permanently closing the
             // optimization channel. Skip the snapshot and keep stepping the live session instead.
-            Some(snapshot) if !reserves_reach_init_asset(&snapshot.reserves, &session_config) => {
+            Some(snapshot) if !reserves_reach_output_asset(&snapshot.reserves, &session_config) => {
                 OptimizationStepUpdate::Continue
             }
             // No lagging-pool gate wired in yet: every reported pool stays active. The kernel-side

@@ -588,7 +588,7 @@ impl<
             .output_indexes
             .get(&output_asset)
             .map(|idxs| idxs.iter().map(|RowIndex(idx)| *idx).collect::<Vec<_>>())
-            .ok_or(OptimizationError::InitAssetOutputNotFound)?;
+            .ok_or(OptimizationError::OutputAssetNotFound)?;
         let output_asset_pools_count = output_asset_pool_indexes.len();
 
         let bypass_indexes = model_layout.bypass_indexes(bridges);
@@ -1542,9 +1542,9 @@ mod tests {
     }
 
     #[test]
-    fn model_init_without_init_asset_output_returns_error() {
+    fn model_init_without_output_asset_output_returns_error() {
         // A single directional reserve: USDC is an input column but never an output row, so a
-        // USDC-rooted model has no way back to the init asset. This must surface as a typed
+        // USDC-rooted model has no way to reach the output asset. This must surface as a typed
         // error, not a panic.
         let reserve = PoolReserves {
             token0: tokens::USDC.address,
@@ -1567,8 +1567,8 @@ mod tests {
         );
 
         match result {
-            Ok(_) => panic!("init without init-asset output unexpectedly succeeded"),
-            Err(error) => assert_eq!(error, OptimizationError::InitAssetOutputNotFound),
+            Ok(_) => panic!("init without output-asset output unexpectedly succeeded"),
+            Err(error) => assert_eq!(error, OptimizationError::OutputAssetNotFound),
         }
     }
 

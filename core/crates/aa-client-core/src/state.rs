@@ -19,7 +19,7 @@ use aa_wire::{HealthResponse, PoolsMetaResponse, SliceRequest, SliceResponse};
 use client_evm::{BlockHash, ChainKey, PoolRef, TokenAddress};
 use optimization::{
     ExecutionPlan, OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
-    OptimizationStepResult, PoolReserves, reserves_reach_init_asset,
+    OptimizationStepResult, PoolReserves, reserves_reach_output_asset,
 };
 
 use crate::pending::{FetchId, PendingFetches};
@@ -551,9 +551,9 @@ fn on_step(
 }
 
 /// Whether a projected reserve set can actually drive the optimizer: non-empty and reaching the
-/// configured init asset (else `init`/`run` would abort with `EmptyReserves`/`InitAssetOutputNotFound`).
+/// configured output asset (else `init`/`run` would abort with `EmptyReserves`/`OutputAssetNotFound`).
 fn is_productive(reserves: &[PoolReserves<PoolRef, TokenAddress>], config: &SessionConfig) -> bool {
-    !reserves.is_empty() && reserves_reach_init_asset(reserves, &config.optimization)
+    !reserves.is_empty() && reserves_reach_output_asset(reserves, &config.optimization)
 }
 
 /// Parses the slice's freshness envelope; the only fallible field is `block_hash`.

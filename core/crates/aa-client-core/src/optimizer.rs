@@ -24,7 +24,7 @@ use client_evm::{PoolRef, TokenAddress};
 use optimization::{
     OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
     OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
-    OptimizationStepUpdate, PoolReserves, reserves_reach_init_asset,
+    OptimizationStepUpdate, PoolReserves, reserves_reach_output_asset,
 };
 
 use crate::latest_slot::LatestReceiver;
@@ -52,7 +52,7 @@ pub(crate) fn run(
     events: Sender<Event>,
 ) {
     // Init loop: wait for the first snapshot that actually initializes. A snapshot that momentarily
-    // cannot reach the init asset (`InitAssetOutputNotFound`) is a transient "not ready yet", not a
+    // cannot reach the output asset (`OutputAssetNotFound`) is a transient "not ready yet", not a
     // fatal error — skip it and wait for the next. Every other init error is fatal.
     let (mut runner, result, plan) = loop {
         let reserves = match receiver.wait_take() {
@@ -67,7 +67,7 @@ pub(crate) fn run(
             step_config,
         ) {
             Ok(initialized) => break initialized,
-            Err(OptimizationInitError::Step(OptimizationStepError::InitAssetOutputNotFound)) => {
+            Err(OptimizationInitError::Step(OptimizationStepError::OutputAssetNotFound)) => {
                 continue;
             }
             Err(error) => {
@@ -89,8 +89,8 @@ pub(crate) fn run(
 
     loop {
         let update = match receiver.try_take() {
-            // Fresh reserves that reach the init asset: step them.
-            Ok(Some(reserves)) if reserves_reach_init_asset(&reserves, &session_config) => {
+            // Fresh reserves that reach the output asset: step them.
+            Ok(Some(reserves)) if reserves_reach_output_asset(&reserves, &session_config) => {
                 OptimizationStepUpdate::NewReserves {
                     reserves,
                     disabled: HashSet::new(),
@@ -183,8 +183,8 @@ mod tests {
         }]
     }
 
-    /// Reserves that never output the session's init asset (a distinct, Arbitrum-stamped token), so
-    /// `reserves_reach_init_asset` is false and init would fail with `InitAssetOutputNotFound`.
+    /// Reserves that never output the session's output asset (a distinct, Arbitrum-stamped token), so
+    /// `reserves_reach_output_asset` is false and init would fail with `OutputAssetNotFound`.
     fn unreachable_reserves() -> ReserveSnapshot {
         let other = TokenAddress(Default::default(), ChainKey::Arbitrum);
         vec![PoolReserves {

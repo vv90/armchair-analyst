@@ -179,8 +179,8 @@ pub enum OptimizationStepError {
     #[error("optimization input amount must be finite and greater than zero: {input_amount}")]
     InvalidInputAmount { input_amount: f32 },
 
-    #[error("init asset output not found")]
-    InitAssetOutputNotFound,
+    #[error("output asset not found")]
+    OutputAssetNotFound,
 
     #[error("optimization model init failed: {source}")]
     ModelInit { source: OptimizationError },
@@ -603,15 +603,16 @@ where
     ))
 }
 
-/// Whether `reserves` can reach the session's init asset — i.e. whether feeding them to a step would
-/// avoid the transient [`OptimizationStepError::InitAssetOutputNotFound`].
+/// Whether `reserves` can reach the session's output asset — i.e. whether feeding them to a step would
+/// avoid the transient [`OptimizationStepError::OutputAssetNotFound`].
 ///
-/// With cross-chain merging a merged snapshot can momentarily fail to reach the init asset (the chain
-/// that owns the quote token reported late, a brief bootstrap/refresh gap, etc.). Initialization
+/// With cross-chain merging a merged snapshot can momentarily fail to reach the output asset (the chain
+/// that owns the sink token reported late, a brief bootstrap/refresh gap, etc.). Initialization
 /// already treats that as "not ready yet" and skips the snapshot; a running session must do the same,
 /// because applying such a snapshot aborts the whole optimization worker. This mirrors the routing +
-/// init-asset reachability check performed inside [`validate_reserve_snapshot`].
-pub fn reserves_reach_init_asset<TPool, TToken>(
+/// output-asset reachability check performed inside [`validate_reserve_snapshot`]. For a closed
+/// arbitrage cycle (`output == source`) this is exactly the source-reachability check it replaced.
+pub fn reserves_reach_output_asset<TPool, TToken>(
     reserves: &[PoolReserves<TPool, TToken>],
     session_config: &OptimizationSessionConfig<TToken>,
 ) -> bool
@@ -621,7 +622,7 @@ where
 {
     crate::routing_filter::admissible_reserves(reserves.to_vec(), session_config)
         .iter()
-        .any(|reserve| reserve.token1 == session_config.source_asset)
+        .any(|reserve| reserve.token1 == session_config.output_asset)
 }
 
 fn validate_reserve_snapshot<TPool, TToken>(
@@ -643,9 +644,9 @@ where
 
     if reserves
         .iter()
-        .all(|reserve| reserve.token1 != session_config.source_asset)
+        .all(|reserve| reserve.token1 != session_config.output_asset)
     {
-        return Err(OptimizationStepError::InitAssetOutputNotFound);
+        return Err(OptimizationStepError::OutputAssetNotFound);
     }
 
     Ok(reserve_keys)
@@ -1170,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_init_asset_output_returns_typed_error() {
+    fn missing_output_asset_returns_typed_error() {
         let error = expect_step_error(initialize_optimization_session::<
             CpuBackend,
             i32,
@@ -1187,21 +1188,21 @@ mod tests {
             &step_config(0),
         ));
 
-        assert_eq!(error, OptimizationStepError::InitAssetOutputNotFound);
+        assert_eq!(error, OptimizationStepError::OutputAssetNotFound);
     }
 
     #[test]
-    fn reserves_reach_init_asset_is_true_when_a_pool_outputs_the_init_asset() {
-        assert!(reserves_reach_init_asset(
+    fn reserves_reach_output_asset_is_true_when_a_pool_outputs_the_output_asset() {
+        assert!(reserves_reach_output_asset(
             &base_reserves(),
             &session_config()
         ));
     }
 
     #[test]
-    fn reserves_reach_init_asset_is_false_when_no_pool_outputs_the_init_asset() {
-        // Same snapshot that drives `missing_init_asset_output_returns_typed_error`: a step fed this
-        // would abort with `InitAssetOutputNotFound`, so the predicate must flag it as not-yet-ready.
+    fn reserves_reach_output_asset_is_false_when_no_pool_outputs_the_output_asset() {
+        // Same snapshot that drives `missing_output_asset_returns_typed_error`: a step fed this
+        // would abort with `OutputAssetNotFound`, so the predicate must flag it as not-yet-ready.
         let reserves = vec![reserve(
             1,
             tokens::USDC.address,
@@ -1209,12 +1210,12 @@ mod tests {
             1_000.0,
         )];
 
-        assert!(!reserves_reach_init_asset(&reserves, &session_config()));
+        assert!(!reserves_reach_output_asset(&reserves, &session_config()));
     }
 
     #[test]
-    fn reserves_reach_init_asset_is_false_for_an_empty_snapshot() {
-        assert!(!reserves_reach_init_asset(
+    fn reserves_reach_output_asset_is_false_for_an_empty_snapshot() {
+        assert!(!reserves_reach_output_asset(
             &Vec::<PoolReserves<i32, TokenAddress>>::new(),
             &session_config(),
         ));
@@ -1420,5 +1421,49 @@ mod tests {
 
         assert_eq!(result.status, OptimizationStepStatus::Updated);
         assert_eq!(result.reserves_count, 6);
+    }
+
+    /// An acyclic USDC—WETH—WBTC chain (two pools, both directions). No cycle exists, so it only
+    /// routes as an open source→output path.
+    fn open_chain_reserves() -> Vec<PoolReserves<i32, TokenAddress>> {
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let wbtc = tokens::WBTC.address;
+        [
+            reserve(1, usdc, weth, 1_000.0),
+            reserve(2, weth, wbtc, 1_000.0),
+        ]
+        .into_iter()
+        .flat_map(|edge| [edge, edge.inverse()])
+        .collect()
+    }
+
+    #[test]
+    fn open_path_session_initializes_to_a_finite_output() {
+        // Increment 3: an open source→output run (USDC→WBTC over the acyclic chain above) now survives
+        // the runner's admission funnel — the virtual-demand-edge filter keeps the chain and the
+        // output-reachability guard admits it. The emitted plan's terminal is still source-labeled
+        // (fixed in Increment 4), so only the scalar output is asserted here.
+        let config = OptimizationSessionConfig {
+            source_asset: tokens::USDC.address,
+            output_asset: tokens::WBTC.address,
+            bridges: HashSet::new(),
+            whitelist: None,
+        };
+
+        let (_session, result, _plan) = initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(open_chain_reserves(), config, &step_config(5))
+        .unwrap();
+
+        assert_eq!(result.status, OptimizationStepStatus::Initialized);
+        assert!(
+            result.output_amount.is_finite() && result.output_amount >= 0.0,
+            "open-path output must be finite and non-negative, got {}",
+            result.output_amount
+        );
     }
 }

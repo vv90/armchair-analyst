@@ -1,16 +1,20 @@
-//! Topological pre-filter that drops pools which cannot participate in a cyclic
-//! swap through the init asset.
+//! Topological pre-filter that drops pools which cannot lie on a route from the
+//! source asset to the output asset.
 //!
-//! The optimizer only ever routes a closed walk that starts and ends at the init
-//! asset, so a pool is usable only if it lies on a cycle reachable from that asset.
-//! That set is exactly the **2-core** of the init asset's connected component:
-//! every token on the route must touch at least two distinct routes (enter via one
-//! pool, leave via another), and the route must connect back to the init asset.
+//! The optimizer routes a fixed-depth flow from the `source_asset` to the
+//! `output_asset`; a pool is usable only if it lies on some source→output path. We
+//! reduce that to a **2-core** question with a single trick: add a virtual "demand"
+//! edge `(source, output)` (representing the flow returning from sink to source),
+//! then keep the 2-core of the source's connected component. Any simple
+//! source→output path plus that edge is a cycle, so the 2-core keeps exactly the
+//! path tokens. When `output == source` no edge is added and this reduces, *by
+//! construction*, to the plain cycle filter (the closed-arbitrage case): every token
+//! on the route must touch at least two distinct routes and connect back to the source.
 //!
 //! The filter is a conservative *necessary* condition — it never drops a pool that
-//! could carry flow in a cycle through the init asset. It is hop-count agnostic
-//! w.r.t. the model's layer depth and ignores liquidity/profitability, which remain
-//! the optimizer's concern.
+//! could carry flow on a source→output route. It is hop-count agnostic w.r.t. the
+//! model's layer depth and ignores liquidity/profitability, which remain the
+//! optimizer's concern.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -33,6 +37,7 @@ where
     routable_reserves(
         reserves,
         session_config.source_asset,
+        session_config.output_asset,
         &session_config.bridges,
     )
 }
@@ -60,28 +65,31 @@ where
         .collect()
 }
 
-/// Keeps only the reserves whose pools can take part in a cyclic swap through
-/// `init_asset`, i.e. the 2-core of the init asset's connected component.
+/// Keeps only the reserves whose pools can lie on a route from `source_asset` to
+/// `output_asset` — the 2-core of the source's connected component after adding a
+/// virtual `(source, output)` demand edge. When `output == source` this is exactly
+/// the 2-core cycle filter (closed arbitrage).
 ///
 /// `bridges` are treated as real (zero-cost) routing edges and counted toward
 /// connectivity and degree — without them an otherwise-reachable subgraph (e.g. a
 /// second chain linked only by a USDC bridge) would be pruned as unreachable.
 ///
-/// If the init asset itself is not routable (fewer than two distinct routes) or the
+/// If the source asset itself is not routable (fewer than two distinct routes) or the
 /// prune would otherwise empty the snapshot, the original `reserves` are returned
 /// unchanged so downstream validation keeps its existing behavior.
 pub(crate) fn routable_reserves<TPool, TToken>(
     reserves: Vec<PoolReserves<TPool, TToken>>,
-    init_asset: TToken,
+    source_asset: TToken,
+    output_asset: TToken,
     bridges: &HashSet<(TToken, TToken)>,
 ) -> Vec<PoolReserves<TPool, TToken>>
 where
     TPool: Copy + Eq + Hash,
     TToken: Copy + Eq + Hash,
 {
-    let keep = routable_tokens(&reserves, init_asset, bridges);
+    let keep = routable_tokens(&reserves, source_asset, output_asset, bridges);
 
-    if !keep.contains(&init_asset) {
+    if !keep.contains(&source_asset) {
         return reserves;
     }
 
@@ -95,10 +103,12 @@ where
 }
 
 /// Computes the set of tokens that survive the 2-core stripping and remain connected
-/// to `init_asset`.
+/// to `source_asset`, after adding a virtual `(source, output)` demand edge (only when
+/// they differ) so a source→output path is treated as a cycle.
 fn routable_tokens<TPool, TToken>(
     reserves: &[PoolReserves<TPool, TToken>],
-    init_asset: TToken,
+    source_asset: TToken,
+    output_asset: TToken,
     bridges: &HashSet<(TToken, TToken)>,
 ) -> HashSet<TToken>
 where
@@ -138,6 +148,19 @@ where
         adjacency.entry(b).or_default().push(a);
     }
 
+    // Virtual demand edge closing an open source→output route into a cycle. Added only when the
+    // assets differ, so the `output == source` case is byte-for-byte the original cycle filter.
+    if source_asset != output_asset {
+        adjacency
+            .entry(source_asset)
+            .or_default()
+            .push(output_asset);
+        adjacency
+            .entry(output_asset)
+            .or_default()
+            .push(source_asset);
+    }
+
     // 2-core: iteratively strip every token with multigraph degree < 2.
     let mut degree: HashMap<TToken, usize> = adjacency
         .iter()
@@ -170,14 +193,14 @@ where
         }
     }
 
-    if removed.contains(&init_asset) || !adjacency.contains_key(&init_asset) {
+    if removed.contains(&source_asset) || !adjacency.contains_key(&source_asset) {
         return HashSet::new();
     }
 
-    // Restrict the surviving graph to the component containing the init asset.
+    // Restrict the surviving graph to the component containing the source asset.
     let mut keep: HashSet<TToken> = HashSet::new();
-    keep.insert(init_asset);
-    let mut frontier = vec![init_asset];
+    keep.insert(source_asset);
+    let mut frontier = vec![source_asset];
     while let Some(token) = frontier.pop() {
         if let Some(neighbors) = adjacency.get(&token) {
             for &neighbor in neighbors {
@@ -256,7 +279,7 @@ mod tests {
         reserves.extend(pool(wbtc, usdc, 3));
         reserves.extend(pool(usdc, uni, 4)); // uni is a leaf
 
-        let pruned = routable_reserves(reserves, usdc, &no_bridges());
+        let pruned = routable_reserves(reserves, usdc, usdc, &no_bridges());
 
         assert!(has_pool(&pruned, 1));
         assert!(has_pool(&pruned, 2));
@@ -275,7 +298,7 @@ mod tests {
         reserves.extend(pool(usdc, weth, 1));
         reserves.extend(pool(usdc, weth, 2));
 
-        let pruned = routable_reserves(reserves, usdc, &no_bridges());
+        let pruned = routable_reserves(reserves, usdc, usdc, &no_bridges());
 
         assert!(has_pool(&pruned, 1));
         assert!(has_pool(&pruned, 2));
@@ -301,12 +324,12 @@ mod tests {
 
         let bridges = HashSet::from([(usdc, arb_usdc), (arb_usdc, usdc)]);
 
-        let with_bridge = routable_reserves(reserves.clone(), usdc, &bridges);
+        let with_bridge = routable_reserves(reserves.clone(), usdc, usdc, &bridges);
         assert!(has_pool(&with_bridge, 4), "bridged component must be kept");
         assert!(has_pool(&with_bridge, 5));
 
         // Without the bridge the Arbitrum component is unreachable from init.
-        let without_bridge = routable_reserves(reserves, usdc, &no_bridges());
+        let without_bridge = routable_reserves(reserves, usdc, usdc, &no_bridges());
         assert!(
             !has_pool(&without_bridge, 4),
             "unbridged component must be dropped"
@@ -330,7 +353,7 @@ mod tests {
         reserves.extend(pool(x, y, 4));
 
         let bridges = HashSet::from([(usdc, x), (x, usdc)]);
-        let pruned = routable_reserves(reserves, usdc, &bridges);
+        let pruned = routable_reserves(reserves, usdc, usdc, &bridges);
 
         assert!(has_pool(&pruned, 1));
         assert!(
@@ -358,7 +381,7 @@ mod tests {
         reserves.extend(pool(b, c, 5));
         reserves.extend(pool(c, a, 6));
 
-        let pruned = routable_reserves(reserves, usdc, &no_bridges());
+        let pruned = routable_reserves(reserves, usdc, usdc, &no_bridges());
 
         assert!(has_pool(&pruned, 1));
         assert!(!has_pool(&pruned, 4));
@@ -373,7 +396,7 @@ mod tests {
 
         // Single pool: both tokens are degree 1, the whole graph collapses.
         let reserves = pool(usdc, weth, 1);
-        let pruned = routable_reserves(reserves.clone(), usdc, &no_bridges());
+        let pruned = routable_reserves(reserves.clone(), usdc, usdc, &no_bridges());
 
         assert_eq!(
             pruned, reserves,
@@ -392,7 +415,7 @@ mod tests {
         reserves.extend(pool(weth, wbtc, 2));
         reserves.extend(pool(wbtc, usdc, 3));
 
-        let pruned = routable_reserves(reserves.clone(), usdc, &no_bridges());
+        let pruned = routable_reserves(reserves.clone(), usdc, usdc, &no_bridges());
 
         assert_eq!(pruned.len(), reserves.len());
         let directions = pruned.iter().filter(|r| r.pool_id == 1).count();
@@ -540,7 +563,7 @@ mod tests {
                 .map(|r| (r.pool_id, r.token0, r.token1))
                 .collect();
 
-            let pruned = routable_reserves(reserves, init, &no_bridges());
+            let pruned = routable_reserves(reserves, init, init, &no_bridges());
 
             for reserve in &pruned {
                 prop_assert!(input_keys.contains(&(reserve.pool_id, reserve.token0, reserve.token1)));
@@ -550,8 +573,8 @@ mod tests {
         #[test]
         fn pruning_is_idempotent(reserves in arbitrary_reserves()) {
             let init = palette()[0];
-            let once = routable_reserves(reserves, init, &no_bridges());
-            let twice = routable_reserves(once.clone(), init, &no_bridges());
+            let once = routable_reserves(reserves, init, init, &no_bridges());
+            let twice = routable_reserves(once.clone(), init, init, &no_bridges());
             prop_assert_eq!(once, twice);
         }
 
@@ -559,7 +582,7 @@ mod tests {
         fn pruning_never_grows_the_snapshot(reserves in arbitrary_reserves()) {
             let init = palette()[0];
             let len_before = reserves.len();
-            let pruned = routable_reserves(reserves, init, &no_bridges());
+            let pruned = routable_reserves(reserves, init, init, &no_bridges());
             prop_assert!(pruned.len() <= len_before);
         }
 
@@ -607,8 +630,224 @@ mod tests {
             let init = palette()[0];
             let config = config_with_whitelist(init, None);
             let admitted = admissible_reserves(reserves.clone(), &config);
-            let routed = routable_reserves(reserves, init, &no_bridges());
+            let routed = routable_reserves(reserves, init, init, &no_bridges());
             prop_assert_eq!(admitted, routed);
+        }
+    }
+
+    // --- Increment 3: source→output path prune (open-ended output asset) ---
+
+    /// A frozen, verbatim copy of the *pre-Increment-3* cycle filter (the 2-core of the source's
+    /// connected component). It is the permanent differential oracle: `routable_reserves` with
+    /// `output == source` must equal this forever, guaranteeing the degenerate case never drifts
+    /// from the arbitrage behavior it replaced.
+    fn cycle_core_reference(
+        reserves: Vec<PoolReserves<u32, TokenAddress>>,
+        init_asset: TokenAddress,
+        bridges: &HashSet<(TokenAddress, TokenAddress)>,
+    ) -> Vec<PoolReserves<u32, TokenAddress>> {
+        let keep = cycle_core_tokens_reference(&reserves, init_asset, bridges);
+
+        if !keep.contains(&init_asset) {
+            return reserves;
+        }
+
+        let pruned: Vec<PoolReserves<u32, TokenAddress>> = reserves
+            .iter()
+            .copied()
+            .filter(|reserve| keep.contains(&reserve.token0) && keep.contains(&reserve.token1))
+            .collect();
+
+        if pruned.is_empty() { reserves } else { pruned }
+    }
+
+    fn cycle_core_tokens_reference(
+        reserves: &[PoolReserves<u32, TokenAddress>],
+        init_asset: TokenAddress,
+        bridges: &HashSet<(TokenAddress, TokenAddress)>,
+    ) -> HashSet<TokenAddress> {
+        let mut adjacency: HashMap<TokenAddress, Vec<TokenAddress>> = HashMap::new();
+
+        let mut seen_pools: HashSet<u32> = HashSet::new();
+        for reserve in reserves {
+            if reserve.token0 == reserve.token1 {
+                continue;
+            }
+            if seen_pools.insert(reserve.pool_id) {
+                adjacency
+                    .entry(reserve.token0)
+                    .or_default()
+                    .push(reserve.token1);
+                adjacency
+                    .entry(reserve.token1)
+                    .or_default()
+                    .push(reserve.token0);
+            }
+        }
+
+        let mut seen_bridges: HashSet<(TokenAddress, TokenAddress)> = HashSet::new();
+        for &(a, b) in bridges {
+            if a == b || seen_bridges.contains(&(b, a)) || !seen_bridges.insert((a, b)) {
+                continue;
+            }
+            adjacency.entry(a).or_default().push(b);
+            adjacency.entry(b).or_default().push(a);
+        }
+
+        let mut degree: HashMap<TokenAddress, usize> = adjacency
+            .iter()
+            .map(|(token, neighbors)| (*token, neighbors.len()))
+            .collect();
+        let mut removed: HashSet<TokenAddress> = HashSet::new();
+        let mut stack: Vec<TokenAddress> = degree
+            .iter()
+            .filter(|(_, d)| **d < 2)
+            .map(|(token, _)| *token)
+            .collect();
+
+        while let Some(token) = stack.pop() {
+            if removed.contains(&token) || degree.get(&token).copied().unwrap_or(0) >= 2 {
+                continue;
+            }
+            removed.insert(token);
+            if let Some(neighbors) = adjacency.get(&token) {
+                for &neighbor in neighbors {
+                    if removed.contains(&neighbor) {
+                        continue;
+                    }
+                    if let Some(d) = degree.get_mut(&neighbor) {
+                        *d = d.saturating_sub(1);
+                        if *d < 2 {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+            }
+        }
+
+        if removed.contains(&init_asset) || !adjacency.contains_key(&init_asset) {
+            return HashSet::new();
+        }
+
+        let mut keep: HashSet<TokenAddress> = HashSet::new();
+        keep.insert(init_asset);
+        let mut frontier = vec![init_asset];
+        while let Some(token) = frontier.pop() {
+            if let Some(neighbors) = adjacency.get(&token) {
+                for &neighbor in neighbors {
+                    if !removed.contains(&neighbor) && keep.insert(neighbor) {
+                        frontier.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        keep
+    }
+
+    prop_compose! {
+        fn arbitrary_bridges()(
+            pairs in prop::collection::vec((0usize..6, 0usize..6), 0..6)
+        ) -> HashSet<(TokenAddress, TokenAddress)> {
+            let palette = palette();
+            pairs
+                .into_iter()
+                .map(|(i, j)| (palette[i], palette[j]))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn open_acyclic_chain_is_kept_and_dangling_leaf_dropped() {
+        // A simple source→output chain with NO cycle: usdc—weth—wbtc. Every vertex is degree ≤ 2 and
+        // the two endpoints are degree 1, so the pre-Increment-3 cycle filter strips the whole graph
+        // and (finding the init asset gone) falls back to returning the input untouched — it cannot
+        // express an acyclic best-execution route. With `output = wbtc` the virtual demand edge
+        // (usdc, wbtc) closes the chain into a cycle, so all three chain pools are kept, while a leaf
+        // (wbtc—uni) hanging off the output is still dropped.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let wbtc = tokens::WBTC.address;
+        let uni = tokens::UNI.address;
+
+        let mut reserves = Vec::new();
+        reserves.extend(pool(usdc, weth, 1));
+        reserves.extend(pool(weth, wbtc, 2));
+        reserves.extend(pool(wbtc, uni, 3)); // dead-end leaf off the output
+
+        let pruned = routable_reserves(reserves, usdc, wbtc, &no_bridges());
+
+        assert!(
+            has_pool(&pruned, 1),
+            "source leg of the s→o chain must be kept"
+        );
+        assert!(
+            has_pool(&pruned, 2),
+            "middle leg of the s→o chain must be kept"
+        );
+        assert!(
+            !has_pool(&pruned, 3),
+            "leaf hanging off the output must be dropped"
+        );
+    }
+
+    #[test]
+    fn open_path_reduces_to_cycle_when_output_equals_source() {
+        // Spot check of the degenerate reduction on a concrete graph (the proptest below is the
+        // exhaustive guard): passing the source as the output reproduces the leaf-drop behavior.
+        let usdc = tokens::USDC.address;
+        let weth = tokens::WETH.address;
+        let wbtc = tokens::WBTC.address;
+        let uni = tokens::UNI.address;
+
+        let mut reserves = Vec::new();
+        reserves.extend(pool(usdc, weth, 1));
+        reserves.extend(pool(weth, wbtc, 2));
+        reserves.extend(pool(wbtc, usdc, 3));
+        reserves.extend(pool(usdc, uni, 4)); // leaf
+
+        let pruned = routable_reserves(reserves.clone(), usdc, usdc, &no_bridges());
+        let reference = cycle_core_reference(reserves, usdc, &no_bridges());
+        assert_eq!(pruned, reference);
+    }
+
+    proptest! {
+        #[test]
+        fn output_source_equal_matches_frozen_cycle_reference(
+            reserves in arbitrary_reserves(),
+            bridges in arbitrary_bridges(),
+        ) {
+            // The permanent differential oracle: with `output == source`, the new path prune is
+            // bit-identical to the frozen pre-Increment-3 cycle filter.
+            let source = palette()[0];
+            let via_path = routable_reserves(reserves.clone(), source, source, &bridges);
+            let via_cycle = cycle_core_reference(reserves, source, &bridges);
+            prop_assert_eq!(via_path, via_cycle);
+        }
+
+        #[test]
+        fn open_path_output_is_a_subset_of_input(reserves in arbitrary_reserves()) {
+            let source = palette()[0];
+            let output = palette()[1];
+            let input_keys: HashSet<(u32, TokenAddress, TokenAddress)> = reserves
+                .iter()
+                .map(|r| (r.pool_id, r.token0, r.token1))
+                .collect();
+
+            let pruned = routable_reserves(reserves, source, output, &no_bridges());
+
+            for reserve in &pruned {
+                prop_assert!(input_keys.contains(&(reserve.pool_id, reserve.token0, reserve.token1)));
+            }
+        }
+
+        #[test]
+        fn open_path_pruning_is_idempotent(reserves in arbitrary_reserves()) {
+            let source = palette()[0];
+            let output = palette()[1];
+            let once = routable_reserves(reserves, source, output, &no_bridges());
+            let twice = routable_reserves(once.clone(), source, output, &no_bridges());
+            prop_assert_eq!(once, twice);
         }
     }
 }

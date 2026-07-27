@@ -13,7 +13,7 @@ pub use execution::{
     OptimizationBackendSelection, OptimizationBackendUsed, OptimizationInitError,
     OptimizationRunner, OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
     OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate,
-    reserves_reach_init_asset,
+    reserves_reach_output_asset,
 };
 pub use model::FlowRecord;
 pub use plan::{ExecutableStep, ExecutionPlan, StepKind, build_plan};
