@@ -5,7 +5,7 @@ use client_evm::{PoolRef, TokenAddress, multi_chain_kernel::OptimizationPoolRese
 use optimization::{
     ExecutionPlan, OptimizationBackendSelection, OptimizationInitError, OptimizationRunner,
     OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
-    OptimizationStepResult, OptimizationStepUpdate, reserves_reach_output_asset,
+    OptimizationStepResult, OptimizationStepUpdate, reserves_reach_route,
 };
 
 use crate::latest_slot::{LatestReceiveError, LatestReceiver};
@@ -60,7 +60,7 @@ pub fn run_optimization<T>(
             // reach the output asset (a chain bootstrapping, a refresh gap). Feeding it to the session
             // would abort the worker with `OutputAssetNotFound`, permanently closing the
             // optimization channel. Skip the snapshot and keep stepping the live session instead.
-            Some(snapshot) if !reserves_reach_output_asset(&snapshot.reserves, &session_config) => {
+            Some(snapshot) if !reserves_reach_route(&snapshot.reserves, &session_config) => {
                 OptimizationStepUpdate::Continue
             }
             // No lagging-pool gate wired in yet: every reported pool stays active. The kernel-side

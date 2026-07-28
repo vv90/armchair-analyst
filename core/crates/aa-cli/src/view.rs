@@ -224,7 +224,9 @@ mod tests {
     fn format_lines_renders_initializing_observation_with_replay_buffer_depth() {
         let observations = [(
             ChainKey::Ethereum,
-            ChainObservation::Initializing { buffered_events: 42 },
+            ChainObservation::Initializing {
+                buffered_events: 42,
+            },
         )];
 
         assert_eq!(

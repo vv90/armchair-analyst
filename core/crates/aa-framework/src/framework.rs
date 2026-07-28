@@ -141,13 +141,12 @@ fn spawn_effects<App: Application, R: Runtime<App>>(
     std::thread::spawn(move || {
         let run_effects = move || {
             effects.into_par_iter().for_each(|effect| {
-                runtime
-                    .execute_effect(effect)
-                    .into_iter()
-                    .for_each(|i| match sender_clone.send(i) {
+                runtime.execute_effect(effect).into_iter().for_each(|i| {
+                    match sender_clone.send(i) {
                         Ok(_) => (),
                         Err(e) => runtime.log_error(ApplicationError::SendError(e)),
-                    })
+                    }
+                })
             });
         };
 

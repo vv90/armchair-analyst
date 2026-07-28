@@ -2,9 +2,7 @@
 //! touching discovery or the artifact writer, so the whitelist can get stricter independently of the
 //! main binary.
 
-use client_evm::{
-    Address, ChainEndpoints, ChainKey, ClientEvmError, EndpointPool, TokenAddress,
-};
+use client_evm::{Address, ChainEndpoints, ChainKey, ClientEvmError, EndpointPool, TokenAddress};
 use serde_json::{Value, json};
 
 const HTTP_REQUEST_ID: u64 = 1;
@@ -33,7 +31,9 @@ pub enum ExaminationVerdict {
         reason: String,
         decimals: Option<u8>,
     },
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
 }
 
 pub trait TokenExaminer {
@@ -90,10 +90,7 @@ impl<'a> ContractExaminer<'a> {
         let decimals = eth_call_decimals(self.agent, pool, token.0).ok().flatten();
         let proxy_target = proxy_target(self.agent, pool, token.0, &code);
         let source = fetch_sourcify_source(self.agent, token);
-        let source_flags = source
-            .as_deref()
-            .map(source_risk_flags)
-            .unwrap_or_default();
+        let source_flags = source.as_deref().map(source_risk_flags).unwrap_or_default();
 
         Ok(ContractEvidence {
             code_present,
@@ -439,7 +436,12 @@ fn source_risk_flags(source: &str) -> Vec<String> {
         &mut flags,
         &source,
         "upgradeable",
-        &["delegatecall", "upgradeability", "upgradeable", "implementation"],
+        &[
+            "delegatecall",
+            "upgradeability",
+            "upgradeable",
+            "implementation",
+        ],
     );
     flags
 }
@@ -495,11 +497,11 @@ fn sourcify_chain_id(chain: ChainKey) -> u64 {
 
 fn managed_exception_reason(token: TokenAddress) -> Option<&'static str> {
     use client_evm::{
-        ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS,
-        AVALANCHE_USDC_TOKEN_ADDRESS, AVALANCHE_WETH_TOKEN_ADDRESS, BASE_USDC_TOKEN_ADDRESS,
-        BASE_WETH_TOKEN_ADDRESS, BNB_USDC_TOKEN_ADDRESS, BNB_WETH_TOKEN_ADDRESS,
-        ETHEREUM_USDC_TOKEN_ADDRESS, ETHEREUM_WETH_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS,
-        OPTIMISM_WETH_TOKEN_ADDRESS, POLYGON_USDC_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS,
+        ARBITRUM_USDC_TOKEN_ADDRESS, ARBITRUM_WETH_TOKEN_ADDRESS, AVALANCHE_USDC_TOKEN_ADDRESS,
+        AVALANCHE_WETH_TOKEN_ADDRESS, BASE_USDC_TOKEN_ADDRESS, BASE_WETH_TOKEN_ADDRESS,
+        BNB_USDC_TOKEN_ADDRESS, BNB_WETH_TOKEN_ADDRESS, ETHEREUM_USDC_TOKEN_ADDRESS,
+        ETHEREUM_WETH_TOKEN_ADDRESS, OPTIMISM_USDC_TOKEN_ADDRESS, OPTIMISM_WETH_TOKEN_ADDRESS,
+        POLYGON_USDC_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS,
     };
 
     let canonical = [
@@ -510,10 +512,19 @@ fn managed_exception_reason(token: TokenAddress) -> Option<&'static str> {
         (POLYGON_USDC_TOKEN_ADDRESS, "canonical USDC bridge asset"),
         (BNB_USDC_TOKEN_ADDRESS, "canonical USDC bridge asset"),
         (AVALANCHE_USDC_TOKEN_ADDRESS, "canonical USDC bridge asset"),
-        (ETHEREUM_WETH_TOKEN_ADDRESS, "canonical wrapped native asset"),
-        (ARBITRUM_WETH_TOKEN_ADDRESS, "canonical wrapped native asset"),
+        (
+            ETHEREUM_WETH_TOKEN_ADDRESS,
+            "canonical wrapped native asset",
+        ),
+        (
+            ARBITRUM_WETH_TOKEN_ADDRESS,
+            "canonical wrapped native asset",
+        ),
         (BASE_WETH_TOKEN_ADDRESS, "canonical wrapped native asset"),
-        (OPTIMISM_WETH_TOKEN_ADDRESS, "canonical wrapped native asset"),
+        (
+            OPTIMISM_WETH_TOKEN_ADDRESS,
+            "canonical wrapped native asset",
+        ),
         (POLYGON_WETH_TOKEN_ADDRESS, "canonical wrapped ETH asset"),
         (BNB_WETH_TOKEN_ADDRESS, "canonical bridged ETH asset"),
         (AVALANCHE_WETH_TOKEN_ADDRESS, "canonical bridged ETH asset"),
@@ -527,19 +538,71 @@ fn managed_exception_reason(token: TokenAddress) -> Option<&'static str> {
 
 fn known_managed_token_reason(token: TokenAddress) -> Option<&'static str> {
     let entries = [
-        (ChainKey::Ethereum, "0xdac17f958d2ee523a2206206994597c13d831ec7", "canonical USDT"),
-        (ChainKey::Arbitrum, "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", "canonical USDT"),
-        (ChainKey::Optimism, "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58", "canonical USDT"),
-        (ChainKey::Polygon, "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", "canonical USDT"),
-        (ChainKey::Bnb, "0x55d398326f99059ff775485246999027b3197955", "canonical USDT"),
-        (ChainKey::Avalanche, "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7", "canonical USDT"),
-        (ChainKey::Ethereum, "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", "canonical WBTC"),
-        (ChainKey::Arbitrum, "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f", "canonical WBTC"),
-        (ChainKey::Base, "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf", "canonical cbBTC"),
-        (ChainKey::Optimism, "0x68f180fcce6836688e9084f035309e29bf0a2095", "canonical WBTC"),
-        (ChainKey::Polygon, "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", "canonical WBTC"),
-        (ChainKey::Bnb, "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", "canonical BTCB"),
-        (ChainKey::Avalanche, "0x50b7545627a5162f82a992c33b87adc75187b218", "canonical WBTC.e"),
+        (
+            ChainKey::Ethereum,
+            "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "canonical USDT",
+        ),
+        (
+            ChainKey::Arbitrum,
+            "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "canonical USDT",
+        ),
+        (
+            ChainKey::Optimism,
+            "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",
+            "canonical USDT",
+        ),
+        (
+            ChainKey::Polygon,
+            "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+            "canonical USDT",
+        ),
+        (
+            ChainKey::Bnb,
+            "0x55d398326f99059ff775485246999027b3197955",
+            "canonical USDT",
+        ),
+        (
+            ChainKey::Avalanche,
+            "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7",
+            "canonical USDT",
+        ),
+        (
+            ChainKey::Ethereum,
+            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+            "canonical WBTC",
+        ),
+        (
+            ChainKey::Arbitrum,
+            "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",
+            "canonical WBTC",
+        ),
+        (
+            ChainKey::Base,
+            "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+            "canonical cbBTC",
+        ),
+        (
+            ChainKey::Optimism,
+            "0x68f180fcce6836688e9084f035309e29bf0a2095",
+            "canonical WBTC",
+        ),
+        (
+            ChainKey::Polygon,
+            "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
+            "canonical WBTC",
+        ),
+        (
+            ChainKey::Bnb,
+            "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",
+            "canonical BTCB",
+        ),
+        (
+            ChainKey::Avalanche,
+            "0x50b7545627a5162f82a992c33b87adc75187b218",
+            "canonical WBTC.e",
+        ),
     ];
 
     let rendered = token.0.to_string().to_ascii_lowercase();
@@ -689,7 +752,8 @@ mod tests {
 
     #[test]
     fn source_scan_allows_plain_balance_conserving_erc20_words() {
-        let source = "contract T { function transfer(address to, uint256 amount) public returns (bool); }";
+        let source =
+            "contract T { function transfer(address to, uint256 amount) public returns (bool); }";
 
         assert!(source_risk_flags(source).is_empty());
     }

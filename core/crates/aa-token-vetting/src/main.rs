@@ -121,16 +121,22 @@ fn run() -> Result<(), VettingError> {
 
     let agent = ureq::Agent::new_with_defaults();
     let examiner = ContractExaminer::new(&agent, &loaded.rpc_endpoints);
-    let trusted_tokens = discovery::fetch_uniswap_default_token_set(&agent).unwrap_or_else(|error| {
-        eprintln!("warn default token-list discovery failed error={error}");
-        HashSet::new()
-    });
+    let trusted_tokens =
+        discovery::fetch_uniswap_default_token_set(&agent).unwrap_or_else(|error| {
+            eprintln!("warn default token-list discovery failed error={error}");
+            HashSet::new()
+        });
 
     let mut approved: Vec<TokenCandidate> = Vec::new();
     let mut report: Vec<ReportEntry> = Vec::new();
 
     for &chain in ACTIVE_CHAINS {
-        let discovered = match discovery::fetch_top_tokens(&agent, &loaded.endpoints, chain, args.top) {
+        let discovered = match discovery::fetch_top_tokens(
+            &agent,
+            &loaded.endpoints,
+            chain,
+            args.top,
+        ) {
             Ok(Some(tokens)) => tokens,
             Ok(None) => {
                 eprintln!(
@@ -314,19 +320,18 @@ mod tests {
 
     #[test]
     fn all_arguments_parse() {
-        let parsed =
-            args(&[
-                "--out",
-                "wl.toml",
-                "--report",
-                "report.json",
-                "--top",
-                "5",
-                "--gecko-pages",
-                "2",
-                "--allow-missing-chains",
-            ])
-            .expect("parses");
+        let parsed = args(&[
+            "--out",
+            "wl.toml",
+            "--report",
+            "report.json",
+            "--top",
+            "5",
+            "--gecko-pages",
+            "2",
+            "--allow-missing-chains",
+        ])
+        .expect("parses");
 
         assert_eq!(
             parsed,

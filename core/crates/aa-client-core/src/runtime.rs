@@ -26,18 +26,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use aa_framework::{Application, Runtime, Transition};
-use client_evm::{ChainKey, ETHEREUM_USDC_TOKEN_ADDRESS, PoolRef, TokenAddress};
+use client_evm::{ChainKey, ETHEREUM_USDC_TOKEN_ADDRESS, TokenAddress};
 use optimization::{
-    OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig, PoolReserves,
+    OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
 };
 
 use crate::http::{DataPlaneClient, FetchRequest};
 use crate::latest_slot::{LatestReceiver, LatestSender, latest_slot};
-use crate::optimizer;
-use crate::state::{self, AppState, Effect, Event, SessionConfig};
-
-/// The reserve snapshot the reducer pushes to the optimizer worker's coalescing slot.
-type ReserveSnapshot = Vec<PoolReserves<PoolRef, TokenAddress>>;
+use crate::optimizer::{self, ReserveSnapshot};
+use crate::state::{self, AppState, Effect, Event, Route, SessionConfig};
 
 /// How often the poll clock fires. The framework's `subscriptions()` is a nullary static, so — like
 /// aa-cli's hardcoded tick — the interval is a const rather than a per-session field for now
@@ -46,8 +43,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// One optimizer step's per-call input amount, matching aa-cli's `default_optimization_step_config`
 /// scale; `iterations` is the bounded grind budget of a single `run` between reserve refreshes.
-const STEP_INPUT_AMOUNT: f32 = 1000.0;
-const STEP_ITERATIONS: usize = 10;
+/// Declared once: both the session config the reducer starts with and the budget the worker is built
+/// with read this same const, so the two copies of a process-fixed value cannot disagree.
+const STEP_CONFIG: OptimizationStepConfig = OptimizationStepConfig {
+    input_amount: 1000.0,
+    iterations: 10,
+};
+
+/// Which optimizer backend the worker initializes. Fixed for the process (never per-route), and read
+/// from here by both holders for the same reason as [`STEP_CONFIG`].
+const BACKEND: OptimizationBackendSelection = OptimizationBackendSelection::Cpu;
 
 /// The long-lived, background work the runtime spawns. A narrow enum (not the effect type) so a
 /// subscription can only be something the runtime actually knows how to spawn.
@@ -60,23 +65,65 @@ pub enum Subscription {
     Optimizer,
 }
 
-/// The session config the engine starts with. Built from consts for now (single Ethereum server,
-/// USDC init asset, no bridges/whitelist, Cpu backend) because the framework's `init`/`subscriptions`
-/// are nullary statics; threading a caller-supplied config in is a later increment.
-fn default_session_config() -> SessionConfig {
+/// The chain the targeted `aa-server` is bound to. The wire is single-chain and carries no chain tag,
+/// so the client supplies it and stamps it onto every projected pool/token — and onto the route.
+const CLIENT_CHAIN: ChainKey = ChainKey::Ethereum;
+
+/// Build the session config for a chosen route. Everything but the route is a const for now (single
+/// Ethereum server, no bridges/whitelist, Cpu backend, fixed step) because the framework's
+/// `init`/`subscriptions` are nullary statics; `chain`/`step`/`backend` configurability is deferred.
+/// One source of truth so `default_session_config` and [`ClientConfig`] cannot drift.
+fn session_config_for(route: Route) -> SessionConfig {
     SessionConfig {
-        chain: ChainKey::Ethereum,
+        chain: CLIENT_CHAIN,
         optimization: OptimizationSessionConfig {
-            source_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
-            output_asset: ETHEREUM_USDC_TOKEN_ADDRESS,
+            source_asset: TokenAddress(route.source, CLIENT_CHAIN),
+            output_asset: TokenAddress(route.output, CLIENT_CHAIN),
             bridges: std::collections::HashSet::new(),
             whitelist: None,
         },
-        step: OptimizationStepConfig {
-            input_amount: STEP_INPUT_AMOUNT,
-            iterations: STEP_ITERATIONS,
-        },
-        backend: OptimizationBackendSelection::Cpu,
+        step: STEP_CONFIG,
+        backend: BACKEND,
+    }
+}
+
+/// The route `init()` seeds: closed-cycle USDC arbitrage, the permanent oracle. A placeholder, not a
+/// policy — the framework's `init` is a nullary static, so `run_engine` replaces it with the caller's
+/// route via an [`Event::SetRoute`] first input.
+const DEFAULT_ROUTE: Route = Route {
+    source: ETHEREUM_USDC_TOKEN_ADDRESS.0,
+    output: ETHEREUM_USDC_TOKEN_ADDRESS.0,
+};
+
+/// The session config the engine starts with before its route is seeded.
+fn default_session_config() -> SessionConfig {
+    session_config_for(DEFAULT_ROUTE)
+}
+
+/// The caller-supplied configuration for one engine: which `aa-server` to target and the [`Route`] to
+/// optimize. The route is user-facing (the app is a route explorer) and stays changeable at runtime
+/// through [`Event::SetRoute`]; chain/backend/step stay const this increment. No default token is
+/// buried in a `new`: a caller either asks for arbitrage on a named asset or for a named route.
+#[derive(Clone, Debug)]
+pub struct ClientConfig {
+    /// The base URL of the `aa-server` data plane to fetch from.
+    pub base_url: String,
+    /// The asset pair to optimize (equal source/output ⇒ closed-cycle arbitrage).
+    pub route: Route,
+}
+
+impl ClientConfig {
+    /// Target `base_url` optimizing the closed arbitrage cycle on `asset`.
+    pub fn arbitrage(base_url: String, asset: client_evm::Address) -> ClientConfig {
+        ClientConfig {
+            base_url,
+            route: Route::arbitrage(asset),
+        }
+    }
+
+    /// Target `base_url` optimizing `route` (an open best-execution path when its ends differ).
+    pub fn for_route(base_url: String, route: Route) -> ClientConfig {
+        ClientConfig { base_url, route }
     }
 }
 
@@ -115,11 +162,18 @@ impl Application for ClientEngineApp {
 /// coalescing reserve slot. `Send + Sync` (the framework runs effects on a pool): the client and
 /// [`LatestSender`] are `Send + Sync`, and the receiver is held behind a `Mutex` until claimed. The
 /// optimizer worker itself — whose runner is not `Send + Sync` — is deliberately *not* here; it lives on
-/// the [`Subscription::Optimizer`] thread, which also gets the session config to init the runner.
+/// the [`Subscription::Optimizer`] thread.
+///
+/// It holds no route. Which pair is being optimized is `AppState`'s alone; it reaches the worker on
+/// each [`Effect::PushReserves`], so there is no second copy here to fall out of step with the
+/// reducer after a retarget. Only the backend and step budget — fixed for the process, never
+/// per-route — are carried, because the worker needs them to build a runner.
 pub struct ClientEngineRuntime {
     client: DataPlaneClient,
-    /// The session's fixed strategy/cadence; handed to the optimizer worker when it spawns.
-    config: SessionConfig,
+    /// Which optimizer backend the worker initializes (wgpu/cpu).
+    backend: OptimizationBackendSelection,
+    /// The per-step input amount and iteration budget the worker grinds with.
+    step: OptimizationStepConfig,
     /// Coalescing sink for the freshest reserves (latest-wins, so a slow worker never backs up).
     reserve_sender: LatestSender<ReserveSnapshot>,
     /// The matching receiver, taken once by the optimizer subscription when it starts.
@@ -133,7 +187,8 @@ impl ClientEngineRuntime {
         let (reserve_sender, reserve_inbox) = latest_slot();
         ClientEngineRuntime {
             client: DataPlaneClient::new(base_url),
-            config: default_session_config(),
+            backend: BACKEND,
+            step: STEP_CONFIG,
             reserve_sender,
             reserve_inbox: Mutex::new(Some(reserve_inbox)),
         }
@@ -153,11 +208,13 @@ impl Runtime<ClientEngineApp> for ClientEngineRuntime {
             Effect::FetchSlice { id, request } => {
                 vec![self.client.handle(FetchRequest::Slice { id, request })]
             }
-            Effect::PushReserves { reserves } => {
+            Effect::PushReserves { reserves, session } => {
                 // Coalescing send: overwrites any un-taken snapshot so the worker grinds the freshest
                 // reserves. A closed slot (worker gone / shutting down) or poisoned lock is swallowed —
                 // never a panic; the next productive slice simply pushes again.
-                let _ = self.reserve_sender.send(reserves);
+                let _ = self
+                    .reserve_sender
+                    .send(ReserveSnapshot { reserves, session });
                 Vec::new()
             }
         }
@@ -184,13 +241,7 @@ impl Runtime<ClientEngineApp> for ClientEngineRuntime {
                     .ok()
                     .and_then(|mut slot| slot.take());
                 if let Some(inbox) = inbox {
-                    optimizer::run(
-                        inbox,
-                        self.config.backend,
-                        self.config.optimization.clone(),
-                        self.config.step,
-                        sender.clone(),
-                    );
+                    optimizer::run(inbox, self.backend, self.step, sender.clone());
                 }
             }
         }
@@ -201,10 +252,18 @@ impl Runtime<ClientEngineApp> for ClientEngineRuntime {
     fn observe_state(&self, _state: &AppState) {}
 }
 
-/// Build the engine for one `aa-server` base URL and start the framework loop on its own thread.
-/// Returns the input sender (the future `AppCommand` seam) and the loop's join handle.
-pub fn run(base_url: String) -> (Sender<Event>, JoinHandle<()>) {
-    ClientEngineRuntime::new(base_url).run()
+/// Build the engine from a [`ClientConfig`] and start the framework loop on its own thread. Returns the
+/// input sender (the runtime **command** seam) and the loop's join handle.
+///
+/// The caller's route reaches the engine as an [`Event::SetRoute`] first input: `init()` can only seed
+/// a placeholder (the framework's `init` is a nullary static), so the route is *set*, exactly as a UI
+/// will later set it. There is no second delivery path — the worker learns the route from the reserves
+/// it is pushed — so this send races nothing: a slice that somehow beat it would be gated, and pushed,
+/// against the placeholder route, and the retarget then re-initializes the worker on the next slice.
+pub fn run(config: ClientConfig) -> (Sender<Event>, JoinHandle<()>) {
+    let (sender, handle) = ClientEngineRuntime::new(config.base_url).run();
+    let _ = sender.send(Event::SetRoute(config.route));
+    (sender, handle)
 }
 
 #[cfg(test)]
@@ -218,7 +277,8 @@ mod tests {
         PoolCompleteness, PoolMetaEntry, PoolQuery, PoolSlice, PoolsMetaResponse, SliceResponse,
         TokenMetaEntry, WirePoolState,
     };
-    use client_evm::Address;
+    use client_evm::{Address, ETHEREUM_WBTC_TOKEN_ADDRESS, PoolRef};
+    use optimization::PoolReserves;
 
     use super::*;
     use crate::state::Phase;
@@ -249,7 +309,7 @@ mod tests {
         Address::from([byte; 20])
     }
 
-    /// The USDC address the default session config uses as its init asset.
+    /// The USDC address the placeholder route arbitrages.
     fn usdc() -> Address {
         ETHEREUM_USDC_TOKEN_ADDRESS.0
     }
@@ -260,7 +320,7 @@ mod tests {
         }
     }
 
-    /// A catalog with one v3 pool over `(USDC, addr(2))` — a pair reaching the default init asset, so a
+    /// A catalog with one v3 pool over `(USDC, addr(2))` — a pair covering the placeholder route, so a
     /// complete slice for it is productive and initializes the optimizer.
     fn productive_meta() -> PoolsMetaResponse {
         PoolsMetaResponse {
@@ -322,7 +382,7 @@ mod tests {
     }
 
     /// Minimal reserves of a given length, to tell one pushed snapshot from another.
-    fn sample_reserves(count: usize) -> ReserveSnapshot {
+    fn sample_reserves(count: usize) -> Vec<PoolReserves<PoolRef, TokenAddress>> {
         (0..count)
             .map(|i| PoolReserves {
                 pool_id: PoolRef::uniswap_v3(addr(i as u8), ChainKey::Ethereum),
@@ -347,6 +407,7 @@ mod tests {
             runtime
                 .execute_effect(Effect::PushReserves {
                     reserves: sample_reserves(1),
+                    session: default_session_config().optimization,
                 })
                 .is_empty()
         );
@@ -354,6 +415,7 @@ mod tests {
             runtime
                 .execute_effect(Effect::PushReserves {
                     reserves: sample_reserves(2),
+                    session: default_session_config().optimization,
                 })
                 .is_empty()
         );
@@ -369,7 +431,7 @@ mod tests {
             .try_take()
             .expect("slot readable")
             .expect("a snapshot is present");
-        assert_eq!(taken.len(), 2);
+        assert_eq!(taken.reserves.len(), 2);
         assert!(inbox.try_take().expect("slot readable").is_none());
     }
 
@@ -410,6 +472,42 @@ mod tests {
         }
     }
 
+    /// Block until `predicate` matches one of the observed phases, panicking with the whole recorded
+    /// history after 10s. The engine self-clocks, so a phase is only reachable by waiting for it.
+    fn wait_for_phase(
+        observed: &Arc<StdMutex<Vec<Phase>>>,
+        what: &str,
+        predicate: impl Fn(&Phase) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reached = observed
+                .lock()
+                .map(|phases| phases.iter().any(&predicate))
+                .unwrap_or(false);
+            if reached {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not reach {what} in time; observed: {:?}",
+                observed
+                    .lock()
+                    .map(|phases| phases.clone())
+                    .unwrap_or_default(),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Forget every phase observed so far, so a later `wait_for_phase` can only match something the
+    /// engine did *after* this point (the phase being awaited may already have occurred once).
+    fn forget_observed(observed: &Arc<StdMutex<Vec<Phase>>>) {
+        if let Ok(mut phases) = observed.lock() {
+            phases.clear();
+        }
+    }
+
     #[test]
     fn engine_runs_from_cold_start_to_optimizing_over_a_loopback_data_plane() {
         let meta = serde_json::to_string(&productive_meta()).expect("serialize meta");
@@ -432,28 +530,126 @@ mod tests {
         // phases until the productive slice has driven the engine into `Optimizing`.
         let (_sender, _handle) = <RecordingRuntime as Runtime<ClientEngineApp>>::run(runtime);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let reached = observed
-                .lock()
-                .map(|phases| {
-                    phases
-                        .iter()
-                        .any(|phase| matches!(phase, Phase::Optimizing { .. }))
-                })
-                .unwrap_or(false);
-            if reached {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "engine did not reach Optimizing in time; observed: {:?}",
-                observed
-                    .lock()
-                    .map(|phases| phases.clone())
-                    .unwrap_or_default(),
-            );
-            std::thread::sleep(Duration::from_millis(20));
+        wait_for_phase(&observed, "Optimizing", |phase| {
+            matches!(phase, Phase::Optimizing { .. })
+        });
+    }
+
+    /// A catalog with one v3 pool over `(WBTC, addr(2))` — reaches WBTC but never USDC, so a complete
+    /// slice for it is productive only under a route whose output is WBTC, not the USDC arbitrage
+    /// default. Reuses `productive_slice`'s pool key (`addr(9)`), so that slice fits this catalog.
+    fn wbtc_route_meta() -> PoolsMetaResponse {
+        PoolsMetaResponse {
+            pools: vec![PoolMetaEntry {
+                key: v3_key(addr(9)),
+                token0: format!("{:#x}", ETHEREUM_WBTC_TOKEN_ADDRESS.0),
+                token1: format!("{:#x}", addr(2)),
+                fee_pips: 3000,
+                tick_spacing: 60,
+            }],
+            tokens: vec![
+                TokenMetaEntry {
+                    address: format!("{:#x}", ETHEREUM_WBTC_TOKEN_ADDRESS.0),
+                    decimals: 8,
+                },
+                TokenMetaEntry {
+                    address: format!("{:#x}", addr(2)),
+                    decimals: 18,
+                },
+            ],
         }
+    }
+
+    #[test]
+    fn a_configured_open_route_reaches_optimizing_end_to_end() {
+        // The whole seam in one run: `ClientConfig::for_route` → `run_engine` → the engine optimizing
+        // an open `addr(2) → WBTC` route against a real (loopback) data plane. The catalog reaches
+        // WBTC but never USDC, so the arbitrage default would sit in `AwaitingFirstSlice` forever —
+        // reaching `Optimizing` proves the caller's route actually took effect. `RecordingRuntime`
+        // wraps the real runtime only to observe phases; the route travels exactly as in `run_engine`.
+        let meta = serde_json::to_string(&wbtc_route_meta()).expect("serialize meta");
+        let slice = serde_json::to_string(&productive_slice()).expect("serialize slice");
+        let health = serde_json::to_string(&aa_wire::HealthResponse::AwaitingAnchor)
+            .expect("serialize health");
+        let (port, _server) = loopback(move |_method, path| match path {
+            "/pools/meta" => (200, meta.clone()),
+            "/slice" => (200, slice.clone()),
+            "/health" => (200, health.clone()),
+            _ => (404, String::new()),
+        });
+
+        let config = ClientConfig::for_route(
+            format!("http://127.0.0.1:{port}"),
+            Route {
+                source: addr(2),
+                output: ETHEREUM_WBTC_TOKEN_ADDRESS.0,
+            },
+        );
+
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = RecordingRuntime {
+            inner: ClientEngineRuntime::new(config.base_url.clone()),
+            observed: observed.clone(),
+        };
+        let (sender, _handle) = <RecordingRuntime as Runtime<ClientEngineApp>>::run(runtime);
+        // Exactly what `run_engine` does with the config: set the caller's route as the first input.
+        let _ = sender.send(Event::SetRoute(config.route));
+
+        wait_for_phase(&observed, "Optimizing on the open route", |phase| {
+            matches!(phase, Phase::Optimizing { .. })
+        });
+    }
+
+    #[test]
+    fn a_mid_session_retarget_restarts_optimization_on_the_new_route() {
+        // What a UI will do: change the route while the engine is already optimizing. End to end, on
+        // one live engine — the reducer drops the old route's results and re-gates the next slice, and
+        // the worker, which learns the route from the reserves it is handed, re-initializes on it. The
+        // engine must therefore leave `Optimizing`, then come back on its own within a poll interval.
+        let meta = serde_json::to_string(&wbtc_route_meta()).expect("serialize meta");
+        let slice = serde_json::to_string(&productive_slice()).expect("serialize slice");
+        let health = serde_json::to_string(&aa_wire::HealthResponse::AwaitingAnchor)
+            .expect("serialize health");
+        let (port, _server) = loopback(move |_method, path| match path {
+            "/pools/meta" => (200, meta.clone()),
+            "/slice" => (200, slice.clone()),
+            "/health" => (200, health.clone()),
+            _ => (404, String::new()),
+        });
+
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = RecordingRuntime {
+            inner: ClientEngineRuntime::new(format!("http://127.0.0.1:{port}")),
+            observed: observed.clone(),
+        };
+        let (sender, _handle) = <RecordingRuntime as Runtime<ClientEngineApp>>::run(runtime);
+
+        // Start on `addr(2) → WBTC`, and wait until it is really optimizing that route.
+        let _ = sender.send(Event::SetRoute(Route {
+            source: addr(2),
+            output: ETHEREUM_WBTC_TOKEN_ADDRESS.0,
+        }));
+        wait_for_phase(&observed, "Optimizing on the first route", |phase| {
+            matches!(phase, Phase::Optimizing { .. })
+        });
+
+        // Retarget to the reverse route, which the same catalog also serves.
+        forget_observed(&observed);
+        let _ = sender.send(Event::SetRoute(Route {
+            source: ETHEREUM_WBTC_TOKEN_ADDRESS.0,
+            output: addr(2),
+        }));
+
+        // The old route's results are gone...
+        wait_for_phase(
+            &observed,
+            "AwaitingFirstSlice after the retarget",
+            |phase| matches!(phase, Phase::AwaitingFirstSlice { .. }),
+        );
+        // ...and the engine recovers onto the new route with no further input.
+        forget_observed(&observed);
+        wait_for_phase(&observed, "Optimizing on the new route", |phase| {
+            matches!(phase, Phase::Optimizing { .. })
+        });
     }
 }

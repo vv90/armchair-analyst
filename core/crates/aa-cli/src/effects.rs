@@ -36,8 +36,10 @@ fn run() -> Result<(), CliError> {
     // the run logger exists so the live provider composition lands alongside the bootstrap events.
     let startup_summary = summarize_endpoints(&resolved);
 
-    let whitelist =
-        load_token_whitelist_with(|name| env::var(name).ok(), |path| std::fs::read_to_string(path))?;
+    let whitelist = load_token_whitelist_with(
+        |name| env::var(name).ok(),
+        |path| std::fs::read_to_string(path),
+    )?;
     let (session_config, dropped_bridges) = optimization_session_config(whitelist.as_ref())?;
     let whitelist_summary = summarize_token_whitelist(whitelist.as_ref(), &dropped_bridges);
 

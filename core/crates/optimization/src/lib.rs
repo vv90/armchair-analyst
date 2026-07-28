@@ -12,8 +12,7 @@ pub use error::OptimizationError;
 pub use execution::{
     OptimizationBackendSelection, OptimizationBackendUsed, OptimizationInitError,
     OptimizationRunner, OptimizationSessionConfig, OptimizationStepConfig, OptimizationStepError,
-    OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate,
-    reserves_reach_output_asset,
+    OptimizationStepResult, OptimizationStepStatus, OptimizationStepUpdate, reserves_reach_route,
 };
 pub use model::FlowRecord;
 pub use plan::{ExecutableStep, ExecutionPlan, StepKind, build_plan};

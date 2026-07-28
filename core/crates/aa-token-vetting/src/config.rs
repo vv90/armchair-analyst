@@ -121,7 +121,6 @@ where
                 weight,
             ));
         }
-
     }
 
     for provider in file.subgraph {
@@ -146,13 +145,11 @@ where
                     ),
                 })?;
             let url = substitute_key(url, key.as_deref());
-            graph_specs.entry(chain).or_default().push(EndpointSpec::new(
-                provider.name.clone(),
-                url,
-                weight,
-            ));
+            graph_specs
+                .entry(chain)
+                .or_default()
+                .push(EndpointSpec::new(provider.name.clone(), url, weight));
         }
-
     }
 
     let rpc_endpoints =
@@ -190,9 +187,7 @@ where
     let env_name = key_env
         .cloned()
         .unwrap_or_else(|| derived_key_env_with_prefix(default_prefix, name));
-    read_env(&env_name)
-        .and_then(normalize)
-        .map(Some)
+    read_env(&env_name).and_then(normalize).map(Some)
 }
 
 trait UrlTemplate {
@@ -312,7 +307,10 @@ mod tests {
     #[test]
     fn provider_without_a_key_is_skipped_and_reported() {
         let loaded = load_graph_endpoints_with(
-            env_from([(CONFIG_FILE_ENV, "aa.toml"), ("AA_RPC_KEY_DRPC", "rpc-secret")]),
+            env_from([
+                (CONFIG_FILE_ENV, "aa.toml"),
+                ("AA_RPC_KEY_DRPC", "rpc-secret"),
+            ]),
             |_| Ok(CONFIG.to_owned()),
         )
         .expect("config loads");
@@ -336,10 +334,9 @@ mod tests {
             avalanche = { http = "https://lb.drpc.org/avalanche/{key}" }
         "#;
 
-        let result =
-            load_graph_endpoints_with(env_from([(CONFIG_FILE_ENV, "aa.toml")]), |_| {
-                Ok(config.to_owned())
-            });
+        let result = load_graph_endpoints_with(env_from([(CONFIG_FILE_ENV, "aa.toml")]), |_| {
+            Ok(config.to_owned())
+        });
 
         assert!(matches!(result, Err(VettingError::ConfigFailed { .. })));
     }

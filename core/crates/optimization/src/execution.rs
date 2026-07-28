@@ -108,6 +108,22 @@ pub struct OptimizationSessionConfig<TToken> {
     pub whitelist: Option<HashSet<TToken>>,
 }
 
+/// Two session configs are equal when they request the same route under the same routing
+/// constraints — i.e. when a session initialized for one still answers the other. Callers compare
+/// them to decide between applying a snapshot to the running session and re-initializing, so this is
+/// part of the type's contract rather than a convenience. Hand-written because a derive would emit a
+/// bare `TToken: PartialEq` bound, which the `HashSet` fields (needing `Eq + Hash`) cannot satisfy.
+impl<TToken: Eq + Hash> PartialEq for OptimizationSessionConfig<TToken> {
+    fn eq(&self, other: &OptimizationSessionConfig<TToken>) -> bool {
+        self.source_asset == other.source_asset
+            && self.output_asset == other.output_asset
+            && self.bridges == other.bridges
+            && self.whitelist == other.whitelist
+    }
+}
+
+impl<TToken: Eq + Hash> Eq for OptimizationSessionConfig<TToken> {}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OptimizationStepConfig {
     pub input_amount: f32,
@@ -181,6 +197,14 @@ pub enum OptimizationStepError {
 
     #[error("output asset not found")]
     OutputAssetNotFound,
+
+    /// No reserve mentions the route's source asset, so the model has no input column to seed the
+    /// route from. Like [`OptimizationStepError::OutputAssetNotFound`] this is a "not ready for this
+    /// route yet" condition, not a malformed snapshot: a later snapshot (or a different route) can
+    /// satisfy it, so callers skip rather than abort. For a closed arbitrage cycle
+    /// (`source == output`) it is unreachable — reaching the output *is* reaching the source.
+    #[error("source asset not found")]
+    SourceAssetNotFound,
 
     #[error("optimization model init failed: {source}")]
     ModelInit { source: OptimizationError },
@@ -604,16 +628,19 @@ where
     ))
 }
 
-/// Whether `reserves` can reach the session's output asset — i.e. whether feeding them to a step would
-/// avoid the transient [`OptimizationStepError::OutputAssetNotFound`].
+/// Whether `reserves` can serve the session's whole route — i.e. whether feeding them to a step would
+/// avoid the transient [`OptimizationStepError::SourceAssetNotFound`] /
+/// [`OptimizationStepError::OutputAssetNotFound`]. Both ends must be present: something to spend the
+/// source asset into, and something that yields the output asset.
 ///
-/// With cross-chain merging a merged snapshot can momentarily fail to reach the output asset (the chain
-/// that owns the sink token reported late, a brief bootstrap/refresh gap, etc.). Initialization
-/// already treats that as "not ready yet" and skips the snapshot; a running session must do the same,
-/// because applying such a snapshot aborts the whole optimization worker. This mirrors the routing +
-/// output-asset reachability check performed inside [`validate_reserve_snapshot`]. For a closed
-/// arbitrage cycle (`output == source`) this is exactly the source-reachability check it replaced.
-pub fn reserves_reach_output_asset<TPool, TToken>(
+/// With cross-chain merging a merged snapshot can momentarily fail to cover the route (the chain that
+/// owns the sink token reported late, a brief bootstrap/refresh gap, etc.). Initialization already
+/// treats that as "not ready yet" and skips the snapshot; a running session must do the same, because
+/// applying such a snapshot aborts the whole optimization worker. This mirrors the routing + route
+/// reachability checks performed inside [`validate_reserve_snapshot`], over the same admitted
+/// reserves the step would see. For a closed arbitrage cycle (`output == source`) the two conjuncts
+/// coincide, so it reduces exactly to the output-reachability check.
+pub fn reserves_reach_route<TPool, TToken>(
     reserves: &[PoolReserves<TPool, TToken>],
     session_config: &OptimizationSessionConfig<TToken>,
 ) -> bool
@@ -621,9 +648,15 @@ where
     TPool: Copy + Eq + Hash,
     TToken: Copy + Eq + Hash,
 {
-    crate::routing_filter::admissible_reserves(reserves.to_vec(), session_config)
+    let admissible = crate::routing_filter::admissible_reserves(reserves.to_vec(), session_config);
+
+    admissible
         .iter()
         .any(|reserve| reserve.token1 == session_config.output_asset)
+        && admissible.iter().any(|reserve| {
+            reserve.token0 == session_config.source_asset
+                || reserve.token1 == session_config.source_asset
+        })
 }
 
 fn validate_reserve_snapshot<TPool, TToken>(
@@ -648,6 +681,19 @@ where
         .all(|reserve| reserve.token1 != session_config.output_asset)
     {
         return Err(OptimizationStepError::OutputAssetNotFound);
+    }
+
+    // The source asset must appear *somewhere* in the snapshot, in either position: the model layout
+    // indexes both of a reserve's tokens as inputs, so a token that is only ever an output still gets
+    // an input column. Checked here, next to the output check, so a route the snapshot cannot serve
+    // is a typed skippable error rather than the `Model::init_route` failure it would otherwise
+    // become — callers read model-init failures as fatal. Only reachable for an open route: when
+    // `source == output` the check above already proves the source is present.
+    if reserves.iter().all(|reserve| {
+        reserve.token0 != session_config.source_asset
+            && reserve.token1 != session_config.source_asset
+    }) {
+        return Err(OptimizationStepError::SourceAssetNotFound);
     }
 
     Ok(reserve_keys)
@@ -1194,15 +1240,41 @@ mod tests {
     }
 
     #[test]
-    fn reserves_reach_output_asset_is_true_when_a_pool_outputs_the_output_asset() {
-        assert!(reserves_reach_output_asset(
+    fn missing_source_asset_returns_typed_error() {
+        // An open route whose *source* asset appears in no reserve: the output is reachable, so the
+        // output-asset check passes, but the model has no input column to seed the route from. That
+        // must be a typed, pre-model "not ready for this route" error — the same class as
+        // `OutputAssetNotFound` — not a `ModelInit` failure, which callers read as fatal.
+        let error = expect_step_error(initialize_optimization_session::<
+            CpuBackend,
+            i32,
+            TokenAddress,
+            1,
+        >(
+            base_reserves(), absent_source_config(), &step_config(0)
+        ));
+
+        assert_eq!(error, OptimizationStepError::SourceAssetNotFound);
+    }
+
+    #[test]
+    fn reserves_reach_route_is_false_when_the_source_asset_is_absent() {
+        // Same snapshot as `missing_source_asset_returns_typed_error`: reachable output, absent
+        // source. The predicate is the caller-side pre-check for exactly the errors a step raises,
+        // so it must flag this as not-yet-ready rather than waving through a snapshot that aborts.
+        assert!(!reserves_reach_route(
             &base_reserves(),
-            &session_config()
+            &absent_source_config()
         ));
     }
 
     #[test]
-    fn reserves_reach_output_asset_is_false_when_no_pool_outputs_the_output_asset() {
+    fn reserves_reach_route_is_true_when_a_pool_outputs_the_output_asset() {
+        assert!(reserves_reach_route(&base_reserves(), &session_config()));
+    }
+
+    #[test]
+    fn reserves_reach_route_is_false_when_no_pool_outputs_the_output_asset() {
         // Same snapshot that drives `missing_output_asset_returns_typed_error`: a step fed this
         // would abort with `OutputAssetNotFound`, so the predicate must flag it as not-yet-ready.
         let reserves = vec![reserve(
@@ -1212,12 +1284,12 @@ mod tests {
             1_000.0,
         )];
 
-        assert!(!reserves_reach_output_asset(&reserves, &session_config()));
+        assert!(!reserves_reach_route(&reserves, &session_config()));
     }
 
     #[test]
-    fn reserves_reach_output_asset_is_false_for_an_empty_snapshot() {
-        assert!(!reserves_reach_output_asset(
+    fn reserves_reach_route_is_false_for_an_empty_snapshot() {
+        assert!(!reserves_reach_route(
             &Vec::<PoolReserves<i32, TokenAddress>>::new(),
             &session_config(),
         ));
@@ -1278,6 +1350,17 @@ mod tests {
     fn session_config() -> OptimizationSessionConfig<TokenAddress> {
         OptimizationSessionConfig {
             source_asset: tokens::USDC.address,
+            output_asset: tokens::USDC.address,
+            bridges: HashSet::new(),
+            whitelist: None,
+        }
+    }
+
+    /// An open route out of an asset that `base_reserves` never mentions (WBTC → USDC over a
+    /// USDC/WETH pool): the output asset is reachable but the source asset has no input column.
+    fn absent_source_config() -> OptimizationSessionConfig<TokenAddress> {
+        OptimizationSessionConfig {
+            source_asset: tokens::WBTC.address,
             output_asset: tokens::USDC.address,
             bridges: HashSet::new(),
             whitelist: None,

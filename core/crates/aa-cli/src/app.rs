@@ -15,11 +15,10 @@ use client_evm::{
     POLYGON_USDT_TOKEN_ADDRESS, POLYGON_WBTC_TOKEN_ADDRESS, POLYGON_WETH_TOKEN_ADDRESS,
     POOL_LOG_BATCH_WINDOW, PoolDataResult, PoolLog, PoolMetadata, PoolMetadataResult, PoolRef,
     ProtocolPoolKey, RangeLogBlock, RequestId, TokenAddress, TokenMetadataResult, TokenWhitelist,
-    WsSubscriptionEndpoint, bootstrap, consolidate_pool_logs, fetch_block_header,
-    fetch_canonical_block_header_at, fetch_block_logs,
-    fetch_finalized_block_header, fetch_pool_candidates_window, fetch_pool_data,
-    fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata, fetch_v4_pool_metadata,
-    kernel,
+    WsSubscriptionEndpoint, bootstrap, consolidate_pool_logs, fetch_block_header, fetch_block_logs,
+    fetch_canonical_block_header_at, fetch_finalized_block_header, fetch_pool_candidates_window,
+    fetch_pool_data, fetch_pool_logs_in_range, fetch_pool_metadata, fetch_token_metadata,
+    fetch_v4_pool_metadata, kernel,
     multi_chain_kernel::{
         ChainObservation, ChainProgress, Effect, Event, OptimizationPoolReserves, PlanVerification,
         State, Subscription, SubscriptionData, transition,
@@ -384,7 +383,10 @@ const RECONNECT_STABILITY_WINDOW: time::Duration = time::Duration::from_secs(10)
 /// treated as healthy and resets to [`RECONNECT_BASE`]; otherwise the previous delay doubles up to
 /// [`RECONNECT_CAP`] (or starts at the base on the first drop). Pure so the policy is unit-tested
 /// without opening a socket.
-fn next_reconnect_delay(previous: Option<time::Duration>, ran_for: time::Duration) -> time::Duration {
+fn next_reconnect_delay(
+    previous: Option<time::Duration>,
+    ran_for: time::Duration,
+) -> time::Duration {
     if ran_for >= RECONNECT_STABILITY_WINDOW {
         return RECONNECT_BASE;
     }
@@ -548,15 +550,19 @@ impl ClientEvmRuntime {
     /// interior mutability.
     fn log_gauge(&self, state: &State) {
         let now = now_millis();
-        if now.saturating_sub(self.last_gauge_millis.load(Ordering::Relaxed)) < GAUGE_INTERVAL_MILLIS
+        if now.saturating_sub(self.last_gauge_millis.load(Ordering::Relaxed))
+            < GAUGE_INTERVAL_MILLIS
         {
             return;
         }
         self.last_gauge_millis.store(now, Ordering::Relaxed);
         let events = self.transitions_since_gauge.swap(0, Ordering::Relaxed);
         let max_transition_millis = self.max_transition_micros.swap(0, Ordering::Relaxed) / 1000;
-        self.logger
-            .log(&format_gauge_log(&state.observe(), events, max_transition_millis));
+        self.logger.log(&format_gauge_log(
+            &state.observe(),
+            events,
+            max_transition_millis,
+        ));
     }
 
     /// Logs the kernel's latest plan-verification verdict next to the claimed profit, once per
@@ -606,8 +612,8 @@ pub(crate) fn start_runtime(
     logger: Logger,
     view: View,
 ) -> JoinHandle<()> {
-    let (_sender, handle) = <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(
-        ClientEvmRuntime::new(
+    let (_sender, handle) =
+        <ClientEvmRuntime as Runtime<ClientEvmApp>>::run(ClientEvmRuntime::new(
             subscriptions,
             endpoints,
             graph_endpoints,
@@ -616,8 +622,7 @@ pub(crate) fn start_runtime(
             token_whitelist,
             logger,
             view,
-        ),
-    );
+        ));
 
     handle
 }
@@ -931,14 +936,12 @@ impl ClientEvmRuntime {
                     from_block,
                     scan_tip,
                 ) {
-                    Ok((blocks, scan_tip, next_from)) => {
-                        bootstrap::Event::PoolCandidatesReceived {
-                            request_id,
-                            blocks,
-                            scan_tip,
-                            next_from,
-                        }
-                    }
+                    Ok((blocks, scan_tip, next_from)) => bootstrap::Event::PoolCandidatesReceived {
+                        request_id,
+                        blocks,
+                        scan_tip,
+                        next_from,
+                    },
                     Err(error) => {
                         let request_id = bootstrap::AnyRequestId::PoolCandidates(request_id);
                         self.logger.log(&format!(
@@ -1319,18 +1322,16 @@ where
         FnOnce(
             BlockHash,
             HashSet<ProtocolPoolKey>,
-        )
-            -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>,
+        ) -> Result<HashMap<ProtocolPoolKey, PoolMetadataResult>, ClientEvmError>,
     FetchTokenMetadata:
         FnOnce(
             BlockHash,
             HashSet<TokenAddress>,
         ) -> Result<HashMap<TokenAddress, TokenMetadataResult>, ClientEvmError>,
-    FetchPoolData:
-        FnOnce(
-            BlockHash,
-            HashSet<PoolRef>,
-        ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
+    FetchPoolData: FnOnce(
+        BlockHash,
+        HashSet<PoolRef>,
+    ) -> Result<HashMap<PoolRef, PoolDataResult>, ClientEvmError>,
     FetchLogsRange: FnOnce(u64, u64) -> Result<Vec<RangeLogBlock>, ClientEvmError>,
 {
     match effect {
@@ -1531,8 +1532,8 @@ where
 mod tests {
     use client_evm::{
         Bloom, ConfigScope, GetBlockHeader, GetBlockLogs, GetCanonicalHeaderAtHeight, GetLogsRange,
-        GetPoolData, GetPoolMetadata, GetTokenMetadata, IssuedRequest, PoolRef, ProtocolPoolKey,
-        PoolFee, PoolLog, PoolMetadata, PoolMetadataResult, RequestId, TokenAddress,
+        GetPoolData, GetPoolMetadata, GetTokenMetadata, IssuedRequest, PoolFee, PoolLog,
+        PoolMetadata, PoolMetadataResult, PoolRef, ProtocolPoolKey, RequestId, TokenAddress,
         TokenMetadataResult, UniswapV3Fee,
     };
     use serde_json::json;
@@ -2124,7 +2125,9 @@ mod tests {
         .expect("resolve succeeds");
 
         let stored = stored.borrow();
-        let stored = stored.as_ref().expect("store must be called with the fetched results");
+        let stored = stored
+            .as_ref()
+            .expect("store must be called with the fetched results");
         assert_eq!(stored.get(&v4), Some(&Ok(pool_metadata(3))));
     }
 
@@ -2362,8 +2365,7 @@ mod tests {
 
     #[test]
     fn session_config_without_whitelist_reproduces_the_default() {
-        let (config, dropped) =
-            optimization_session_config(None).expect("whitelist-free config");
+        let (config, dropped) = optimization_session_config(None).expect("whitelist-free config");
 
         assert_eq!(config.source_asset, ETHEREUM_USDC_TOKEN_ADDRESS);
         assert_eq!(config.bridges, default_optimization_bridges());

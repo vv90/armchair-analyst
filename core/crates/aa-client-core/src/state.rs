@@ -3,7 +3,8 @@
 //! logic — when to poll the data plane, when to start optimizing — while holding **none** of the heavy
 //! machinery. In particular the optimizer's mutable tensor state never lives here:
 //! `optimization::OptimizationRunner` is a move-based state machine that owns the `Model`; the reducer
-//! only hands the worker fresh reserves (via [`Effect::PushReserves`]) and folds its results back in as
+//! only hands the worker fresh reserves and the route they were gated against (via
+//! [`Effect::PushReserves`]) and folds its results back in as
 //! [`Event::OptimizerStepped`]. The grind cadence (`Continue` vs `NewReserves`) is the worker's, not the
 //! reducer's. Keeping the derived heavy thing out of the reducible state is the same discipline the
 //! kernel uses for reserves and pool folds.
@@ -16,10 +17,10 @@
 use std::str::FromStr;
 
 use aa_wire::{HealthResponse, PoolsMetaResponse, SliceRequest, SliceResponse};
-use client_evm::{BlockHash, ChainKey, PoolRef, TokenAddress};
+use client_evm::{Address, BlockHash, ChainKey, PoolRef, TokenAddress};
 use optimization::{
     ExecutionPlan, OptimizationBackendSelection, OptimizationSessionConfig, OptimizationStepConfig,
-    OptimizationStepResult, PoolReserves, reserves_reach_output_asset,
+    OptimizationStepResult, PoolReserves, reserves_reach_route,
 };
 
 use crate::pending::{FetchId, PendingFetches};
@@ -34,7 +35,8 @@ use crate::{WireAdapterError, slice_to_reserves};
 pub struct SessionConfig {
     /// The chain the target server is bound to; stamped onto every projected `PoolRef`/`TokenAddress`.
     pub chain: ChainKey,
-    /// The routing strategy the client optimizes for: init asset, bridge pairs, token whitelist. The
+    /// The routing strategy the client optimizes for: the source/output route, bridge pairs, token
+    /// whitelist. Retargeted in place by [`Event::SetRoute`], and the single owner of the route. The
     /// server never serves strategy, so this is purely client-side.
     pub optimization: OptimizationSessionConfig<TokenAddress>,
     /// Per-step input amount and the iteration budget of a single `run` — the bounded unit of work
@@ -42,6 +44,32 @@ pub struct SessionConfig {
     pub step: OptimizationStepConfig,
     /// Which optimizer backend to initialize (wgpu/cpu).
     pub backend: OptimizationBackendSelection,
+}
+
+/// The asset pair one optimization is for: spend `source`, maximize the received `output`. Equal ⇒ a
+/// closed arbitrage cycle; distinct ⇒ an open best-execution path. This is what a user picks, so it
+/// is also what the [`Event::SetRoute`] command and the client config carry.
+///
+/// Plain [`Address`]es rather than chain-stamped `TokenAddress`es: the session's `chain` is the one
+/// place a chain is decided (the wire is single-chain and carries no chain tag), and it is stamped on
+/// when the route meets the reserves. A route tagged with some *other* chain would match no reserve
+/// and silently starve the optimizer — so it is made unrepresentable instead of validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route {
+    /// The asset the committed input is denominated in.
+    pub source: Address,
+    /// The asset whose received amount the optimizer maximizes.
+    pub output: Address,
+}
+
+impl Route {
+    /// The closed arbitrage cycle on `asset`: spend it and maximize it (`source == output`).
+    pub fn arbitrage(asset: Address) -> Route {
+        Route {
+            source: asset,
+            output: asset,
+        }
+    }
 }
 
 /// The freshness envelope of the reserves currently driving the optimizer: which block the state was
@@ -88,8 +116,8 @@ impl AppState {
 }
 
 /// The engine lifecycle. `AwaitingFirstSlice` is the pre-optimizer state (mirrors the server's
-/// `AwaitingAnchor → Running`): the optimizer requires a non-empty reserve set that reaches the init
-/// asset, so it is only initialized once such a slice arrives. `last_step`/`plan`/`latest` only exist
+/// `AwaitingAnchor → Running`): the optimizer requires a non-empty reserve set covering the
+/// configured route, so it is only initialized once such a slice arrives. `last_step`/`plan`/`latest` only exist
 /// in `Optimizing`, so "optimizer running but no reserves yet" is unrepresentable.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Phase {
@@ -124,9 +152,10 @@ pub enum Phase {
 pub enum AwaitStatus {
     /// Waiting for the initial catalog/slice to arrive.
     Bootstrapping,
-    /// A slice arrived but its reserves cannot reach the configured init asset — nothing to arbitrage
-    /// yet, so the optimizer is intentionally not initialized (it would abort on such a snapshot).
-    NoInitAssetRoute,
+    /// A slice arrived but its reserves do not cover the configured route — either nothing to spend
+    /// the source asset into or nothing yielding the output asset — so the optimizer is intentionally
+    /// not initialized (it would abort on such a snapshot).
+    NoRoute,
     /// A fetch or projection fault was recorded while still awaiting the first productive slice.
     Error(EffectError),
 }
@@ -228,6 +257,12 @@ pub enum Event {
     EffectFailed(EffectError),
     /// The poll clock fired.
     Tick,
+    /// Retarget the engine at a different [`Route`]. The runtime **command** seam — the input
+    /// `Sender` `run_engine` returns carries these, and it is the only event that is a user *intent*
+    /// rather than the outcome of an effect. `run_engine` sends one at startup to seed the caller's
+    /// route (the framework's `init` is a nullary static and can only seed a placeholder); a UI
+    /// dispatches one per user route change, mid-session, with no further plumbing.
+    SetRoute(Route),
 }
 
 /// A side effect the reducer asks the driver to perform. Executing an effect eventually produces one
@@ -252,12 +287,20 @@ pub enum Effect {
         /// The pools to request state for.
         request: SliceRequest,
     },
-    /// Push the latest projected reserves to the optimizer worker's coalescing slot. The worker owns
-    /// the grind cadence: it inits on the first snapshot, applies later ones as `NewReserves`, and
-    /// self-continues when no fresh snapshot is waiting — so the reducer only ever hands it reserves.
+    /// Push the latest projected reserves — and the route they were gated against — to the optimizer
+    /// worker's coalescing slot. The worker owns the grind cadence: it inits on the first snapshot,
+    /// applies later ones as `NewReserves`, and self-continues when no fresh snapshot is waiting.
+    ///
+    /// The route rides along rather than being configured into the worker once, so [`AppState`] stays
+    /// its **single owner**: a worker holding its own copy would keep optimizing the old pair after an
+    /// [`Event::SetRoute`], silently disagreeing with the gate that admitted the reserves. Carrying it
+    /// makes every snapshot self-describing, so the worker re-initializes exactly when the route it is
+    /// handed stops matching the one it initialized on.
     PushReserves {
         /// The freshest productive reserves to grind (latest-wins; older un-taken pushes are dropped).
         reserves: Vec<PoolReserves<PoolRef, TokenAddress>>,
+        /// The route (and routing constraints) these reserves were admitted for.
+        session: OptimizationSessionConfig<TokenAddress>,
     },
 }
 
@@ -273,11 +316,11 @@ pub fn slice_request_for(meta: &PoolsMetaResponse) -> SliceRequest {
 /// [`EffectError`] rather than a panic.
 pub fn transition(state: AppState, event: Event) -> (AppState, Vec<Effect>) {
     let AppState {
-        config,
+        mut config,
         phase,
         pending,
     } = state;
-    let (phase, pending, effects) = reduce(&config, phase, pending, event);
+    let (phase, pending, effects) = reduce(&mut config, phase, pending, event);
     (
         AppState {
             config,
@@ -288,8 +331,11 @@ pub fn transition(state: AppState, event: Event) -> (AppState, Vec<Effect>) {
     )
 }
 
+/// `config` is `&mut` for the single event that retargets it ([`Event::SetRoute`], the command seam);
+/// every other arm only reads it. Keeping that arm here rather than intercepting it in `transition`
+/// leaves exactly one dispatch point over `Event`, so no variant is handled in two places.
 fn reduce(
-    config: &SessionConfig,
+    config: &mut SessionConfig,
     phase: Phase,
     mut pending: PendingFetches,
     event: Event,
@@ -330,6 +376,50 @@ fn reduce(
             (phase, pending, effects)
         }
         Event::EffectFailed(error) => (with_error(phase, error), pending, vec![]),
+        Event::SetRoute(route) => (on_set_route(config, phase, route), pending, vec![]),
+    }
+}
+
+/// Retarget the optimized route. The route is retargeted in place and everything the optimizer
+/// produced for the *previous* route is discarded: `last_step` and `plan` describe amounts and a swap
+/// path for the old pair, so keeping them would leave them on display — attributed to the new route —
+/// until fresh reserves land. The catalog survives (it is route-independent, and the slice already in
+/// flight still answers it), so re-optimizing costs one poll interval and no refetch. Emits no
+/// effects: the next slice pushes reserves through the retargeted gate on its own.
+///
+/// Setting the route already in force is a no-op, so `run_engine`'s startup seeding and a UI
+/// re-sending the current pair never interrupt a running optimization.
+fn on_set_route(config: &mut SessionConfig, phase: Phase, route: Route) -> Phase {
+    // The session's chain is stamped on here — the one place the client decides a chain — exactly as
+    // `slice_to_reserves` stamps it onto every projected pool and token.
+    let source = TokenAddress(route.source, config.chain);
+    let output = TokenAddress(route.output, config.chain);
+    if config.optimization.source_asset == source && config.optimization.output_asset == output {
+        return phase;
+    }
+    config.optimization.source_asset = source;
+    config.optimization.output_asset = output;
+
+    let (meta, health, status) = match phase {
+        Phase::Optimizing { meta, health, .. } => (Some(meta), health, AwaitStatus::Bootstrapping),
+        Phase::AwaitingFirstSlice {
+            meta,
+            health,
+            status,
+        } => {
+            // A recorded fetch/adapter fault is about the transport, not the route, so it outlives a
+            // retarget; a `NoRoute` verdict was about the old route and does not.
+            let status = match status {
+                AwaitStatus::Error(error) => AwaitStatus::Error(error),
+                _ => AwaitStatus::Bootstrapping,
+            };
+            (meta, health, status)
+        }
+    };
+    Phase::AwaitingFirstSlice {
+        meta,
+        health,
+        status,
     }
 }
 
@@ -416,7 +506,7 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                     Phase::AwaitingFirstSlice {
                         meta: Some(meta),
                         health,
-                        status: AwaitStatus::NoInitAssetRoute,
+                        status: AwaitStatus::NoRoute,
                     },
                     vec![],
                 );
@@ -431,7 +521,10 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                     health,
                     last_error: None,
                 },
-                vec![Effect::PushReserves { reserves }],
+                vec![Effect::PushReserves {
+                    reserves,
+                    session: config.optimization.clone(),
+                }],
             )
         }
         Phase::AwaitingFirstSlice {
@@ -514,7 +607,10 @@ fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phas
                     health,
                     last_error: None,
                 },
-                vec![Effect::PushReserves { reserves }],
+                vec![Effect::PushReserves {
+                    reserves,
+                    session: config.optimization.clone(),
+                }],
             )
         }
     }
@@ -550,10 +646,13 @@ fn on_step(
     }
 }
 
-/// Whether a projected reserve set can actually drive the optimizer: non-empty and reaching the
-/// configured output asset (else `init`/`run` would abort with `EmptyReserves`/`OutputAssetNotFound`).
+/// Whether a projected reserve set can actually drive the optimizer: non-empty and covering *both*
+/// ends of the configured route — something to spend the source asset into and something that yields
+/// the output asset (else `init`/`run` would abort with `EmptyReserves` /
+/// `SourceAssetNotFound` / `OutputAssetNotFound`). The source half only bites on an open route: when
+/// `source == output` reaching the output is reaching the source.
 fn is_productive(reserves: &[PoolReserves<PoolRef, TokenAddress>], config: &SessionConfig) -> bool {
-    !reserves.is_empty() && reserves_reach_output_asset(reserves, &config.optimization)
+    !reserves.is_empty() && reserves_reach_route(reserves, &config.optimization)
 }
 
 /// Parses the slice's freshness envelope; the only fallible field is `block_hash`.
@@ -696,7 +795,7 @@ mod tests {
         }
     }
 
-    /// A session whose init asset is `addr(1)`.
+    /// A session whose route is the closed cycle on `addr(1)`.
     fn config() -> SessionConfig {
         SessionConfig {
             chain: CHAIN,
@@ -804,7 +903,7 @@ mod tests {
     /// The reserves of the `PushReserves` effect in a batch, if one was emitted.
     fn pushed_reserves(effects: &[Effect]) -> Option<&Vec<PoolReserves<PoolRef, TokenAddress>>> {
         effects.iter().find_map(|e| match e {
-            Effect::PushReserves { reserves } => Some(reserves),
+            Effect::PushReserves { reserves, .. } => Some(reserves),
             _ => None,
         })
     }
@@ -858,6 +957,169 @@ mod tests {
         assert!(any_push_reserves(&effects));
         assert!(matches!(state.phase, Phase::Optimizing { .. }));
         state
+    }
+
+    /// `config()` retargeted to spend `source` and maximize `output` (both `addr`-bytes, this chain).
+    fn route_config(source: u8, output: u8) -> SessionConfig {
+        let mut config = config();
+        config.optimization.source_asset = TokenAddress(addr(source), CHAIN);
+        config.optimization.output_asset = TokenAddress(addr(output), CHAIN);
+        config
+    }
+
+    #[test]
+    fn set_route_retargets_the_config_without_effects() {
+        // The runtime command seam: `SetRoute` retargets the route in place and emits nothing. From a
+        // cold start there are no results to discard, so the phase is untouched too (contrast
+        // `set_route_to_a_new_route_discards_the_previous_route_s_results`).
+        let state = AppState::started(config());
+        let phase_before = state.phase.clone();
+        let (next, effects) = transition(
+            state,
+            Event::SetRoute(Route {
+                source: addr(1),
+                output: addr(2),
+            }),
+        );
+        assert!(
+            effects.is_empty(),
+            "SetRoute emits no effects this increment"
+        );
+        assert_eq!(
+            next.config.optimization.source_asset,
+            TokenAddress(addr(1), CHAIN)
+        );
+        assert_eq!(
+            next.config.optimization.output_asset,
+            TokenAddress(addr(2), CHAIN)
+        );
+        assert_eq!(next.phase, phase_before, "phase is untouched by SetRoute");
+    }
+
+    #[test]
+    fn productivity_gate_honors_the_configured_output_asset() {
+        // One and the same slice — a single pool over (addr(1), addr(2)) — drives the gate two ways.
+        // With `output = addr(2)` the reserves reach the sink, so the engine starts optimizing; with
+        // `output = addr(3)` (a token absent from the slice) they do not, so it stays awaiting. Proves
+        // `is_productive` reads the *configured* output, not a hardcoded asset.
+        let (state, slice) = after_catalog(route_config(1, 2), meta_over(1, 2));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
+        );
+        assert!(
+            any_push_reserves(&effects),
+            "output = addr(2) is reachable ⇒ productive"
+        );
+        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+
+        let (state, slice) = after_catalog(route_config(1, 3), meta_over(1, 2));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
+        );
+        assert!(
+            !any_push_reserves(&effects),
+            "output = addr(3) is absent ⇒ not productive"
+        );
+        assert!(matches!(
+            state.phase,
+            Phase::AwaitingFirstSlice {
+                status: AwaitStatus::NoRoute,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn set_route_to_a_new_route_discards_the_previous_route_s_results() {
+        // A retarget invalidates everything the optimizer produced for the old route. Staying in
+        // `Optimizing` would leave `last_step`/`plan` — amounts and a swap path for the *previous*
+        // pair — on display under the new route's label until a fresh slice lands. Drop back to
+        // awaiting instead, keeping the catalog (route-independent) so no refetch is needed.
+        let state = optimizing_state();
+        let (state, _) = transition(
+            state,
+            Event::OptimizerStepped {
+                result: step_result(),
+                plan: None,
+            },
+        );
+        assert!(matches!(
+            state.phase,
+            Phase::Optimizing {
+                last_step: Some(_),
+                ..
+            }
+        ));
+
+        let (state, effects) = transition(
+            state,
+            Event::SetRoute(Route {
+                source: addr(1),
+                output: addr(2),
+            }),
+        );
+
+        match state.phase {
+            Phase::AwaitingFirstSlice { meta, status, .. } => {
+                assert!(meta.is_some(), "the catalog survives a retarget");
+                assert_eq!(status, AwaitStatus::Bootstrapping);
+            }
+            other => panic!("a retarget must discard the old route's results, got {other:?}"),
+        }
+        assert!(effects.is_empty(), "SetRoute emits no effects");
+    }
+
+    #[test]
+    fn set_route_to_the_current_route_is_a_no_op() {
+        // `run_engine` seeds the reducer with a `SetRoute` whose route may equal the default, and a UI
+        // can re-send the current pair. Neither may interrupt a running optimization.
+        let state = optimizing_state();
+        let route = state.config.optimization.clone();
+        let (state, effects) = transition(
+            state,
+            Event::SetRoute(Route {
+                source: route.source_asset.0,
+                output: route.output_asset.0,
+            }),
+        );
+
+        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn productivity_gate_requires_the_source_asset_to_be_present() {
+        // A route *out of* a token the catalog never mentions: the slice reaches the output asset
+        // (`addr(2)`), so the output-reachability half of the gate passes, but nothing can be spent
+        // from `addr(3)`. Pushing such a snapshot aborts the optimizer's model init — and that abort
+        // is fatal to the worker thread — so the gate must reject it and keep the engine awaiting.
+        let (state, slice) = after_catalog(route_config(3, 2), meta_over(1, 2));
+        let (state, effects) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice,
+                response: slice_complete(),
+            },
+        );
+        assert!(
+            !any_push_reserves(&effects),
+            "source = addr(3) is absent from the slice ⇒ not productive"
+        );
+        assert!(matches!(
+            state.phase,
+            Phase::AwaitingFirstSlice {
+                status: AwaitStatus::NoRoute,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1008,7 +1270,7 @@ mod tests {
 
     #[test]
     fn unproductive_slice_stays_awaiting_without_optimizing() {
-        // Catalog over tokens that do NOT include the init asset (`addr(1)`).
+        // Catalog over tokens that do NOT include the route asset (`addr(1)`).
         let (state, slice) = after_catalog(config(), meta_over(3, 4));
         let (state, effects) = transition(
             state,
@@ -1021,7 +1283,7 @@ mod tests {
         assert!(matches!(
             state.phase,
             Phase::AwaitingFirstSlice {
-                status: AwaitStatus::NoInitAssetRoute,
+                status: AwaitStatus::NoRoute,
                 ..
             }
         ));

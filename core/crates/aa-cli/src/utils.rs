@@ -29,31 +29,14 @@ const KEY_PLACEHOLDER: &str = "{key}";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CliError {
-    MissingRequiredConfig {
-        env_name: &'static str,
-    },
-    PromptFailed {
-        prompt: String,
-        message: String,
-    },
-    RuntimeFailed {
-        message: String,
-    },
-    LogInitFailed {
-        message: String,
-    },
-    CacheInitFailed {
-        message: String,
-    },
-    EndpointConfigFailed {
-        message: String,
-    },
-    WhitelistConfigFailed {
-        message: String,
-    },
-    InitAssetNotWhitelisted {
-        init_asset: String,
-    },
+    MissingRequiredConfig { env_name: &'static str },
+    PromptFailed { prompt: String, message: String },
+    RuntimeFailed { message: String },
+    LogInitFailed { message: String },
+    CacheInitFailed { message: String },
+    EndpointConfigFailed { message: String },
+    WhitelistConfigFailed { message: String },
+    InitAssetNotWhitelisted { init_asset: String },
 }
 
 impl fmt::Display for CliError {
@@ -291,9 +274,10 @@ where
         message: format!("failed to read {path}: {error}"),
     })?;
 
-    let file: ConfigFile = toml::from_str(&content).map_err(|error| CliError::EndpointConfigFailed {
-        message: error.to_string(),
-    })?;
+    let file: ConfigFile =
+        toml::from_str(&content).map_err(|error| CliError::EndpointConfigFailed {
+            message: error.to_string(),
+        })?;
 
     resolve_config(file, &mut read_env, &mut prompt)
 }
@@ -617,7 +601,10 @@ mod tests {
         .expect("resolution succeeds");
 
         // Two HTTP providers on Ethereum, dRPC first with key substituted and weight 3.
-        let eth_http = resolved.rpc_http.get(&ChainKey::Ethereum).expect("eth http");
+        let eth_http = resolved
+            .rpc_http
+            .get(&ChainKey::Ethereum)
+            .expect("eth http");
         assert_eq!(eth_http.len(), 2);
         assert_eq!(
             eth_http[0],
@@ -648,7 +635,10 @@ mod tests {
         );
 
         // Subgraph on Ethereum with the graph key substituted.
-        let eth_graph = resolved.subgraph.get(&ChainKey::Ethereum).expect("eth graph");
+        let eth_graph = resolved
+            .subgraph
+            .get(&ChainKey::Ethereum)
+            .expect("eth graph");
         assert_eq!(
             eth_graph[0],
             EndpointSpec::new(
@@ -781,9 +771,10 @@ mod tests {
                 EndpointSpec::new("alchemy", "https://a", 4),
             ],
         );
-        resolved
-            .rpc_http
-            .insert(ChainKey::Arbitrum, vec![EndpointSpec::new("publicnode", "https://p", 1)]);
+        resolved.rpc_http.insert(
+            ChainKey::Arbitrum,
+            vec![EndpointSpec::new("publicnode", "https://p", 1)],
+        );
         // Ethereum has two WS providers; Arbitrum has none, so its `ws=` list must render empty.
         resolved.rpc_ws.insert(
             ChainKey::Ethereum,
@@ -807,12 +798,14 @@ mod tests {
     #[test]
     fn summarize_endpoints_lists_subgraph_pools_and_key_sources() {
         let mut resolved = ResolvedEndpoints::default();
-        resolved
-            .rpc_http
-            .insert(ChainKey::Ethereum, vec![EndpointSpec::new("drpc", "https://d", 3)]);
-        resolved
-            .subgraph
-            .insert(ChainKey::Ethereum, vec![EndpointSpec::new("thegraph", "https://g", 3)]);
+        resolved.rpc_http.insert(
+            ChainKey::Ethereum,
+            vec![EndpointSpec::new("drpc", "https://d", 3)],
+        );
+        resolved.subgraph.insert(
+            ChainKey::Ethereum,
+            vec![EndpointSpec::new("thegraph", "https://g", 3)],
+        );
         resolved.key_sources.push((
             "drpc".to_owned(),
             KeySource::Env("AA_RPC_KEY_DRPC".to_owned()),
@@ -955,7 +948,10 @@ mod tests {
             PathBuf::from(DEFAULT_METADATA_CACHE_PATH)
         );
         assert_eq!(
-            metadata_cache_path_with(static_env_from([(METADATA_CACHE_PATH_ENV, " /tmp/cache.redb ")])),
+            metadata_cache_path_with(static_env_from([(
+                METADATA_CACHE_PATH_ENV,
+                " /tmp/cache.redb "
+            )])),
             PathBuf::from("/tmp/cache.redb")
         );
     }
@@ -1057,18 +1053,17 @@ mod tests {
 
     #[test]
     fn absent_whitelist_env_disables_whitelisting() {
-        let result =
-            load_token_whitelist_with(env_from([]), |_| panic!("file must not be read"));
+        let result = load_token_whitelist_with(env_from([]), |_| panic!("file must not be read"));
 
         assert_eq!(result, Ok(None));
     }
 
     #[test]
     fn blank_whitelist_env_disables_whitelisting() {
-        let result = load_token_whitelist_with(
-            env_from([(TOKEN_WHITELIST_FILE_ENV, "  ")]),
-            |_| panic!("file must not be read"),
-        );
+        let result =
+            load_token_whitelist_with(env_from([(TOKEN_WHITELIST_FILE_ENV, "  ")]), |_| {
+                panic!("file must not be read")
+            });
 
         assert_eq!(result, Ok(None));
     }
@@ -1097,7 +1092,10 @@ mod tests {
             |_| Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
         );
 
-        assert!(matches!(result, Err(CliError::WhitelistConfigFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(CliError::WhitelistConfigFailed { .. })
+        ));
     }
 
     #[test]
@@ -1107,7 +1105,10 @@ mod tests {
             |_| Ok("chains = 42".to_owned()),
         );
 
-        assert!(matches!(result, Err(CliError::WhitelistConfigFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(CliError::WhitelistConfigFailed { .. })
+        ));
     }
 
     #[test]
@@ -1121,7 +1122,10 @@ mod tests {
             |_| Ok(toml.to_owned()),
         );
 
-        assert!(matches!(result, Err(CliError::WhitelistConfigFailed { .. })));
+        assert!(matches!(
+            result,
+            Err(CliError::WhitelistConfigFailed { .. })
+        ));
     }
 
     fn loaded_whitelist(toml: &str) -> TokenWhitelist {
@@ -1148,9 +1152,7 @@ mod tests {
 
         assert_eq!(
             lines.first().map(String::as_str),
-            Some(
-                "token_whitelist enabled ethereum=2 base=0 optimism=0 avalanche=0"
-            )
+            Some("token_whitelist enabled ethereum=2 base=0 optimism=0 avalanche=0")
         );
         // Every active chain but Ethereum is absent from the file → one warning each.
         assert_eq!(lines.len(), 1 + (ACTIVE_CHAINS.len() - 1));

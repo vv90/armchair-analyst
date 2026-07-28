@@ -108,9 +108,21 @@ mod tests {
 
         let lines = receiver.iter().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("t="), "missing timestamp: {}", lines[0]);
-        assert!(lines[0].ends_with(" first"), "unexpected line: {}", lines[0]);
-        assert!(lines[1].ends_with(" second"), "unexpected line: {}", lines[1]);
+        assert!(
+            lines[0].starts_with("t="),
+            "missing timestamp: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with(" first"),
+            "unexpected line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(" second"),
+            "unexpected line: {}",
+            lines[1]
+        );
     }
 
     #[test]
@@ -136,7 +148,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(offsets.len(), 2);
-        assert!(offsets[1] >= offsets[0], "offsets went backwards: {offsets:?}");
+        assert!(
+            offsets[1] >= offsets[0],
+            "offsets went backwards: {offsets:?}"
+        );
     }
 
     #[test]
