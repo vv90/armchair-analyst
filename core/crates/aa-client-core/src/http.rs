@@ -17,7 +17,7 @@ use aa_wire::{HealthResponse, PoolsMetaResponse, SliceRequest, SliceResponse};
 use serde::de::DeserializeOwned;
 
 use crate::pending::FetchId;
-use crate::state::{EffectError, Event, FetchKind};
+use crate::state::{Event, FetchKind};
 
 /// The three data-plane fetches the reducer can ask for — a narrow mirror of [`crate::Effect`]'s fetch
 /// variants so the adapter is total over exactly its domain (the driver maps `Effect::FetchMeta { id }
@@ -63,83 +63,70 @@ impl DataPlaneClient {
     }
 
     /// Execute one fetch, returning the [`Event`] the reducer must be fed. Total: any transport,
-    /// non-2xx status, body-read, or JSON-parse fault becomes
-    /// [`Event::EffectFailed`]`(`[`EffectError::Fetch`]`)`, so the adapter can never take down the loop.
+    /// non-2xx status, body-read, or JSON-parse fault becomes [`Event::FetchFailed`], so the adapter
+    /// can never take down the loop. The driver reports *what failed and why*; turning that into a
+    /// typed [`EffectError`] is the reducer's job, so the request kind is written exactly once here.
     pub fn handle(&self, request: FetchRequest) -> Event {
         match request {
-            FetchRequest::Meta { id } => {
-                match self.get::<PoolsMetaResponse>("/pools/meta", FetchKind::Meta) {
-                    Ok(response) => Event::MetaFetched { id, response },
-                    Err(error) => Event::FetchFailed {
-                        id,
-                        kind: FetchKind::Meta,
-                        error,
-                    },
-                }
-            }
-            FetchRequest::Health { id } => {
-                match self.get::<HealthResponse>("/health", FetchKind::Health) {
-                    Ok(response) => Event::HealthFetched { id, response },
-                    Err(error) => Event::FetchFailed {
-                        id,
-                        kind: FetchKind::Health,
-                        error,
-                    },
-                }
-            }
+            FetchRequest::Meta { id } => match self.get::<PoolsMetaResponse>("/pools/meta") {
+                Ok(response) => Event::MetaFetched { id, response },
+                Err(message) => Event::FetchFailed {
+                    id,
+                    kind: FetchKind::Meta,
+                    message,
+                },
+            },
+            FetchRequest::Health { id } => match self.get::<HealthResponse>("/health") {
+                Ok(response) => Event::HealthFetched { id, response },
+                Err(message) => Event::FetchFailed {
+                    id,
+                    kind: FetchKind::Health,
+                    message,
+                },
+            },
             FetchRequest::Slice { id, request } => match self.post_slice(&request) {
                 Ok(response) => Event::SliceFetched { id, response },
-                Err(error) => Event::FetchFailed {
+                Err(message) => Event::FetchFailed {
                     id,
                     kind: FetchKind::Slice,
-                    error,
+                    message,
                 },
             },
         }
     }
 
-    /// One GET + JSON-decode against `path`. A `ureq::Error` covers both transport faults and non-2xx
-    /// statuses (ureq surfaces the latter as `Error::StatusCode`), so every failure funnels through the
-    /// same typed [`EffectError::Fetch`].
-    fn get<T: DeserializeOwned>(&self, path: &str, what: FetchKind) -> Result<T, EffectError> {
+    /// One GET + JSON-decode against `path`, yielding the failure's diagnostic text on any fault. A
+    /// `ureq::Error` covers both transport faults and non-2xx statuses (ureq surfaces the latter as
+    /// `Error::StatusCode`), so every failure funnels through the same `Err(String)`.
+    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let url = format!("{}{path}", self.base_url);
         let mut response = self
             .agent
             .get(&url)
             .call()
-            .map_err(|error| fetch_error(what, error))?;
+            .map_err(|error| error.to_string())?;
         let body = response
             .body_mut()
             .read_to_string()
-            .map_err(|error| fetch_error(what, error))?;
-        serde_json::from_str::<T>(&body).map_err(|error| fetch_error(what, error))
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str::<T>(&body).map_err(|error| error.to_string())
     }
 
     /// The `POST /slice` counterpart of [`DataPlaneClient::get`]: serialize the request body, POST it,
-    /// then read + JSON-decode the response. Same uniform [`EffectError::Fetch`] path.
-    fn post_slice(&self, request: &SliceRequest) -> Result<SliceResponse, EffectError> {
+    /// then read + JSON-decode the response. Same uniform `Err(String)` path.
+    fn post_slice(&self, request: &SliceRequest) -> Result<SliceResponse, String> {
         let url = format!("{}/slice", self.base_url);
-        let body =
-            serde_json::to_string(request).map_err(|error| fetch_error(FetchKind::Slice, error))?;
+        let body = serde_json::to_string(request).map_err(|error| error.to_string())?;
         let mut response = self
             .agent
             .post(&url)
             .send(body.as_str())
-            .map_err(|error| fetch_error(FetchKind::Slice, error))?;
+            .map_err(|error| error.to_string())?;
         let body = response
             .body_mut()
             .read_to_string()
-            .map_err(|error| fetch_error(FetchKind::Slice, error))?;
-        serde_json::from_str::<SliceResponse>(&body)
-            .map_err(|error| fetch_error(FetchKind::Slice, error))
-    }
-}
-
-/// Wraps any failure (transport, status, read, or parse) into the typed fetch error the reducer records.
-fn fetch_error(what: FetchKind, message: impl std::fmt::Display) -> EffectError {
-    EffectError::Fetch {
-        what,
-        message: message.to_string(),
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str::<SliceResponse>(&body).map_err(|error| error.to_string())
     }
 }
 
@@ -341,17 +328,11 @@ mod tests {
 
         let event = client_for(port).handle(FetchRequest::Meta { id: id() });
 
-        assert!(matches!(
-            event,
-            Event::FetchFailed {
-                kind: FetchKind::Meta,
-                error: EffectError::Fetch {
-                    what: FetchKind::Meta,
-                    ..
-                },
-                ..
-            }
-        ));
+        let Event::FetchFailed { kind, message, .. } = event else {
+            panic!("a non-2xx status must be a recorded fetch failure, got {event:?}");
+        };
+        assert_eq!(kind, FetchKind::Meta);
+        assert!(!message.is_empty(), "the failure must carry a diagnostic");
     }
 
     #[test]
@@ -360,17 +341,11 @@ mod tests {
 
         let event = client_for(port).handle(FetchRequest::Health { id: id() });
 
-        assert!(matches!(
-            event,
-            Event::FetchFailed {
-                kind: FetchKind::Health,
-                error: EffectError::Fetch {
-                    what: FetchKind::Health,
-                    ..
-                },
-                ..
-            }
-        ));
+        let Event::FetchFailed { kind, message, .. } = event else {
+            panic!("an undecodable body must be a recorded fetch failure, got {event:?}");
+        };
+        assert_eq!(kind, FetchKind::Health);
+        assert!(!message.is_empty(), "the failure must carry a diagnostic");
     }
 
     #[test]
@@ -379,17 +354,11 @@ mod tests {
         let event = DataPlaneClient::new("http://127.0.0.1:1".to_owned())
             .handle(FetchRequest::Meta { id: id() });
 
-        assert!(matches!(
-            event,
-            Event::FetchFailed {
-                kind: FetchKind::Meta,
-                error: EffectError::Fetch {
-                    what: FetchKind::Meta,
-                    ..
-                },
-                ..
-            }
-        ));
+        let Event::FetchFailed { kind, message, .. } = event else {
+            panic!("a refused connection must be a recorded fetch failure, got {event:?}");
+        };
+        assert_eq!(kind, FetchKind::Meta);
+        assert!(!message.is_empty(), "the failure must carry a diagnostic");
     }
 
     #[test]

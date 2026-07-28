@@ -76,14 +76,16 @@ impl Route {
 /// valid at and how deep below the observed tip it sat. Consuming these `/slice` facts is what the
 /// wire→reserves adapter deliberately left for the engine; candidate-lifetime re-evaluation against
 /// later slices is a follow-up.
+///
+/// Deliberately carries no chain: the session is single-chain and [`SessionConfig::chain`] is that
+/// fact's sole owner, so a view renders the chain from config rather than from the slice. Copying it
+/// in here would be a second writable copy with no invariant tying the two together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SliceProvenance {
     /// The frontier block hash the reserves were projected from.
     pub block_hash: BlockHash,
     /// Canonical blocks the observed tip was ahead of that frontier (reorg-depth / staleness).
     pub confirmations: u64,
-    /// The chain the reserves belong to (echoes the session's `chain`).
-    pub chain: ChainKey,
 }
 
 /// The whole application state: immutable session config, the two facts that are true independently
@@ -270,15 +272,19 @@ pub enum Event {
         /// The fetched health snapshot.
         response: HealthResponse,
     },
-    /// A data-plane fetch for request `id` (of `kind`) failed; `error` is its recorded fault. Distinct
-    /// from [`Event::EffectFailed`] (optimizer faults) so the reducer can free the right ledger slot.
+    /// A data-plane fetch for request `id` (of `kind`) failed with diagnostic `message`. Distinct from
+    /// [`Event::EffectFailed`] (optimizer faults) so the reducer can free the right ledger slot.
+    ///
+    /// The driver reports the raw failure, not a built [`EffectError`]: `kind` names both the slot to
+    /// free and the fault to record, so the two cannot name different requests, and a fetch outcome
+    /// cannot masquerade as an adapter or optimizer fault.
     FetchFailed {
         /// The id of the fetch that failed.
         id: FetchId,
-        /// Which data-plane request it was, so the reducer clears the matching slot.
+        /// Which data-plane request it was: the slot the reducer clears, and the `what` it records.
         kind: FetchKind,
-        /// The recorded fault.
-        error: EffectError,
+        /// The driver's diagnostic text.
+        message: String,
     },
     /// The optimizer completed a step (init or run), returning its scalar result and recovered plan.
     OptimizerStepped {
@@ -380,9 +386,12 @@ fn reduce(state: &mut AppState, event: Event) -> Vec<Effect> {
             }
             vec![]
         }
-        Event::FetchFailed { id, kind, error } => {
+        Event::FetchFailed { id, kind, message } => {
             if state.pending.accept(kind, id) {
-                state.last_error = Some(error);
+                state.last_error = Some(EffectError::Fetch {
+                    what: kind,
+                    message,
+                });
             }
             vec![]
         }
@@ -493,7 +502,7 @@ fn on_slice(state: &mut AppState, slice: SliceResponse) -> Vec<Effect> {
             return vec![];
         }
     };
-    let provenance = match parse_provenance(&slice, chain) {
+    let provenance = match parse_provenance(&slice) {
         Ok(provenance) => provenance,
         Err(error) => {
             state.last_error = Some(error);
@@ -565,10 +574,7 @@ fn is_productive(reserves: &[PoolReserves<PoolRef, TokenAddress>], config: &Sess
 }
 
 /// Parses the slice's freshness envelope; the only fallible field is `block_hash`.
-fn parse_provenance(
-    slice: &SliceResponse,
-    chain: ChainKey,
-) -> Result<SliceProvenance, EffectError> {
+fn parse_provenance(slice: &SliceResponse) -> Result<SliceProvenance, EffectError> {
     let block_hash =
         BlockHash::from_str(&slice.block_hash).map_err(|_| EffectError::Provenance {
             field: "block_hash",
@@ -577,7 +583,6 @@ fn parse_provenance(
     Ok(SliceProvenance {
         block_hash,
         confirmations: slice.confirmations,
-        chain,
     })
 }
 
@@ -767,6 +772,15 @@ mod tests {
                 _ => None,
             })
             .expect("FetchSlice issued")
+    }
+
+    /// The id of the effect of `kind` in a batch, if one was issued. The kind-parametric counterpart
+    /// of [`meta_id`]/[`health_id`]/[`slice_id`], for properties that quantify over `FetchKind`.
+    fn issued_id(effects: &[Effect], kind: FetchKind) -> Option<FetchId> {
+        effects.iter().find_map(|effect| match effect_kind(effect) {
+            Some((issued, id)) if issued == kind => Some(id),
+            _ => None,
+        })
     }
 
     /// Cold-start tick → deliver the catalog. Returns the state (with a slice now in flight) and the
@@ -1147,10 +1161,7 @@ mod tests {
                 GeneratedEvent::FetchFailed { id, kind } => Event::FetchFailed {
                     id: resolve(&live, kind, id),
                     kind,
-                    error: EffectError::Fetch {
-                        what: kind,
-                        message: "generated".to_owned(),
-                    },
+                    message: "generated".to_owned(),
                 },
                 GeneratedEvent::OptimizerStepped { output_amount } => {
                     let mut result = step_result();
@@ -1299,11 +1310,7 @@ mod tests {
 
             let before = observable(&state);
             let event = if failure {
-                Event::FetchFailed {
-                    id: forged,
-                    kind,
-                    error: EffectError::Fetch { what: kind, message: "late".to_owned() },
-                }
+                Event::FetchFailed { id: forged, kind, message: "late".to_owned() }
             } else {
                 match kind {
                     FetchKind::Meta => Event::MetaFetched { id: forged, response: catalog(0) },
@@ -1322,6 +1329,46 @@ mod tests {
 
             prop_assert!(effects.is_empty(), "an unheld id produced effects: {effects:?}");
             prop_assert_eq!(observable(&next), before);
+        }
+
+        /// A fetch failure records a fault naming the same request it frees. `kind` is the only
+        /// source of that name — the driver reports a raw message, the reducer builds the typed
+        /// error — so the fault a view renders and the slot the ledger reopens cannot name different
+        /// requests. Parametric over all three kinds and over the diagnostic text; generalises
+        /// `failed_fetch_frees_the_slot_for_reissue`, which pins the `Meta` case concretely.
+        #[test]
+        fn a_fetch_failure_names_the_kind_it_frees(kind in fetch_kind(), message in any::<String>()) {
+            // `/health` and `/pools/meta` go out on the cold-start tick; a slice needs a catalog first.
+            let (state, effects) = transition(AppState::started(config()), Event::Tick);
+            let (state, effects) = match kind {
+                FetchKind::Slice => transition(
+                    state,
+                    Event::MetaFetched { id: meta_id(&effects), response: catalog(1) },
+                ),
+                FetchKind::Meta | FetchKind::Health => (state, effects),
+            };
+            let Some(id) = issued_id(&effects, kind) else {
+                return Err(TestCaseError::fail(format!("no {kind:?} fetch in flight")));
+            };
+
+            let (state, effects) = transition(
+                state,
+                Event::FetchFailed { id, kind, message: message.clone() },
+            );
+            prop_assert!(effects.is_empty(), "a failure schedules nothing: {effects:?}");
+            prop_assert_eq!(
+                &state.last_error,
+                &Some(EffectError::Fetch { what: kind, message }),
+                "the recorded fault must name the request that failed"
+            );
+
+            // The other half of the same fact: that kind's slot is free, so the next tick re-issues it.
+            let (_state, effects) = transition(state, Event::Tick);
+            let reissued = issued_id(&effects, kind);
+            prop_assert!(
+                reissued.is_some_and(|next| next != id),
+                "the failed kind must be re-issued with a fresh id, got {reissued:?}"
+            );
         }
 
         /// Optimizer results are last-write-wins and never schedule work: from any reached state, a
@@ -1626,10 +1673,7 @@ mod tests {
             Event::FetchFailed {
                 id: health,
                 kind: FetchKind::Health,
-                error: EffectError::Fetch {
-                    what: FetchKind::Health,
-                    message: "boom".to_owned(),
-                },
+                message: "boom".to_owned(),
             },
         );
 
@@ -1918,10 +1962,7 @@ mod tests {
             Event::FetchFailed {
                 id,
                 kind: FetchKind::Meta,
-                error: EffectError::Fetch {
-                    what: FetchKind::Meta,
-                    message: "boom".to_owned(),
-                },
+                message: "boom".to_owned(),
             },
         );
         assert!(effects.is_empty());
@@ -1944,10 +1985,7 @@ mod tests {
             Event::FetchFailed {
                 id: stale,
                 kind: FetchKind::Meta,
-                error: EffectError::Fetch {
-                    what: FetchKind::Meta,
-                    message: "boom".to_owned(),
-                },
+                message: "boom".to_owned(),
             },
         );
         assert!(effects.is_empty());
