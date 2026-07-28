@@ -24,7 +24,7 @@ use optimization::{
 };
 
 use crate::pending::{FetchId, PendingFetches};
-use crate::{WireAdapterError, slice_to_reserves};
+use crate::{Catalog, WireAdapterError};
 
 /// Client-owned strategy and cadence for one server session. The optimizer's own config types are
 /// reused verbatim (`OptimizationSessionConfig`/`OptimizationStepConfig`) so there is no mirror to
@@ -131,7 +131,7 @@ impl AppState {
     /// The catalog currently held, if any. The only thing a `/slice` can be requested for or
     /// projected against, so every consumer — the poll loop, the projection, a future view — reads
     /// it through here rather than re-matching the lifecycle.
-    pub fn catalog(&self) -> Option<&PoolsMetaResponse> {
+    pub fn catalog(&self) -> Option<&Catalog> {
         match &self.session {
             Session::NoCatalog => None,
             Session::Ready { catalog, .. } => Some(catalog),
@@ -155,9 +155,10 @@ pub enum Session {
     NoCatalog,
     /// The static catalog is held; `work` says how far past it the engine has got.
     Ready {
-        /// The catalog every `/slice` request and projection is built from. Route-independent, so it
-        /// survives a retarget.
-        catalog: PoolsMetaResponse,
+        /// The catalog every `/slice` request and projection is built from — validated at its own
+        /// boundary, so holding one means holding a *usable* one. Route-independent, so it survives
+        /// a retarget.
+        catalog: Catalog,
         /// Whether a productive slice has been applied yet.
         work: Work,
     },
@@ -344,13 +345,6 @@ pub enum Effect {
     },
 }
 
-/// Builds the `POST /slice` request that asks for every catalog pool's current-tick state.
-pub fn slice_request_for(meta: &PoolsMetaResponse) -> SliceRequest {
-    SliceRequest {
-        pools: meta.pools.iter().map(|entry| entry.key.clone()).collect(),
-    }
-}
-
 /// The reducer: fold one [`Event`] into the state, returning the next state and the effects to run.
 /// Pure and total — every event maps to a valid next state, and any data fault becomes a recorded
 /// [`EffectError`] rather than a panic.
@@ -449,25 +443,33 @@ fn on_tick(state: &mut AppState) -> Vec<Effect> {
     if let Some(id) = state.pending.ensure(FetchKind::Health) {
         effects.push(Effect::FetchHealth { id });
     }
-    match state.catalog().map(slice_request_for) {
-        Some(request) => {
-            if let Some(id) = state.pending.ensure(FetchKind::Slice) {
-                effects.push(Effect::FetchSlice { id, request });
-            }
+    if state.catalog().is_none() {
+        if let Some(id) = state.pending.ensure(FetchKind::Meta) {
+            effects.push(Effect::FetchMeta { id });
         }
-        None => {
-            if let Some(id) = state.pending.ensure(FetchKind::Meta) {
-                effects.push(Effect::FetchMeta { id });
-            }
-        }
+        return effects;
+    }
+    // The ledger gate comes *before* the request is materialized: the catalog's prebuilt request is
+    // still a clone per pool, and on most ticks the previous slice is still in flight, so building it
+    // first would allocate the whole pool list only to drop it.
+    if let Some(id) = state.pending.ensure(FetchKind::Slice)
+        && let Some(catalog) = state.catalog()
+    {
+        effects.push(Effect::FetchSlice {
+            id,
+            request: catalog.slice_request().clone(),
+        });
     }
     effects
 }
 
-/// The catalog arrived: store it and immediately request the first slice for it (don't wait a full
-/// poll interval). The slice slot is free at this point, so `ensure` issues.
-fn on_meta(state: &mut AppState, catalog: PoolsMetaResponse) -> Vec<Effect> {
-    let request = slice_request_for(&catalog);
+/// The catalog arrived: validate it into a [`Catalog`], store it, and immediately request the first
+/// slice for it (don't wait a full poll interval). The slice slot is free at this point, so `ensure`
+/// issues. Validation is where every catalog data fault is settled — once, here, instead of being
+/// rediscovered against each slice that arrives later.
+fn on_meta(state: &mut AppState, response: PoolsMetaResponse) -> Vec<Effect> {
+    let catalog = Catalog::parse(&response, state.config.chain);
+    let request = catalog.slice_request().clone();
     match &mut state.session {
         // A refetched catalog replaces the held one; how far the engine has got is unaffected.
         Session::Ready { catalog: held, .. } => *held = catalog,
@@ -488,14 +490,13 @@ fn on_meta(state: &mut AppState, catalog: PoolsMetaResponse) -> Vec<Effect> {
 /// (re)drive the optimizer. Faults and unproductive snapshots are recorded without leaving a valid
 /// state and without touching the optimizer.
 fn on_slice(state: &mut AppState, slice: SliceResponse) -> Vec<Effect> {
-    let chain = state.config.chain;
     let Session::Ready { catalog, work } = &mut state.session else {
         // A slice is only ever requested once a catalog is held, and the catalog is never dropped, so
         // this is unreachable in practice — there is simply nothing to project the payload against.
         return vec![];
     };
 
-    let reserves = match slice_to_reserves(&slice, catalog, chain) {
+    let reserves = match catalog.project(&slice) {
         Ok(reserves) => reserves,
         Err(error) => {
             state.last_error = Some(EffectError::Adapter(error));
@@ -1107,7 +1108,7 @@ mod tests {
             if let Effect::FetchSlice { request, .. } = effect {
                 match state.catalog() {
                     Some(catalog) => {
-                        if request.pools != slice_request_for(catalog).pools {
+                        if request.pools != catalog.slice_request().pools {
                             return Err("slice request does not match the held catalog".into());
                         }
                     }
@@ -1463,9 +1464,12 @@ mod tests {
 
             let response = slice_for(index, block, true);
             // Only meaningful when the slice really answers the catalog the reducer is holding.
-            prop_assume!(slice_request_for(&held).pools == slice_request_for(&catalog(index)).pools);
+            prop_assume!(
+                held.slice_request().pools
+                    == Catalog::parse(&catalog(index), CHAIN).slice_request().pools
+            );
 
-            let reserves = match slice_to_reserves(&response, &held, CHAIN) {
+            let reserves = match held.project(&response) {
                 Ok(reserves) => reserves,
                 Err(_) => return Ok(()),
             };

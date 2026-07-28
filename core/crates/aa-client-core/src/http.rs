@@ -65,7 +65,7 @@ impl DataPlaneClient {
     /// Execute one fetch, returning the [`Event`] the reducer must be fed. Total: any transport,
     /// non-2xx status, body-read, or JSON-parse fault becomes [`Event::FetchFailed`], so the adapter
     /// can never take down the loop. The driver reports *what failed and why*; turning that into a
-    /// typed [`EffectError`] is the reducer's job, so the request kind is written exactly once here.
+    /// typed [`crate::EffectError`] is the reducer's job, so the request kind is written once here.
     pub fn handle(&self, request: FetchRequest) -> Event {
         match request {
             FetchRequest::Meta { id } => match self.get::<PoolsMetaResponse>("/pools/meta") {

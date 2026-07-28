@@ -24,13 +24,13 @@ pub use runtime::{
 };
 pub use state::{
     AppState, AwaitReason, Effect, EffectError, Event, FetchKind, OptimizeStage, Route, Session,
-    SessionConfig, SliceProvenance, Work, slice_request_for, transition,
+    SessionConfig, SliceProvenance, Work, transition,
 };
 
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use aa_wire::{PoolCompleteness, PoolQuery, PoolsMetaResponse, SliceResponse};
+use aa_wire::{PoolCompleteness, PoolQuery, PoolsMetaResponse, SliceRequest, SliceResponse};
 use client_evm::multi_chain_kernel::{PoolReserveProjectionError, pool_reserve_values};
 use client_evm::uniswap_v4::PoolId;
 use client_evm::{
@@ -39,24 +39,16 @@ use client_evm::{
 };
 use optimization::{Invertible, PoolReserves};
 
-/// Why a wire slice could not be projected into optimizer reserves. Every variant is a data fault in
-/// the received payload (or a downstream math failure), never a panic — the adapter is total over
-/// arbitrary input so a malformed server response degrades to a typed error, not a crash.
+/// Why a `/slice` payload could not be projected into optimizer reserves. Both variants are faults in
+/// the *fresh* payload — the static catalog's own faults are settled once, at its boundary, and are
+/// [`CatalogFault`]s instead. Never a panic: [`Catalog::project`] is total over arbitrary input, so a
+/// malformed or version-skewed response degrades to a typed error rather than a crash.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireAdapterError {
-    /// A `0x`-hex field (address, pool id, `sqrt_price_x96`, `liquidity`, or `tick`) did not parse.
+    /// A `0x`-hex slice field (pool address, pool id, `sqrt_price_x96`, `liquidity`, or `tick`) did
+    /// not parse.
     #[error("failed to parse wire field `{field}` value {value:?}")]
     HexParse { field: &'static str, value: String },
-    /// A token's decimals fell outside the supported range.
-    #[error("unsupported token decimals for {address:?}")]
-    Decimals { address: String },
-    /// A pool appeared in the `/slice` response but not in the `/pools/meta` catalog, so its token
-    /// pair and fee are unknown and it cannot be projected.
-    #[error("slice pool {pool:?} has no metadata entry")]
-    UnknownPool { pool: PoolRef },
-    /// A pool references a token whose decimals are absent from the `/pools/meta` token catalog.
-    #[error("pool {pool:?} references token {token:?} with no decimals entry")]
-    UnknownToken { pool: PoolRef, token: Address },
     /// The reused domain projection math (virtual reserves / swap caps / fee) failed for a pool.
     /// Boxed because `PoolReserveProjectionError` embeds a `PoolState` clone, which would otherwise
     /// make every `Result<_, WireAdapterError>` in this module oversized (`clippy::result_large_err`).
@@ -64,112 +56,247 @@ pub enum WireAdapterError {
     Projection(Box<PoolReserveProjectionError>),
 }
 
-/// Maps a deserialized `/slice` state response plus its `/pools/meta` catalog into the optimizer's
-/// input, `Vec<PoolReserves<PoolRef, TokenAddress>>` — the first consumer of the `aa-wire` deserialize
-/// contract and the client-side mirror of the server's domain projection.
+/// Why one `/pools/meta` entry was excluded from a [`Catalog`]. An excluded pool is one this client
+/// cannot project, so it is never requested and never re-diagnosed — the reason is recorded here
+/// once, instead of being rediscovered on every slice for the rest of the process.
 ///
-/// The wire is single-chain (it carries no chain tag), so the caller supplies the `chain` the server
-/// is bound to; every parsed `PoolRef`/`TokenAddress` is stamped with it. The reserve/swap-cap/fee
-/// assembly is not re-implemented here: it delegates to `client_evm::pool_reserve_values`, the same
-/// function the server-side domain path (`pool_reserves_for_optimization`) uses, so the two paths
-/// cannot drift.
+/// A malformed *token* entry has no variant of its own: it simply fails to enter the decimals map,
+/// and surfaces as [`CatalogFault::MissingDecimals`] on each pool that references it — which is the
+/// only way an unreferenced token entry could ever matter.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CatalogFault {
+    /// A `0x`-hex field of a catalog pool entry (its key, `token0`, or `token1`) did not parse.
+    #[error("failed to parse catalog field `{field}` value {value:?}")]
+    HexParse { field: &'static str, value: String },
+    /// The pool references a token with no usable decimals in the catalog's token list — either
+    /// absent (the server lists a pool as soon as its pool registry holds it, before its token
+    /// metadata has necessarily resolved) or present with an out-of-range value.
+    #[error("pool {pool:?} references token {token:?} with no usable decimals entry")]
+    MissingDecimals { pool: PoolRef, token: Address },
+}
+
+/// One pool's fully resolved catalog metadata: exactly the arguments `pool_reserve_values` takes
+/// beyond the pool ref and its state, so projecting a slice does no assembly and no re-parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoolEntry {
+    token0: TokenAddress,
+    token1: TokenAddress,
+    fee: PoolFee,
+    token0_decimals: TokenDecimals,
+    token1_decimals: TokenDecimals,
+}
+
+/// A validated `/pools/meta` payload: the pools this client can actually project, the `/slice`
+/// request that asks for exactly those, and why every other entry was excluded.
 ///
-/// Behaviour mirrors the domain projection: `Incomplete` pools (no frontier state) are skipped; each
-/// projected pool is emitted **twice** — forward and `.inverse()` — so the optimizer sees both swap
-/// directions; and output is sorted by `PoolRef` for deterministic, domain-matching order. The
-/// response's `block_hash`/`confirmations` freshness facts are intentionally not consumed yet.
-pub fn slice_to_reserves(
-    slice: &SliceResponse,
-    meta: &PoolsMetaResponse,
+/// Holding this instead of the raw `PoolsMetaResponse` moves a decision that was being re-derived on
+/// every single slice — parse each token address, validate its decimals, parse each pool key and both
+/// of its token addresses, build two maps — to one pass at the boundary. Projecting a slice then
+/// costs one key parse and one lookup per pool. It also makes "a catalog is held" mean "a usable
+/// catalog is held": an entry that cannot be resolved is excluded *here*, with a reason, rather than
+/// failing later against payloads that are not at fault.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Catalog {
+    /// The chain every parsed `PoolRef`/`TokenAddress` is stamped with. Owned by the catalog rather
+    /// than passed per call, so a slice cannot be projected against a different chain than the
+    /// catalog was built for.
     chain: ChainKey,
-) -> Result<Vec<PoolReserves<PoolRef, TokenAddress>>, WireAdapterError> {
-    // Token address -> validated decimals, from the catalog's token list.
-    let mut decimals = HashMap::with_capacity(meta.tokens.len());
-    for token in &meta.tokens {
-        let address = parse_address(&token.address, "token.address")?;
-        let value = TokenDecimals::try_from_u256(U256::from(token.decimals)).map_err(|_| {
-            WireAdapterError::Decimals {
-                address: token.address.clone(),
-            }
-        })?;
-        decimals.insert(address, value);
-    }
+    pools: HashMap<PoolRef, PoolEntry>,
+    request: SliceRequest,
+    excluded: Vec<CatalogFault>,
+}
 
-    // Domain PoolRef -> (token0, token1, fee), from the catalog's pool list. Keying by the parsed
-    // domain ref (rather than the wire `PoolQuery`) avoids widening the wire DTOs with `Hash`.
-    let mut pool_meta = HashMap::with_capacity(meta.pools.len());
-    for entry in &meta.pools {
-        let pool = pool_ref_of(&entry.key, chain)?;
-        let token0 = TokenAddress(parse_address(&entry.token0, "pool.token0")?, chain);
-        let token1 = TokenAddress(parse_address(&entry.token1, "pool.token1")?, chain);
-        let fee = PoolFee::Static {
-            pips: entry.fee_pips,
-            tick_spacing: entry.tick_spacing,
-        };
-        pool_meta.insert(pool, (token0, token1, fee));
-    }
+impl Catalog {
+    /// Resolves a `/pools/meta` payload. **Total**: every pool entry either lands in the admissible
+    /// set or in [`Catalog::excluded`] with its reason, so an entry can never be silently dropped and
+    /// a corrupt catalog can never panic the engine thread.
+    pub fn parse(meta: &PoolsMetaResponse, chain: ChainKey) -> Catalog {
+        // Token address -> validated decimals. Entries that don't parse or don't validate are simply
+        // absent; the pools that reference them are excluded below, where the pool can be named.
+        let mut decimals = HashMap::with_capacity(meta.tokens.len());
+        for token in &meta.tokens {
+            let (Ok(address), Ok(value)) = (
+                Address::from_str(&token.address),
+                TokenDecimals::try_from_u256(U256::from(token.decimals)),
+            ) else {
+                continue;
+            };
+            decimals.insert(address, value);
+        }
 
-    // Project every pool that resolved to a frontier state; skip the rest.
-    let mut projected = Vec::new();
-    for slice_pool in &slice.pools {
-        let PoolCompleteness::Complete { state } = &slice_pool.state else {
-            continue;
-        };
-        let pool = pool_ref_of(&slice_pool.key, chain)?;
-        let Some(&(token0, token1, fee)) = pool_meta.get(&pool) else {
-            return Err(WireAdapterError::UnknownPool { pool });
-        };
-        let token0_decimals = *decimals
-            .get(&token0.0)
-            .ok_or(WireAdapterError::UnknownToken {
+        let mut pools = HashMap::with_capacity(meta.pools.len());
+        let mut request = Vec::with_capacity(meta.pools.len());
+        let mut excluded = Vec::new();
+        for entry in &meta.pools {
+            // Keyed by the parsed domain ref (rather than the wire `PoolQuery`) so the slice's own
+            // keys are normalized through the same parse before they are looked up.
+            let resolved = pool_ref_of(&entry.key, chain).and_then(|pool| {
+                let token0 = parse_address(&entry.token0, "pool.token0")?;
+                let token1 = parse_address(&entry.token1, "pool.token1")?;
+                Ok((pool, token0, token1))
+            });
+            let (pool, token0, token1) = match resolved {
+                Ok(resolved) => resolved,
+                Err(fault) => {
+                    excluded.push(fault.into());
+                    continue;
+                }
+            };
+            let (Some(&token0_decimals), Some(&token1_decimals)) =
+                (decimals.get(&token0), decimals.get(&token1))
+            else {
+                let token = if decimals.contains_key(&token0) {
+                    token1
+                } else {
+                    token0
+                };
+                excluded.push(CatalogFault::MissingDecimals { pool, token });
+                continue;
+            };
+
+            pools.insert(
                 pool,
-                token: token0.0,
-            })?;
-        let token1_decimals = *decimals
-            .get(&token1.0)
-            .ok_or(WireAdapterError::UnknownToken {
+                PoolEntry {
+                    token0: TokenAddress(token0, chain),
+                    token1: TokenAddress(token1, chain),
+                    fee: PoolFee::Static {
+                        pips: entry.fee_pips,
+                        tick_spacing: entry.tick_spacing,
+                    },
+                    token0_decimals,
+                    token1_decimals,
+                },
+            );
+            request.push(entry.key.clone());
+        }
+
+        Catalog {
+            chain,
+            pools,
+            request: SliceRequest { pools: request },
+            excluded,
+        }
+    }
+
+    /// The prebuilt `POST /slice` request: every admissible pool, and nothing else. Asking only for
+    /// what can be projected is what makes an unprojectable *requested* pool unreachable rather than
+    /// merely untested.
+    pub fn slice_request(&self) -> &SliceRequest {
+        &self.request
+    }
+
+    /// The number of pools this client can project.
+    pub fn len(&self) -> usize {
+        self.pools.len()
+    }
+
+    /// Whether no catalog pool resolved (an empty or wholly unusable payload).
+    pub fn is_empty(&self) -> bool {
+        self.pools.is_empty()
+    }
+
+    /// The catalog entries this client cannot use, and why — a durable, view-renderable record of
+    /// what the server offered but the client dropped.
+    pub fn excluded(&self) -> &[CatalogFault] {
+        &self.excluded
+    }
+
+    /// Maps a deserialized `/slice` state response into the optimizer's input,
+    /// `Vec<PoolReserves<PoolRef, TokenAddress>>` — the client-side mirror of the server's domain
+    /// projection. The reserve/swap-cap/fee assembly is not re-implemented here: it delegates to
+    /// `client_evm::pool_reserve_values`, the same function the server-side domain path
+    /// (`pool_reserves_for_optimization`) uses, so the two paths cannot drift.
+    ///
+    /// A slice pool is projected iff it is `Complete` **and** admissible in this catalog; anything
+    /// else is skipped, costing exactly that pool. A pool absent from the catalog is one the client
+    /// never asked for — the server volunteered it, or the catalog was replaced while the slice was
+    /// in flight — and voiding the whole slice over it would strand every other pool.
+    ///
+    /// Otherwise behaviour mirrors the domain projection: each projected pool is emitted **twice** —
+    /// forward and `.inverse()` — so the optimizer sees both swap directions; and output is sorted by
+    /// `PoolRef` for deterministic, domain-matching order. The response's `block_hash`/`confirmations`
+    /// freshness facts are consumed by the reducer, not here.
+    pub fn project(
+        &self,
+        slice: &SliceResponse,
+    ) -> Result<Vec<PoolReserves<PoolRef, TokenAddress>>, WireAdapterError> {
+        let mut projected = Vec::new();
+        for slice_pool in &slice.pools {
+            let PoolCompleteness::Complete { state } = &slice_pool.state else {
+                continue;
+            };
+            let pool = pool_ref_of(&slice_pool.key, self.chain)?;
+            let Some(entry) = self.pools.get(&pool) else {
+                continue;
+            };
+
+            let pool_state = parse_pool_state(state)?;
+            let value = pool_reserve_values(
                 pool,
-                token: token1.0,
-            })?;
+                &pool_state,
+                entry.fee,
+                entry.token0,
+                entry.token1,
+                entry.token0_decimals,
+                entry.token1_decimals,
+            )
+            .map_err(|source| WireAdapterError::Projection(Box::new(source)))?;
 
-        let pool_state = parse_pool_state(state)?;
-        let value = pool_reserve_values(
-            pool,
-            &pool_state,
-            fee,
-            token0,
-            token1,
-            token0_decimals,
-            token1_decimals,
-        )
-        .map_err(|source| WireAdapterError::Projection(Box::new(source)))?;
+            projected.push(PoolReserves {
+                token0: entry.token0,
+                token1: entry.token1,
+                pool_id: pool,
+                value,
+            });
+        }
 
-        projected.push(PoolReserves {
-            token0,
-            token1,
-            pool_id: pool,
-            value,
-        });
+        // Deterministic, domain-matching order: sort by pool, then emit forward + inverse per pool.
+        projected.sort_by_key(|reserve| reserve.pool_id);
+        let mut reserves = Vec::with_capacity(projected.len() * 2);
+        for reserve in projected {
+            reserves.extend([reserve, reserve.inverse()]);
+        }
+        Ok(reserves)
     }
+}
 
-    // Deterministic, domain-matching order: sort by pool, then emit forward + inverse per pool.
-    projected.sort_by_key(|reserve| reserve.pool_id);
-    let mut reserves = Vec::with_capacity(projected.len() * 2);
-    for reserve in projected {
-        reserves.extend([reserve, reserve.inverse()]);
+/// A `0x`-hex wire field that did not parse — the *only* thing the shared parse helpers can fail
+/// with. Returning this rather than one of the two error enums is what lets the catalog and the slice
+/// share a single parse of a pool key while each names the failure in its own vocabulary, with no
+/// unreachable variant to invent on either side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HexFault {
+    field: &'static str,
+    value: String,
+}
+
+impl From<HexFault> for WireAdapterError {
+    fn from(fault: HexFault) -> WireAdapterError {
+        WireAdapterError::HexParse {
+            field: fault.field,
+            value: fault.value,
+        }
     }
-    Ok(reserves)
+}
+
+impl From<HexFault> for CatalogFault {
+    fn from(fault: HexFault) -> CatalogFault {
+        CatalogFault::HexParse {
+            field: fault.field,
+            value: fault.value,
+        }
+    }
 }
 
 /// Parses a wire `PoolQuery` into its domain `PoolRef` on the given chain.
-fn pool_ref_of(key: &PoolQuery, chain: ChainKey) -> Result<PoolRef, WireAdapterError> {
+fn pool_ref_of(key: &PoolQuery, chain: ChainKey) -> Result<PoolRef, HexFault> {
     match key {
         PoolQuery::UniswapV3 { address } => Ok(PoolRef::uniswap_v3(
             parse_address(address, "pool.address")?,
             chain,
         )),
         PoolQuery::UniswapV4 { pool_id } => {
-            let hash = BlockHash::from_str(pool_id).map_err(|_| WireAdapterError::HexParse {
+            let hash = BlockHash::from_str(pool_id).map_err(|_| HexFault {
                 field: "pool.pool_id",
                 value: pool_id.clone(),
             })?;
@@ -181,21 +308,17 @@ fn pool_ref_of(key: &PoolQuery, chain: ChainKey) -> Result<PoolRef, WireAdapterE
 /// Parses a wire `WirePoolState` into the domain `PoolState`. The two big integers ride as
 /// lowercase, minimal-width `0x`-hex (matching the server's `{:#x}` encoding); `tick` is a plain
 /// `i32` that must fit an `I24`.
-fn parse_pool_state(state: &aa_wire::WirePoolState) -> Result<PoolState, WireAdapterError> {
+fn parse_pool_state(state: &aa_wire::WirePoolState) -> Result<PoolState, HexFault> {
     let sqrt_price_x96 =
-        U160::from_str_radix(strip_0x(&state.sqrt_price_x96), 16).map_err(|_| {
-            WireAdapterError::HexParse {
-                field: "sqrt_price_x96",
-                value: state.sqrt_price_x96.clone(),
-            }
+        U160::from_str_radix(strip_0x(&state.sqrt_price_x96), 16).map_err(|_| HexFault {
+            field: "sqrt_price_x96",
+            value: state.sqrt_price_x96.clone(),
         })?;
-    let liquidity = u128::from_str_radix(strip_0x(&state.liquidity), 16).map_err(|_| {
-        WireAdapterError::HexParse {
-            field: "liquidity",
-            value: state.liquidity.clone(),
-        }
+    let liquidity = u128::from_str_radix(strip_0x(&state.liquidity), 16).map_err(|_| HexFault {
+        field: "liquidity",
+        value: state.liquidity.clone(),
     })?;
-    let tick = client_evm::I24::try_from(state.tick).map_err(|_| WireAdapterError::HexParse {
+    let tick = client_evm::I24::try_from(state.tick).map_err(|_| HexFault {
         field: "tick",
         value: state.tick.to_string(),
     })?;
@@ -207,8 +330,8 @@ fn parse_pool_state(state: &aa_wire::WirePoolState) -> Result<PoolState, WireAda
 }
 
 /// Parses a `0x`-hex 20-byte address, tagging failures with the wire field name for diagnostics.
-fn parse_address(value: &str, field: &'static str) -> Result<Address, WireAdapterError> {
-    Address::from_str(value).map_err(|_| WireAdapterError::HexParse {
+fn parse_address(value: &str, field: &'static str) -> Result<Address, HexFault> {
+    Address::from_str(value).map_err(|_| HexFault {
         field,
         value: value.to_owned(),
     })
@@ -232,6 +355,17 @@ mod tests {
     // Tick-0 price (`2^96`), so `swap_limit_x/y` stay non-underflowing with any tick spacing.
     const SQRT_PRICE_TICK_0: u128 = 79_228_162_514_264_337_593_543_950_336;
     const CHAIN: ChainKey = ChainKey::Ethereum;
+
+    /// Parse-then-project in one call. The projection properties below are about what comes out of a
+    /// slice, not about how the catalog was resolved — the boundary has its own properties — so they
+    /// state the whole wire→reserves path in the one shape they care about.
+    fn slice_to_reserves(
+        slice: &SliceResponse,
+        meta: &PoolsMetaResponse,
+        chain: ChainKey,
+    ) -> Result<Vec<PoolReserves<PoolRef, TokenAddress>>, WireAdapterError> {
+        Catalog::parse(meta, chain).project(slice)
+    }
 
     /// A pool to put on the wire: protocol, identity byte, its token pair, fee facts, liquidity, and
     /// whether `/slice` reports it `Complete`. Deliberately symbolic (small byte indices rather than
@@ -488,13 +622,105 @@ mod tests {
             }
         }
 
-        /// The adapter is **total over arbitrary wire input**: any combination of malformed hex,
-        /// pools missing from the catalog, tokens missing decimals, and out-of-range values yields
-        /// `Ok` or a typed `WireAdapterError` — never a panic. The server is a separate process, so
-        /// a corrupted or version-skewed response is untrusted input; a panic here would take down
-        /// the whole engine thread.
+        /// Every catalog entry is accounted for: admitted into the request, or excluded with a
+        /// reason. This is what makes exclusion a *record* rather than a drop — the client silently
+        /// losing pools the server offered would be indistinguishable from the server not offering
+        /// them, and the catalog is fetched once, so the loss would be permanent.
+        ///
+        /// Both exclusion paths are exercised: a corrupted `token0` cannot parse, and a removed
+        /// token entry leaves the pools referencing it with no decimals.
         #[test]
-        fn projection_is_total_over_arbitrary_wire_input(
+        fn every_catalog_entry_is_either_requested_or_recorded(
+            (_pools, _decimals, _slice, mut meta) in generated_catalog(),
+            corrupted in prop::collection::vec(any::<bool>(), 0..10),
+            dropped in 0u8..8,
+        ) {
+            for (entry, corrupt) in meta.pools.iter_mut().zip(&corrupted) {
+                if *corrupt {
+                    entry.token0 = "0xnot-hex".to_owned();
+                }
+            }
+            meta.tokens.retain(|token| token.address != format!("{:#x}", addr(dropped)));
+
+            let catalog = Catalog::parse(&meta, CHAIN);
+
+            prop_assert_eq!(
+                catalog.slice_request().pools.len() + catalog.excluded().len(),
+                meta.pools.len()
+            );
+        }
+
+        /// Everything the catalog asks the server for is something it can project, and every pool it
+        /// admitted is asked for exactly once. Together these are why a requested-but-unprojectable
+        /// pool is unreachable rather than merely unobserved: the request is built from the resolved
+        /// set, so the reserve set can have no hole where a pool was fetched and then dropped.
+        #[test]
+        fn every_requested_pool_is_one_the_catalog_can_project(
+            (_pools, _decimals, _slice, meta) in generated_catalog(),
+        ) {
+            let catalog = Catalog::parse(&meta, CHAIN);
+            // Answer the catalog's own request, with every pool complete.
+            let slice = SliceResponse {
+                block_hash: format!("{:#x}", pool_id(0)),
+                confirmations: 0,
+                pools: catalog
+                    .slice_request()
+                    .pools
+                    .iter()
+                    .cloned()
+                    .map(|key| PoolSlice {
+                        key,
+                        state: PoolCompleteness::Complete { state: wire_state(&sample_state()) },
+                    })
+                    .collect(),
+            };
+
+            let reserves = catalog.project(&slice).expect("the catalog's own pools project");
+
+            prop_assert_eq!(
+                catalog.slice_request().pools.len(),
+                catalog.len(),
+                "an admissible pool must be requested exactly once"
+            );
+            prop_assert_eq!(
+                reserves.len(),
+                catalog.len() * 2,
+                "a requested pool that does not project would be a hole in the reserve set"
+            );
+        }
+
+        /// A catalog entry the client cannot resolve costs exactly that pool, never the slice. The
+        /// server lists a pool as soon as its pool registry holds it but renders `tokens` from the
+        /// tokens whose metadata it has, so a pool that outran its token metadata is an ordinary
+        /// catalog — and the client fetches `/pools/meta` exactly once. Failing the whole slice over
+        /// one such pool would mean recording a fault every poll and never optimizing at all.
+        #[test]
+        fn a_pool_with_unresolvable_metadata_does_not_void_the_others(
+            (pools, _decimals, slice, mut meta) in generated_catalog(),
+            dropped in 0u8..8,
+        ) {
+            // Exactly the shape a warming-up server emits: the pool stays listed, its token doesn't.
+            meta.tokens.retain(|token| token.address != format!("{:#x}", addr(dropped)));
+
+            let reserves = slice_to_reserves(&slice, &meta, CHAIN)
+                .expect("a partial catalog still projects");
+
+            let projectable = pools
+                .iter()
+                .filter(|pool| pool.complete && pool.token0 != dropped && pool.token1 != dropped)
+                .count();
+            prop_assert_eq!(reserves.len(), projectable * 2);
+        }
+
+        /// **Both stages are total over arbitrary wire input**: any combination of malformed hex,
+        /// pools missing from the catalog, tokens missing decimals, and out-of-range values yields a
+        /// `Catalog` (never a failure — every entry is admitted or recorded) and then `Ok` or a typed
+        /// `WireAdapterError` — never a panic. The server is a separate process, so a corrupted or
+        /// version-skewed response is untrusted input; a panic here would take down the whole engine
+        /// thread. The accounting law is asserted here too, in the regime where nearly every entry is
+        /// excluded, as the counterpart to the mixed regime above.
+        #[test]
+        fn parse_and_projection_are_total_over_arbitrary_wire_input(
             block_hash in "[0-9a-fx]{0,70}",
             pool_keys in prop::collection::vec("(0x)?[0-9a-zA-Z]{0,66}", 0..6),
             meta_keys in prop::collection::vec("(0x)?[0-9a-zA-Z]{0,66}", 0..6),
@@ -543,8 +769,13 @@ mod tests {
                     .collect(),
             };
 
-            // The assertion *is* that this returns rather than unwinding.
-            let _ = slice_to_reserves(&slice, &meta, CHAIN);
+            // The assertion *is* that these return rather than unwinding.
+            let catalog = Catalog::parse(&meta, CHAIN);
+            prop_assert_eq!(
+                catalog.slice_request().pools.len() + catalog.excluded().len(),
+                meta.pools.len()
+            );
+            let _ = catalog.project(&slice);
         }
     }
 
@@ -704,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_when_slice_pool_missing_from_meta() {
+    fn skips_slice_pool_missing_from_meta() {
         let key = PoolQuery::UniswapV3 {
             address: format!("{:#x}", addr(9)),
         };
@@ -723,16 +954,11 @@ mod tests {
             tokens: vec![],
         };
 
-        assert_eq!(
-            slice_to_reserves(&slice, &meta, CHAIN),
-            Err(WireAdapterError::UnknownPool {
-                pool: PoolRef::uniswap_v3(addr(9), CHAIN),
-            })
-        );
+        assert_eq!(slice_to_reserves(&slice, &meta, CHAIN), Ok(vec![]));
     }
 
     #[test]
-    fn errors_when_pool_token_decimals_absent() {
+    fn skips_pool_whose_token_decimals_are_absent() {
         let key = PoolQuery::UniswapV3 {
             address: format!("{:#x}", addr(9)),
         };
@@ -761,13 +987,7 @@ mod tests {
             }],
         };
 
-        assert_eq!(
-            slice_to_reserves(&slice, &meta, CHAIN),
-            Err(WireAdapterError::UnknownToken {
-                pool: PoolRef::uniswap_v3(addr(9), CHAIN),
-                token: addr(2),
-            })
-        );
+        assert_eq!(slice_to_reserves(&slice, &meta, CHAIN), Ok(vec![]));
     }
 
     #[test]
