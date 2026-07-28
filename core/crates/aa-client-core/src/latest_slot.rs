@@ -162,7 +162,90 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        /// **The** coalescing contract, over any burst: after a run of sends the slot yields exactly
+        /// the last value and is then empty. Nothing queues behind it, whatever the burst length —
+        /// which is what stops a fast poll loop from building the optimizer a backlog of stale
+        /// reserves to grind through.
+        #[test]
+        fn a_burst_of_sends_leaves_exactly_the_last_value(values in prop::collection::vec(any::<i32>(), 1..64)) {
+            let (sender, receiver) = latest_slot();
+            for value in &values {
+                prop_assert_eq!(sender.send(*value), Ok(()));
+            }
+
+            let last = values.last().copied();
+            prop_assert_eq!(receiver.try_take(), Ok(last));
+            prop_assert_eq!(receiver.try_take(), Ok(None), "nothing may queue behind the latest value");
+        }
+
+        /// Interleaving sends and takes never invents, duplicates, or reorders a value: every value
+        /// a take produces was sent, they come out in send order, and each take consumes exactly one.
+        /// Coalescing may *drop* values (that is the point) but may never corrupt the ones it keeps.
+        #[test]
+        fn takes_yield_a_subsequence_of_what_was_sent(
+            script in prop::collection::vec(prop_oneof![
+                any::<i32>().prop_map(Some),
+                Just(None),
+            ], 0..64),
+        ) {
+            let (sender, receiver) = latest_slot();
+            let mut sent = Vec::new();
+            let mut taken = Vec::new();
+
+            for step in &script {
+                match step {
+                    // `Some(v)` is a send, `None` is a take.
+                    Some(value) => {
+                        prop_assert_eq!(sender.send(*value), Ok(()));
+                        sent.push(*value);
+                    }
+                    None => {
+                        if let Ok(Some(value)) = receiver.try_take() {
+                            taken.push(value);
+                        }
+                    }
+                }
+            }
+
+            // Every taken value was sent, in order, without repetition: `taken` is a subsequence.
+            let mut remaining = sent.iter();
+            for value in &taken {
+                prop_assert!(
+                    remaining.any(|sent_value| sent_value == value),
+                    "take produced {:?}, which is not a later value of the send sequence {:?}",
+                    value,
+                    sent
+                );
+            }
+        }
+
+        /// Closing is terminal and total from either side: after the sender is dropped, every send
+        /// is refused and — once the slot has been drained — every take reports `Closed`, forever.
+        /// This is what lets the worker's `try_take`/`wait_take` double as the shutdown signal.
+        #[test]
+        fn a_closed_slot_stays_closed(values in prop::collection::vec(any::<i32>(), 0..16), takes in 1usize..8) {
+            let (sender, receiver) = latest_slot();
+            for value in &values {
+                prop_assert_eq!(sender.send(*value), Ok(()));
+            }
+            drop(sender);
+
+            // A pending value survives the close and is still delivered exactly once.
+            if !values.is_empty() {
+                prop_assert_eq!(receiver.try_take(), Ok(values.last().copied()));
+            }
+            // Thereafter every take — however many — reports Closed, never a spurious value.
+            for _ in 0..takes {
+                prop_assert_eq!(receiver.try_take(), Err(LatestReceiveError::Closed));
+                prop_assert_eq!(receiver.wait_take(), Err(LatestReceiveError::Closed));
+            }
+        }
+    }
 
     #[test]
     fn wait_take_returns_sent_value() {

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 791515d5608685f5d36b20c4a265ba377e4a52f828bf8758da845cecb63b3501 # shrinks to events = [Tick, MetaFetched { id: Current, catalog: 0 }, SetRoute { source: 0, output: 0 }, SliceFetched { id: Current, catalog: 0, block: 0, complete: true }], kind = Meta, raw = 0, failure = false
+cc 6c4c7ffb669355619a8298fa7224692b5973b20157c8426432bdb920c201225e # shrinks to events = [Tick, MetaFetched { id: Current, catalog: 1 }, SliceFetched { id: Current, catalog: 0, block: 0, complete: true }], index = 0, block = 0
+cc 81104a438e829ea9a72d1f4437cb5a541154f822ac5cfbccc1c08d003dcf9412 # shrinks to events = [Tick, MetaFetched { id: Current, catalog: 2 }, SetRoute { source: 0, output: 0 }, SliceFetched { id: Current, catalog: 0, block: 0, complete: true }], source = 0, output = 0
+cc 5f9e2ec2a2ccc3cf3f7e1d7a6c9bf4cc3f429635b7872dca1f682b1266960d51 # shrinks to events = [Tick, SetRoute { source: 0, output: 0 }, MetaFetched { id: Current, catalog: 0 }, SliceFetched { id: Current, catalog: 0, block: 0, complete: true }]

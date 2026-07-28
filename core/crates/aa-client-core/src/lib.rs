@@ -225,12 +225,322 @@ fn strip_0x(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use aa_wire::{PoolMetaEntry, PoolSlice, TokenMetaEntry, WirePoolState};
+    use proptest::prelude::*;
 
     use super::*;
 
     // Tick-0 price (`2^96`), so `swap_limit_x/y` stay non-underflowing with any tick spacing.
     const SQRT_PRICE_TICK_0: u128 = 79_228_162_514_264_337_593_543_950_336;
     const CHAIN: ChainKey = ChainKey::Ethereum;
+
+    /// A pool to put on the wire: protocol, identity byte, its token pair, fee facts, liquidity, and
+    /// whether `/slice` reports it `Complete`. Deliberately symbolic (small byte indices rather than
+    /// raw addresses) so proptest shrinks to a readable counterexample — the kernel's
+    /// `GeneratedEvent` uses the same trick.
+    ///
+    /// The price is pinned at the tick-0 boundary (`2^96`) and only *liquidity* varies, exactly as
+    /// the server-side `pool_reserves_projection_emits_two_finite_directional_entries_per_pool`
+    /// property does with `balanced_pool_state`: an arbitrary `(sqrt_price, tick)` pair is not
+    /// generally self-consistent, and `sqrt_price_at_tick` is not exported from `client-evm`.
+    #[derive(Clone, Copy, Debug)]
+    struct GeneratedPool {
+        uniswap_v4: bool,
+        key_byte: u8,
+        token0: u8,
+        token1: u8,
+        fee_pips: u32,
+        tick_spacing: u16,
+        liquidity: u128,
+        complete: bool,
+    }
+
+    impl GeneratedPool {
+        fn key(&self) -> PoolQuery {
+            if self.uniswap_v4 {
+                PoolQuery::UniswapV4 {
+                    pool_id: format!("{:#x}", pool_id(self.key_byte)),
+                }
+            } else {
+                PoolQuery::UniswapV3 {
+                    address: format!("{:#x}", addr(self.key_byte)),
+                }
+            }
+        }
+
+        fn pool_ref(&self) -> PoolRef {
+            if self.uniswap_v4 {
+                PoolRef::uniswap_v4(PoolId(pool_id(self.key_byte)), CHAIN)
+            } else {
+                PoolRef::uniswap_v3(addr(self.key_byte), CHAIN)
+            }
+        }
+
+        fn state(&self) -> PoolState {
+            PoolState {
+                sqrt_price_x96: U160::from(SQRT_PRICE_TICK_0),
+                tick: client_evm::I24::ZERO,
+                liquidity: self.liquidity,
+            }
+        }
+
+        fn fee(&self) -> PoolFee {
+            PoolFee::Static {
+                pips: self.fee_pips,
+                tick_spacing: self.tick_spacing,
+            }
+        }
+    }
+
+    fn generated_pool() -> impl Strategy<Value = GeneratedPool> {
+        (
+            any::<bool>(),
+            0u8..12,
+            0u8..6,
+            0u8..6,
+            prop_oneof![Just(100u32), Just(500), Just(3000), Just(10_000)],
+            prop_oneof![Just(1u16), Just(10), Just(60), Just(200)],
+            1u128..1_000_000_000_000_000_000_000,
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    uniswap_v4,
+                    key_byte,
+                    token0,
+                    token1,
+                    fee_pips,
+                    tick_spacing,
+                    liquidity,
+                    complete,
+                )| GeneratedPool {
+                    uniswap_v4,
+                    key_byte,
+                    // A pool over one token twice is a degenerate pair the catalog never emits.
+                    token0,
+                    token1: if token1 == token0 { token0 + 1 } else { token1 },
+                    fee_pips,
+                    tick_spacing,
+                    liquidity,
+                    complete,
+                },
+            )
+    }
+
+    /// A catalog and a matching slice for a set of pools whose `(protocol, key_byte)` identities are
+    /// unique — the catalog is a map keyed by pool, so duplicates are not a shape the server emits.
+    fn generated_catalog()
+    -> impl Strategy<Value = (Vec<GeneratedPool>, Vec<u8>, SliceResponse, PoolsMetaResponse)> {
+        (
+            prop::collection::vec(generated_pool(), 0..10),
+            // Decimals for token bytes 0..7; `TokenDecimals` accepts the usual ERC-20 range.
+            prop::collection::vec(0u8..=18, 8),
+            any::<u8>(),
+            any::<u64>(),
+        )
+            .prop_map(|(pools, decimals, block, confirmations)| {
+                let mut seen = std::collections::HashSet::new();
+                let pools = pools
+                    .into_iter()
+                    .filter(|pool| seen.insert((pool.uniswap_v4, pool.key_byte)))
+                    .collect::<Vec<_>>();
+
+                let slice = SliceResponse {
+                    block_hash: format!("{:#x}", pool_id(block)),
+                    confirmations,
+                    pools: pools
+                        .iter()
+                        .map(|pool| PoolSlice {
+                            key: pool.key(),
+                            state: if pool.complete {
+                                PoolCompleteness::Complete {
+                                    state: wire_state(&pool.state()),
+                                }
+                            } else {
+                                PoolCompleteness::Incomplete
+                            },
+                        })
+                        .collect(),
+                };
+                let meta = PoolsMetaResponse {
+                    pools: pools
+                        .iter()
+                        .map(|pool| PoolMetaEntry {
+                            key: pool.key(),
+                            token0: format!("{:#x}", addr(pool.token0)),
+                            token1: format!("{:#x}", addr(pool.token1)),
+                            fee_pips: pool.fee_pips,
+                            tick_spacing: pool.tick_spacing,
+                        })
+                        .collect(),
+                    // Every token byte a pool can reference (0..=6, after the `token0 + 1` bump).
+                    tokens: (0u8..8)
+                        .map(|byte| TokenMetaEntry {
+                            address: format!("{:#x}", addr(byte)),
+                            decimals: decimals.get(usize::from(byte)).copied().unwrap_or(18),
+                        })
+                        .collect(),
+                };
+
+                (pools, decimals, slice, meta)
+            })
+    }
+
+    proptest! {
+        /// The projection's shape contract, over any catalog: exactly two entries per *complete*
+        /// pool (incomplete ones contribute nothing), ordered by `PoolRef`, and each adjacent pair
+        /// is a pool and its own inverse. The optimizer relies on all three — it indexes reserves
+        /// positionally and needs both swap directions present for every pool.
+        ///
+        /// This is the client-side twin of `client-evm`'s
+        /// `pool_reserves_projection_emits_two_finite_directional_entries_per_pool`.
+        #[test]
+        fn projection_emits_two_sorted_directional_entries_per_complete_pool(
+            (pools, _decimals, slice, meta) in generated_catalog(),
+        ) {
+            let reserves = slice_to_reserves(&slice, &meta, CHAIN).expect("a valid catalog projects");
+
+            let complete = pools.iter().filter(|pool| pool.complete).count();
+            prop_assert_eq!(reserves.len(), complete * 2);
+
+            // Sorted by pool, with each pool's inverse immediately after it.
+            for pair in reserves.chunks(2) {
+                let [forward, inverse] = pair else {
+                    prop_assert!(false, "reserves must come in directional pairs");
+                    return Ok(());
+                };
+                prop_assert_eq!(inverse, &forward.inverse());
+                prop_assert_eq!(forward.pool_id, inverse.pool_id);
+            }
+            let order = reserves
+                .iter()
+                .step_by(2)
+                .map(|reserve| reserve.pool_id)
+                .collect::<Vec<_>>();
+            let mut sorted = order.clone();
+            sorted.sort();
+            prop_assert_eq!(order, sorted, "pools must be emitted in PoolRef order");
+        }
+
+        /// Every projected value is finite and in range — no NaN, no infinity, no negative reserve
+        /// or swap cap, and a fee multiplier in `(0, 1]`. The optimizer packs these straight into
+        /// tensors, where a NaN would silently poison the whole model rather than fail loudly.
+        /// Same value-domain pin as the server-side projection property.
+        #[test]
+        fn projected_values_are_finite_and_in_range(
+            (_pools, _decimals, slice, meta) in generated_catalog(),
+        ) {
+            let reserves = slice_to_reserves(&slice, &meta, CHAIN).expect("a valid catalog projects");
+
+            for reserve in &reserves {
+                let value = reserve.value;
+                prop_assert!(value.token_0.is_finite() && value.token_0 >= 0.0);
+                prop_assert!(value.token_1.is_finite() && value.token_1 >= 0.0);
+                prop_assert!(value.max_swap_0.is_finite() && value.max_swap_0 >= 0.0);
+                prop_assert!(value.max_swap_1.is_finite() && value.max_swap_1 >= 0.0);
+                prop_assert!(value.fee_multiplier > 0.0 && value.fee_multiplier <= 1.0);
+            }
+        }
+
+        /// Parity with the domain projection, over any catalog. `slice_to_reserves`' contract is
+        /// that it re-uses `client_evm::pool_reserve_values` rather than re-implementing the math,
+        /// "so the two paths cannot drift" — this is that claim as an executable oracle, covering
+        /// every generated fee tier, decimals pair, liquidity, and protocol rather than the single
+        /// hand-written fixture. It also proves the hex round-trip recovers the exact input state.
+        #[test]
+        fn projection_matches_the_domain_math_pool_for_pool(
+            (pools, decimals, slice, meta) in generated_catalog(),
+        ) {
+            let reserves = slice_to_reserves(&slice, &meta, CHAIN).expect("a valid catalog projects");
+
+            for pool in pools.iter().filter(|pool| pool.complete) {
+                let entry = reserves
+                    .iter()
+                    .find(|reserve| {
+                        reserve.pool_id == pool.pool_ref()
+                            && reserve.token0 == TokenAddress(addr(pool.token0), CHAIN)
+                    })
+                    .expect("every complete pool has a forward entry");
+
+                let decimals_of = |byte: u8| {
+                    TokenDecimals::try_from_u256(U256::from(
+                        decimals.get(usize::from(byte)).copied().unwrap_or(18),
+                    ))
+                    .expect("generated decimals are in range")
+                };
+                let expected = pool_reserve_values(
+                    pool.pool_ref(),
+                    &pool.state(),
+                    pool.fee(),
+                    TokenAddress(addr(pool.token0), CHAIN),
+                    TokenAddress(addr(pool.token1), CHAIN),
+                    decimals_of(pool.token0),
+                    decimals_of(pool.token1),
+                )
+                .expect("the domain projection succeeds on the same inputs");
+
+                prop_assert_eq!(entry.value, expected);
+            }
+        }
+
+        /// The adapter is **total over arbitrary wire input**: any combination of malformed hex,
+        /// pools missing from the catalog, tokens missing decimals, and out-of-range values yields
+        /// `Ok` or a typed `WireAdapterError` — never a panic. The server is a separate process, so
+        /// a corrupted or version-skewed response is untrusted input; a panic here would take down
+        /// the whole engine thread.
+        #[test]
+        fn projection_is_total_over_arbitrary_wire_input(
+            block_hash in "[0-9a-fx]{0,70}",
+            pool_keys in prop::collection::vec("(0x)?[0-9a-zA-Z]{0,66}", 0..6),
+            meta_keys in prop::collection::vec("(0x)?[0-9a-zA-Z]{0,66}", 0..6),
+            sqrt_prices in prop::collection::vec("(0x)?[0-9a-zA-Z]{0,50}", 0..6),
+            liquidities in prop::collection::vec("(0x)?[0-9a-zA-Z]{0,40}", 0..6),
+            ticks in prop::collection::vec(any::<i32>(), 0..6),
+            token_decimals in prop::collection::vec(any::<u8>(), 0..6),
+            confirmations in any::<u64>(),
+        ) {
+            let slice = SliceResponse {
+                block_hash,
+                confirmations,
+                pools: pool_keys
+                    .iter()
+                    .enumerate()
+                    .map(|(index, address)| PoolSlice {
+                        key: PoolQuery::UniswapV3 { address: address.clone() },
+                        state: PoolCompleteness::Complete {
+                            state: WirePoolState {
+                                sqrt_price_x96: sqrt_prices.get(index).cloned().unwrap_or_default(),
+                                tick: ticks.get(index).copied().unwrap_or_default(),
+                                liquidity: liquidities.get(index).cloned().unwrap_or_default(),
+                            },
+                        },
+                    })
+                    .collect(),
+            };
+            let meta = PoolsMetaResponse {
+                pools: meta_keys
+                    .iter()
+                    .map(|address| PoolMetaEntry {
+                        key: PoolQuery::UniswapV3 { address: address.clone() },
+                        token0: address.clone(),
+                        token1: address.clone(),
+                        fee_pips: 3000,
+                        tick_spacing: 60,
+                    })
+                    .collect(),
+                tokens: token_decimals
+                    .iter()
+                    .enumerate()
+                    .map(|(index, decimals)| TokenMetaEntry {
+                        address: format!("{:#x}", addr(index as u8)),
+                        decimals: *decimals,
+                    })
+                    .collect(),
+            };
+
+            // The assertion *is* that this returns rather than unwinding.
+            let _ = slice_to_reserves(&slice, &meta, CHAIN);
+        }
+    }
 
     fn addr(byte: u8) -> Address {
         Address::from([byte; 20])

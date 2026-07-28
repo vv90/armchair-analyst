@@ -766,6 +766,7 @@ mod tests {
         PoolCompleteness, PoolMetaEntry, PoolQuery, PoolSlice, TokenMetaEntry, WirePoolState,
     };
     use optimization::OptimizationStepStatus;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -965,6 +966,575 @@ mod tests {
         config.optimization.source_asset = TokenAddress(addr(source), CHAIN);
         config.optimization.output_asset = TokenAddress(addr(output), CHAIN);
         config
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Property-based coverage of the reducer.
+    //
+    // Shape borrowed from `client-evm`'s kernel tests: a *symbolic* event enum with small index
+    // fields (so proptest shrinks to a readable counterexample), a bounded random event sequence,
+    // and an `assert_state_invariants` helper applied after **every** transition rather than only
+    // at the end of a run. The invariants are the design claims this module's doc comments make —
+    // route single-ownership, the productivity gate, effect/ledger correlation — turned into
+    // executable checks over arbitrary histories.
+    // ----------------------------------------------------------------------------------------
+
+    /// Which [`FetchId`] a generated response carries. `Current` is the id the ledger most recently
+    /// issued for that kind (a timely response); `Raw` is an arbitrary one (superseded, forged, or
+    /// simply late). Drawn from the same small range the ledger mints from so collisions are real.
+    #[derive(Clone, Copy, Debug)]
+    enum IdChoice {
+        Current,
+        Raw(u64),
+    }
+
+    /// A symbolic event. Catalogs and slices are chosen by small index rather than generated
+    /// wholesale, so the sequence explores *reducer* behaviour (ordering, gating, phase transitions)
+    /// rather than re-testing the wire adapter, which has its own properties in `lib.rs`.
+    #[derive(Clone, Copy, Debug)]
+    enum GeneratedEvent {
+        Tick,
+        MetaFetched { id: IdChoice, catalog: u8 },
+        SliceFetched { id: IdChoice, catalog: u8, block: u8, complete: bool },
+        HealthFetched { id: IdChoice },
+        FetchFailed { id: IdChoice, kind: FetchKind },
+        OptimizerStepped { output_amount: u8 },
+        EffectFailed,
+        SetRoute { source: u8, output: u8 },
+    }
+
+    fn id_choice() -> impl Strategy<Value = IdChoice> {
+        prop_oneof![
+            // Weighted towards `Current`: a run made only of rejected ids would never get past
+            // bootstrap, so the interesting states would be unreachable.
+            3 => Just(IdChoice::Current),
+            1 => (0u64..24).prop_map(IdChoice::Raw),
+        ]
+    }
+
+    fn fetch_kind() -> impl Strategy<Value = FetchKind> {
+        prop_oneof![
+            Just(FetchKind::Meta),
+            Just(FetchKind::Health),
+            Just(FetchKind::Slice),
+        ]
+    }
+
+    fn generated_event() -> impl Strategy<Value = GeneratedEvent> {
+        prop_oneof![
+            3 => Just(GeneratedEvent::Tick),
+            2 => (id_choice(), 0u8..CATALOG_COUNT)
+                .prop_map(|(id, catalog)| GeneratedEvent::MetaFetched { id, catalog }),
+            4 => (id_choice(), 0u8..CATALOG_COUNT, any::<u8>(), any::<bool>())
+                .prop_map(|(id, catalog, block, complete)| GeneratedEvent::SliceFetched {
+                    id,
+                    catalog,
+                    block,
+                    complete,
+                }),
+            1 => id_choice().prop_map(|id| GeneratedEvent::HealthFetched { id }),
+            1 => (id_choice(), fetch_kind())
+                .prop_map(|(id, kind)| GeneratedEvent::FetchFailed { id, kind }),
+            2 => any::<u8>().prop_map(|output_amount| GeneratedEvent::OptimizerStepped { output_amount }),
+            1 => Just(GeneratedEvent::EffectFailed),
+            2 => (0u8..TOKEN_COUNT, 0u8..TOKEN_COUNT)
+                .prop_map(|(source, output)| GeneratedEvent::SetRoute { source, output }),
+        ]
+    }
+
+    fn generated_event_sequence() -> impl Strategy<Value = Vec<GeneratedEvent>> {
+        prop::collection::vec(generated_event(), 0..80)
+    }
+
+    /// Token bytes a generated route may name: `1..=4`. `1` and `2` are the tokens the catalogs are
+    /// built over, so some routes are servable and others deliberately are not.
+    const TOKEN_COUNT: u8 = 5;
+    /// How many distinct catalogs the generator can serve.
+    const CATALOG_COUNT: u8 = 3;
+
+    /// The catalog for a generated index. Deliberately a small fixed set spanning the three cases
+    /// that matter to the reducer: a pool pair covering the default route, one covering nothing the
+    /// default route names, and a two-pool catalog (so a slice request carries more than one entry).
+    fn catalog(index: u8) -> PoolsMetaResponse {
+        match index % CATALOG_COUNT {
+            0 => meta_over(1, 2),
+            1 => meta_over(3, 4),
+            _ => PoolsMetaResponse {
+                pools: vec![
+                    PoolMetaEntry {
+                        key: v3_key(9),
+                        token0: format!("{:#x}", addr(1)),
+                        token1: format!("{:#x}", addr(2)),
+                        fee_pips: 3000,
+                        tick_spacing: 60,
+                    },
+                    PoolMetaEntry {
+                        key: v3_key(10),
+                        token0: format!("{:#x}", addr(2)),
+                        token1: format!("{:#x}", addr(3)),
+                        fee_pips: 500,
+                        tick_spacing: 10,
+                    },
+                ],
+                tokens: (1u8..=4)
+                    .map(|byte| TokenMetaEntry {
+                        address: format!("{:#x}", addr(byte)),
+                        decimals: 18,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// A slice answering `catalog(index)`: every pool of that catalog, all `Complete` or all
+    /// `Incomplete`, at the given block.
+    fn slice_for(index: u8, block: u8, complete: bool) -> SliceResponse {
+        SliceResponse {
+            block_hash: format!("{:#x}", hash(block)),
+            confirmations: u64::from(block),
+            pools: catalog(index)
+                .pools
+                .into_iter()
+                .map(|entry| PoolSlice {
+                    key: entry.key,
+                    state: if complete {
+                        PoolCompleteness::Complete {
+                            state: wire_state(),
+                        }
+                    } else {
+                        PoolCompleteness::Incomplete
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// The fetch kind an effect requests, if it is a fetch.
+    fn effect_kind(effect: &Effect) -> Option<(FetchKind, FetchId)> {
+        match effect {
+            Effect::FetchMeta { id } => Some((FetchKind::Meta, *id)),
+            Effect::FetchHealth { id } => Some((FetchKind::Health, *id)),
+            Effect::FetchSlice { id, .. } => Some((FetchKind::Slice, *id)),
+            Effect::PushReserves { .. } => None,
+        }
+    }
+
+    /// Every invariant the reducer must maintain, asserted after a single transition against the
+    /// state it produced and the effects it emitted. Returns a message on the first violation.
+    fn check_invariants(state: &AppState, effects: &[Effect]) -> Result<(), String> {
+        // (1) The session chain is stamped on the route. `Route` carries bare `Address`es precisely
+        // so a foreign-chain route is unrepresentable; a route tagged with another chain would match
+        // no reserve and silently starve the optimizer forever.
+        let route = &state.config.optimization;
+        if route.source_asset.1 != state.config.chain || route.output_asset.1 != state.config.chain {
+            return Err(format!(
+                "route {route:?} is not stamped with the session chain {:?}",
+                state.config.chain
+            ));
+        }
+
+        // (2) Every emitted fetch is recorded as pending work under its own id — the client-side
+        // analogue of the kernel's `assert_effects_are_well_formed`. A fetch effect whose id the
+        // ledger does not hold would have its response rejected on arrival, stalling that kind
+        // until the TTL; one recorded under the wrong kind would free the wrong slot.
+        for effect in effects {
+            if let Some((kind, id)) = effect_kind(effect)
+                && !state.pending.clone().accept(kind, id)
+            {
+                return Err(format!("emitted {effect:?} is not recorded as pending {kind:?}"));
+            }
+        }
+
+        // (3) At most one fetch per kind per transition: two concurrent requests of a kind would
+        // race, and only one could ever be accepted (the ledger holds a single slot).
+        for kind in [FetchKind::Meta, FetchKind::Health, FetchKind::Slice] {
+            let issued = effects
+                .iter()
+                .filter(|effect| effect_kind(effect).map(|(k, _)| k) == Some(kind))
+                .count();
+            if issued > 1 {
+                return Err(format!("{issued} concurrent {kind:?} fetches in one transition"));
+            }
+        }
+
+        for effect in effects {
+            if let Effect::PushReserves { reserves, session } = effect {
+                // (4) `AppState` is the single owner of the route: a pushed snapshot always carries
+                // the route currently in force. A snapshot describing a stale route would make the
+                // worker keep optimizing the pair the user just navigated away from.
+                if session != &state.config.optimization {
+                    return Err(format!(
+                        "pushed session {session:?} disagrees with the config's {:?}",
+                        state.config.optimization
+                    ));
+                }
+                // (5) The productivity gate holds at the push, not just at the call site. An
+                // unproductive snapshot aborts `OptimizationRunner::init` — which is fatal to the
+                // worker thread, and *nothing restarts it* — so this is a liveness invariant, not a
+                // tidiness one.
+                if reserves.is_empty() || !reserves_reach_route(reserves, session) {
+                    return Err("pushed reserves do not cover the route they were gated for".into());
+                }
+            }
+        }
+
+        // (6) A slice is only ever requested for the catalog currently held, and asks for exactly
+        // its pools — the request cannot drift from the catalog its response will be projected
+        // against, which is what makes `UnknownPool` unreachable in practice.
+        for effect in effects {
+            if let Effect::FetchSlice { request, .. } = effect {
+                match meta_of(&state.phase) {
+                    Some(meta) => {
+                        if request.pools != slice_request_for(meta).pools {
+                            return Err("slice request does not match the held catalog".into());
+                        }
+                    }
+                    None => return Err("slice requested with no catalog to project it against".into()),
+                }
+            }
+        }
+
+        // (7) `NoRoute` is a verdict about a projected slice, so it is only reachable once a catalog
+        // exists to project one against.
+        if let Phase::AwaitingFirstSlice {
+            meta: None,
+            status: AwaitStatus::NoRoute,
+            ..
+        } = &state.phase
+        {
+            return Err("NoRoute recorded without a catalog".into());
+        }
+
+        Ok(())
+    }
+
+    /// Folds a symbolic event sequence through the reducer, resolving `IdChoice::Current` against
+    /// the ids the reducer actually issued (exactly as a real driver echoes them back) and checking
+    /// every invariant after each step. Returns the final state.
+    fn drive(
+        config: SessionConfig,
+        events: &[GeneratedEvent],
+    ) -> Result<AppState, TestCaseError> {
+        let mut state = AppState::started(config);
+        // The most recent id issued per kind, learned from the effects — the driver's own view.
+        let mut live: Vec<(FetchKind, FetchId)> = Vec::new();
+        let resolve = |live: &[(FetchKind, FetchId)], kind: FetchKind, choice: IdChoice| match choice
+        {
+            IdChoice::Raw(raw) => FetchId::from_raw_for_test(raw),
+            IdChoice::Current => live
+                .iter()
+                .find(|(held, _)| *held == kind)
+                .map(|(_, id)| *id)
+                .unwrap_or_else(|| FetchId::from_raw_for_test(u64::MAX)),
+        };
+
+        for generated in events {
+            let event = match *generated {
+                GeneratedEvent::Tick => Event::Tick,
+                GeneratedEvent::MetaFetched { id, catalog: index } => Event::MetaFetched {
+                    id: resolve(&live, FetchKind::Meta, id),
+                    response: catalog(index),
+                },
+                GeneratedEvent::SliceFetched {
+                    id,
+                    catalog: index,
+                    block,
+                    complete,
+                } => Event::SliceFetched {
+                    id: resolve(&live, FetchKind::Slice, id),
+                    response: slice_for(index, block, complete),
+                },
+                GeneratedEvent::HealthFetched { id } => Event::HealthFetched {
+                    id: resolve(&live, FetchKind::Health, id),
+                    response: aa_wire::HealthResponse::AwaitingAnchor,
+                },
+                GeneratedEvent::FetchFailed { id, kind } => Event::FetchFailed {
+                    id: resolve(&live, kind, id),
+                    kind,
+                    error: EffectError::Fetch {
+                        what: kind,
+                        message: "generated".to_owned(),
+                    },
+                },
+                GeneratedEvent::OptimizerStepped { output_amount } => {
+                    let mut result = step_result();
+                    result.output_amount = f32::from(output_amount);
+                    Event::OptimizerStepped { result, plan: None }
+                }
+                GeneratedEvent::EffectFailed => Event::EffectFailed(EffectError::Optimize {
+                    stage: OptimizeStage::Run,
+                    message: "generated".to_owned(),
+                }),
+                GeneratedEvent::SetRoute { source, output } => Event::SetRoute(Route {
+                    source: addr(source),
+                    output: addr(output),
+                }),
+            };
+
+            let (next, effects) = transition(state, event);
+            if let Err(message) = check_invariants(&next, &effects) {
+                return Err(TestCaseError::fail(format!(
+                    "invariant violated after {generated:?}: {message}"
+                )));
+            }
+            for (kind, id) in effects.iter().filter_map(effect_kind) {
+                live.retain(|(held, _)| *held != kind);
+                live.push((kind, id));
+            }
+            state = next;
+        }
+
+        Ok(state)
+    }
+
+    /// A route's identity as the reducer stores it, for comparing two states' routes.
+    fn route_of(state: &AppState) -> (TokenAddress, TokenAddress) {
+        (
+            state.config.optimization.source_asset,
+            state.config.optimization.output_asset,
+        )
+    }
+
+    proptest! {
+        /// The reducer is **total** and preserves every invariant across arbitrary histories: any
+        /// interleaving of ticks, timely/superseded/forged responses, failures, optimizer steps, and
+        /// mid-flight retargets leaves a valid state and well-formed effects. This is the property
+        /// the whole crate rests on — the engine's decision logic is pure, so if it holds here it
+        /// holds in production regardless of transport timing.
+        #[test]
+        fn transition_is_total_and_preserves_every_invariant(events in generated_event_sequence()) {
+            drive(config(), &events)?;
+        }
+
+        /// The same, from an *open* route (source ≠ output) rather than the arbitrage default. Open
+        /// routes take the other half of the productivity gate (the source asset must be spendable,
+        /// not just the output reachable), so they reach states the closed-cycle run cannot.
+        #[test]
+        fn transition_preserves_every_invariant_on_an_open_route(
+            events in generated_event_sequence(),
+            source in 0u8..TOKEN_COUNT,
+            output in 0u8..TOKEN_COUNT,
+        ) {
+            drive(route_config(source, output), &events)?;
+        }
+
+        /// Retargeting to the route already in force is a total no-op, from *any* reached state:
+        /// same phase, same ledger, no effects. `run_engine` seeds the reducer with a `SetRoute`
+        /// that may equal the default, and a UI can re-send the current pair on any redraw —
+        /// neither may interrupt a running optimization or perturb the fetch ledger.
+        #[test]
+        fn setting_the_route_already_in_force_changes_nothing(events in generated_event_sequence()) {
+            let state = drive(config(), &events)?;
+            let (source, output) = route_of(&state);
+            let phase_before = state.phase.clone();
+            let pending_before = state.pending.clone();
+
+            let (next, effects) = transition(state, Event::SetRoute(Route {
+                source: source.0,
+                output: output.0,
+            }));
+
+            prop_assert!(effects.is_empty(), "a redundant retarget emitted {effects:?}");
+            prop_assert_eq!(route_of(&next), (source, output));
+            prop_assert_eq!(next.phase, phase_before);
+            prop_assert_eq!(next.pending, pending_before);
+        }
+
+        /// A retarget always takes effect and always leaves the engine consistent: the config holds
+        /// exactly the requested pair (chain-stamped), and no result attributed to the *previous*
+        /// route survives into the new one. `last_step`/`plan` are amounts and a swap path for the
+        /// old pair — leaving them would put them on screen under the new route's label.
+        #[test]
+        fn a_retarget_takes_effect_and_discards_the_previous_route_s_results(
+            events in generated_event_sequence(),
+            source in 0u8..TOKEN_COUNT,
+            output in 0u8..TOKEN_COUNT,
+        ) {
+            let state = drive(config(), &events)?;
+            let before = route_of(&state);
+            let (next, effects) = transition(state, Event::SetRoute(Route {
+                source: addr(source),
+                output: addr(output),
+            }));
+
+            prop_assert!(effects.is_empty(), "SetRoute emits no effects");
+            prop_assert_eq!(
+                route_of(&next),
+                (TokenAddress(addr(source), CHAIN), TokenAddress(addr(output), CHAIN))
+            );
+
+            // A *changed* route must drop back to awaiting; an unchanged one is the no-op above.
+            if before != route_of(&next) {
+                match &next.phase {
+                    Phase::AwaitingFirstSlice { .. } => {}
+                    other => prop_assert!(
+                        false,
+                        "a retarget must discard the old route's results, got {other:?}"
+                    ),
+                }
+            }
+        }
+
+        /// A response carrying an id the ledger is not holding is ignored *entirely*: no phase
+        /// change, no ledger change, no effects. This is what makes TTL retry safe — after a
+        /// re-issue two replies are on the wire, and applying the abandoned one would move the
+        /// engine backwards onto staler reserves. Parametric over all three fetch kinds and over
+        /// both success and failure outcomes.
+        #[test]
+        fn a_response_with_an_unheld_id_is_ignored_entirely(
+            events in generated_event_sequence(),
+            kind in fetch_kind(),
+            raw in 0u64..64,
+            failure in any::<bool>(),
+        ) {
+            let state = drive(config(), &events)?;
+            let forged = FetchId::from_raw_for_test(raw);
+            // Only exercise ids the ledger really is not holding.
+            prop_assume!(!state.pending.clone().accept(kind, forged));
+
+            let phase_before = state.phase.clone();
+            let pending_before = state.pending.clone();
+            let event = if failure {
+                Event::FetchFailed {
+                    id: forged,
+                    kind,
+                    error: EffectError::Fetch { what: kind, message: "late".to_owned() },
+                }
+            } else {
+                match kind {
+                    FetchKind::Meta => Event::MetaFetched { id: forged, response: catalog(0) },
+                    FetchKind::Health => Event::HealthFetched {
+                        id: forged,
+                        response: aa_wire::HealthResponse::AwaitingAnchor,
+                    },
+                    FetchKind::Slice => Event::SliceFetched {
+                        id: forged,
+                        response: slice_for(0, 0xcc, true),
+                    },
+                }
+            };
+
+            let (next, effects) = transition(state, event);
+
+            prop_assert!(effects.is_empty(), "an unheld id produced effects: {effects:?}");
+            prop_assert_eq!(next.phase, phase_before);
+            prop_assert_eq!(next.pending, pending_before);
+        }
+
+        /// Optimizer results are last-write-wins and never schedule work: from any reached state, a
+        /// run of steps leaves the last one recorded and emits nothing. The worker self-clocks its
+        /// own `Continue`, so a reducer that emitted a follow-up effect per step would double-drive
+        /// it. Direct analogue of the kernel's
+        /// `optimization_step_completed_overwrites_previous_result`.
+        #[test]
+        fn optimizer_steps_are_last_write_wins_and_emit_nothing(
+            events in generated_event_sequence(),
+            outputs in prop::collection::vec(any::<u8>(), 1..8),
+        ) {
+            let mut state = drive(config(), &events)?;
+            let optimizing = matches!(state.phase, Phase::Optimizing { .. });
+
+            for output_amount in &outputs {
+                let mut result = step_result();
+                result.output_amount = f32::from(*output_amount);
+                let (next, effects) = transition(state, Event::OptimizerStepped { result, plan: None });
+                prop_assert!(effects.is_empty(), "a step scheduled work: {effects:?}");
+                state = next;
+            }
+
+            match (&state.phase, optimizing) {
+                (Phase::Optimizing { last_step: Some(last), .. }, true) => {
+                    let expected = outputs.last().copied().unwrap_or_default();
+                    prop_assert_eq!(last.output_amount, f32::from(expected));
+                }
+                // A step that arrives while not optimizing is stale and is dropped by design.
+                (_, false) => {}
+                (phase, _) => prop_assert!(false, "expected a recorded step, got {phase:?}"),
+            }
+        }
+
+        /// The in-flight gate holds *across* transitions, not just within one: over any window of
+        /// `FETCH_TTL_TICKS - 1` consecutive ticks with no response delivered, each kind is fetched
+        /// at most once. A slot re-issued at the start of the window cannot expire again inside it,
+        /// so this bound is exact — and it is precisely what stops a slow or hung server from
+        /// accumulating concurrent requests (review finding (a)).
+        #[test]
+        fn a_ttl_window_of_idle_ticks_issues_each_kind_at_most_once(
+            events in generated_event_sequence(),
+        ) {
+            let mut state = drive(config(), &events)?;
+            let mut issued = Vec::new();
+
+            for _ in 0..(crate::pending::FETCH_TTL_TICKS - 1) {
+                let (next, effects) = transition(state, Event::Tick);
+                issued.extend(effects.iter().filter_map(effect_kind).map(|(kind, _)| kind));
+                state = next;
+            }
+
+            for kind in [FetchKind::Meta, FetchKind::Health, FetchKind::Slice] {
+                let count = issued.iter().filter(|entry| **entry == kind).count();
+                prop_assert!(
+                    count <= 1,
+                    "{kind:?} was fetched {count} times inside one TTL window"
+                );
+            }
+        }
+
+        /// Liveness: whenever a catalog is held and the arriving slice is productive for the route,
+        /// the engine *always* ends up optimizing and *always* pushes exactly one snapshot. The
+        /// engine has no other way to make progress, so a gate that silently rejected a servable
+        /// slice would leave it stuck in `AwaitingFirstSlice` forever with no error to show.
+        #[test]
+        fn a_productive_slice_always_drives_the_optimizer(
+            events in generated_event_sequence(),
+            index in 0u8..CATALOG_COUNT,
+            block in any::<u8>(),
+        ) {
+            // Reach a state, then force a known catalog and a fresh slice request for it.
+            let state = drive(config(), &events)?;
+            let (state, effects) = transition(state, Event::Tick);
+            let meta_slot = effects.iter().filter_map(effect_kind)
+                .find(|(kind, _)| *kind == FetchKind::Meta)
+                .map(|(_, id)| id);
+            let (state, effects) = match meta_slot {
+                Some(id) => transition(state, Event::MetaFetched { id, response: catalog(index) }),
+                None => (state, effects),
+            };
+            let Some((_, slice)) = effects.iter().filter_map(effect_kind)
+                .find(|(kind, _)| *kind == FetchKind::Slice)
+            else {
+                // No slice slot was free this tick; nothing to assert about.
+                return Ok(());
+            };
+            let held = match meta_of(&state.phase) {
+                Some(meta) => meta.clone(),
+                None => return Ok(()),
+            };
+
+            let response = slice_for(index, block, true);
+            // Only meaningful when the slice really answers the catalog the reducer is holding.
+            prop_assume!(slice_request_for(&held).pools == slice_request_for(&catalog(index)).pools);
+
+            let reserves = match slice_to_reserves(&response, &held, CHAIN) {
+                Ok(reserves) => reserves,
+                Err(_) => return Ok(()),
+            };
+            prop_assume!(!reserves.is_empty()
+                && reserves_reach_route(&reserves, &state.config.optimization));
+
+            let (next, effects) = transition(state, Event::SliceFetched { id: slice, response });
+
+            prop_assert!(
+                matches!(next.phase, Phase::Optimizing { .. }),
+                "a productive slice left the engine in {:?}",
+                next.phase
+            );
+            prop_assert_eq!(
+                effects.iter().filter(|e| matches!(e, Effect::PushReserves { .. })).count(),
+                1,
+                "a productive slice must push exactly one snapshot"
+            );
+        }
     }
 
     #[test]

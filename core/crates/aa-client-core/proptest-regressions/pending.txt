@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 452573ac34ccc3f63b46f7e00758691ff120460bfec1fe6cf213bd5408c4bf01 # shrinks to ops = [Ensure(Slice), Ensure(Health), Ensure(Meta), AcceptCurrent(Health), AcceptCurrent(Slice), Ensure(Slice), AcceptCurrent(Slice), Ensure(Health), Ensure(Slice), AcceptStale(Slice, 2)], focus = Slice
+cc de58c454be7c4e73dfbc5116c1a2aa8f56823bdb78da9cf343bba229494beb0d # shrinks to kind = Health, lead = 0
+cc 21bde42cc3fe8be6940d0d170a563a3f63f9f2d736f2ce7d8f46e885374393a9 # shrinks to kind = Health
+cc 7ba042c9416fe319cdd70748176678026f80c6e03d857f07e53c518af0aa888c # shrinks to ops = [], kind = Health
+cc 9455d610ca13fed6789eb757a20a7c9205a89bb2652e8478db8ec198c7a6be2b # shrinks to ops = [Ensure(Health), Ensure(Slice)], focus = Slice
