@@ -281,7 +281,29 @@ mod tests {
     use optimization::PoolReserves;
 
     use super::*;
-    use crate::state::Phase;
+    use crate::state::{Session, Work};
+
+    /// Whether an observed lifecycle is grinding the optimizer.
+    fn optimizing(session: &Session) -> bool {
+        matches!(
+            session,
+            Session::Ready {
+                work: Work::Optimizing { .. },
+                ..
+            }
+        )
+    }
+
+    /// Whether an observed lifecycle is still awaiting its first productive slice.
+    fn awaiting(session: &Session) -> bool {
+        matches!(
+            session,
+            Session::Ready {
+                work: Work::Awaiting(_),
+                ..
+            }
+        )
+    }
 
     // Tick-0 price (`2^96`): keeps swap caps non-underflowing for any tick spacing.
     const SQRT_PRICE_TICK_0: u128 = 79_228_162_514_264_337_593_543_950_336;
@@ -449,11 +471,11 @@ mod tests {
     }
 
     /// A recording runtime: delegates every effect/subscription to a real [`ClientEngineRuntime`] and
-    /// only overrides `observe_state` to capture each post-transition phase. Lets the end-to-end test
-    /// watch the engine reach `Optimizing` without changing the production runtime.
+    /// only overrides `observe_state` to capture each post-transition lifecycle. Lets the end-to-end
+    /// test watch the engine reach `Optimizing` without changing the production runtime.
     struct RecordingRuntime {
         inner: ClientEngineRuntime,
-        observed: Arc<StdMutex<Vec<Phase>>>,
+        observed: Arc<StdMutex<Vec<Session>>>,
     }
 
     impl Runtime<ClientEngineApp> for RecordingRuntime {
@@ -467,23 +489,23 @@ mod tests {
 
         fn observe_state(&self, state: &AppState) {
             if let Ok(mut observed) = self.observed.lock() {
-                observed.push(state.phase.clone());
+                observed.push(state.session.clone());
             }
         }
     }
 
-    /// Block until `predicate` matches one of the observed phases, panicking with the whole recorded
-    /// history after 10s. The engine self-clocks, so a phase is only reachable by waiting for it.
+    /// Block until `predicate` matches one of the observed lifecycles, panicking with the whole
+    /// recorded history after 10s. The engine self-clocks, so a state is only reachable by waiting.
     fn wait_for_phase(
-        observed: &Arc<StdMutex<Vec<Phase>>>,
+        observed: &Arc<StdMutex<Vec<Session>>>,
         what: &str,
-        predicate: impl Fn(&Phase) -> bool,
+        predicate: impl Fn(&Session) -> bool,
     ) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let reached = observed
                 .lock()
-                .map(|phases| phases.iter().any(&predicate))
+                .map(|sessions| sessions.iter().any(&predicate))
                 .unwrap_or(false);
             if reached {
                 return;
@@ -493,18 +515,18 @@ mod tests {
                 "engine did not reach {what} in time; observed: {:?}",
                 observed
                     .lock()
-                    .map(|phases| phases.clone())
+                    .map(|sessions| sessions.clone())
                     .unwrap_or_default(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
-    /// Forget every phase observed so far, so a later `wait_for_phase` can only match something the
-    /// engine did *after* this point (the phase being awaited may already have occurred once).
-    fn forget_observed(observed: &Arc<StdMutex<Vec<Phase>>>) {
-        if let Ok(mut phases) = observed.lock() {
-            phases.clear();
+    /// Forget every lifecycle observed so far, so a later `wait_for_phase` can only match something
+    /// the engine did *after* this point (the state being awaited may already have occurred once).
+    fn forget_observed(observed: &Arc<StdMutex<Vec<Session>>>) {
+        if let Ok(mut sessions) = observed.lock() {
+            sessions.clear();
         }
     }
 
@@ -530,9 +552,7 @@ mod tests {
         // phases until the productive slice has driven the engine into `Optimizing`.
         let (_sender, _handle) = <RecordingRuntime as Runtime<ClientEngineApp>>::run(runtime);
 
-        wait_for_phase(&observed, "Optimizing", |phase| {
-            matches!(phase, Phase::Optimizing { .. })
-        });
+        wait_for_phase(&observed, "Optimizing", optimizing);
     }
 
     /// A catalog with one v3 pool over `(WBTC, addr(2))` — reaches WBTC but never USDC, so a complete
@@ -595,9 +615,7 @@ mod tests {
         // Exactly what `run_engine` does with the config: set the caller's route as the first input.
         let _ = sender.send(Event::SetRoute(config.route));
 
-        wait_for_phase(&observed, "Optimizing on the open route", |phase| {
-            matches!(phase, Phase::Optimizing { .. })
-        });
+        wait_for_phase(&observed, "Optimizing on the open route", optimizing);
     }
 
     #[test]
@@ -629,9 +647,7 @@ mod tests {
             source: addr(2),
             output: ETHEREUM_WBTC_TOKEN_ADDRESS.0,
         }));
-        wait_for_phase(&observed, "Optimizing on the first route", |phase| {
-            matches!(phase, Phase::Optimizing { .. })
-        });
+        wait_for_phase(&observed, "Optimizing on the first route", optimizing);
 
         // Retarget to the reverse route, which the same catalog also serves.
         forget_observed(&observed);
@@ -641,15 +657,9 @@ mod tests {
         }));
 
         // The old route's results are gone...
-        wait_for_phase(
-            &observed,
-            "AwaitingFirstSlice after the retarget",
-            |phase| matches!(phase, Phase::AwaitingFirstSlice { .. }),
-        );
+        wait_for_phase(&observed, "AwaitingFirstSlice after the retarget", awaiting);
         // ...and the engine recovers onto the new route with no further input.
         forget_observed(&observed);
-        wait_for_phase(&observed, "Optimizing on the new route", |phase| {
-            matches!(phase, Phase::Optimizing { .. })
-        });
+        wait_for_phase(&observed, "Optimizing on the new route", optimizing);
     }
 }

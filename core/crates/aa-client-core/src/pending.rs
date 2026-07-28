@@ -197,7 +197,10 @@ mod tests {
 
     /// Fold `ops` through a fresh ledger, returning the final ledger, every id `ensure` ever issued,
     /// and the observations for `focus` only.
-    fn drive(ops: &[LedgerOp], focus: FetchKind) -> (PendingFetches, Vec<FetchId>, Vec<Observation>) {
+    fn drive(
+        ops: &[LedgerOp],
+        focus: FetchKind,
+    ) -> (PendingFetches, Vec<FetchId>, Vec<Observation>) {
         let mut pending = PendingFetches::new();
         let mut issued = Vec::new();
         let mut observed = Vec::new();

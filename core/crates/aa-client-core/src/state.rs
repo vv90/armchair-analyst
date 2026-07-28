@@ -86,14 +86,28 @@ pub struct SliceProvenance {
     pub chain: ChainKey,
 }
 
-/// The whole application state: immutable session config, the current lifecycle [`Phase`], and the
-/// in-flight fetch ledger that gates and correlates data-plane requests.
+/// The whole application state: immutable session config, the two facts that are true independently
+/// of the lifecycle (the latest `/health` snapshot and the most recent fault), the [`Session`]
+/// lifecycle itself, and the in-flight fetch ledger that gates and correlates data-plane requests.
+///
+/// `health` and `last_error` sit here rather than inside [`Session`] because no combination of them
+/// with a lifecycle state is invalid: `/health` polls on its own clock, and a transport fault can be
+/// recorded at any point without changing where the engine is. Anything whose *presence* is tied to
+/// the lifecycle lives inside [`Session`]/[`Work`] instead, so it cannot be observed out of place.
 #[derive(Clone, Debug)]
 pub struct AppState {
     /// The session's fixed strategy/cadence for its whole lifetime.
     pub config: SessionConfig,
+    /// The latest server freshness snapshot, if `/health` has been polled. Orthogonal to the
+    /// lifecycle: the poll runs from the first tick and never gates anything.
+    pub health: Option<HealthResponse>,
+    /// The most recent recorded fault (fetch/adapter/optimizer), cleared when a good slice is
+    /// applied. Orthogonal to the lifecycle *and* to why the engine is waiting: a failed `/health`
+    /// poll says nothing about whether the route is servable, so the two are recorded separately
+    /// rather than overwriting each other.
+    pub last_error: Option<EffectError>,
     /// Where in the bootstrap→optimize lifecycle the engine currently is.
-    pub phase: Phase,
+    pub session: Session,
     /// Which `/pools/meta`, `/slice`, and `/health` requests are outstanding — one per kind — so the
     /// poll loop never double-issues, retries a lost fetch on TTL, and rejects superseded responses.
     pub pending: PendingFetches,
@@ -105,63 +119,83 @@ impl AppState {
     pub fn started(config: SessionConfig) -> AppState {
         AppState {
             config,
-            phase: Phase::AwaitingFirstSlice {
-                meta: None,
-                health: None,
-                status: AwaitStatus::Bootstrapping,
-            },
+            health: None,
+            last_error: None,
+            session: Session::NoCatalog,
             pending: PendingFetches::new(),
+        }
+    }
+
+    /// The catalog currently held, if any. The only thing a `/slice` can be requested for or
+    /// projected against, so every consumer — the poll loop, the projection, a future view — reads
+    /// it through here rather than re-matching the lifecycle.
+    pub fn catalog(&self) -> Option<&PoolsMetaResponse> {
+        match &self.session {
+            Session::NoCatalog => None,
+            Session::Ready { catalog, .. } => Some(catalog),
         }
     }
 }
 
-/// The engine lifecycle. `AwaitingFirstSlice` is the pre-optimizer state (mirrors the server's
-/// `AwaitingAnchor → Running`): the optimizer requires a non-empty reserve set covering the
-/// configured route, so it is only initialized once such a slice arrives. `last_step`/`plan`/`latest` only exist
-/// in `Optimizing`, so "optimizer running but no reserves yet" is unrepresentable.
+/// The engine lifecycle's outer step: whether a catalog has been fetched. Everything downstream —
+/// requesting a slice, projecting one, deciding a route is unservable, optimizing — requires one, so
+/// nesting [`Work`] under `Ready` makes "any of that without a catalog" unrepresentable rather than
+/// merely untested.
+// Same shape as the server's `ServerState`, and allowed for the same reason: `Ready` is the large,
+// permanent state and `NoCatalog` is the brief startup one. Boxing to shrink a variant the engine
+// occupies for one round-trip would put an allocation behind every reserve refresh for the whole
+// process lifetime.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
-pub enum Phase {
-    /// No productive reserve snapshot has been applied yet; the optimizer has not been initialized.
-    AwaitingFirstSlice {
-        /// The static catalog, once fetched — needed to project any slice.
-        meta: Option<PoolsMetaResponse>,
-        /// The latest server freshness snapshot, if `/health` has been polled.
-        health: Option<HealthResponse>,
-        /// Why the engine is still waiting (bootstrapping, no route, or a recorded fault).
-        status: AwaitStatus,
+pub enum Session {
+    /// `/pools/meta` has not come back yet; there is nothing to project a slice against, so the poll
+    /// loop asks for the catalog and nothing else.
+    NoCatalog,
+    /// The static catalog is held; `work` says how far past it the engine has got.
+    Ready {
+        /// The catalog every `/slice` request and projection is built from. Route-independent, so it
+        /// survives a retarget.
+        catalog: PoolsMetaResponse,
+        /// Whether a productive slice has been applied yet.
+        work: Work,
     },
+}
+
+/// The lifecycle's inner step, under a held catalog (mirrors the server's `AwaitingAnchor →
+/// Running`): the optimizer requires a non-empty reserve set covering the configured route, so it is
+/// only driven once such a slice arrives. `latest`/`last_step`/`plan` exist only in `Optimizing`, so
+/// "optimizer running but no reserves yet" stays unrepresentable.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Work {
+    /// No productive reserve snapshot has been applied yet; the optimizer has not been initialized.
+    Awaiting(AwaitReason),
     /// The optimizer has been initialized and is being fed fresh reserves + grinding iterations.
     Optimizing {
-        /// The static catalog used to project each slice.
-        meta: PoolsMetaResponse,
         /// Freshness envelope of the reserves currently driving the optimizer.
         latest: SliceProvenance,
         /// The most recent optimizer step result, once one has come back.
         last_step: Option<OptimizationStepResult>,
         /// The executable plan recovered from the most recent step, if any.
         plan: Option<ExecutionPlan<PoolRef, TokenAddress>>,
-        /// The latest server freshness snapshot, if polled.
-        health: Option<HealthResponse>,
-        /// The most recent recorded fault (adapter/fetch), cleared when a good slice is applied.
-        last_error: Option<EffectError>,
     },
 }
 
-/// Why the engine is still in `AwaitingFirstSlice`. A view-facing status, not a control signal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AwaitStatus {
-    /// Waiting for the initial catalog/slice to arrive.
+/// Why the engine is still awaiting its first productive slice. A view-facing status, not a control
+/// signal — and *only* a wait-reason: a recorded fault is a separate, orthogonal fact
+/// ([`AppState::last_error`]) rather than a third variant here, so an unrelated `/health` failure
+/// cannot erase a `NoRoute` verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AwaitReason {
+    /// Waiting for the first slice to arrive (or for a retarget's first slice).
     Bootstrapping,
     /// A slice arrived but its reserves do not cover the configured route — either nothing to spend
     /// the source asset into or nothing yielding the output asset — so the optimizer is intentionally
     /// not initialized (it would abort on such a snapshot).
     NoRoute,
-    /// A fetch or projection fault was recorded while still awaiting the first productive slice.
-    Error(EffectError),
 }
 
 /// A fault surfaced into view state. Never a panic: a malformed server response or a failed fetch
-/// degrades to a recorded, typed error, and the engine stays in a valid phase.
+/// degrades to a recorded, typed error, and the engine stays in a valid state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectError {
     /// A driver-side fetch effect failed; `what` names the request and `message` is its diagnostic.
@@ -312,71 +346,58 @@ pub fn slice_request_for(meta: &PoolsMetaResponse) -> SliceRequest {
 }
 
 /// The reducer: fold one [`Event`] into the state, returning the next state and the effects to run.
-/// Pure and total — every event maps to a valid next phase, and any data fault becomes a recorded
+/// Pure and total — every event maps to a valid next state, and any data fault becomes a recorded
 /// [`EffectError`] rather than a panic.
-pub fn transition(state: AppState, event: Event) -> (AppState, Vec<Effect>) {
-    let AppState {
-        mut config,
-        phase,
-        pending,
-    } = state;
-    let (phase, pending, effects) = reduce(&mut config, phase, pending, event);
-    (
-        AppState {
-            config,
-            phase,
-            pending,
-        },
-        effects,
-    )
+pub fn transition(mut state: AppState, event: Event) -> (AppState, Vec<Effect>) {
+    let effects = reduce(&mut state, event);
+    (state, effects)
 }
 
-/// `config` is `&mut` for the single event that retargets it ([`Event::SetRoute`], the command seam);
-/// every other arm only reads it. Keeping that arm here rather than intercepting it in `transition`
-/// leaves exactly one dispatch point over `Event`, so no variant is handled in two places.
-fn reduce(
-    config: &mut SessionConfig,
-    phase: Phase,
-    mut pending: PendingFetches,
-    event: Event,
-) -> (Phase, PendingFetches, Vec<Effect>) {
+/// The single dispatch point over [`Event`], so no variant is handled in two places. Takes `&mut`
+/// rather than threading each field: with the lifecycle-independent facts (`health`, `last_error`)
+/// out of [`Session`], most arms are a single field write and rebuilding the whole state around them
+/// would be pure noise.
+fn reduce(state: &mut AppState, event: Event) -> Vec<Effect> {
     match event {
-        Event::Tick => on_tick(phase, pending),
+        Event::Tick => on_tick(state),
         Event::MetaFetched { id, response } => {
-            if pending.accept(FetchKind::Meta, id) {
-                on_meta(response, phase, pending)
+            if state.pending.accept(FetchKind::Meta, id) {
+                on_meta(state, response)
             } else {
-                (phase, pending, vec![])
+                vec![]
             }
         }
         Event::SliceFetched { id, response } => {
-            if pending.accept(FetchKind::Slice, id) {
-                let (phase, effects) = on_slice(config, phase, response);
-                (phase, pending, effects)
+            if state.pending.accept(FetchKind::Slice, id) {
+                on_slice(state, response)
             } else {
-                (phase, pending, vec![])
+                vec![]
             }
         }
         Event::HealthFetched { id, response } => {
-            if pending.accept(FetchKind::Health, id) {
-                (with_health(phase, response), pending, vec![])
-            } else {
-                (phase, pending, vec![])
+            if state.pending.accept(FetchKind::Health, id) {
+                state.health = Some(response);
             }
+            vec![]
         }
         Event::FetchFailed { id, kind, error } => {
-            if pending.accept(kind, id) {
-                (with_error(phase, error), pending, vec![])
-            } else {
-                (phase, pending, vec![])
+            if state.pending.accept(kind, id) {
+                state.last_error = Some(error);
             }
+            vec![]
         }
         Event::OptimizerStepped { result, plan } => {
-            let (phase, effects) = on_step(phase, result, plan);
-            (phase, pending, effects)
+            on_step(state, result, plan);
+            vec![]
         }
-        Event::EffectFailed(error) => (with_error(phase, error), pending, vec![]),
-        Event::SetRoute(route) => (on_set_route(config, phase, route), pending, vec![]),
+        Event::EffectFailed(error) => {
+            state.last_error = Some(error);
+            vec![]
+        }
+        Event::SetRoute(route) => {
+            on_set_route(state, route);
+            vec![]
+        }
     }
 }
 
@@ -389,37 +410,23 @@ fn reduce(
 ///
 /// Setting the route already in force is a no-op, so `run_engine`'s startup seeding and a UI
 /// re-sending the current pair never interrupt a running optimization.
-fn on_set_route(config: &mut SessionConfig, phase: Phase, route: Route) -> Phase {
+fn on_set_route(state: &mut AppState, route: Route) {
     // The session's chain is stamped on here — the one place the client decides a chain — exactly as
     // `slice_to_reserves` stamps it onto every projected pool and token.
-    let source = TokenAddress(route.source, config.chain);
-    let output = TokenAddress(route.output, config.chain);
-    if config.optimization.source_asset == source && config.optimization.output_asset == output {
-        return phase;
+    let source = TokenAddress(route.source, state.config.chain);
+    let output = TokenAddress(route.output, state.config.chain);
+    let optimization = &mut state.config.optimization;
+    if optimization.source_asset == source && optimization.output_asset == output {
+        return;
     }
-    config.optimization.source_asset = source;
-    config.optimization.output_asset = output;
+    optimization.source_asset = source;
+    optimization.output_asset = output;
 
-    let (meta, health, status) = match phase {
-        Phase::Optimizing { meta, health, .. } => (Some(meta), health, AwaitStatus::Bootstrapping),
-        Phase::AwaitingFirstSlice {
-            meta,
-            health,
-            status,
-        } => {
-            // A recorded fetch/adapter fault is about the transport, not the route, so it outlives a
-            // retarget; a `NoRoute` verdict was about the old route and does not.
-            let status = match status {
-                AwaitStatus::Error(error) => AwaitStatus::Error(error),
-                _ => AwaitStatus::Bootstrapping,
-            };
-            (meta, health, status)
-        }
-    };
-    Phase::AwaitingFirstSlice {
-        meta,
-        health,
-        status,
+    // Only the *work* is route-dependent. The catalog is not, and neither is a recorded fault: it is
+    // about the transport, so it outlives a retarget — uniformly, which it did not when it was
+    // encoded one way while awaiting and another while optimizing.
+    if let Session::Ready { work, .. } = &mut state.session {
+        *work = Work::Awaiting(AwaitReason::Bootstrapping);
     }
 }
 
@@ -427,222 +434,124 @@ fn on_set_route(config: &mut SessionConfig, phase: Phase, route: Route) -> Phase
 /// `/health` always, plus a fresh slice for the known catalog (else the catalog itself). `ensure`
 /// gates on the ledger, so a fetch is issued only when that kind is free or its request has expired;
 /// the periodic `Tick` subscription re-arms the clock, so the reducer no longer schedules it.
-fn on_tick(phase: Phase, mut pending: PendingFetches) -> (Phase, PendingFetches, Vec<Effect>) {
-    pending.advance();
+fn on_tick(state: &mut AppState) -> Vec<Effect> {
+    state.pending.advance();
     let mut effects = Vec::new();
-    if let Some(id) = pending.ensure(FetchKind::Health) {
+    if let Some(id) = state.pending.ensure(FetchKind::Health) {
         effects.push(Effect::FetchHealth { id });
     }
-    match meta_of(&phase) {
-        Some(meta) => {
-            let request = slice_request_for(meta);
-            if let Some(id) = pending.ensure(FetchKind::Slice) {
+    match state.catalog().map(slice_request_for) {
+        Some(request) => {
+            if let Some(id) = state.pending.ensure(FetchKind::Slice) {
                 effects.push(Effect::FetchSlice { id, request });
             }
         }
         None => {
-            if let Some(id) = pending.ensure(FetchKind::Meta) {
+            if let Some(id) = state.pending.ensure(FetchKind::Meta) {
                 effects.push(Effect::FetchMeta { id });
             }
         }
     }
-    (phase, pending, effects)
+    effects
 }
 
 /// The catalog arrived: store it and immediately request the first slice for it (don't wait a full
 /// poll interval). The slice slot is free at this point, so `ensure` issues.
-fn on_meta(
-    meta: PoolsMetaResponse,
-    phase: Phase,
-    mut pending: PendingFetches,
-) -> (Phase, PendingFetches, Vec<Effect>) {
-    let request = slice_request_for(&meta);
-    let phase = set_meta(phase, meta);
-    let effects = match pending.ensure(FetchKind::Slice) {
+fn on_meta(state: &mut AppState, catalog: PoolsMetaResponse) -> Vec<Effect> {
+    let request = slice_request_for(&catalog);
+    match &mut state.session {
+        // A refetched catalog replaces the held one; how far the engine has got is unaffected.
+        Session::Ready { catalog: held, .. } => *held = catalog,
+        session => {
+            *session = Session::Ready {
+                catalog,
+                work: Work::Awaiting(AwaitReason::Bootstrapping),
+            };
+        }
+    }
+    match state.pending.ensure(FetchKind::Slice) {
         Some(id) => vec![Effect::FetchSlice { id, request }],
         None => vec![],
-    };
-    (phase, pending, effects)
+    }
 }
 
 /// A slice arrived: project it against the catalog and, if it yields a productive reserve set,
 /// (re)drive the optimizer. Faults and unproductive snapshots are recorded without leaving a valid
-/// phase and without touching the optimizer.
-fn on_slice(config: &SessionConfig, phase: Phase, slice: SliceResponse) -> (Phase, Vec<Effect>) {
-    match phase {
-        Phase::AwaitingFirstSlice {
-            meta: Some(meta),
-            health,
-            status: _,
-        } => {
-            let reserves = match slice_to_reserves(&slice, &meta, config.chain) {
-                Ok(reserves) => reserves,
-                Err(error) => {
-                    return (
-                        Phase::AwaitingFirstSlice {
-                            meta: Some(meta),
-                            health,
-                            status: AwaitStatus::Error(EffectError::Adapter(error)),
-                        },
-                        vec![],
-                    );
-                }
-            };
-            let provenance = match parse_provenance(&slice, config.chain) {
-                Ok(provenance) => provenance,
-                Err(error) => {
-                    return (
-                        Phase::AwaitingFirstSlice {
-                            meta: Some(meta),
-                            health,
-                            status: AwaitStatus::Error(error),
-                        },
-                        vec![],
-                    );
-                }
-            };
-            if !is_productive(&reserves, config) {
-                return (
-                    Phase::AwaitingFirstSlice {
-                        meta: Some(meta),
-                        health,
-                        status: AwaitStatus::NoRoute,
-                    },
-                    vec![],
-                );
-            }
-            // The worker inits on this first productive snapshot; later slices arrive as `NewReserves`.
-            (
-                Phase::Optimizing {
-                    meta,
-                    latest: provenance,
-                    last_step: None,
-                    plan: None,
-                    health,
-                    last_error: None,
-                },
-                vec![Effect::PushReserves {
-                    reserves,
-                    session: config.optimization.clone(),
-                }],
-            )
+/// state and without touching the optimizer.
+fn on_slice(state: &mut AppState, slice: SliceResponse) -> Vec<Effect> {
+    let chain = state.config.chain;
+    let Session::Ready { catalog, work } = &mut state.session else {
+        // A slice is only ever requested once a catalog is held, and the catalog is never dropped, so
+        // this is unreachable in practice — there is simply nothing to project the payload against.
+        return vec![];
+    };
+
+    let reserves = match slice_to_reserves(&slice, catalog, chain) {
+        Ok(reserves) => reserves,
+        Err(error) => {
+            state.last_error = Some(EffectError::Adapter(error));
+            return vec![];
         }
-        Phase::AwaitingFirstSlice {
-            meta: None,
-            health,
-            status,
-        } => {
-            // A slice with no catalog to project it against; nothing to do until `/pools/meta` lands.
-            (
-                Phase::AwaitingFirstSlice {
-                    meta: None,
-                    health,
-                    status,
-                },
-                vec![],
-            )
+    };
+    let provenance = match parse_provenance(&slice, chain) {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            state.last_error = Some(error);
+            return vec![];
         }
-        Phase::Optimizing {
-            meta,
-            latest,
-            last_step,
-            plan,
-            health,
-            last_error,
-        } => {
-            let reserves = match slice_to_reserves(&slice, &meta, config.chain) {
-                Ok(reserves) => reserves,
-                Err(error) => {
-                    return (
-                        Phase::Optimizing {
-                            meta,
-                            latest,
-                            last_step,
-                            plan,
-                            health,
-                            last_error: Some(EffectError::Adapter(error)),
-                        },
-                        vec![],
-                    );
-                }
-            };
-            let provenance = match parse_provenance(&slice, config.chain) {
-                Ok(provenance) => provenance,
-                Err(error) => {
-                    return (
-                        Phase::Optimizing {
-                            meta,
-                            latest,
-                            last_step,
-                            plan,
-                            health,
-                            last_error: Some(error),
-                        },
-                        vec![],
-                    );
-                }
-            };
-            if !is_productive(&reserves, config) {
-                // A momentarily unreachable snapshot would abort the runner; skip it and keep
-                // optimizing on the reserves already loaded.
-                return (
-                    Phase::Optimizing {
-                        meta,
-                        latest,
-                        last_step,
-                        plan,
-                        health,
-                        last_error,
-                    },
-                    vec![],
-                );
-            }
-            // Push the freshest reserves; the worker coalesces and applies them as `NewReserves`.
-            (
-                Phase::Optimizing {
-                    meta,
-                    latest: provenance,
-                    last_step,
-                    plan,
-                    health,
-                    last_error: None,
-                },
-                vec![Effect::PushReserves {
-                    reserves,
-                    session: config.optimization.clone(),
-                }],
-            )
+    };
+    if !is_productive(&reserves, &state.config) {
+        match work {
+            // Nothing loaded yet: record *why* the engine is still waiting.
+            Work::Awaiting(reason) => *reason = AwaitReason::NoRoute,
+            // Already grinding: a momentarily unreachable snapshot would abort the runner, so skip
+            // it and keep optimizing the reserves already loaded.
+            Work::Optimizing { .. } => {}
         }
+        return vec![];
     }
+
+    // The worker inits on the first productive snapshot and applies later ones as `NewReserves`;
+    // either way what changes here is the provenance. Results carry over so a refresh does not blank
+    // the view between steps — they describe the same route, which only `SetRoute` invalidates.
+    let (last_step, plan) = match work {
+        Work::Awaiting(_) => (None, None),
+        Work::Optimizing {
+            last_step, plan, ..
+        } => (last_step.take(), plan.take()),
+    };
+    *work = Work::Optimizing {
+        latest: provenance,
+        last_step,
+        plan,
+    };
+    state.last_error = None;
+    vec![Effect::PushReserves {
+        reserves,
+        session: state.config.optimization.clone(),
+    }]
 }
 
 /// A step came back: record its result and plan. No effect follows — the worker self-clocks, pulling
 /// fresh reserves or self-continuing on its own thread, so the reducer never re-issues a `Continue`.
 fn on_step(
-    phase: Phase,
+    state: &mut AppState,
     result: OptimizationStepResult,
     plan: Option<ExecutionPlan<PoolRef, TokenAddress>>,
-) -> (Phase, Vec<Effect>) {
-    match phase {
-        Phase::Optimizing {
-            meta,
-            latest,
-            health,
-            last_error,
-            ..
-        } => (
-            Phase::Optimizing {
-                meta,
-                latest,
-                last_step: Some(result),
-                plan,
-                health,
-                last_error,
+) {
+    // A step result arriving while not optimizing is stale (e.g. it crossed a retarget); ignore it.
+    if let Session::Ready {
+        work:
+            Work::Optimizing {
+                last_step,
+                plan: held,
+                ..
             },
-            vec![],
-        ),
-        // A step result while not optimizing is stale (e.g. after a reset); ignore it.
-        other => (other, vec![]),
+        ..
+    } = &mut state.session
+    {
+        *last_step = Some(result);
+        *held = plan;
     }
 }
 
@@ -670,92 +579,6 @@ fn parse_provenance(
         confirmations: slice.confirmations,
         chain,
     })
-}
-
-/// The catalog visible in the current phase, if any.
-fn meta_of(phase: &Phase) -> Option<&PoolsMetaResponse> {
-    match phase {
-        Phase::AwaitingFirstSlice { meta, .. } => meta.as_ref(),
-        Phase::Optimizing { meta, .. } => Some(meta),
-    }
-}
-
-/// Stores/refreshes the catalog in whichever phase is current.
-fn set_meta(phase: Phase, meta: PoolsMetaResponse) -> Phase {
-    match phase {
-        Phase::AwaitingFirstSlice { health, status, .. } => Phase::AwaitingFirstSlice {
-            meta: Some(meta),
-            health,
-            status,
-        },
-        Phase::Optimizing {
-            latest,
-            last_step,
-            plan,
-            health,
-            last_error,
-            ..
-        } => Phase::Optimizing {
-            meta,
-            latest,
-            last_step,
-            plan,
-            health,
-            last_error,
-        },
-    }
-}
-
-/// Stores the latest `/health` snapshot in whichever phase is current.
-fn with_health(phase: Phase, health: HealthResponse) -> Phase {
-    match phase {
-        Phase::AwaitingFirstSlice { meta, status, .. } => Phase::AwaitingFirstSlice {
-            meta,
-            health: Some(health),
-            status,
-        },
-        Phase::Optimizing {
-            meta,
-            latest,
-            last_step,
-            plan,
-            last_error,
-            ..
-        } => Phase::Optimizing {
-            meta,
-            latest,
-            last_step,
-            plan,
-            health: Some(health),
-            last_error,
-        },
-    }
-}
-
-/// Records a fault into whichever phase is current, without changing the lifecycle.
-fn with_error(phase: Phase, error: EffectError) -> Phase {
-    match phase {
-        Phase::AwaitingFirstSlice { meta, health, .. } => Phase::AwaitingFirstSlice {
-            meta,
-            health,
-            status: AwaitStatus::Error(error),
-        },
-        Phase::Optimizing {
-            meta,
-            latest,
-            last_step,
-            plan,
-            health,
-            ..
-        } => Phase::Optimizing {
-            meta,
-            latest,
-            last_step,
-            plan,
-            health,
-            last_error: Some(error),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -924,6 +747,17 @@ mod tests {
             .expect("FetchMeta issued")
     }
 
+    /// The id of the `FetchHealth` effect in a batch (issued on every tick the slot is free).
+    fn health_id(effects: &[Effect]) -> FetchId {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FetchHealth { id } => Some(*id),
+                _ => None,
+            })
+            .expect("FetchHealth issued")
+    }
+
     /// The id of the `FetchSlice` effect in a batch.
     fn slice_id(effects: &[Effect]) -> FetchId {
         effects
@@ -956,8 +790,55 @@ mod tests {
             },
         );
         assert!(any_push_reserves(&effects));
-        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(is_optimizing(&state));
         state
+    }
+
+    /// Whether the engine is grinding the optimizer.
+    fn is_optimizing(state: &AppState) -> bool {
+        matches!(
+            state.session,
+            Session::Ready {
+                work: Work::Optimizing { .. },
+                ..
+            }
+        )
+    }
+
+    /// The work under a held catalog, if there is one — the reduced form most assertions want.
+    fn work_of(state: &AppState) -> Option<&Work> {
+        match &state.session {
+            Session::NoCatalog => None,
+            Session::Ready { work, .. } => Some(work),
+        }
+    }
+
+    /// Why the engine is waiting, if it is.
+    fn await_reason(state: &AppState) -> Option<AwaitReason> {
+        match work_of(state) {
+            Some(Work::Awaiting(reason)) => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// Everything a transition may change except the route, bundled so "nothing changed" is one
+    /// assertion. `SessionConfig` has no `PartialEq` (it embeds the optimizer's own config types), so
+    /// the route is compared separately via [`route_of`].
+    #[derive(Clone, Debug, PartialEq)]
+    struct Observable {
+        session: Session,
+        health: Option<HealthResponse>,
+        last_error: Option<EffectError>,
+        pending: PendingFetches,
+    }
+
+    fn observable(state: &AppState) -> Observable {
+        Observable {
+            session: state.session.clone(),
+            health: state.health.clone(),
+            last_error: state.last_error.clone(),
+            pending: state.pending.clone(),
+        }
     }
 
     /// `config()` retargeted to spend `source` and maximize `output` (both `addr`-bytes, this chain).
@@ -994,13 +875,31 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum GeneratedEvent {
         Tick,
-        MetaFetched { id: IdChoice, catalog: u8 },
-        SliceFetched { id: IdChoice, catalog: u8, block: u8, complete: bool },
-        HealthFetched { id: IdChoice },
-        FetchFailed { id: IdChoice, kind: FetchKind },
-        OptimizerStepped { output_amount: u8 },
+        MetaFetched {
+            id: IdChoice,
+            catalog: u8,
+        },
+        SliceFetched {
+            id: IdChoice,
+            catalog: u8,
+            block: u8,
+            complete: bool,
+        },
+        HealthFetched {
+            id: IdChoice,
+        },
+        FetchFailed {
+            id: IdChoice,
+            kind: FetchKind,
+        },
+        OptimizerStepped {
+            output_amount: u8,
+        },
         EffectFailed,
-        SetRoute { source: u8, output: u8 },
+        SetRoute {
+            source: u8,
+            output: u8,
+        },
     }
 
     fn id_choice() -> impl Strategy<Value = IdChoice> {
@@ -1126,7 +1025,8 @@ mod tests {
         // so a foreign-chain route is unrepresentable; a route tagged with another chain would match
         // no reserve and silently starve the optimizer forever.
         let route = &state.config.optimization;
-        if route.source_asset.1 != state.config.chain || route.output_asset.1 != state.config.chain {
+        if route.source_asset.1 != state.config.chain || route.output_asset.1 != state.config.chain
+        {
             return Err(format!(
                 "route {route:?} is not stamped with the session chain {:?}",
                 state.config.chain
@@ -1141,7 +1041,9 @@ mod tests {
             if let Some((kind, id)) = effect_kind(effect)
                 && !state.pending.clone().accept(kind, id)
             {
-                return Err(format!("emitted {effect:?} is not recorded as pending {kind:?}"));
+                return Err(format!(
+                    "emitted {effect:?} is not recorded as pending {kind:?}"
+                ));
             }
         }
 
@@ -1153,7 +1055,9 @@ mod tests {
                 .filter(|effect| effect_kind(effect).map(|(k, _)| k) == Some(kind))
                 .count();
             if issued > 1 {
-                return Err(format!("{issued} concurrent {kind:?} fetches in one transition"));
+                return Err(format!(
+                    "{issued} concurrent {kind:?} fetches in one transition"
+                ));
             }
         }
 
@@ -1181,28 +1085,23 @@ mod tests {
         // (6) A slice is only ever requested for the catalog currently held, and asks for exactly
         // its pools — the request cannot drift from the catalog its response will be projected
         // against, which is what makes `UnknownPool` unreachable in practice.
+        //
+        // Its companion — "`NoRoute` is never recorded without a catalog to have projected a slice
+        // against" — used to be invariant (7) here. `AwaitReason` now lives under `Session::Ready`,
+        // so that state is unrepresentable and the check has nothing left to catch.
         for effect in effects {
             if let Effect::FetchSlice { request, .. } = effect {
-                match meta_of(&state.phase) {
-                    Some(meta) => {
-                        if request.pools != slice_request_for(meta).pools {
+                match state.catalog() {
+                    Some(catalog) => {
+                        if request.pools != slice_request_for(catalog).pools {
                             return Err("slice request does not match the held catalog".into());
                         }
                     }
-                    None => return Err("slice requested with no catalog to project it against".into()),
+                    None => {
+                        return Err("slice requested with no catalog to project it against".into());
+                    }
                 }
             }
-        }
-
-        // (7) `NoRoute` is a verdict about a projected slice, so it is only reachable once a catalog
-        // exists to project one against.
-        if let Phase::AwaitingFirstSlice {
-            meta: None,
-            status: AwaitStatus::NoRoute,
-            ..
-        } = &state.phase
-        {
-            return Err("NoRoute recorded without a catalog".into());
         }
 
         Ok(())
@@ -1211,22 +1110,19 @@ mod tests {
     /// Folds a symbolic event sequence through the reducer, resolving `IdChoice::Current` against
     /// the ids the reducer actually issued (exactly as a real driver echoes them back) and checking
     /// every invariant after each step. Returns the final state.
-    fn drive(
-        config: SessionConfig,
-        events: &[GeneratedEvent],
-    ) -> Result<AppState, TestCaseError> {
+    fn drive(config: SessionConfig, events: &[GeneratedEvent]) -> Result<AppState, TestCaseError> {
         let mut state = AppState::started(config);
         // The most recent id issued per kind, learned from the effects — the driver's own view.
         let mut live: Vec<(FetchKind, FetchId)> = Vec::new();
-        let resolve = |live: &[(FetchKind, FetchId)], kind: FetchKind, choice: IdChoice| match choice
-        {
-            IdChoice::Raw(raw) => FetchId::from_raw_for_test(raw),
-            IdChoice::Current => live
-                .iter()
-                .find(|(held, _)| *held == kind)
-                .map(|(_, id)| *id)
-                .unwrap_or_else(|| FetchId::from_raw_for_test(u64::MAX)),
-        };
+        let resolve =
+            |live: &[(FetchKind, FetchId)], kind: FetchKind, choice: IdChoice| match choice {
+                IdChoice::Raw(raw) => FetchId::from_raw_for_test(raw),
+                IdChoice::Current => live
+                    .iter()
+                    .find(|(held, _)| *held == kind)
+                    .map(|(_, id)| *id)
+                    .unwrap_or_else(|| FetchId::from_raw_for_test(u64::MAX)),
+            };
 
         for generated in events {
             let event = match *generated {
@@ -1326,8 +1222,7 @@ mod tests {
         fn setting_the_route_already_in_force_changes_nothing(events in generated_event_sequence()) {
             let state = drive(config(), &events)?;
             let (source, output) = route_of(&state);
-            let phase_before = state.phase.clone();
-            let pending_before = state.pending.clone();
+            let before = observable(&state);
 
             let (next, effects) = transition(state, Event::SetRoute(Route {
                 source: source.0,
@@ -1336,14 +1231,18 @@ mod tests {
 
             prop_assert!(effects.is_empty(), "a redundant retarget emitted {effects:?}");
             prop_assert_eq!(route_of(&next), (source, output));
-            prop_assert_eq!(next.phase, phase_before);
-            prop_assert_eq!(next.pending, pending_before);
+            prop_assert_eq!(observable(&next), before);
         }
 
         /// A retarget always takes effect and always leaves the engine consistent: the config holds
         /// exactly the requested pair (chain-stamped), and no result attributed to the *previous*
         /// route survives into the new one. `last_step`/`plan` are amounts and a swap path for the
         /// old pair — leaving them would put them on screen under the new route's label.
+        ///
+        /// What is *not* route-dependent survives, and survives **uniformly**: the catalog, the
+        /// `/health` snapshot, and any recorded fault. The fault is the sharp case — it describes the
+        /// transport, so a retarget must neither invent nor erase one, no matter which lifecycle the
+        /// engine was in when the retarget arrived.
         #[test]
         fn a_retarget_takes_effect_and_discards_the_previous_route_s_results(
             events in generated_event_sequence(),
@@ -1352,6 +1251,10 @@ mod tests {
         ) {
             let state = drive(config(), &events)?;
             let before = route_of(&state);
+            let catalog_before = state.catalog().cloned();
+            let health_before = state.health.clone();
+            let error_before = state.last_error.clone();
+
             let (next, effects) = transition(state, Event::SetRoute(Route {
                 source: addr(source),
                 output: addr(output),
@@ -1362,16 +1265,18 @@ mod tests {
                 route_of(&next),
                 (TokenAddress(addr(source), CHAIN), TokenAddress(addr(output), CHAIN))
             );
+            prop_assert_eq!(next.catalog().cloned(), catalog_before, "the catalog is route-independent");
+            prop_assert_eq!(&next.health, &health_before, "`/health` is route-independent");
+            prop_assert_eq!(&next.last_error, &error_before, "a fault is about the transport, not the route");
 
             // A *changed* route must drop back to awaiting; an unchanged one is the no-op above.
             if before != route_of(&next) {
-                match &next.phase {
-                    Phase::AwaitingFirstSlice { .. } => {}
-                    other => prop_assert!(
-                        false,
-                        "a retarget must discard the old route's results, got {other:?}"
-                    ),
-                }
+                prop_assert_eq!(
+                    await_reason(&next),
+                    next.catalog().map(|_| AwaitReason::Bootstrapping),
+                    "a retarget must discard the old route's results, got {:?}",
+                    next.session
+                );
             }
         }
 
@@ -1392,8 +1297,7 @@ mod tests {
             // Only exercise ids the ledger really is not holding.
             prop_assume!(!state.pending.clone().accept(kind, forged));
 
-            let phase_before = state.phase.clone();
-            let pending_before = state.pending.clone();
+            let before = observable(&state);
             let event = if failure {
                 Event::FetchFailed {
                     id: forged,
@@ -1417,8 +1321,7 @@ mod tests {
             let (next, effects) = transition(state, event);
 
             prop_assert!(effects.is_empty(), "an unheld id produced effects: {effects:?}");
-            prop_assert_eq!(next.phase, phase_before);
-            prop_assert_eq!(next.pending, pending_before);
+            prop_assert_eq!(observable(&next), before);
         }
 
         /// Optimizer results are last-write-wins and never schedule work: from any reached state, a
@@ -1432,7 +1335,7 @@ mod tests {
             outputs in prop::collection::vec(any::<u8>(), 1..8),
         ) {
             let mut state = drive(config(), &events)?;
-            let optimizing = matches!(state.phase, Phase::Optimizing { .. });
+            let optimizing = is_optimizing(&state);
 
             for output_amount in &outputs {
                 let mut result = step_result();
@@ -1442,14 +1345,14 @@ mod tests {
                 state = next;
             }
 
-            match (&state.phase, optimizing) {
-                (Phase::Optimizing { last_step: Some(last), .. }, true) => {
+            match (work_of(&state), optimizing) {
+                (Some(Work::Optimizing { last_step: Some(last), .. }), true) => {
                     let expected = outputs.last().copied().unwrap_or_default();
                     prop_assert_eq!(last.output_amount, f32::from(expected));
                 }
                 // A step that arrives while not optimizing is stale and is dropped by design.
                 (_, false) => {}
-                (phase, _) => prop_assert!(false, "expected a recorded step, got {phase:?}"),
+                (work, _) => prop_assert!(false, "expected a recorded step, got {work:?}"),
             }
         }
 
@@ -1506,8 +1409,8 @@ mod tests {
                 // No slice slot was free this tick; nothing to assert about.
                 return Ok(());
             };
-            let held = match meta_of(&state.phase) {
-                Some(meta) => meta.clone(),
+            let held = match state.catalog() {
+                Some(catalog) => catalog.clone(),
                 None => return Ok(()),
             };
 
@@ -1525,9 +1428,9 @@ mod tests {
             let (next, effects) = transition(state, Event::SliceFetched { id: slice, response });
 
             prop_assert!(
-                matches!(next.phase, Phase::Optimizing { .. }),
+                is_optimizing(&next),
                 "a productive slice left the engine in {:?}",
-                next.phase
+                next.session
             );
             prop_assert_eq!(
                 effects.iter().filter(|e| matches!(e, Effect::PushReserves { .. })).count(),
@@ -1540,10 +1443,10 @@ mod tests {
     #[test]
     fn set_route_retargets_the_config_without_effects() {
         // The runtime command seam: `SetRoute` retargets the route in place and emits nothing. From a
-        // cold start there are no results to discard, so the phase is untouched too (contrast
+        // cold start there are no results to discard, so the lifecycle is untouched too (contrast
         // `set_route_to_a_new_route_discards_the_previous_route_s_results`).
         let state = AppState::started(config());
-        let phase_before = state.phase.clone();
+        let before = observable(&state);
         let (next, effects) = transition(
             state,
             Event::SetRoute(Route {
@@ -1563,7 +1466,11 @@ mod tests {
             next.config.optimization.output_asset,
             TokenAddress(addr(2), CHAIN)
         );
-        assert_eq!(next.phase, phase_before, "phase is untouched by SetRoute");
+        assert_eq!(
+            observable(&next),
+            before,
+            "the lifecycle is untouched by SetRoute"
+        );
     }
 
     #[test]
@@ -1584,7 +1491,7 @@ mod tests {
             any_push_reserves(&effects),
             "output = addr(2) is reachable ⇒ productive"
         );
-        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(is_optimizing(&state));
 
         let (state, slice) = after_catalog(route_config(1, 3), meta_over(1, 2));
         let (state, effects) = transition(
@@ -1598,13 +1505,7 @@ mod tests {
             !any_push_reserves(&effects),
             "output = addr(3) is absent ⇒ not productive"
         );
-        assert!(matches!(
-            state.phase,
-            Phase::AwaitingFirstSlice {
-                status: AwaitStatus::NoRoute,
-                ..
-            }
-        ));
+        assert_eq!(await_reason(&state), Some(AwaitReason::NoRoute));
     }
 
     #[test]
@@ -1622,11 +1523,11 @@ mod tests {
             },
         );
         assert!(matches!(
-            state.phase,
-            Phase::Optimizing {
+            work_of(&state),
+            Some(Work::Optimizing {
                 last_step: Some(_),
                 ..
-            }
+            })
         ));
 
         let (state, effects) = transition(
@@ -1637,13 +1538,8 @@ mod tests {
             }),
         );
 
-        match state.phase {
-            Phase::AwaitingFirstSlice { meta, status, .. } => {
-                assert!(meta.is_some(), "the catalog survives a retarget");
-                assert_eq!(status, AwaitStatus::Bootstrapping);
-            }
-            other => panic!("a retarget must discard the old route's results, got {other:?}"),
-        }
+        assert!(state.catalog().is_some(), "the catalog survives a retarget");
+        assert_eq!(await_reason(&state), Some(AwaitReason::Bootstrapping));
         assert!(effects.is_empty(), "SetRoute emits no effects");
     }
 
@@ -1661,8 +1557,94 @@ mod tests {
             }),
         );
 
-        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(is_optimizing(&state));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_fault_survives_a_retarget_from_either_lifecycle() {
+        // A fault describes the transport, not the route, so a retarget must not clear it — and must
+        // not clear it *only sometimes*. While the fault lived in two places (a wait-status variant
+        // when awaiting, a field when optimizing) the optimizing copy was silently dropped here,
+        // because `on_set_route` rebuilt `AwaitingFirstSlice` from the parts it bothered to name.
+        // One home, one rule: both halves of this test now exercise the same line.
+        let retarget = Event::SetRoute(Route {
+            source: addr(7),
+            output: addr(8),
+        });
+        let fault = || {
+            Event::EffectFailed(EffectError::Optimize {
+                stage: OptimizeStage::Run,
+                message: "boom".to_owned(),
+            })
+        };
+
+        // From `Awaiting`: the case that always worked.
+        let (state, _) = transition(AppState::started(config()), fault());
+        let (state, _) = transition(state, retarget.clone());
+        assert!(
+            state.last_error.is_some(),
+            "a fault recorded while awaiting must survive a retarget"
+        );
+
+        // From `Optimizing`: the case that silently lost the fault.
+        let (state, _) = transition(optimizing_state(), fault());
+        assert!(state.last_error.is_some(), "the fault is recorded");
+        let (state, _) = transition(state, retarget);
+        assert!(
+            state.last_error.is_some(),
+            "a fault recorded while optimizing must survive a retarget too"
+        );
+    }
+
+    #[test]
+    fn a_transport_fault_does_not_erase_a_no_route_verdict() {
+        // Two independent facts about an idle engine: *why* it is not optimizing (this route is not
+        // servable by the catalog) and *what last went wrong on the wire*. They were unioned into one
+        // `AwaitStatus`, so recording either erased the other — a failed `/health` poll would wipe a
+        // `NoRoute` verdict it says nothing about. Separate fields, so both are observable at once.
+        let (state, effects) = transition(AppState::started(route_config(1, 3)), Event::Tick);
+        let health = health_id(&effects);
+        let (state, effects) = transition(
+            state,
+            Event::MetaFetched {
+                id: meta_id(&effects),
+                response: meta_over(1, 2),
+            },
+        );
+        let (state, _) = transition(
+            state,
+            Event::SliceFetched {
+                id: slice_id(&effects),
+                response: slice_complete(),
+            },
+        );
+        assert_eq!(await_reason(&state), Some(AwaitReason::NoRoute));
+
+        let (state, _) = transition(
+            state,
+            Event::FetchFailed {
+                id: health,
+                kind: FetchKind::Health,
+                error: EffectError::Fetch {
+                    what: FetchKind::Health,
+                    message: "boom".to_owned(),
+                },
+            },
+        );
+
+        assert_eq!(
+            await_reason(&state),
+            Some(AwaitReason::NoRoute),
+            "an unrelated fetch failure must not overwrite why the engine is waiting"
+        );
+        assert!(matches!(
+            state.last_error,
+            Some(EffectError::Fetch {
+                what: FetchKind::Health,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1683,13 +1665,7 @@ mod tests {
             !any_push_reserves(&effects),
             "source = addr(3) is absent from the slice ⇒ not productive"
         );
-        assert!(matches!(
-            state.phase,
-            Phase::AwaitingFirstSlice {
-                status: AwaitStatus::NoRoute,
-                ..
-            }
-        ));
+        assert_eq!(await_reason(&state), Some(AwaitReason::NoRoute));
     }
 
     #[test]
@@ -1769,10 +1745,7 @@ mod tests {
             })
             .expect("slice request");
         assert_eq!(request.pools, vec![v3_key(9)]);
-        assert!(matches!(
-            state.phase,
-            Phase::AwaitingFirstSlice { meta: Some(_), .. }
-        ));
+        assert_eq!(await_reason(&state), Some(AwaitReason::Bootstrapping));
     }
 
     #[test]
@@ -1791,11 +1764,11 @@ mod tests {
         // The one v3 pool projects to forward + inverse.
         assert_eq!(reserves.len(), 2);
 
-        let Phase::Optimizing {
+        let Some(Work::Optimizing {
             latest, last_step, ..
-        } = &state.phase
+        }) = work_of(&state)
         else {
-            panic!("expected Optimizing, got {:?}", state.phase);
+            panic!("expected Optimizing, got {:?}", state.session);
         };
         assert_eq!(latest.confirmations, 2);
         assert_eq!(latest.block_hash, hash(0xbb));
@@ -1817,7 +1790,7 @@ mod tests {
         );
         // Init vs update is the worker's concern now; the reducer just pushes the freshest reserves.
         assert!(any_push_reserves(&effects));
-        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(is_optimizing(&state));
     }
 
     #[test]
@@ -1832,7 +1805,7 @@ mod tests {
         );
         // The worker self-clocks its own `Continue`; the reducer emits no follow-up effect.
         assert!(effects.is_empty());
-        let Phase::Optimizing { last_step, .. } = &state.phase else {
+        let Some(Work::Optimizing { last_step, .. }) = work_of(&state) else {
             panic!("expected Optimizing");
         };
         assert!(last_step.is_some());
@@ -1850,13 +1823,7 @@ mod tests {
             },
         );
         assert!(!any_push_reserves(&effects));
-        assert!(matches!(
-            state.phase,
-            Phase::AwaitingFirstSlice {
-                status: AwaitStatus::NoRoute,
-                ..
-            }
-        ));
+        assert_eq!(await_reason(&state), Some(AwaitReason::NoRoute));
     }
 
     #[test]
@@ -1886,18 +1853,18 @@ mod tests {
         );
         assert!(!any_push_reserves(&effects));
         assert!(matches!(
-            state.phase,
-            Phase::AwaitingFirstSlice {
-                status: AwaitStatus::Error(EffectError::Adapter(WireAdapterError::HexParse { .. })),
-                ..
-            }
+            state.last_error,
+            Some(EffectError::Adapter(WireAdapterError::HexParse { .. }))
         ));
+        // The fault is recorded *beside* the wait-reason, not in place of it: a malformed payload
+        // says nothing about whether the route is servable, so the engine is still bootstrapping.
+        assert_eq!(await_reason(&state), Some(AwaitReason::Bootstrapping));
     }
 
     #[test]
     fn mismatched_slice_id_is_rejected_then_the_real_id_is_accepted() {
         let (state, slice) = after_catalog(config(), meta_over(1, 2));
-        let phase_before = state.phase.clone();
+        let before = observable(&state);
 
         // A slice carrying a stale id the ledger never issued is dropped: no effects, no state change.
         let stale = FetchId::from_raw_for_test(9999);
@@ -1909,7 +1876,7 @@ mod tests {
             },
         );
         assert!(effects.is_empty());
-        assert_eq!(state.phase, phase_before);
+        assert_eq!(observable(&state), before);
 
         // The real in-flight id is still accepted and drives the optimizer.
         let (state, effects) = transition(
@@ -1920,7 +1887,7 @@ mod tests {
             },
         );
         assert!(any_push_reserves(&effects));
-        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(is_optimizing(&state));
     }
 
     #[test]
@@ -1958,13 +1925,7 @@ mod tests {
             },
         );
         assert!(effects.is_empty());
-        assert!(matches!(
-            state.phase,
-            Phase::AwaitingFirstSlice {
-                status: AwaitStatus::Error(EffectError::Fetch { .. }),
-                ..
-            }
-        ));
+        assert!(matches!(state.last_error, Some(EffectError::Fetch { .. })));
         // The next tick re-issues meta with a fresh id (still no catalog).
         let (_state, effects) = transition(state, Event::Tick);
         assert_ne!(meta_id(&effects), id);
@@ -1974,7 +1935,7 @@ mod tests {
     fn stale_failure_is_rejected() {
         let (state, effects) = transition(AppState::started(config()), Event::Tick);
         let real = meta_id(&effects);
-        let phase_before = state.phase.clone();
+        let before = observable(&state);
         // A failure carrying an id the ledger no longer holds is ignored — state is unchanged.
         let stale = FetchId::from_raw_for_test(9999);
         assert_ne!(real, stale);
@@ -1990,7 +1951,7 @@ mod tests {
             },
         );
         assert!(effects.is_empty());
-        assert_eq!(state.phase, phase_before);
+        assert_eq!(observable(&state), before);
     }
 
     // --- Review-2 findings (a) & (e): fetch in-flight gating and out-of-order slice application. ---
@@ -2033,7 +1994,7 @@ mod tests {
             },
         );
         assert!(!any_push_reserves(&effects));
-        assert!(matches!(state.phase, Phase::AwaitingFirstSlice { .. }));
+        assert_eq!(await_reason(&state), Some(AwaitReason::Bootstrapping));
 
         let (state, effects) = transition(
             state,
@@ -2043,7 +2004,7 @@ mod tests {
             },
         );
         assert!(any_push_reserves(&effects));
-        assert!(matches!(state.phase, Phase::Optimizing { .. }));
+        assert!(is_optimizing(&state));
     }
 
     #[test]
@@ -2066,7 +2027,7 @@ mod tests {
                 response: slice_at(0xcc, 1),
             },
         );
-        let Phase::Optimizing { latest, .. } = &state.phase else {
+        let Some(Work::Optimizing { latest, .. }) = work_of(&state) else {
             panic!("expected Optimizing");
         };
         assert_eq!(latest.block_hash, hash(0xcc));
@@ -2082,7 +2043,7 @@ mod tests {
             },
         );
         assert!(!any_push_reserves(&effects));
-        let Phase::Optimizing { latest, .. } = &state.phase else {
+        let Some(Work::Optimizing { latest, .. }) = work_of(&state) else {
             panic!("expected Optimizing");
         };
         assert_eq!(

@@ -23,8 +23,8 @@ pub use runtime::{
     ClientConfig, ClientEngineApp, ClientEngineRuntime, Subscription, run as run_engine,
 };
 pub use state::{
-    AppState, AwaitStatus, Effect, EffectError, Event, FetchKind, OptimizeStage, Phase, Route,
-    SessionConfig, SliceProvenance, slice_request_for, transition,
+    AppState, AwaitReason, Effect, EffectError, Event, FetchKind, OptimizeStage, Route, Session,
+    SessionConfig, SliceProvenance, Work, slice_request_for, transition,
 };
 
 use std::collections::HashMap;
@@ -328,8 +328,14 @@ mod tests {
 
     /// A catalog and a matching slice for a set of pools whose `(protocol, key_byte)` identities are
     /// unique — the catalog is a map keyed by pool, so duplicates are not a shape the server emits.
-    fn generated_catalog()
-    -> impl Strategy<Value = (Vec<GeneratedPool>, Vec<u8>, SliceResponse, PoolsMetaResponse)> {
+    fn generated_catalog() -> impl Strategy<
+        Value = (
+            Vec<GeneratedPool>,
+            Vec<u8>,
+            SliceResponse,
+            PoolsMetaResponse,
+        ),
+    > {
         (
             prop::collection::vec(generated_pool(), 0..10),
             // Decimals for token bytes 0..7; `TokenDecimals` accepts the usual ERC-20 range.
